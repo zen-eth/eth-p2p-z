@@ -1,0 +1,6 @@
+[submodule "deps/specs"]
+	path = deps/specs
+	url = https://github.com/libp2p/specs.git
+[submodule "deps/go-libp2p"]
+	path = deps/go-libp2p
+	url = https://github.com/libp2p/go-libp2p.git
