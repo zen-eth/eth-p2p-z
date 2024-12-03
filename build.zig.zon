@@ -24,8 +24,8 @@
     // internet connectivity.
     .dependencies = .{
         .libuv = .{
-            .url = "https://github.com/farey0/ZLibuv/archive/refs/heads/main.zip",
-            .hash = "122020a6204c1af697bb621b8e4d05818d31b6751fc9e58c252a084af3f911737fd2",
+            .url = "https://github.com/zen-eth/ZLibuv/archive/refs/heads/main.zip",
+            .hash = "12207a67837e98ec720563e27608822c2f072e7d5b14653b4233890c1dc55baffbad",
         },
     },
     .paths = .{

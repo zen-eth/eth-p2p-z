@@ -2,7 +2,7 @@
 //! you are building an executable. If you are making a library, the convention
 //! is to delete this file and start with root.zig instead.
 const std = @import("std");
-
+const uv = @import("libuv");
 
 pub fn main() !void {
     // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
@@ -18,6 +18,44 @@ pub fn main() !void {
     try stdout.print("Run `zig build test` to run the tests.\n", .{});
 
     try bw.flush(); // Don't forget to flush!
+
+    var loop: uv.Loop = undefined;
+    var server: uv.Tcp = undefined;
+    var client: uv.Tcp = undefined;
+    try loop.Init();
+
+    try server.Init(&loop);
+    try client.Init(&loop);
+
+    const connectionCallback: uv.Stream.Callback.Connection = MyConnectionCallback;
+    var sa = try uv.SocketAddress.FromString("127.0.0.1", 8080);
+    server.Bind(&sa, false) catch unreachable;
+    server.GetStream().Listen(128, connectionCallback) catch unreachable;
+    var connect_req = uv.Request.Connect{};
+    const connectCallback: uv.Stream.Callback.Connect = MyConnectCallback;
+    client.Connect(&connect_req, &sa, connectCallback) catch unreachable;
+
+    // Run the event loop once to process the connection
+    try loop.Run(.Once);
+
+    // Close handles before closing the loop
+    server.GetHandle().Close(null);
+    client.GetHandle().Close(null);
+
+    // Run again to process close events
+    try loop.Run(.Once);
+
+    try loop.Close();
+}
+
+fn MyConnectionCallback(_: uv.Stream, _: ?uv.Stream.Error) void {
+    // Handle connection result
+    std.debug.print("Connection result\n", .{});
+}
+
+fn MyConnectCallback(_: *uv.Request.Connect, _: ?uv.Stream.Error) void {
+    // Handle connection result
+    std.debug.print("Connect result\n", .{});
 }
 
 test "simple test" {
