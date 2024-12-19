@@ -18,6 +18,9 @@ pub fn build(b: *std.Build) void {
     const libuv_dep = b.dependency("libuv", .{});
     const libuv_module = libuv_dep.module("ZLibuv");
 
+    const multiformats_zig_dep = b.dependency("multiformats-zig", .{});
+    const multiformats_zig_module = multiformats_zig_dep.module("multiformats-zig");
+
     const lib = b.addStaticLibrary(.{
         .name = "zig-libp2p2",
         // In this case the main source file is merely a path, however, in more
@@ -28,6 +31,7 @@ pub fn build(b: *std.Build) void {
     });
 
     lib.root_module.addImport("libuv", libuv_module);
+    lib.root_module.addImport("multiformats-zig", multiformats_zig_module);
     // This declares intent for the library to be installed into the standard
     // location when the user invokes the "install" step (the default step when
     // running `zig build`).
@@ -41,6 +45,7 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addImport("libuv", libuv_module);
+    exe.root_module.addImport("multiformats-zig", multiformats_zig_module);
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
@@ -78,6 +83,7 @@ pub fn build(b: *std.Build) void {
     });
 
     lib_unit_tests.root_module.addImport("libuv", libuv_module);
+    lib_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
@@ -88,6 +94,7 @@ pub fn build(b: *std.Build) void {
     });
 
     exe_unit_tests.root_module.addImport("libuv", libuv_module);
+    exe_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 

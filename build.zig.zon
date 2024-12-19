@@ -27,6 +27,10 @@
             .url = "https://github.com/zen-eth/ZLibuv/archive/refs/heads/main.zip",
             .hash = "12207a67837e98ec720563e27608822c2f072e7d5b14653b4233890c1dc55baffbad",
         },
+        .@"multiformats-zig" = .{
+            .url = "https://github.com/optimism-java/multiformats-zig/archive/main.tar.gz",
+            .hash = "1220b9aeacf60c93b1ecc530061e69a6eba4d294a183e72c90641cf6fd1be67c3ec7",
+        },
     },
     .paths = .{
         "build.zig",

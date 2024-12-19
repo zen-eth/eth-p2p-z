@@ -2,7 +2,7 @@ const std = @import("std");
 const uv = @import("libuv");
 const io = @import("io.zig");
 const transport = @import("transport.zig");
-const MultiAddr = @import("multiaddr").MultiAddr;
+const Multiaddr = @import("multiformats-zig").multiaddr.Multiaddr;
 const PeerId = @import("peer").PeerId;
 
 pub const TcpConnection = struct {

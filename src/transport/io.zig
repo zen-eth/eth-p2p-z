@@ -1,5 +1,7 @@
 const std = @import("std");
 const uv = @import("libuv");
+const multiformats = @import("multiformats-zig");
+const Multiaddr = multiformats.multiaddr.Multiaddr;
 
 pub const IoError = error{
     InitFailed,
@@ -15,7 +17,6 @@ pub const IoBackend = enum {
 
 pub const IoStreamType = enum {
     tcp,
-    udp,
 };
 
 pub const IoStream = struct {
@@ -25,14 +26,9 @@ pub const IoStream = struct {
                 .libuv => uv.Tcp,
             },
         },
-        udp: struct {
-            handle: switch (IoBackend) {
-                .libuv => uv.Udp,
-            },
-        },
     },
 
-    pub fn init(loop: io.IoLoop, stream_type: IoStreamType) !IoStream {
+    pub fn init(loop: IoLoop, stream_type: IoStreamType) !IoStream {
         return switch (stream_type) {
             .tcp => {
                 var tcp_handle: uv.Tcp = undefined;
@@ -41,17 +37,10 @@ pub const IoStream = struct {
                 }
                 return IoStream{ .impl = .{ .tcp = .{ .handle = tcp_handle } } };
             },
-            .udp => {
-                var udp_handle: uv.Udp = undefined;
-                switch (loop.impl) {
-                    .libuv => |uv_loop| try udp_handle.Init(uv_loop),
-                }
-                return IoStream{ .impl = .{ .udp = .{ .handle = udp_handle } } };
-            },
         };
     }
 
-    pub fn connect(self: *IoStream, addr: MultiAddr) !void {
+    pub fn connect(self: *IoStream, addr: Multiaddr) !void {
         switch (self.impl) {
             .tcp => |*t| {
                 var connect_req = uv.Request.Connect{};
@@ -62,7 +51,7 @@ pub const IoStream = struct {
         }
     }
 
-    pub fn bind(self: *IoStream, addr: MultiAddr) !void {
+    pub fn bind(self: *IoStream, addr: Multiaddr) !void {
         switch (self.impl) {
             .tcp => |*t| {
                 const socket_addr = try addr.toSocketAddr();
@@ -93,7 +82,7 @@ pub const IoStream = struct {
     };
 
     pub fn read(self: *IoStream, buffer: []u8) !usize {
-        switch(self.impl) {
+        switch (self.impl) {
             .tcp => |t| {
                 const nread = try t.handle.GetStream().read(buffer);
                 if (nread < 0) return ReadError.ReadFailed;
@@ -104,7 +93,7 @@ pub const IoStream = struct {
     }
 
     pub fn write(self: *IoStream, data: []const u8) !void {
-        switch(self.impl) {
+        switch (self.impl) {
             .tcp => |t| {
                 const write_req = try t.handle.GetStream().write(data);
                 if (write_req < 0) return WriteError.WriteFailed;
@@ -114,21 +103,21 @@ pub const IoStream = struct {
     }
 
     pub fn getLocalAddr(self: *IoStream) MultiAddr {
-        return switch(self.impl) {
+        return switch (self.impl) {
             .tcp => |t| MultiAddr.fromSocketAddr(t.handle.GetSockName()),
             .udp => |u| MultiAddr.fromSocketAddr(u.handle.GetSockName()),
         };
     }
 
     pub fn getRemoteAddr(self: *IoStream) MultiAddr {
-        return switch(self.impl) {
+        return switch (self.impl) {
             .tcp => |t| MultiAddr.fromSocketAddr(t.handle.GetPeerName()),
             .udp => |u| MultiAddr.fromSocketAddr(u.handle.GetPeerName()),
         };
     }
 
     pub fn isConnected(self: *IoStream) bool {
-        return switch(self.impl) {
+        return switch (self.impl) {
             .tcp => |t| t.handle.isConnected(),
             .udp => true, // UDP is connectionless, so it's always "connected"
         };
@@ -140,7 +129,7 @@ pub const IoLoop = struct {
     },
 
     pub fn run(self: *IoLoop) !void {
-        switch(self.impl) {
+        switch (self.impl) {
             .libuv => |loop| {
                 try loop.Run(.Default);
             },
