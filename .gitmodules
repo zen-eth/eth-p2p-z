@@ -4,3 +4,6 @@
 [submodule "deps/go-libp2p"]
 	path = deps/go-libp2p
 	url = https://github.com/libp2p/go-libp2p.git
+[submodule "deps/rust-libp2p"]
+	path = deps/rust-libp2p
+	url = https://github.com/libp2p/rust-libp2p.git

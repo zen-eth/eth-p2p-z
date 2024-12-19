@@ -5,8 +5,14 @@ const std = @import("std");
 const testing = std.testing;
 const uv = @import("libuv");
 
+pub const peer_id = @import("peer/id.zig");
+
 export fn add(a: i32, b: i32) i32 {
     return a + b;
+}
+
+test {
+    std.testing.refAllDeclsRecursive(@This());
 }
 
 test "basic add functionality" {
