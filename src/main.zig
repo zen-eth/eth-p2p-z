@@ -23,7 +23,6 @@ pub fn main() !void {
     var server: uv.Tcp = undefined;
     var client: uv.Tcp = undefined;
     try loop.Init();
-
     try server.Init(&loop);
     try client.Init(&loop);
 
