@@ -102,10 +102,10 @@ pub const IoStream = struct {
         }
     }
 
-    pub fn getLocalAddr(self: *IoStream) MultiAddr {
+    pub fn getLocalAddr(self: *IoStream) Multiaddr {
         return switch (self.impl) {
-            .tcp => |t| MultiAddr.fromSocketAddr(t.handle.GetSockName()),
-            .udp => |u| MultiAddr.fromSocketAddr(u.handle.GetSockName()),
+            .tcp => |t| Multiaddr.fromSocketAddr(t.handle.GetSockName()),
+            .udp => |u| Multiaddr.fromSocketAddr(u.handle.GetSockName()),
         };
     }
 

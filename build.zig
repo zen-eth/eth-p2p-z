@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const libuv_dep = b.dependency("libuv", .{});
-    const libuv_module = libuv_dep.module("ZLibuv");
+    const libuv_module = libuv_dep.module("libuv");
 
     const multiformats_zig_dep = b.dependency("multiformats-zig", .{});
     const multiformats_zig_module = multiformats_zig_dep.module("multiformats-zig");
@@ -32,6 +32,8 @@ pub fn build(b: *std.Build) void {
 
     lib.root_module.addImport("libuv", libuv_module);
     lib.root_module.addImport("multiformats-zig", multiformats_zig_module);
+    // lib.addIncludePath(libuv_dep.path("libuv/include/"));
+    // lib.addIncludePath(libuv_dep.path("include/"));
     // This declares intent for the library to be installed into the standard
     // location when the user invokes the "install" step (the default step when
     // running `zig build`).
@@ -46,6 +48,8 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("libuv", libuv_module);
     exe.root_module.addImport("multiformats-zig", multiformats_zig_module);
+    // exe.addIncludePath(libuv_dep.path("libuv/include/"));
+    // exe.addIncludePath(libuv_dep.path("include/"));
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
@@ -84,7 +88,8 @@ pub fn build(b: *std.Build) void {
 
     lib_unit_tests.root_module.addImport("libuv", libuv_module);
     lib_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
-
+    // lib_unit_tests.addIncludePath(libuv_dep.path("libuv/include/"));
+    // lib_unit_tests.addIncludePath(libuv_dep.path("include/"));
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
     const exe_unit_tests = b.addTest(.{
@@ -95,6 +100,8 @@ pub fn build(b: *std.Build) void {
 
     exe_unit_tests.root_module.addImport("libuv", libuv_module);
     exe_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
+    // exe_unit_tests.addIncludePath(libuv_dep.path("libuv/include/"));
+    // exe_unit_tests.addIncludePath(libuv_dep.path("include/"));
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 

@@ -1,5 +1,7 @@
 const std = @import("std");
 const uv = @import("libuv");
+const Loop = uv.Loop;
+const Tcp = uv.Tcp;
 const Allocator = @import("std").mem.Allocator;
 const Multiaddr = @import("multiformats-zig").multiaddr.Multiaddr;
 
@@ -9,45 +11,44 @@ pub const LibuvProvider = struct {
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) !LibuvProvider {
-        const tcp: *uv.Tcp = undefined;
-        const loop: *uv.Loop = undefined;
-        try loop.Init();
-        try tcp.Init(loop);
+        var loop = try Loop.init(allocator);
+        var tcp = try Tcp.init(loop, allocator);
+
         const provider = LibuvProvider{
-            .loop = loop,
-            .tcp = tcp,
+            .loop = &loop,
+            .tcp = &tcp,
             .allocator = allocator,
         };
         return provider;
     }
 
-    pub fn listen(self: *LibuvProvider, addr: *Multiaddr) !void {
-        const sa = try multiaddr_to_sockaddr(addr);
-        self.tcp.Bind(&sa, false) catch unreachable;
-        const callback: uv.Stream.Callback.Connection = MyConnectionCallback;
-        self.tcp.GetStream().Listen(128, callback) catch unreachable;
-    }
+    // pub fn listen(self: *LibuvProvider, addr: *Multiaddr) !void {
+    //     const sa = try multiaddr_to_sockaddr(addr);
+    //     self.tcp.Bind(&sa, false) catch unreachable;
+    //     const callback: uv.Stream.Callback.Connection = MyConnectionCallback;
+    //     self.tcp.GetStream().Listen(128, callback) catch unreachable;
+    // }
 
-    fn multiaddr_to_sockaddr(addr: *Multiaddr) !uv.SocketAddress {
+    fn multiaddr_to_sockaddr(addr: *Multiaddr) !std.net.Address {
         var port: ?u16 = null;
         var address = addr.*;
 
         while (try address.pop()) |proto| {
             switch (proto) {
-                .Ip4 => |ipv4| {
+                .Ip4 => |*ipv4| { // Change from |*a| to |a| to get value instead of pointer
                     if (port) |p| {
-                        const addr_str: [:0]const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(&ipv4.sa.addr)));
-                        const sockaddr = try uv.SocketAddress.FromString(addr_str, p);
-                        return sockaddr;
+                        const mutable_ipv4 = @as(*std.net.Ip4Address, @constCast(ipv4));
+                        mutable_ipv4.setPort(p);
+                        return .{ .in = ipv4.* };
                     } else {
                         return error.MissingPort;
                     }
                 },
-                .Ip6 => |ipv6| {
+                .Ip6 => |*ipv6| {
                     if (port) |p| {
-                        const addr_str: [:0]const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(&ipv6.sa.addr)));
-                        const sockaddr = try uv.SocketAddress.FromString(addr_str, p);
-                        return sockaddr;
+                        const mutable_ipv6 = @as(*std.net.Ip6Address, @constCast(ipv6));
+                        mutable_ipv6.setPort(p);
+                        return .{ .in6 = ipv6.* };
                     } else {
                         return error.MissingPort;
                     }
@@ -73,22 +74,20 @@ fn MyConnectionCallback(_: uv.Stream, _: ?uv.Stream.Error) void {
 
 const testing = std.testing;
 
-// test "multiaddr_to_sockaddr converts valid IPv4 address" {
-//     const allocator = testing.allocator;
-//
-//     // Create a multiaddr for "127.0.0.1:8080"
-//     var addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/8080");
-//     defer addr.deinit();
-//
-//     const provider = try LibuvProvider.init(allocator);
-//
-//     const sockaddr = try provider.multiaddr_to_sockaddr(&addr);
-//
-//     var buf: [22]u8 = undefined;
-//     const addr_str = try std.fmt.bufPrint(&buf, "{}", .{sockaddr});
-//
-//     try testing.expectEqualStrings("127.0.0.2:8080", addr_str);
-// }
+test "multiaddr_to_sockaddr converts valid IPv4 address" {
+    const allocator = testing.allocator;
+
+    // Create a multiaddr for "127.0.0.1:8080"
+    var addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/8080");
+    defer addr.deinit();
+
+    const sockaddr = try LibuvProvider.multiaddr_to_sockaddr(&addr);
+
+    var buf: [22]u8 = undefined;
+    const addr_str = try std.fmt.bufPrint(&buf, "{}", .{sockaddr});
+
+    try testing.expectEqualStrings("127.0.0.1:8080", addr_str);
+}
 
 // test "multiaddr_to_sockaddr handles invalid address" {
 //     var allocator = testing.allocator;
