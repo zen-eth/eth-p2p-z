@@ -5,29 +5,53 @@ const Tcp = uv.Tcp;
 const Allocator = @import("std").mem.Allocator;
 const Multiaddr = @import("multiformats-zig").multiaddr.Multiaddr;
 
-pub const LibuvProvider = struct {
-    loop: *uv.Loop,
-    tcp: *uv.Tcp,
+pub const Config = struct {
+    backlog: i32 = 128,
+};
+
+pub const Connection = struct {
+    inner: *Tcp,
+};
+
+pub const LibuvTransport = struct {
+    loop: Loop,
+    listeners: std.AutoHashMap(Multiaddr, Tcp),
+    streams: std.ArrayList(Tcp),
+    mutex: std.Thread.Mutex,
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator) !LibuvProvider {
-        var loop = try Loop.init(allocator);
-        var tcp = try Tcp.init(loop, allocator);
-
-        const provider = LibuvProvider{
-            .loop = &loop,
-            .tcp = &tcp,
+    pub fn init(allocator: Allocator) !LibuvTransport {
+        const provider = LibuvTransport{
+            .loop = try Loop.init(allocator),
+            .listeners = std.AutoHashMap(Multiaddr, Tcp).init(allocator),
+            .streams = std.ArrayList(Tcp).init(allocator),
+            .mutex = .{},
             .allocator = allocator,
         };
         return provider;
     }
 
-    // pub fn listen(self: *LibuvProvider, addr: *Multiaddr) !void {
-    //     const sa = try multiaddr_to_sockaddr(addr);
-    //     self.tcp.Bind(&sa, false) catch unreachable;
-    //     const callback: uv.Stream.Callback.Connection = MyConnectionCallback;
-    //     self.tcp.GetStream().Listen(128, callback) catch unreachable;
-    // }
+    fn create_stream(self: *LibuvTransport) !Tcp {
+        const tcp = try Tcp.init(self.loop, self.allocator);
+        return tcp;
+    }
+
+    pub fn listen(self: *LibuvTransport, addr: *const Multiaddr, backlog: i32, comptime cb: fn (*Tcp, i32) void) !void {
+        const sa = try multiaddr_to_sockaddr(addr);
+        const tcp = try self.create_tcp();
+
+        self.mutex.lock();
+        self.streams.append(tcp);
+        self.mutex.unlock();
+
+        try tcp.bind(sa);
+        try tcp.listen(backlog, cb);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.listeners.put(addr, tcp);
+    }
+
+    fn on_stream_closed(_: *Tcp) void {}
 
     fn multiaddr_to_sockaddr(addr: *Multiaddr) !std.net.Address {
         var port: ?u16 = null;
@@ -35,7 +59,7 @@ pub const LibuvProvider = struct {
 
         while (try address.pop()) |proto| {
             switch (proto) {
-                .Ip4 => |*ipv4| { // Change from |*a| to |a| to get value instead of pointer
+                .Ip4 => |*ipv4| {
                     if (port) |p| {
                         const mutable_ipv4 = @as(*std.net.Ip4Address, @constCast(ipv4));
                         mutable_ipv4.setPort(p);
@@ -81,7 +105,7 @@ test "multiaddr_to_sockaddr converts valid IPv4 address" {
     var addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/8080");
     defer addr.deinit();
 
-    const sockaddr = try LibuvProvider.multiaddr_to_sockaddr(&addr);
+    const sockaddr = try LibuvTransport.multiaddr_to_sockaddr(&addr);
 
     var buf: [22]u8 = undefined;
     const addr_str = try std.fmt.bufPrint(&buf, "{}", .{sockaddr});

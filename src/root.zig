@@ -3,7 +3,7 @@
 //! start with main.zig instead.
 const std = @import("std");
 const testing = std.testing;
-pub const libuv_tcp = @import("transport/tcp/libuv.zig");
+pub const libuv_tcp = @import("transport/libuv.zig");
 
 pub const peer_id = @import("peer/id.zig");
 
