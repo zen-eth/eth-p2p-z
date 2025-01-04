@@ -4,19 +4,31 @@ const Loop = uv.Loop;
 const Tcp = uv.Tcp;
 const Allocator = @import("std").mem.Allocator;
 const Multiaddr = @import("multiformats-zig").multiaddr.Multiaddr;
+const Transport = @import("../transport/transport.zig").Transport;
+
+pub const DEFAULT_BACKLOG = 128;
 
 pub const Config = struct {
     backlog: i32 = 128,
 };
 
 pub const Connection = struct {
-    inner: *Tcp,
+    inner_conn: *Tcp,
+    transport: *Transport,
+    on_close: ?fn (*Connection) void,
+
+    pub fn close(self: *Connection) void {
+        self.inner_conn.close();
+        if (self.on_close) |on_close| {
+            @call(.always_inline, on_close, .{self});
+        }
+    }
 };
 
 pub const LibuvTransport = struct {
     loop: Loop,
     listeners: std.AutoHashMap(Multiaddr, Tcp),
-    streams: std.ArrayList(Tcp),
+    sockets: std.ArrayList(Tcp),
     mutex: std.Thread.Mutex,
     allocator: Allocator,
 
@@ -24,24 +36,24 @@ pub const LibuvTransport = struct {
         const provider = LibuvTransport{
             .loop = try Loop.init(allocator),
             .listeners = std.AutoHashMap(Multiaddr, Tcp).init(allocator),
-            .streams = std.ArrayList(Tcp).init(allocator),
+            .sockets = std.ArrayList(Tcp).init(allocator),
             .mutex = .{},
             .allocator = allocator,
         };
         return provider;
     }
 
-    fn create_stream(self: *LibuvTransport) !Tcp {
+    fn create_connection(self: *LibuvTransport) !Tcp {
         const tcp = try Tcp.init(self.loop, self.allocator);
         return tcp;
     }
 
     pub fn listen(self: *LibuvTransport, addr: *const Multiaddr, backlog: i32, comptime cb: fn (*Tcp, i32) void) !void {
         const sa = try multiaddr_to_sockaddr(addr);
-        const tcp = try self.create_tcp();
+        const tcp = try self.create_connection();
 
         self.mutex.lock();
-        self.streams.append(tcp);
+        self.sockets.append(tcp);
         self.mutex.unlock();
 
         try tcp.bind(sa);
@@ -52,6 +64,22 @@ pub const LibuvTransport = struct {
     }
 
     fn on_stream_closed(_: *Tcp) void {}
+
+    pub fn wrap_on_peer_connect(self: *LibuvTransport, cb: fn (*Connection) void) fn (*Tcp, i32) void {
+        return struct {
+            fn wrapper(tcp: *Tcp, status: i32) void {
+                if (status != 0) {
+                    return;
+                }
+                const conn = Connection{
+                    .inner_conn = tcp,
+                    .transport = &.{ .tcp = .{ .libuvTransport = self.* } },
+                    .on_close = null,
+                };
+                cb(&conn);
+            }
+        }.wrapper;
+    }
 
     fn multiaddr_to_sockaddr(addr: *Multiaddr) !std.net.Address {
         var port: ?u16 = null;
@@ -83,6 +111,7 @@ pub const LibuvTransport = struct {
                     }
                     port = portnum;
                 },
+                // TODO: Add support for other protocols
                 // .P2p => {},
                 else => return error.UnsupportedProtocol,
             }
