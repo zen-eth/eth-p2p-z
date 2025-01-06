@@ -5,7 +5,6 @@ const LibuvTransport = libuv_transport.LibuvTransport;
 const Connection = @import("../../network/network.zig").Connection;
 const Tcp = @import("../../transport/libuv.zig").Tcp;
 
-
 pub const Transport = union(enum) {
     libuvTransport: LibuvTransport,
 
@@ -14,8 +13,6 @@ pub const Transport = union(enum) {
             .libuvTransport => |transport| transport.listen(addr, libuv_transport.DEFAULT_BACKLOG, transport.wrap_on_peer_connect(cb)),
         };
     }
-
-
 };
 
 // pub const Transport = struct {

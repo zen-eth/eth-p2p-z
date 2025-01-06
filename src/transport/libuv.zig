@@ -13,75 +13,124 @@ pub const Config = struct {
 };
 
 pub const Connection = struct {
-    inner_conn: *Tcp,
-    transport: *Transport,
-    on_close: ?fn (*Connection) void,
-
-    pub fn close(self: *Connection) void {
-        self.inner_conn.close();
-        if (self.on_close) |on_close| {
-            @call(.always_inline, on_close, .{self});
-        }
-    }
+    socket: *Tcp,
+    transport: *LibuvTransport,
 };
 
 pub const LibuvTransport = struct {
     loop: Loop,
-    listeners: std.AutoHashMap(Multiaddr, Tcp),
-    sockets: std.ArrayList(Tcp),
-    mutex: std.Thread.Mutex,
+    servers: struct {
+        mutex: std.Thread.Mutex,
+        listeners: std.StringHashMap(Tcp),
+    },
+    clients: struct {
+        mutex: std.Thread.Mutex,
+        sockets: std.ArrayList(Tcp),
+    },
+    config: Config,
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator) !LibuvTransport {
+    pub fn init(allocator: Allocator, config: Config) !LibuvTransport {
         const provider = LibuvTransport{
             .loop = try Loop.init(allocator),
-            .listeners = std.AutoHashMap(Multiaddr, Tcp).init(allocator),
-            .sockets = std.ArrayList(Tcp).init(allocator),
-            .mutex = .{},
+            .servers = .{
+                .mutex = .{},
+                .listeners = std.StringHashMap(Tcp).init(allocator),
+            },
+            .clients = .{
+                .mutex = .{},
+                .sockets = std.ArrayList(Tcp).init(allocator),
+            },
+            .config = config,
             .allocator = allocator,
         };
         return provider;
     }
 
-    fn create_connection(self: *LibuvTransport) !Tcp {
-        const tcp = try Tcp.init(self.loop, self.allocator);
-        return tcp;
-    }
-
-    pub fn listen(self: *LibuvTransport, addr: *const Multiaddr, backlog: i32, comptime cb: fn (*Tcp, i32) void) !void {
+    pub fn listen(self: *LibuvTransport, addr: *const Multiaddr) !void {
         const sa = try multiaddr_to_sockaddr(addr);
-        const tcp = try self.create_connection();
-
-        self.mutex.lock();
-        self.sockets.append(tcp);
-        self.mutex.unlock();
-
+        var tcp = try Tcp.init(self.loop, self.allocator);
+        tcp.setData(self);
         try tcp.bind(sa);
-        try tcp.listen(backlog, cb);
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.listeners.put(addr, tcp);
+        try tcp.listen(self.config.backlog, create_listen_cb);
+
+        self.servers.mutex.lock();
+        defer self.servers.mutex.unlock();
+        try self.servers.listeners.put(try addr.toString(self.allocator), tcp);
     }
 
-    fn on_stream_closed(_: *Tcp) void {}
+    fn create_client_close_err_cb(_: *Tcp) void {}
 
-    pub fn wrap_on_peer_connect(self: *LibuvTransport, cb: fn (*Connection) void) fn (*Tcp, i32) void {
-        return struct {
-            fn wrapper(tcp: *Tcp, status: i32) void {
-                if (status != 0) {
-                    return;
-                }
-                const conn = Connection{
-                    .inner_conn = tcp,
-                    .transport = &.{ .tcp = .{ .libuvTransport = self.* } },
-                    .on_close = null,
-                };
-                cb(&conn);
-            }
-        }.wrapper;
+    fn create_server_close_err_cb(_: *Tcp) void {}
+
+    fn create_listen_cb(server: *Tcp, status: i32) void {
+        const transport = server.getData(LibuvTransport).?;
+        if (status != 0) {
+            std.debug.print("failed to listen on socket: {}\n", .{status});
+            server.close(create_server_close_err_cb);
+            server.deinit(transport.allocator);
+            return;
+        }
+
+        var client = Tcp.init(server.loop(), transport.allocator) catch |err| {
+            std.debug.print("failed to create client socket: {}\n", .{err});
+            server.close(create_server_close_err_cb);
+            server.deinit(transport.allocator);
+            return;
+        };
+
+        server.accept(&client) catch |err| {
+            std.debug.print("failed to accept connection: {}\n", .{err});
+            client.close(create_client_close_err_cb);
+            client.deinit(transport.allocator);
+            return;
+        };
+
+        transport.clients.mutex.lock();
+        transport.clients.sockets.append(client) catch |err| {
+            std.debug.print("failed to create socket: {}\n", .{err});
+            client.close(create_client_close_err_cb);
+            client.deinit(transport.allocator);
+            return;
+        };
+        transport.clients.mutex.unlock();
+
+        var conn = .{ .socket = client, .transport = transport };
+        client.setData(&conn);
+        client.readStart(create_alloc_cb, create_read_cb) catch |err| {
+            std.debug.print("failed to start reading: {}\n", .{err});
+            client.close(create_client_close_err_cb);
+            client.deinit(transport.allocator);
+            return;
+        };
     }
 
-    fn multiaddr_to_sockaddr(addr: *Multiaddr) !std.net.Address {
+    fn create_alloc_cb(tcp: *Tcp, size: usize) ?[]u8 {
+        const conn = tcp.getData(Connection).?;
+        return conn.transport.allocator.alloc(u8, size) catch |err| {
+            std.debug.print("failed to allocate buffer: {}\n", .{err});
+            return null;
+        };
+    }
+
+    fn create_read_cb(client: *Tcp, nread: isize, buf: []const u8) void {
+        const conn = client.getData(Connection).?;
+        if (nread < 0) {
+            client.close(create_client_close_err_cb);
+            client.deinit(conn.transport.allocator);
+            return;
+        }
+
+        if (nread == 0) {
+            return;
+        }
+
+        const data = buf[0..@as(usize, @intCast(nread))];
+        std.debug.print("received {d} bytes: {s}\n", .{ nread, data });
+        conn.transport.allocator.free(buf);
+    }
+
+    fn multiaddr_to_sockaddr(addr: *const Multiaddr) !std.net.Address {
         var port: ?u16 = null;
         var address = addr.*;
 

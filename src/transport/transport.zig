@@ -1,5 +1,4 @@
 const std = @import("std");
-const io = @import("io.zig");
 const Multiaddr = @import("multiformats-zig").multiaddr.Multiaddr;
 const PeerId = @import("peer").PeerId;
 const TcpTransport = @import("tcp/tcp.zig").Transport;
@@ -62,7 +61,7 @@ pub const Transport = union(enum) {
             .tcp => |tcp| {
                 switch (tcp) {
                     .libuvTransport => |transport| {
-                        transport.listen(addr, io.DEFAULT_BACKLOG, cb);
+                        transport.listen(addr, 128, cb);
                     },
                 }
             },

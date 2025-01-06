@@ -38,15 +38,13 @@ pub const Network = struct {
     }
 
     pub fn listen(self: *Network, addr: *const Multiaddr) !void {
-        const t= try self.get_transport(addr);
+        const t = try self.get_transport(addr);
         try t.listen(addr);
     }
 
-    fn get_transport(self: *Network, addr: *const Multiaddr) !*Transport {
+    fn get_transport(self: *Network, _: *const Multiaddr) !Transport {
         for (self.transports.items) |t| {
-            if (t.supports(addr)) {
-                return &transport;
-            }
+            return t;
         }
         return error.TransportNotSupported;
     }
