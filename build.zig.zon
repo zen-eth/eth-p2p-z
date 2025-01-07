@@ -29,7 +29,7 @@
         },
         .libuv = .{
             .url = "https://github.com/zen-eth/zig-libuv/archive/refs/heads/main.zip",
-            .hash = "12207c66cf167178c103932b1e6021baf1a0c993c9bc7098460688e248687bd771e7",
+            .hash = "1220fd9f66231bcae161c8ef630a528179d6435e4e083f784e8ff0cd46c0990ed9b5",
         },
     },
     .paths = .{

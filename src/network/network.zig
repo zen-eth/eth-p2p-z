@@ -14,8 +14,8 @@ pub const Connection = union(enum) {
 };
 
 pub const ConnectionHandler = struct {
-    pub fn handle_connection(conn: *Connection) void {
-        std.debug.print("Connection received\n", .{conn.*});
+    pub fn handle_connection(_: *Connection) void {
+        // std.debug.print("Connection received\n", .{conn.*});
     }
 };
 

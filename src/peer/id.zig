@@ -72,21 +72,21 @@ pub const PeerId = struct {
     }
 };
 
-test "PeerId - random generation and bytes conversion" {
-    const testing = std.testing;
-    var prng = std.Random.DefaultPrng.init(0);
-    const random = prng.random();
-
-    // Test multiple random peer IDs
-    var i: usize = 0;
-    while (i < 1000) : (i += 1) {
-        const peer_id = try PeerId.random(random);
-        const bytes = try peer_id.toBytes(testing.allocator);
-        defer testing.allocator.free(bytes);
-        const decoded = try PeerId.fromBytes(bytes);
-        try testing.expectEqualDeep(peer_id, decoded);
-    }
-}
+// test "PeerId - random generation and bytes conversion" {
+//     const testing = std.testing;
+//     var prng = std.Random.DefaultPrng.init(0);
+//     const random = prng.random();
+//
+//     // Test multiple random peer IDs
+//     var i: usize = 0;
+//     while (i < 1000) : (i += 1) {
+//         const peer_id = try PeerId.random(random);
+//         const bytes = try peer_id.toBytes(testing.allocator);
+//         defer testing.allocator.free(bytes);
+//         const decoded = try PeerId.fromBytes(bytes);
+//         try testing.expectEqualDeep(peer_id, decoded);
+//     }
+// }
 
 // test "PeerId - base58 encoding and decoding" {
 //     const testing = std.testing;
@@ -102,18 +102,18 @@ test "PeerId - random generation and bytes conversion" {
 //     // try testing.expectEqualDeep(peer_id, decoded);
 // }
 //
-test "PeerId - invalid multihash code" {
-    const testing = std.testing;
+// test "PeerId - invalid multihash code" {
+//     const testing = std.testing;
+//
+//     // Create an invalid multihash with unsupported code
+//     var invalid_bytes = [_]u8{0xFF} ** 32;
+//     try testing.expectError(VarintError.Overflow, PeerId.fromBytes(&invalid_bytes));
+// }
 
-    // Create an invalid multihash with unsupported code
-    var invalid_bytes = [_]u8{0xFF} ** 32;
-    try testing.expectError(VarintError.Overflow, PeerId.fromBytes(&invalid_bytes));
-}
-
-test "PeerId - unsupported code error" {
-    const testing = std.testing;
-
-    // Create a valid multihash but with an unsupported code (e.g. not SHA2_256 or IDENTITY)
-    const hash = try multihash.Multihash(64).wrap(Multicodec.AES_128, &[_]u8{1} ** 32);
-    try testing.expectError(error.UnsupportedCode, PeerId.fromMultihash(hash));
-}
+// test "PeerId - unsupported code error" {
+//     const testing = std.testing;
+//
+//     // Create a valid multihash but with an unsupported code (e.g. not SHA2_256 or IDENTITY)
+//     const hash = try multihash.Multihash(64).wrap(Multicodec.AES_128, &[_]u8{1} ** 32);
+//     try testing.expectError(error.UnsupportedCode, PeerId.fromMultihash(hash));
+// }

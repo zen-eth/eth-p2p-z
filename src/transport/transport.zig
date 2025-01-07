@@ -68,6 +68,21 @@ pub const Transport = union(enum) {
         };
     }
 
+    pub fn dial(
+        self: *Transport,
+        remote_addr: *const Multiaddr,
+    ) !void {
+        return switch (self.*) {
+            .tcp => |*tcp| {
+                switch (tcp.*) {
+                    .libuvTransport => |*transport| {
+                        return transport.dial(remote_addr);
+                    },
+                }
+            },
+        };
+    }
+
     // pub fn dial(
     //     self: *Transport,
     //     loop: io.IoLoop,
