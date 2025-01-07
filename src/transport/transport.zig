@@ -56,12 +56,12 @@ const Connection = @import("../network/network.zig").Connection;
 pub const Transport = union(enum) {
     tcp: TcpTransport,
 
-    pub fn listen(self: *Transport, addr: *const Multiaddr, comptime cb: fn (*Connection, i32) void) !void {
+    pub fn listen(self: *Transport, addr: *const Multiaddr) !void {
         return switch (self.*) {
-            .tcp => |tcp| {
-                switch (tcp) {
-                    .libuvTransport => |transport| {
-                        transport.listen(addr, 128, cb);
+            .tcp => |*tcp| {
+                switch (tcp.*) {
+                    .libuvTransport => |*transport| {
+                        try transport.listen(addr);
                     },
                 }
             },

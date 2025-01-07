@@ -2,6 +2,7 @@ const std = @import("std");
 const uv = @import("libuv");
 const Loop = uv.Loop;
 const Tcp = uv.Tcp;
+const ConnectReq = Tcp.ConnectReq;
 const Allocator = @import("std").mem.Allocator;
 const Multiaddr = @import("multiformats-zig").multiaddr.Multiaddr;
 const Transport = @import("../transport/transport.zig").Transport;
@@ -52,36 +53,74 @@ pub const LibuvTransport = struct {
         var tcp = try Tcp.init(self.loop, self.allocator);
         tcp.setData(self);
         try tcp.bind(sa);
-        try tcp.listen(self.config.backlog, create_listen_cb);
+        try tcp.listen(self.config.backlog, listen_cb);
 
         self.servers.mutex.lock();
         defer self.servers.mutex.unlock();
         try self.servers.listeners.put(try addr.toString(self.allocator), tcp);
     }
 
-    fn create_client_close_err_cb(_: *Tcp) void {}
+    pub fn dial(self: *LibuvTransport, addr: *const Multiaddr) !void {
+        const sa = try multiaddr_to_sockaddr(addr);
+        var tcp = try Tcp.init(self.loop, self.allocator);
+        var conn_req = try ConnectReq.init(self.allocator);
+        tcp.setData(self);
+        try tcp.connect(&conn_req, sa, connect_cb);
+    }
 
-    fn create_server_close_err_cb(_: *Tcp) void {}
+    fn connect_cb(conn_req: *ConnectReq, status: i32) void {
+        const client = conn_req.handle(Tcp).?;
+        const transport = client.getData(LibuvTransport).?;
+        if (status != 0) {
+            std.debug.print("Connection failed\n", .{});
+            const is_active = client.isActive() catch |err| {
+                std.debug.print("failed to check if client is active: {}\n", .{err});
+                return;
+            };
+            if (is_active) {
+                client.close(accepted_socket_close_err_cb);
+            }
+            conn_req.deinit(transport.allocator);
+            return;
+        }
 
-    fn create_listen_cb(server: *Tcp, status: i32) void {
+        transport.clients.mutex.lock();
+        defer transport.clients.mutex.unlock();
+        transport.clients.sockets.append(client) catch |err| {
+            std.debug.print("failed to create socket: {}\n", .{err});
+            client.close(accepted_socket_close_err_cb);
+            conn_req.deinit(transport.allocator);
+            return;
+        };
+
+        std.Thread.sleep(std.time.ns_per_s * 10);
+        client.close(accepted_socket_close_err_cb);
+        conn_req.deinit(transport.allocator);
+    }
+
+    fn accepted_socket_close_err_cb(_: *Tcp) void {}
+
+    fn server_close_err_cb(_: *Tcp) void {}
+
+    fn listen_cb(server: *Tcp, status: i32) void {
         const transport = server.getData(LibuvTransport).?;
         if (status != 0) {
             std.debug.print("failed to listen on socket: {}\n", .{status});
-            server.close(create_server_close_err_cb);
+            server.close(server_close_err_cb);
             server.deinit(transport.allocator);
             return;
         }
 
         var client = Tcp.init(server.loop(), transport.allocator) catch |err| {
             std.debug.print("failed to create client socket: {}\n", .{err});
-            server.close(create_server_close_err_cb);
+            server.close(server_close_err_cb);
             server.deinit(transport.allocator);
             return;
         };
 
         server.accept(&client) catch |err| {
             std.debug.print("failed to accept connection: {}\n", .{err});
-            client.close(create_client_close_err_cb);
+            client.close(accepted_socket_close_err_cb);
             client.deinit(transport.allocator);
             return;
         };
@@ -89,7 +128,7 @@ pub const LibuvTransport = struct {
         transport.clients.mutex.lock();
         transport.clients.sockets.append(client) catch |err| {
             std.debug.print("failed to create socket: {}\n", .{err});
-            client.close(create_client_close_err_cb);
+            client.close(accepted_socket_close_err_cb);
             client.deinit(transport.allocator);
             return;
         };
@@ -97,15 +136,15 @@ pub const LibuvTransport = struct {
 
         var conn = .{ .socket = client, .transport = transport };
         client.setData(&conn);
-        client.readStart(create_alloc_cb, create_read_cb) catch |err| {
+        client.readStart(alloc_cb, server_socket_read_cb) catch |err| {
             std.debug.print("failed to start reading: {}\n", .{err});
-            client.close(create_client_close_err_cb);
+            client.close(accepted_socket_close_err_cb);
             client.deinit(transport.allocator);
             return;
         };
     }
 
-    fn create_alloc_cb(tcp: *Tcp, size: usize) ?[]u8 {
+    fn alloc_cb(tcp: *Tcp, size: usize) ?[]u8 {
         const conn = tcp.getData(Connection).?;
         return conn.transport.allocator.alloc(u8, size) catch |err| {
             std.debug.print("failed to allocate buffer: {}\n", .{err});
@@ -113,10 +152,10 @@ pub const LibuvTransport = struct {
         };
     }
 
-    fn create_read_cb(client: *Tcp, nread: isize, buf: []const u8) void {
+    fn server_socket_read_cb(client: *Tcp, nread: isize, buf: []const u8) void {
         const conn = client.getData(Connection).?;
         if (nread < 0) {
-            client.close(create_client_close_err_cb);
+            client.close(accepted_socket_close_err_cb);
             client.deinit(conn.transport.allocator);
             return;
         }
@@ -168,11 +207,6 @@ pub const LibuvTransport = struct {
         return error.InvalidAddress;
     }
 };
-
-fn MyConnectionCallback(_: uv.Stream, _: ?uv.Stream.Error) void {
-    // Handle connection result
-    std.debug.print("Connection result\n", .{});
-}
 
 const testing = std.testing;
 

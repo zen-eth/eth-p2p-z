@@ -8,9 +8,9 @@ const Tcp = @import("../../transport/libuv.zig").Tcp;
 pub const Transport = union(enum) {
     libuvTransport: LibuvTransport,
 
-    pub fn listen(self: *Transport, addr: *const Multiaddr, comptime cb: fn (*Connection) void) !void {
+    pub fn listen(self: *Transport, addr: *const Multiaddr) !void {
         return switch (self.*) {
-            .libuvTransport => |transport| transport.listen(addr, libuv_transport.DEFAULT_BACKLOG, transport.wrap_on_peer_connect(cb)),
+            .libuvTransport => |transport| transport.listen(addr),
         };
     }
 };
