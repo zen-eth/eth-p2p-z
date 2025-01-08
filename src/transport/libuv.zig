@@ -8,6 +8,7 @@ const c = uv.c;
 const Allocator = @import("std").mem.Allocator;
 const Multiaddr = @import("multiformats-zig").multiaddr.Multiaddr;
 const Transport = @import("../transport/transport.zig").Transport;
+const testing = std.testing;
 
 pub const DEFAULT_BACKLOG = 128;
 
@@ -121,7 +122,7 @@ pub const LibuvTransport = struct {
     fn onSignalReceived(sig: *Signal, _: c_int) void {
         const transport = sig.getData(LibuvTransport).?;
 
-        transport.serverClose();
+        transport.close();
         sig.close(onSignalClosed);
     }
 
@@ -164,30 +165,32 @@ pub const LibuvTransport = struct {
         }
     }
 
+    fn onListenerClose(_: *Tcp) void {}
+
     fn serverCloseErrCallback(_: *Tcp) void {}
 
     fn onPeerConnected(server: *Tcp, status: i32) void {
         const transport = server.getData(LibuvTransport).?;
         if (status != 0) {
-            // std.debug.print("failed to listen on socket: {}\n", .{status});
+            std.debug.print("failed to listen on socket: {}\n", .{status});
             return;
         }
 
-        var client = Tcp.init(server.loop(), transport.allocator) catch {
-            // std.debug.print("failed to create client socket: {}\n", .{err});
+        var client = Tcp.init(server.loop(), transport.allocator) catch |err| {
+            std.debug.print("failed to create client socket: {}\n", .{err});
             return;
         };
 
-        server.accept(&client) catch {
-            // std.debug.print("failed to accept connection: {}\n", .{err});
+        server.accept(&client) catch |err| {
+            std.debug.print("failed to accept connection: {}\n", .{err});
             client.close(onClientClose);
             client.deinit(transport.allocator);
             return;
         };
 
         transport.clients.mutex.lock();
-        transport.clients.sockets.append(client) catch {
-            // std.debug.print("failed to create socket: {}\n", .{err});
+        transport.clients.sockets.append(client) catch |err| {
+            std.debug.print("failed to create socket: {}\n", .{err});
             client.close(onClientClose);
             client.deinit(transport.allocator);
             return;
@@ -196,28 +199,34 @@ pub const LibuvTransport = struct {
 
         var conn = Connection.init(&client, transport);
         client.setData(&conn);
-        client.readStart(allocCallback, serverSocketReadCallback) catch {
-            // std.debug.print("failed to start reading: {}\n", .{err});
+        client.readStart(onAlloc, onServerSocketRead) catch |err| {
+            std.debug.print("failed to start reading: {}\n", .{err});
             client.close(onClientClose);
             client.deinit(transport.allocator);
             return;
         };
     }
 
-    fn allocCallback(tcp: *Tcp, _: usize) ?[]u8 {
-        _ = tcp.getData(Connection).?;
-        return null;
-        // return conn.transport.allocator.alloc(u8, size) catch  {
-        //     // std.debug.print("failed to allocate buffer: {}\n", .{err});
-        //     return null;
-        // };
+    fn onAlloc(tcp: *Tcp, size: usize) ?[]u8 {
+        const conn = tcp.getData(Connection).?;
+        return conn.transport.allocator.alloc(u8, size) catch |err| {
+            std.debug.print("failed to allocate buffer: {}\n", .{err});
+            return null;
+        };
     }
 
-    fn serverSocketReadCallback(client: *Tcp, nread: isize, buf: []const u8) void {
+    fn onServerSocketRead(client: *Tcp, nread: isize, buf: []const u8) void {
         const conn = client.getData(Connection).?;
         if (nread < 0) {
             client.close(onClientClose);
-            client.deinit(conn.transport.allocator);
+            conn.transport.clients.mutex.lock();
+            for (conn.transport.clients.sockets.items, 0..) |*s, i| {
+                if (s == client) {
+                    _ = conn.transport.clients.sockets.swapRemove(i);
+                    break;
+                }
+            }
+            conn.transport.clients.mutex.unlock();
             return;
         }
 
@@ -229,11 +238,17 @@ pub const LibuvTransport = struct {
         conn.transport.allocator.free(buf);
     }
 
-    fn serverClose(self: *LibuvTransport) void {
+    pub fn start(self: *LibuvTransport) !void {
+        const status = try self.loop.run(.default);
+        if (status != 0) {
+            std.debug.print("failed to start signal: {}\n", .{status});
+        }
+    }
+
+    fn close(self: *LibuvTransport) void {
         self.clients.mutex.lock();
         for (self.clients.sockets.items) |*s| {
             s.close(onClientClose);
-            // s.deinit(self.allocator);
         }
         self.clients.mutex.unlock();
 
@@ -241,8 +256,7 @@ pub const LibuvTransport = struct {
         defer self.servers.mutex.unlock();
         var iter = self.servers.listeners.valueIterator();
         while (iter.next()) |l| {
-            l.close(null);
-            // l.deinit(self.allocator);
+            l.close(onListenerClose);
         }
     }
 
@@ -285,21 +299,19 @@ pub const LibuvTransport = struct {
     }
 };
 
-const testing = std.testing;
+test "multiaddr_to_sockaddr converts valid IPv4 address" {
+    const allocator = testing.allocator;
 
-// test "multiaddr_to_sockaddr converts valid IPv4 address" {
-//     const allocator = testing.allocator;
-//
-//     // Create a multiaddr for "127.0.0.1:8080"
-//     var addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/8080");
-//     defer addr.deinit();
-//
-//     const sockaddr = try LibuvTransport.multiaddrToSockaddr(&addr);
-//
-//     var buf: [22]u8 = undefined;
-//     const addr_str = try std.fmt.bufPrint(&buf, "{}", .{sockaddr});
-//     try testing.expectEqualStrings("127.0.0.1:8080", addr_str);
-// }
+    // Create a multiaddr for "127.0.0.1:8080"
+    var addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/tcp/8080");
+    defer addr.deinit();
+
+    const sockaddr = try LibuvTransport.multiaddrToSockaddr(&addr);
+
+    var buf: [22]u8 = undefined;
+    const addr_str = try std.fmt.bufPrint(&buf, "{}", .{sockaddr});
+    try testing.expectEqualStrings("127.0.0.1:8080", addr_str);
+}
 
 test "transport_listen_accept" {
     const allocator = testing.allocator;
@@ -314,6 +326,6 @@ test "transport_listen_accept" {
 
     try uv.convertError(c.uv_kill(c.uv_os_getpid(), @as(c_int, std.posix.SIG.INT)));
 
-    _ = try transport.loop.run(.default);
+    try transport.start();
     transport.deinit();
 }
