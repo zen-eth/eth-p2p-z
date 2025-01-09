@@ -15,11 +15,17 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    const libuv_dep = b.dependency("libuv", .{});
-    const libuv_module = libuv_dep.module("libuv");
+    // const libuv_dep = b.dependency("libuv", .{});
+    // const libuv_module = libuv_dep.module("libuv");
+    //
+    // const multiformats_zig_dep = b.dependency("multiformats-zig", .{});
+    // const multiformats_zig_module = multiformats_zig_dep.module("multiformats-zig");
 
-    const multiformats_zig_dep = b.dependency("multiformats-zig", .{});
-    const multiformats_zig_module = multiformats_zig_dep.module("multiformats-zig");
+    const libxev_dep = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const libxev_module = libxev_dep.module("xev");
 
     const lib = b.addStaticLibrary(.{
         .name = "zig-libp2p2",
@@ -30,10 +36,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    lib.root_module.addImport("libuv", libuv_module);
-    lib.root_module.addImport("multiformats-zig", multiformats_zig_module);
-    // lib.addIncludePath(libuv_dep.path("libuv/include/"));
-    // lib.addIncludePath(libuv_dep.path("include/"));
+    // lib.root_module.addImport("libuv", libuv_module);
+    // lib.root_module.addImport("multiformats-zig", multiformats_zig_module);
+
+    lib.root_module.addImport("xev", libxev_module);
     // This declares intent for the library to be installed into the standard
     // location when the user invokes the "install" step (the default step when
     // running `zig build`).
@@ -46,10 +52,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe.root_module.addImport("libuv", libuv_module);
-    exe.root_module.addImport("multiformats-zig", multiformats_zig_module);
-    // exe.addIncludePath(libuv_dep.path("libuv/include/"));
-    // exe.addIncludePath(libuv_dep.path("include/"));
+    // exe.root_module.addImport("libuv", libuv_module);
+    // exe.root_module.addImport("multiformats-zig", multiformats_zig_module);
+    exe.root_module.addImport("xev", libxev_module);
+
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
@@ -86,10 +92,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    lib_unit_tests.root_module.addImport("libuv", libuv_module);
-    lib_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
-    // lib_unit_tests.addIncludePath(libuv_dep.path("libuv/include/"));
-    // lib_unit_tests.addIncludePath(libuv_dep.path("include/"));
+    // lib_unit_tests.root_module.addImport("libuv", libuv_module);
+    // lib_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
+
+    lib_unit_tests.root_module.addImport("xev", libxev_module);
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
     const exe_unit_tests = b.addTest(.{
@@ -98,10 +104,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe_unit_tests.root_module.addImport("libuv", libuv_module);
-    exe_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
-    // exe_unit_tests.addIncludePath(libuv_dep.path("libuv/include/"));
-    // exe_unit_tests.addIncludePath(libuv_dep.path("include/"));
+    // exe_unit_tests.root_module.addImport("libuv", libuv_module);
+    // exe_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
+    exe_unit_tests.root_module.addImport("xev", libxev_module);
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 

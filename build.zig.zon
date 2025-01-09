@@ -23,13 +23,17 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .@"multiformats-zig" = .{
-            .url = "https://github.com/zen-eth/multiformats-zig/archive/main.tar.gz",
-            .hash = "1220041512f3b82076a2b601864a2afa5123e786c54e7317a6627c5c83d813e9ca19",
-        },
-        .libuv = .{
-            .url = "https://github.com/zen-eth/zig-libuv/archive/refs/heads/main.zip",
-            .hash = "1220fd9f66231bcae161c8ef630a528179d6435e4e083f784e8ff0cd46c0990ed9b5",
+        // .@"multiformats-zig" = .{
+        //     .url = "https://github.com/zen-eth/multiformats-zig/archive/main.tar.gz",
+        //     .hash = "1220041512f3b82076a2b601864a2afa5123e786c54e7317a6627c5c83d813e9ca19",
+        // },
+        // .libuv = .{
+        //     .url = "https://github.com/zen-eth/zig-libuv/archive/refs/heads/main.zip",
+        //     .hash = "1220fd9f66231bcae161c8ef630a528179d6435e4e083f784e8ff0cd46c0990ed9b5",
+        // },
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.zip",
+            .hash = "12206029de146b685739f69b10a6f08baee86b3d0a5f9a659fa2b2b66c9602078bbf",
         },
     },
     .paths = .{
