@@ -24,6 +24,21 @@ pub const ZigAIOTransport = struct {
         try std.posix.bind(server_socket.*, &address.any, address.getOsSockLen());
         try std.posix.listen(server_socket.*, self.options.backlog);
     }
+
+    pub fn dial(_: *ZigAIOTransport, remote_addr: std.net.Address, client_socket: *std.posix.socket_t) !void {
+        try coro.io.single(aio.Socket{
+            .domain = std.posix.AF.INET,
+            .flags = std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            .protocol = std.posix.IPPROTO.TCP,
+            .out_socket = client_socket,
+        });
+
+        try coro.io.single(aio.Connect{
+            .socket = client_socket.*,
+            .addr = &remote_addr.any,
+            .addrlen = remote_addr.getOsSockLen(),
+        });
+    }
 };
 
 test "ZigAIOTransport" {
