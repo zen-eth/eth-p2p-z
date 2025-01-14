@@ -4,6 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 pub const zig_aio = @import("transport/zigaio.zig");
+pub const network_switch = @import("network/switch.zig");
 // pub const libuv = @import("transport/libuv.zig");
 // pub const transport = @import("transport/transport.zig");
 // pub const network = @import("network/network.zig");
