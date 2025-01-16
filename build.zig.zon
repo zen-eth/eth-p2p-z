@@ -31,13 +31,9 @@
         //     .url = "https://github.com/zen-eth/zig-libuv/archive/refs/heads/main.zip",
         //     .hash = "1220fd9f66231bcae161c8ef630a528179d6435e4e083f784e8ff0cd46c0990ed9b5",
         // },
-        // .libxev = .{
-        //     .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.zip",
-        //     .hash = "12206029de146b685739f69b10a6f08baee86b3d0a5f9a659fa2b2b66c9602078bbf",
-        // },
-        .@"zig-aio" = .{
-            .url = "git+https://github.com/Cloudef/zig-aio.git#2da1fae553626c80da50850577cff0719698a08f",
-            .hash = "12208adb3c17ff073f57ae0e5abf4d7cf2fac578673abbe9e403e7d224ba13bab7bf",
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.zip",
+            .hash = "12206029de146b685739f69b10a6f08baee86b3d0a5f9a659fa2b2b66c9602078bbf",
         },
     },
     .paths = .{

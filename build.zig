@@ -21,17 +21,17 @@ pub fn build(b: *std.Build) void {
     // const multiformats_zig_dep = b.dependency("multiformats-zig", .{});
     // const multiformats_zig_module = multiformats_zig_dep.module("multiformats-zig");
 
-    // const libxev_dep = b.dependency("libxev", .{
-    //     .target = target,
-    //     .optimize = optimize,
-    // });
-    // const libxev_module = libxev_dep.module("xev");
+    const libxev_dep = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const libxev_module = libxev_dep.module("xev");
 
     // get the "zig-aio" dependency from "build.zig.zon"
-    const zig_aio = b.dependency("zig-aio", .{});
-
-    const zig_aio_module = zig_aio.module("aio");
-    const zig_coro_module = zig_aio.module("coro");
+    // const zig_aio = b.dependency("zig-aio", .{});
+    //
+    // const zig_aio_module = zig_aio.module("aio");
+    // const zig_coro_module = zig_aio.module("coro");
 
     const lib = b.addStaticLibrary(.{
         .name = "zig-libp2p2",
@@ -45,14 +45,14 @@ pub fn build(b: *std.Build) void {
     // lib.root_module.addImport("libuv", libuv_module);
     // lib.root_module.addImport("multiformats-zig", multiformats_zig_module);
 
-    // lib.root_module.addImport("xev", libxev_module);
+    lib.root_module.addImport("xev", libxev_module);
     // This declares intent for the library to be installed into the standard
     // location when the user invokes the "install" step (the default step when
     // running `zig build`).
-    // for exe, lib, tests, etc.
-    lib.root_module.addImport("aio", zig_aio_module);
-    // for coroutines api
-    lib.root_module.addImport("coro", zig_coro_module);
+    // // for exe, lib, tests, etc.
+    // lib.root_module.addImport("aio", zig_aio_module);
+    // // for coroutines api
+    // lib.root_module.addImport("coro", zig_coro_module);
     b.installArtifact(lib);
 
     const exe = b.addExecutable(.{
@@ -64,11 +64,11 @@ pub fn build(b: *std.Build) void {
 
     // exe.root_module.addImport("libuv", libuv_module);
     // exe.root_module.addImport("multiformats-zig", multiformats_zig_module);
-    // exe.root_module.addImport("xev", libxev_module);
-    // for exe, lib, tests, etc.
-    exe.root_module.addImport("aio", zig_aio_module);
-    // for coroutines api
-    exe.root_module.addImport("coro", zig_coro_module);
+    exe.root_module.addImport("xev", libxev_module);
+    // // for exe, lib, tests, etc.
+    // exe.root_module.addImport("aio", zig_aio_module);
+    // // for coroutines api
+    // exe.root_module.addImport("coro", zig_coro_module);
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
@@ -108,12 +108,12 @@ pub fn build(b: *std.Build) void {
     // lib_unit_tests.root_module.addImport("libuv", libuv_module);
     // lib_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
 
-    // lib_unit_tests.root_module.addImport("xev", libxev_module);
+    lib_unit_tests.root_module.addImport("xev", libxev_module);
 
-    // for exe, lib, tests, etc.
-    lib_unit_tests.root_module.addImport("aio", zig_aio_module);
-    // for coroutines api
-    lib_unit_tests.root_module.addImport("coro", zig_coro_module);
+    // // for exe, lib, tests, etc.
+    // lib_unit_tests.root_module.addImport("aio", zig_aio_module);
+    // // for coroutines api
+    // lib_unit_tests.root_module.addImport("coro", zig_coro_module);
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
     const exe_unit_tests = b.addTest(.{
@@ -124,11 +124,11 @@ pub fn build(b: *std.Build) void {
 
     // exe_unit_tests.root_module.addImport("libuv", libuv_module);
     // exe_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
-    // exe_unit_tests.root_module.addImport("xev", libxev_module);
-    // for exe, lib, tests, etc.
-    exe_unit_tests.root_module.addImport("aio", zig_aio_module);
-    // for coroutines api
-    exe_unit_tests.root_module.addImport("coro", zig_coro_module);
+    exe_unit_tests.root_module.addImport("xev", libxev_module);
+    // // for exe, lib, tests, etc.
+    // exe_unit_tests.root_module.addImport("aio", zig_aio_module);
+    // // for coroutines api
+    // exe_unit_tests.root_module.addImport("coro", zig_coro_module);
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
     // Similar to creating the run step earlier, this exposes a `test` step to
