@@ -69,9 +69,11 @@ pub const XevTransport = struct {
         self.buffer_pool.deinit();
         self.completion_pool.deinit();
         self.socket_pool.deinit();
+        self.stop_notifier.deinit();
         self.loop.deinit();
         self.threadPool.shutdown();
         self.threadPool.deinit();
+        self.allocator.destroy(self.threadPool);
     }
 
     pub fn dial(self: *XevTransport, addr: std.net.Address) !void {
@@ -89,7 +91,9 @@ pub const XevTransport = struct {
         server.accept(&self.loop, c_accept, XevTransport, self, acceptCallback);
 
         self.listeners.mutex.lock();
-        self.listeners.m.put(try formatAddress(addr, self.allocator), server) catch |err| {
+        const key = try formatAddress(addr, self.allocator);
+        defer self.allocator.free(key);
+        self.listeners.m.put(key, server) catch |err| {
             std.debug.print("Error adding server to map: {}\n", .{err});
         };
         self.listeners.mutex.unlock();
@@ -172,6 +176,7 @@ pub const XevTransport = struct {
         _: *xev.Completion,
         r: xev.TCP.AcceptError!xev.TCP,
     ) xev.CallbackAction {
+        std.debug.print("accept callback\n", .{});
         const self = self_.?;
 
         // Create our socket
@@ -195,15 +200,18 @@ pub const XevTransport = struct {
         buf: xev.ReadBuffer,
         r: xev.TCP.ReadError!usize,
     ) xev.CallbackAction {
+        std.debug.print("read callback\n", .{});
         const self = self_.?;
         const n = r catch |err| switch (err) {
             error.EOF => {
+                std.debug.print("EOF\n", .{});
                 self.destroyBuf(buf.slice);
                 socket.shutdown(loop, c, XevTransport, self, shutdownCallback);
                 return .disarm;
             },
 
             else => {
+                std.debug.print("Error reading: {}\n", .{err});
                 self.destroyBuf(buf.slice);
                 self.completion_pool.destroy(c);
                 std.log.warn("server read unexpected err={}", .{err});
@@ -229,6 +237,7 @@ pub const XevTransport = struct {
         buf: xev.WriteBuffer,
         r: xev.TCP.WriteError!usize,
     ) xev.CallbackAction {
+        std.debug.print("write callback\n", .{});
         _ = l;
         _ = s;
         _ = r catch unreachable;
@@ -251,6 +260,7 @@ pub const XevTransport = struct {
         s: xev.TCP,
         r: xev.TCP.ShutdownError!void,
     ) xev.CallbackAction {
+        std.debug.print("shutdown callback\n", .{});
         _ = r catch {};
 
         const self = self_.?;
@@ -265,6 +275,7 @@ pub const XevTransport = struct {
         socket: xev.TCP,
         r: xev.TCP.CloseError!void,
     ) xev.CallbackAction {
+        std.debug.print("close callback\n", .{});
         _ = l;
         _ = r catch unreachable;
         _ = socket;
@@ -289,6 +300,23 @@ pub const XevTransport = struct {
         return addr_str;
     }
 };
+
+test "transport serve and stop" {
+    const allocator = std.testing.allocator;
+    const opts = Options{ .backlog = 128 };
+    var peer1 = try XevTransport.init(allocator, opts);
+    defer peer1.deinit();
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 8080);
+    try peer1.listen(addr);
+
+    const server_thr = try std.Thread.spawn(.{}, XevTransport.serve, .{&peer1});
+
+    // sleep for 1 second
+    std.time.sleep(3_000_000_000);
+    peer1.stop();
+    server_thr.join();
+}
 
 // test "test ping-pong" {
 //     const allocator = std.testing.allocator;
