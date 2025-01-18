@@ -14,8 +14,7 @@ pub const Options = struct {
 };
 
 pub const XevTransport = struct {
-    server_loop: xev.Loop,
-    client_loop: xev.Loop,
+    loop: xev.Loop,
     buffer_pool: BufferPool,
     completion_pool: CompletionPool,
     socket_pool: TCPPool,
@@ -29,6 +28,7 @@ pub const XevTransport = struct {
         l: std.ArrayList(TCP),
     },
     options: Options,
+    stop_notifier: xev.Async,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, opts: Options) !XevTransport {
@@ -38,13 +38,12 @@ pub const XevTransport = struct {
             .thread_pool = thread_pool,
         };
         const server_loop = try xev.Loop.init(loop_opts);
-        const client_loop = try xev.Loop.init(loop_opts);
+        const shutdown_notifier = try xev.Async.init();
         return XevTransport{
             .buffer_pool = BufferPool.init(allocator),
             .completion_pool = CompletionPool.init(allocator),
             .socket_pool = TCPPool.init(allocator),
-            .server_loop = server_loop,
-            .client_loop = client_loop,
+            .loop = server_loop,
             .threadPool = thread_pool,
             .listeners = .{
                 .mutex = .{},
@@ -55,23 +54,30 @@ pub const XevTransport = struct {
                 .l = std.ArrayList(TCP).init(allocator),
             },
             .options = opts,
+            .stop_notifier = shutdown_notifier,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *XevTransport) void {
-        self.server_loop.deinit();
-        self.client_loop.deinit();
-        self.threadPool.deinit();
-        self.listeners.mutex.lock();
-        self.listeners.m.deinit();
-        self.listeners.mutex.unlock();
         self.sockets.mutex.lock();
         self.sockets.l.deinit();
         self.sockets.mutex.unlock();
+        self.listeners.mutex.lock();
+        self.listeners.m.deinit();
+        self.listeners.mutex.unlock();
         self.buffer_pool.deinit();
         self.completion_pool.deinit();
         self.socket_pool.deinit();
+        self.loop.deinit();
+        self.threadPool.shutdown();
+        self.threadPool.deinit();
+    }
+
+    pub fn dial(self: *XevTransport, addr: std.net.Address) !void {
+        const client = try TCP.init(addr);
+        const c = try self.completion_pool.create();
+        client.connect(&self.loop, c, addr, XevTransport, self, connectCallback);
     }
 
     pub fn listen(self: *XevTransport, addr: std.net.Address) !void {
@@ -79,14 +85,85 @@ pub const XevTransport = struct {
         try server.bind(addr);
         try server.listen(self.options.backlog);
 
-        var c_accept: xev.Completion = undefined;
-        server.accept(&self.server_loop, &c_accept, XevTransport, self, acceptCallback);
+        const c_accept = try self.completion_pool.create();
+        server.accept(&self.loop, c_accept, XevTransport, self, acceptCallback);
 
         self.listeners.mutex.lock();
         self.listeners.m.put(try formatAddress(addr, self.allocator), server) catch |err| {
             std.debug.print("Error adding server to map: {}\n", .{err});
         };
         self.listeners.mutex.unlock();
+    }
+
+    pub fn serve(self: *XevTransport) !void {
+        const userdata: ?*void = null;
+        var c: xev.Completion = undefined;
+        self.stop_notifier.wait(&self.loop, &c, void, userdata, &stopCallback);
+        try self.loop.run(.until_done);
+    }
+
+    pub fn stop(self: *XevTransport) void {
+        self.stop_notifier.notify() catch |err| {
+            std.debug.print("Error notifying stop: {}\n", .{err});
+        };
+    }
+
+    fn stopCallback(
+        _: ?*void,
+        loop: *xev.Loop,
+        _: *xev.Completion,
+        r: xev.Async.WaitError!void,
+    ) xev.CallbackAction {
+        _ = r catch unreachable;
+
+        loop.stop();
+        return .disarm;
+    }
+
+    fn connectCallback(
+        self_: ?*XevTransport,
+        l: *xev.Loop,
+        c: *xev.Completion,
+        socket: xev.TCP,
+        r: xev.TCP.ConnectError!void,
+    ) xev.CallbackAction {
+        _ = r catch unreachable;
+
+        const self = self_.?;
+        const buf = self.buffer_pool.create() catch unreachable;
+        socket.read(l, c, .{ .slice = buf }, XevTransport, self, clientReadCallback);
+        return .disarm;
+    }
+
+    fn clientReadCallback(
+        self_: ?*XevTransport,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        socket: xev.TCP,
+        buf: xev.ReadBuffer,
+        r: xev.TCP.ReadError!usize,
+    ) xev.CallbackAction {
+        const self = self_.?;
+        const n = r catch |err| switch (err) {
+            error.EOF => {
+                self.destroyBuf(buf.slice);
+                socket.shutdown(loop, c, XevTransport, self, shutdownCallback);
+                return .disarm;
+            },
+
+            else => {
+                self.destroyBuf(buf.slice);
+                self.completion_pool.destroy(c);
+                std.log.warn("server read unexpected err={}", .{err});
+                return .disarm;
+            },
+        };
+
+        // Echo it back
+        std.debug.print("client read {any}\n", .{buf.slice[0..n]});
+
+        // Read again
+        return .rearm;
     }
 
     fn acceptCallback(
@@ -104,7 +181,6 @@ pub const XevTransport = struct {
         self.sockets.l.append(socket.*) catch unreachable;
         self.sockets.mutex.unlock();
 
-        // Start reading -- we can reuse c here because its done.
         const buf = self.buffer_pool.create() catch unreachable;
         const c_read = self.completion_pool.create() catch unreachable;
         socket.read(l, c_read, .{ .slice = buf }, XevTransport, self, readCallback);
@@ -213,3 +289,15 @@ pub const XevTransport = struct {
         return addr_str;
     }
 };
+
+// test "test ping-pong" {
+//     const allocator = std.testing.allocator;
+//     const opts = Options{ .backlog = 128 };
+//     const peer1 = try XevTransport.init(allocator, opts);
+//     defer peer1.deinit();
+//
+//     const addr = try std.net.Address.parseIp("127.0.0.1", 8080);
+//     try peer1.listen(addr);
+//
+//     const server_thr = try std.Thread.spawn(.{}, XevTransport.serve, .{&peer1});
+// }
