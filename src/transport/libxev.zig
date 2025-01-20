@@ -1,5 +1,7 @@
 const std = @import("std");
 const xev = @import("xev");
+const Intrusive = @import("../utils/queue_mpsc.zig").Intrusive;
+const Queue=Intrusive(AsyncIOQueueElem);
 const TCP = xev.TCP;
 const Allocator = std.mem.Allocator;
 const ThreadPool = xev.ThreadPool;
@@ -11,6 +13,19 @@ const TCPPool = std.heap.MemoryPool(xev.TCP);
 
 pub const Options = struct {
     backlog: u31,
+};
+
+pub const AsyncIOQueueElem = struct {
+    const Self = @This();
+    next: ?*Self = null,
+    op: union(enum) {
+        connect: struct {
+            address: std.net.Address,
+        },
+        write: struct {
+            buffer: []const u8,
+        },
+    },
 };
 
 pub const XevTransport = struct {
@@ -29,6 +44,8 @@ pub const XevTransport = struct {
     },
     options: Options,
     stop_notifier: xev.Async,
+    async_io_notifier: xev.Async,
+    async_task_queue: Queue,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, opts: Options) !XevTransport {
@@ -39,6 +56,9 @@ pub const XevTransport = struct {
         };
         const server_loop = try xev.Loop.init(loop_opts);
         const shutdown_notifier = try xev.Async.init();
+        const async_io_notifier = try xev.Async.init();
+        var q: Queue = undefined;
+        q.init();
         return XevTransport{
             .buffer_pool = BufferPool.init(allocator),
             .completion_pool = CompletionPool.init(allocator),
@@ -55,6 +75,8 @@ pub const XevTransport = struct {
             },
             .options = opts,
             .stop_notifier = shutdown_notifier,
+            .async_io_notifier = async_io_notifier,
+            .async_task_queue = q,
             .allocator = allocator,
         };
     }
@@ -70,6 +92,7 @@ pub const XevTransport = struct {
         self.completion_pool.deinit();
         self.socket_pool.deinit();
         self.stop_notifier.deinit();
+        self.async_io_notifier.deinit();
         self.loop.deinit();
         self.threadPool.shutdown();
         self.threadPool.deinit();
