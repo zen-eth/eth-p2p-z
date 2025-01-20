@@ -1,7 +1,7 @@
 const std = @import("std");
 const xev = @import("xev");
 const Intrusive = @import("../utils/queue_mpsc.zig").Intrusive;
-const Queue=Intrusive(AsyncIOQueueElem);
+const Queue = Intrusive(AsyncIOQueueElem);
 const TCP = xev.TCP;
 const Allocator = std.mem.Allocator;
 const ThreadPool = xev.ThreadPool;
@@ -123,9 +123,10 @@ pub const XevTransport = struct {
     }
 
     pub fn serve(self: *XevTransport) !void {
-        const userdata: ?*void = null;
-        var c: xev.Completion = undefined;
-        self.stop_notifier.wait(&self.loop, &c, void, userdata, &stopCallback);
+        var c_stop: xev.Completion = undefined;
+        self.stop_notifier.wait(&self.loop, &c_stop, void, null, &stopCallback);
+        var c_async: xev.Completion = undefined;
+        self.async_io_notifier.wait(&self.loop, &c_async, XevTransport, self, &asyncIOCallback);
         try self.loop.run(.until_done);
     }
 
@@ -133,6 +134,33 @@ pub const XevTransport = struct {
         self.stop_notifier.notify() catch |err| {
             std.debug.print("Error notifying stop: {}\n", .{err});
         };
+    }
+
+    fn asyncIOCallback(
+        self_: ?*XevTransport,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        r: xev.Async.WaitError!void,
+    ) xev.CallbackAction {
+        _ = r catch unreachable;
+        const self = self_.?;
+
+        while (self.async_task_queue.pop()) |elem| {
+            switch (elem.op) {
+                .connect => {
+                    self.dial(elem.op.connect.address) catch |err| {
+                        std.debug.print("Error dialing: {}\n", .{err});
+                    };
+                },
+                .write => {
+                    // self.write(elem.op.write.buffer) catch |err| {
+                    //     std.debug.print("Error writing: {}\n", .{err});
+                    // };
+                },
+            }
+        }
+
+        return .rearm;
     }
 
     fn stopCallback(
