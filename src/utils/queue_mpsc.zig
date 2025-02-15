@@ -39,7 +39,7 @@ pub fn Intrusive(comptime T: type) type {
         /// Push an item onto the queue. This can be called by any number
         /// of producers.
         pub fn push(self: *Self, v: *T) void {
-            @atomicStore(?*T, &v.next, null, .release);
+            @atomicStore(?*T, &v.next, null, .unordered);
             const prev = @atomicRmw(*T, &self.head, .Xchg, v, .acq_rel);
             @atomicStore(?*T, &prev.next, v, .release);
         }
@@ -47,11 +47,11 @@ pub fn Intrusive(comptime T: type) type {
         /// Pop the first in element from the queue. This must be called
         /// by only a single consumer at any given time.
         pub fn pop(self: *Self) ?*T {
-            var tail = @atomicLoad(*T, &self.tail, .acquire);
+            var tail = @atomicLoad(*T, &self.tail, .unordered);
             var next_ = @atomicLoad(?*T, &tail.next, .acquire);
             if (tail == &self.stub) {
                 const next = next_ orelse return null;
-                @atomicStore(*T, &self.tail, next, .release);
+                @atomicStore(*T, &self.tail, next, .unordered);
                 tail = next;
                 next_ = @atomicLoad(?*T, &tail.next, .acquire);
             }
@@ -62,13 +62,13 @@ pub fn Intrusive(comptime T: type) type {
                 return tail;
             }
 
-            const head = @atomicLoad(*T, &self.head, .acquire);
+            const head = @atomicLoad(*T, &self.head, .unordered);
             if (tail != head) return null;
             self.push(&self.stub);
 
             next_ = @atomicLoad(?*T, &tail.next, .acquire);
             if (next_) |next| {
-                @atomicStore(*T, &self.tail, next, .release);
+                @atomicStore(*T, &self.tail, next, .unordered);
                 tail.next = null;
                 return tail;
             }
