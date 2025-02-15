@@ -337,7 +337,7 @@ pub const XevTransport = struct {
     options: Options,
     stop_notifier: xev.Async,
     async_io_notifier: xev.Async,
-    async_task_queue: Queue,
+    async_task_queue: *Queue,
     handler: ChannelHandler,
     mutex: std.Thread.Mutex,
     async_task_queue1: std.SinglyLinkedList(*AsyncIOQueueElem),
@@ -353,7 +353,7 @@ pub const XevTransport = struct {
         const server_loop = try xev.Loop.init(loop_opts);
         const shutdown_notifier = try xev.Async.init();
         const async_io_notifier = try xev.Async.init();
-        var q: Queue = undefined;
+        var q = try allocator.create(Queue);
         q.init();
         return XevTransport{
             .mutex = .{},
@@ -395,12 +395,12 @@ pub const XevTransport = struct {
                 },
             },
         };
-        const node = try self.allocator.create(QueueNode);
-        node.* = .{ .data = element };
-        // self.async_task_queue.push(element);
-        self.mutex.lock();
-        self.async_task_queue1.prepend(node);
-        self.mutex.unlock();
+        // const node = try self.allocator.create(QueueNode);
+        // node.* = .{ .data = element };
+        self.async_task_queue.push(element);
+        // self.mutex.lock();
+        // self.async_task_queue1.prepend(node);
+        // self.mutex.unlock();
         self.async_io_notifier.notify() catch |err| {
             std.debug.print("Error notifying async io: {}\n", .{err});
         };
@@ -463,14 +463,15 @@ pub const XevTransport = struct {
         std.debug.print("AsyncIO callback entered\n", .{});
         self.mutex.lock();
         defer self.mutex.unlock();
-        while (self.async_task_queue1.popFirst()) |node| {
-            std.debug.print("Got element from queue at {*}\n", .{node});
+        while (self.async_task_queue.pop()) |node| {
+            // std.debug.print("Got element from queue at {}\n", .{node.*});
             // Track the element's op type before switch
-            std.debug.print("Element op type: {any}\n", .{@tagName(node.data.op)});
+            // std.debug.print("Element op type: {any}\n", .{@tagName(node.op)});
 
-            const ele = node.data;
+            const ele = node;
             switch (ele.op) {
                 .connect => |*conn| {
+                    // std.debug.print("Connect address{}\n", .{conn.*});
                     const address = conn.address;
                     var socket = TCP.init(address) catch unreachable;
                     const channel_future = conn.channel_future;
@@ -512,7 +513,7 @@ pub const XevTransport = struct {
                 // },
             }
 
-            self.allocator.destroy(node.data);
+            // self.allocator.destroy(node.data);
             self.allocator.destroy(node);
         }
 
