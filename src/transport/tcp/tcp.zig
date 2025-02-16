@@ -1,70 +1,44 @@
 const std = @import("std");
-const Multiaddr = @import("multiformats-zig").multiaddr.Multiaddr;
-const libuv_transport = @import("../../transport/libuv.zig");
-const LibuvTransport = libuv_transport.LibuvTransport;
-const Connection = @import("../../network/network.zig").Connection;
-const Tcp = @import("../../transport/libuv.zig").Tcp;
+const xev = @import("../libxev.zig");
+const XevSocketChannel = xev.SocketChannel;
+const XevTransport = xev.XevTransport;
+const Allocator = std.mem.Allocator;
+const Future = @import("../../utils/future.zig").Future;
+
+pub const Connection = union(enum) {
+    xev_channel: *XevSocketChannel,
+};
 
 pub const Transport = union(enum) {
-    libuvTransport: LibuvTransport,
+    xev_transport: XevTransport,
 
-    pub fn listen(self: *Transport, addr: *const Multiaddr) !void {
+    pub fn listen(self: *Transport, addr: std.net.Address) !void {
         return switch (self.*) {
-            .libuvTransport => |transport| transport.listen(addr),
+            .xev_transport => |*transport| transport.listen(addr),
+        };
+    }
+
+    pub fn dial(self: *Transport, addr: std.net.Address, connection_future: *Future(*Connection), allocator: Allocator) !void {
+        return switch (self.*) {
+            .xev_transport => |*transport| {
+                const channel_future = try allocator.create(Future(*XevSocketChannel));
+                channel_future.* = Future(*XevSocketChannel).init();
+                try transport.dial(addr, channel_future);
+
+                const Context = struct {
+                    pub fn on_success(socket_channel: *XevSocketChannel) void {
+                        const connection = try allocator.create(Connection);
+                        connection.* = Connection{ .xev_channel = socket_channel };
+                        connection_future.complete(Connection{ .xev_channel = socket_channel });
+                    }
+
+                    pub fn on_failure(err: anyerror) void {
+                        connection_future.completeError(err);
+                    }
+                };
+
+                channel_future.listen();
+            },
         };
     }
 };
-
-// pub const Transport = struct {
-//     pub usingnamespace LibuvTransport;
-//     // config: Config,
-//     // impl: Provider,
-//     //
-//     // const Self = @This();
-//     //
-//     // pub fn init(config: *const Config) !Self {
-//     //     var transport = try config.allocator.create(Self);
-//     //     transport.* = .{
-//     //         .config = config,
-//     //         .impl = switch (config.backend) {
-//     //             .libuv => try LibuvImpl.init(config.allocator),
-//     //             .std => try StdImpl.init(config.allocator),
-//     //         },
-//     //     };
-//     //     return transport;
-//     // }
-//     //
-//     // pub fn listen(self: *Self, addr: Multiaddr) !void {
-//     //     return self.impl.listen(addr);
-//     // }
-//     //
-//     // pub fn dial(self: *Self, addr: Multiaddr) !void {
-//     //     return self.impl.dial(addr);
-//     // }
-//     //
-//     // pub fn deinit(self: *Self) void {
-//     //     self.impl.deinit();
-//     // }
-// };
-
-// const Provider = union(ProviderType) {
-//     libuv: LibuvImpl,
-//
-//     pub fn listen(self: Provider, addr: multiaddr.Multiaddr) !void {
-//         return switch (self) {
-//             .libuv => |impl| impl.listen(addr),
-//         };
-//     }
-//
-//     pub fn dial(self: Provider, addr: multiaddr.Multiaddr) !void {
-//         return switch (self) {
-//             .libuv => |impl| impl.dial(addr),
-//         };
-//     }
-//
-//     pub fn deinit(self: Provider) void {
-//         switch (self) {
-//             .libuv => |impl| impl.deinit(),
-//         }
-//     }
-// };

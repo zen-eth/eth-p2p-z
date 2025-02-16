@@ -1,22 +1,20 @@
 const std = @import("std");
 const xev = @import("xev");
 const Intrusive = @import("../utils/queue_mpsc.zig").Intrusive;
-const Queue = Intrusive(AsyncIOQueueElem);
+const Queue = Intrusive(AsyncIOQueueNode);
 const TCP = xev.TCP;
 const Allocator = std.mem.Allocator;
 const ThreadPool = xev.ThreadPool;
 const Future = @import("../utils/future.zig").Future;
-const QueueNode = std.SinglyLinkedList(*AsyncIOQueueElem).Node;
 
 /// Memory pools for things that need stable pointers
 const BufferPool = std.heap.MemoryPool([4096]u8);
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
 const TCPPool = std.heap.MemoryPool(xev.TCP);
-const SocketChannelPool = std.heap.MemoryPool(SocketChannel);
-const ConnectCallbackDataPool = std.heap.MemoryPool(ConnectCallbackData);
-const ElementPool = std.heap.MemoryPool(AsyncIOQueueElem);
-const NodePool = std.heap.MemoryPool(QueueNode);
+const ChannelPool = std.heap.MemoryPool(SocketChannel);
 
+/// SocketChannelManager keeps track of all the inbound and outbound socket channels .
+/// It also keeps track of all the listening sockets.
 pub const SocketChannelManager = struct {
     listeners: struct {
         mutex: std.Thread.Mutex,
@@ -27,7 +25,7 @@ pub const SocketChannelManager = struct {
         l: std.ArrayList(*SocketChannel),
     },
     socket_pool: TCPPool,
-    channel_pool: SocketChannelPool,
+    channel_pool: ChannelPool,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) SocketChannelManager {
@@ -41,7 +39,7 @@ pub const SocketChannelManager = struct {
                 .l = std.ArrayList(*SocketChannel).init(allocator),
             },
             .socket_pool = TCPPool.init(allocator),
-            .channel_pool = SocketChannelPool.init(allocator),
+            .channel_pool = ChannelPool.init(allocator),
             .allocator = allocator,
         };
     }
@@ -50,6 +48,7 @@ pub const SocketChannelManager = struct {
         self.sockets.mutex.lock();
         for (self.sockets.l.items) |socket_channel| {
             socket_channel.deinit();
+            self.channel_pool.destroy(socket_channel);
         }
         self.sockets.l.deinit();
         self.sockets.mutex.unlock();
@@ -66,14 +65,15 @@ pub const SocketChannelManager = struct {
     }
 };
 
+/// SocketChannel represents a socket channel. It is used to send and receive messages.
 pub const SocketChannel = struct {
-    socket: *xev.TCP,
+    socket: *TCP,
     transport: *XevTransport,
     read_buf: []u8,
     is_auto_read: bool,
     is_initiator: bool,
 
-    pub fn init(self: *SocketChannel, socket: *xev.TCP, transport: *XevTransport, is_initiator: bool, is_auto_read: bool) void {
+    pub fn init(self: *SocketChannel, socket: *TCP, transport: *XevTransport, is_initiator: bool, is_auto_read: bool) void {
         self.socket = socket;
         self.transport = transport;
         self.is_auto_read = is_auto_read;
@@ -85,27 +85,9 @@ pub const SocketChannel = struct {
         self.is_auto_read = is_auto_read;
     }
 
-    pub fn close(self: *SocketChannel) void {
-        self.transport.destroyBuf(self.read_buf);
-        // search socket in transport and remove it
-        self.transport.socket_channel_manager.sockets.mutex.lock();
-        for (self.transport.socket_channel_manager.sockets.l.items, 0..) |socket_channel, i| {
-            if (socket_channel == self) {
-                _ = self.transport.socket_channel_manager.sockets.l.swapRemove(i);
-                break;
-            }
-        }
-        self.transport.socket_channel_manager.sockets.mutex.unlock();
-
-        self.transport.destroySocket(self.socket);
-        self.transport.socket_channel_manager.channel_pool.destroy(self);
-    }
-
     pub fn deinit(self: *SocketChannel) void {
-        std.debug.print("SocketChannel.deinit{}\n", .{self});
         self.transport.destroyBuf(self.read_buf);
         self.transport.destroySocket(self.socket);
-        self.transport.socket_channel_manager.channel_pool.destroy(self);
     }
 
     // pub fn write(self: *SocketChannel, buf: []const u8) void {
@@ -158,7 +140,6 @@ pub const SocketChannel = struct {
         const self = self_.?;
         const n = r catch |err| switch (err) {
             error.EOF => {
-                self.transport.destroyBuf(buf.slice);
                 socket.shutdown(loop, c, SocketChannel, self, shutdownCallback);
                 return .disarm;
             },
@@ -167,7 +148,6 @@ pub const SocketChannel = struct {
                 if (self.transport.handler.io_error) |cb| {
                     cb(self, err);
                 }
-                self.transport.destroyBuf(buf.slice);
                 socket.shutdown(loop, c, SocketChannel, self, shutdownCallback);
                 std.log.warn("server read unexpected err={}", .{err});
                 return .disarm;
@@ -259,7 +239,6 @@ pub const SocketChannel = struct {
         s: xev.TCP,
         r: xev.TCP.ShutdownError!void,
     ) xev.CallbackAction {
-        std.debug.print("shutdown callback\n", .{});
         _ = r catch |err| {
             std.debug.print("Error shutting down: {}\n", .{err});
         };
@@ -283,17 +262,21 @@ pub const SocketChannel = struct {
 
         const self = self_.?;
 
+        self.deinit();
+        //TODO: need remove it from socket channel list
         self.transport.completion_pool.destroy(c);
         return .disarm;
     }
 };
 
+/// ChannelHandler is used to implement the protocol specific behavior of a channel.
 pub const ChannelHandler = struct {
     inbound_channel_read: ?*const fn (*SocketChannel, []const u8) void = null,
     outbound_channel_read: ?*const fn (*SocketChannel, []const u8) void = null,
     io_error: ?*const fn (*SocketChannel, anyerror) void = null,
 };
 
+/// Options for the transport.
 pub const Options = struct {
     backlog: u31,
     inbound_channel_options: struct {
@@ -304,7 +287,8 @@ pub const Options = struct {
     },
 };
 
-pub const AsyncIOQueueElem = struct {
+/// AsyncIOQueueNode is used to store the operation to be performed on the transport.
+pub const AsyncIOQueueNode = struct {
     const Self = @This();
     next: ?*Self = null,
     op: union(enum) {
@@ -331,7 +315,6 @@ pub const XevTransport = struct {
     loop: xev.Loop,
     buffer_pool: BufferPool,
     completion_pool: CompletionPool,
-    connect_cb_data_pool: ConnectCallbackDataPool,
     threadPool: *xev.ThreadPool,
     socket_channel_manager: SocketChannelManager,
     options: Options,
@@ -340,7 +323,6 @@ pub const XevTransport = struct {
     async_task_queue: *Queue,
     handler: ChannelHandler,
     mutex: std.Thread.Mutex,
-    async_task_queue1: std.SinglyLinkedList(*AsyncIOQueueElem),
     c_accept: *xev.Completion,
     allocator: Allocator,
 
@@ -358,10 +340,8 @@ pub const XevTransport = struct {
         return XevTransport{
             .mutex = .{},
             .c_accept = try allocator.create(xev.Completion),
-            .async_task_queue1 = .{},
             .buffer_pool = BufferPool.init(allocator),
             .completion_pool = CompletionPool.init(allocator),
-            .connect_cb_data_pool = ConnectCallbackDataPool.init(allocator),
             .loop = server_loop,
             .threadPool = thread_pool,
             .socket_channel_manager = SocketChannelManager.init(allocator),
@@ -385,8 +365,8 @@ pub const XevTransport = struct {
     }
 
     pub fn dial(self: *XevTransport, addr: std.net.Address, channel_future: *Future(*SocketChannel)) !void {
-        const element = try self.allocator.create(AsyncIOQueueElem);
-        element.* = AsyncIOQueueElem{
+        const node = try self.allocator.create(AsyncIOQueueNode);
+        node.* = AsyncIOQueueNode{
             .next = null,
             .op = .{
                 .connect = .{
@@ -395,12 +375,9 @@ pub const XevTransport = struct {
                 },
             },
         };
-        // const node = try self.allocator.create(QueueNode);
-        // node.* = .{ .data = element };
-        self.async_task_queue.push(element);
-        // self.mutex.lock();
-        // self.async_task_queue1.prepend(node);
-        // self.mutex.unlock();
+
+        self.async_task_queue.push(node);
+
         self.async_io_notifier.notify() catch |err| {
             std.debug.print("Error notifying async io: {}\n", .{err});
         };
@@ -460,31 +437,22 @@ pub const XevTransport = struct {
     ) xev.CallbackAction {
         _ = r catch unreachable;
         const self = self_.?;
-        std.debug.print("AsyncIO callback entered\n", .{});
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        while (self.async_task_queue.pop()) |node| {
-            // std.debug.print("Got element from queue at {}\n", .{node.*});
-            // Track the element's op type before switch
-            // std.debug.print("Element op type: {any}\n", .{@tagName(node.op)});
 
-            const ele = node;
-            switch (ele.op) {
+        while (self.async_task_queue.pop()) |node| {
+            switch (node.op) {
                 .connect => |*conn| {
                     // std.debug.print("Connect address{}\n", .{conn.*});
                     const address = conn.address;
                     var socket = TCP.init(address) catch unreachable;
                     const channel_future = conn.channel_future;
-                    channel_future.* = Future(*SocketChannel).init();
+                    // channel_future.* = Future(*SocketChannel).init();
 
                     const connect_cb_data = self.allocator.create(ConnectCallbackData) catch unreachable;
                     connect_cb_data.* = ConnectCallbackData{
                         .transport = self,
                         .channel_future = channel_future,
                     };
-                    std.debug.print("Connect callback data: {any}\n", .{connect_cb_data});
-                    // Move data out of elem before the connect call
-                    // self.queue_element_pool.destroy(elem);
+
                     const c = self.allocator.create(xev.Completion) catch unreachable;
                     socket.connect(loop, c, address, ConnectCallbackData, connect_cb_data, connectCallback);
                 },
@@ -513,11 +481,8 @@ pub const XevTransport = struct {
                 // },
             }
 
-            // self.allocator.destroy(node.data);
             self.allocator.destroy(node);
         }
-
-        std.debug.print("Queue processing complete\n", .{});
 
         return .rearm;
     }
@@ -537,7 +502,6 @@ pub const XevTransport = struct {
         self.socket_channel_manager.deinit();
         self.buffer_pool.deinit();
         self.completion_pool.deinit();
-        self.connect_cb_data_pool.deinit();
         return .disarm;
     }
 
@@ -550,7 +514,6 @@ pub const XevTransport = struct {
     ) xev.CallbackAction {
         const self = self_.?;
         defer self.transport.allocator.destroy(c);
-        // defer self.transport.allocator.destroy(self);
         _ = r catch |err| {
             // TODO: Handle timeout error and retry
             std.debug.print("Error connecting: {}\n", .{err});
@@ -558,27 +521,19 @@ pub const XevTransport = struct {
             return .disarm;
         };
 
-        std.debug.print("Accepted connection{}\n", .{34});
-
-        // std.debug.print("self {}\n", .{self.transport});
-
-        std.debug.print("Accepted connection{}\n", .{35});
         const s = self.transport.socket_channel_manager.socket_pool.create() catch unreachable;
         s.* = socket;
         const channel = self.transport.socket_channel_manager.channel_pool.create() catch unreachable;
         channel.init(s, self.transport, true, self.transport.options.outbound_channel_options.is_auto_read);
-        std.debug.print("Accepted connection{}\n", .{36});
         self.transport.socket_channel_manager.sockets.mutex.lock();
         self.transport.socket_channel_manager.sockets.l.append(channel) catch unreachable;
         self.transport.socket_channel_manager.sockets.mutex.unlock();
         self.channel_future.complete(channel);
 
-        std.debug.print("Accepted connection{}\n", .{37});
         if (self.transport.options.outbound_channel_options.is_auto_read) {
             // channel.read();
         }
 
-        std.debug.print("Accepted connection{}\n", .{38});
         return .disarm;
     }
 
@@ -595,18 +550,10 @@ pub const XevTransport = struct {
             return .rearm;
         };
 
-        std.debug.print("accept callback\n", .{});
-
-        std.debug.print("Accepted connection{}\n", .{22});
-        // Create our socket
         const socket = self.socket_channel_manager.socket_pool.create() catch unreachable;
-        std.debug.print("Accepted connection{}\n", .{222});
         socket.* = r catch unreachable;
-        std.debug.print("Accepted connection{}\n", .{23});
-        // Create our channel
         const channel = self.socket_channel_manager.channel_pool.create() catch unreachable;
         channel.init(socket, self, false, self.options.inbound_channel_options.is_auto_read);
-        std.debug.print("Accepted connection{}\n", .{24});
         self.socket_channel_manager.sockets.mutex.lock();
         self.socket_channel_manager.sockets.l.append(channel) catch unreachable;
         self.socket_channel_manager.sockets.mutex.unlock();
@@ -615,7 +562,6 @@ pub const XevTransport = struct {
             // channel.read();
         }
 
-        std.debug.print("Accepted connection{}\n", .{25});
         return .rearm;
     }
 
@@ -629,56 +575,24 @@ pub const XevTransport = struct {
 
     fn destroySocket(self: *XevTransport, socket: *xev.TCP) void {
         self.socket_channel_manager.socket_pool.destroy(
-            @alignCast(
-                @as(*align(8) TCP, @ptrFromInt(@intFromPtr(socket))),
-            ),
+            @alignCast(socket),
         );
-        // self.socket_channel_manager.socket_pool.destroy(
-        //     socket
-        // );
     }
 
     pub fn formatAddress(addr: std.net.Address, allocator: Allocator) ![]const u8 {
         const addr_str = try std.fmt.allocPrint(allocator, "{}", .{addr});
-        std.debug.print("Address: {s}\n", .{addr_str});
         return addr_str;
     }
 };
 
-// test "transport serve and stop" {
-//     const allocator = std.testing.allocator;
-//     const opts = Options{
-//         .backlog = 128,
-//         .inbound_channel_options = .{ .is_auto_read = true },
-//         .outbound_channel_options = .{ .is_auto_read = true },
-//     };
-//     const handler = ChannelHandler{
-//         .inbound_channel_read = null,
-//         .outbound_channel_read = null,
-//     };
-//     var peer1 = try XevTransport.init(allocator, opts, handler);
-//     defer peer1.deinit();
-//
-//     const addr = try std.net.Address.parseIp("127.0.0.1", 8080);
-//     try peer1.listen(addr);
-//
-//     const server_thr = try std.Thread.spawn(.{}, XevTransport.serve, .{&peer1,addr});
-//
-//     // sleep for 1 second
-//     std.time.sleep(3_000_000_000);
-//     peer1.stop();
-//     server_thr.join();
-//     std.debug.print("Server stopped\n", .{});
-// }
-
-test "echo client and server" {
+test "echo client and server with multiple clients" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
     const opts = Options{
         .backlog = 128,
-        .inbound_channel_options = .{ .is_auto_read = false },
-        .outbound_channel_options = .{ .is_auto_read = false },
+        .inbound_channel_options = .{ .is_auto_read = true },
+        .outbound_channel_options = .{ .is_auto_read = true },
     };
     const handler = ChannelHandler{
         // .inbound_channel_read = struct {
@@ -693,27 +607,35 @@ test "echo client and server" {
     defer server.deinit();
 
     const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
-    // try server.listen(addr);
 
     var client = try XevTransport.init(allocator, opts, handler);
     defer client.deinit();
 
     const client_addr = try std.net.Address.parseIp("0.0.0.0", 8082);
-    // try client.listen(client_addr);
+
+    var client1 = try XevTransport.init(allocator, opts, handler);
+    defer client1.deinit();
+
+    const client_addr1 = try std.net.Address.parseIp("0.0.0.0", 8083);
 
     const server_thr = try std.Thread.spawn(.{}, XevTransport.serve, .{ &server, addr });
     const client_thr = try std.Thread.spawn(.{}, XevTransport.serve, .{ &client, client_addr });
+    const client_thr1 = try std.Thread.spawn(.{}, XevTransport.serve, .{ &client1, client_addr1 });
 
     const server_addr = try std.net.Address.parseIp("127.0.0.1", 8081);
 
-    const channel_future: *Future(*SocketChannel) = allocator.create(Future(*SocketChannel)) catch unreachable;
-    defer allocator.destroy(channel_future);
-    _ = try client.dial(server_addr, channel_future);
-    // _ = try client_channel.wait();
-    // sleep for 1 second
-    std.time.sleep(3_000_000_000);
+    var channel_future = Future(*SocketChannel).init();
+    try client.dial(server_addr, &channel_future);
+
+    var channel_future1 = Future(*SocketChannel).init();
+    try client1.dial(server_addr, &channel_future1);
+
+    _ = try channel_future.wait();
+    _ = try channel_future1.wait();
+
+    std.time.sleep(100_000_000);
     server.socket_channel_manager.sockets.mutex.lock();
-    try std.testing.expectEqual(1, server.socket_channel_manager.sockets.l.items.len);
+    try std.testing.expectEqual(2, server.socket_channel_manager.sockets.l.items.len);
     server.socket_channel_manager.sockets.mutex.unlock();
     server.socket_channel_manager.listeners.mutex.lock();
     try std.testing.expectEqual(1, server.socket_channel_manager.listeners.m.count());
@@ -724,12 +646,10 @@ test "echo client and server" {
     client.socket_channel_manager.listeners.mutex.lock();
     try std.testing.expectEqual(1, client.socket_channel_manager.listeners.m.count());
     client.socket_channel_manager.listeners.mutex.unlock();
-    std.debug.print("Client connected to server11\n", .{});
     server.stop();
-    std.debug.print("Client connected to server12\n", .{});
     client.stop();
-    std.debug.print("Client connected to server13\n", .{});
+    client1.stop();
     server_thr.join();
     client_thr.join();
-    std.debug.print("Server and client stopped\n", .{});
+    client_thr1.join();
 }

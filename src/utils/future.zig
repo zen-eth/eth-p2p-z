@@ -11,9 +11,18 @@ pub fn Future(comptime T: type) type {
         condition: std.Thread.Condition = .{},
         onSuccess: ?*const fn (T) void = null,
         onError: ?*const fn (anyerror) void = null,
+        free_on_complete: bool = false,
+        allocator: ?std.mem.Allocator = null,
 
         pub fn init() Self {
             return Self{};
+        }
+
+        pub fn initWithCleanup(allocator: std.mem.Allocator) Self {
+            return Self{
+                .free_on_complete = true,
+                .allocator = allocator,
+            };
         }
 
         pub fn listen(self: *Self, on_success: ?*const fn (T) void, on_error: ?*const fn (anyerror) void) void {
@@ -34,7 +43,13 @@ pub fn Future(comptime T: type) type {
 
         pub fn complete(self: *Self, data: T) void {
             self.mutex.lock();
-            defer self.mutex.unlock();
+            defer {
+                if (self.free_on_complete and self.allocator != null) {
+                    self.allocator.?.destroy(self);
+                } else {
+                    self.mutex.unlock();
+                }
+            }
 
             self.value = data;
             self.completed = true;
@@ -44,7 +59,13 @@ pub fn Future(comptime T: type) type {
 
         pub fn completeError(self: *Self, err: anyerror) void {
             self.mutex.lock();
-            defer self.mutex.unlock();
+            defer {
+                if (self.free_on_complete and self.allocator != null) {
+                    self.allocator.?.destroy(self);
+                } else {
+                    self.mutex.unlock();
+                }
+            }
 
             self.err = err;
             self.completed = true;
