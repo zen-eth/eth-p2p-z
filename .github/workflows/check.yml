@@ -44,14 +44,6 @@ jobs:
       - name: Formatting
         run: zig fmt --check --color on .
 
-      - name: Installing dependencies
-        run: |
-          make deps
-
-      - name: Installing spec test
-        run: |
-          make deps_test
-
       - name: Unit testing
         run: zig build test --summary all
 
