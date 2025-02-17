@@ -1,11 +1,11 @@
 const std = @import("std");
 const xev = @import("xev");
-const Intrusive = @import("../utils/queue_mpsc.zig").Intrusive;
+const Intrusive = @import("../../utils/queue_mpsc.zig").Intrusive;
 const Queue = Intrusive(AsyncIOQueueNode);
 const TCP = xev.TCP;
 const Allocator = std.mem.Allocator;
 const ThreadPool = xev.ThreadPool;
-const Future = @import("../utils/future.zig").Future;
+const Future = @import("../../utils/future.zig").Future;
 
 /// Memory pools for things that need stable pointers
 const BufferPool = std.heap.MemoryPool([4096]u8);
@@ -383,30 +383,15 @@ pub const XevTransport = struct {
         };
     }
 
-    pub fn listen(self: *XevTransport, addr: std.net.Address) !void {
-        const server = try self.allocator.create(TCP);
-        server.* = try TCP.init(addr);
-        try server.bind(addr);
-        try server.listen(self.options.backlog);
-
-        server.accept(&self.loop, self.c_accept, XevTransport, self, acceptCallback);
-
-        self.socket_channel_manager.listeners.mutex.lock();
-        const key = try formatAddress(addr, self.allocator);
-        // defer self.allocator.free(key);
-        self.socket_channel_manager.listeners.m.put(key, server) catch |err| {
-            std.debug.print("Error adding server to map: {}\n", .{err});
-        };
-        self.socket_channel_manager.listeners.mutex.unlock();
-    }
-
     pub fn serve(self: *XevTransport, addr: std.net.Address) !void {
         const server = try self.allocator.create(TCP);
         server.* = try TCP.init(addr);
         try server.bind(addr);
         try server.listen(self.options.backlog);
 
-        server.accept(&self.loop, self.c_accept, XevTransport, self, acceptCallback);
+        const c_accept = try self.allocator.create(xev.Completion);
+        defer self.allocator.destroy(c_accept);
+        server.accept(&self.loop, c_accept, XevTransport, self, acceptCallback);
 
         self.socket_channel_manager.listeners.mutex.lock();
         const key = try formatAddress(addr, self.allocator);
