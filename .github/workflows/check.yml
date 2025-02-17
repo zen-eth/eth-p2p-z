@@ -25,7 +25,7 @@ jobs:
       - name: Install Zig
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          wget https://ziglang.org/download/zig-linux-x86_64-${{ env.ZIG_VERSION }}.tar.xz
+          wget https://ziglang.org/download/${{ env.ZIG_VERSION }}/zig-linux-x86_64-${{ env.ZIG_VERSION }}.tar.xz
           tar -xf zig-linux-x86_64-${{ env.ZIG_VERSION }}.tar.xz
           mv zig-linux-x86_64-${{ env.ZIG_VERSION }} ~/zig
 
