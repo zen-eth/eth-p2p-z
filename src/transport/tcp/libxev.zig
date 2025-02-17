@@ -383,7 +383,7 @@ pub const XevTransport = struct {
         };
     }
 
-    pub fn serve(self: *XevTransport, addr: std.net.Address) !void {
+    pub fn listen(self: *XevTransport, addr: std.net.Address) !void {
         const server = try self.allocator.create(TCP);
         server.* = try TCP.init(addr);
         try server.bind(addr);
@@ -603,9 +603,9 @@ test "echo client and server with multiple clients" {
 
     const client_addr1 = try std.net.Address.parseIp("0.0.0.0", 8083);
 
-    const server_thr = try std.Thread.spawn(.{}, XevTransport.serve, .{ &server, addr });
-    const client_thr = try std.Thread.spawn(.{}, XevTransport.serve, .{ &client, client_addr });
-    const client_thr1 = try std.Thread.spawn(.{}, XevTransport.serve, .{ &client1, client_addr1 });
+    const server_thr = try std.Thread.spawn(.{}, XevTransport.listen, .{ &server, addr });
+    const client_thr = try std.Thread.spawn(.{}, XevTransport.listen, .{ &client, client_addr });
+    const client_thr1 = try std.Thread.spawn(.{}, XevTransport.listen, .{ &client1, client_addr1 });
 
     const server_addr = try std.net.Address.parseIp("127.0.0.1", 8081);
 
