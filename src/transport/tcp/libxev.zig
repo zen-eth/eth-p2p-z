@@ -1,6 +1,6 @@
 const std = @import("std");
-const xev = @import("xev").Dynamic;
-// const xev = @import("xev");
+// const xev = @import("xev").Dynamic;
+const xev = @import("xev");
 const Intrusive = @import("../../utils/queue_mpsc.zig").Intrusive;
 const IOQueue = Intrusive(AsyncIOQueueNode);
 const TCP = xev.TCP;
@@ -581,7 +581,7 @@ test "dial in separate thread with error" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    xev.backend = .epoll;
+    // xev.backend = .epoll;
     const opts = Options{ .backlog = 128 };
     var transport = try XevTransport.init(allocator, opts);
     defer transport.deinit();
