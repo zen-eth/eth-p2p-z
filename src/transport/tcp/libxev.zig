@@ -282,7 +282,7 @@ pub const Listener = struct {
         self_: ?*OpenChannelCallbackData,
         _: *xev.Loop,
         _: *xev.Completion,
-        r: xev.TCP.AcceptError!xev.TCP,
+        r: xev.AcceptError!xev.TCP,
     ) xev.CallbackAction {
         const self = self_.?;
         const socket = r catch |err| {
@@ -471,7 +471,7 @@ pub const XevTransport = struct {
         _: *xev.Loop,
         _: *xev.Completion,
         socket: xev.TCP,
-        r: xev.TCP.ConnectError!void,
+        r: xev.ConnectError!void,
     ) xev.CallbackAction {
         const self = self_.?;
         _ = r catch |err| {
