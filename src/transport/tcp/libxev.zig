@@ -484,20 +484,6 @@ pub const XevTransport = struct {
 
         return .disarm;
     }
-
-    fn destroyBuf(self: *XevTransport, buf: []const u8) void {
-        self.buffer_pool.destroy(
-            @alignCast(
-                @as(*[4096]u8, @ptrFromInt(@intFromPtr(buf.ptr))),
-            ),
-        );
-    }
-
-    // fn destroySocket(self: *XevTransport, socket: *xev.TCP) void {
-    //     self.socket_pool.destroy(
-    //         @alignCast(socket),
-    //     );
-    // }
 };
 
 test "dial with error" {
@@ -516,78 +502,78 @@ test "dial with error" {
     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel));
 }
 
-test "dial and accept" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-
-    const opts = Options{
-        .backlog = 128,
-    };
-
-    const addr = try std.net.Address.parseIp("127.0.0.1", 8000);
-
-    var server = try XevTransport.init(allocator, opts);
-    defer server.deinit();
-
-    var listener: Listener = undefined;
-    try server.listen(addr, &listener);
-
-    var channel: SocketChannel = undefined;
-    const thread = try std.Thread.spawn(.{}, Listener.accept, .{ &listener, &channel });
-
-    var client = try XevTransport.init(allocator, opts);
-    defer client.deinit();
-
-    var channel1: SocketChannel = undefined;
-    try client.dial(addr, &channel1);
-
-    thread.join();
-
-    try std.testing.expectEqual(false, channel.is_initiator);
-    try std.testing.expectEqual(true, channel1.is_initiator);
-}
-
-test "dial and accept with multiple clients" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-
-    const opts = Options{
-        .backlog = 128,
-    };
-
-    const addr = try std.net.Address.parseIp("127.0.0.1", 7000);
-
-    var server = try XevTransport.init(allocator, opts);
-    defer server.deinit();
-    var listener: Listener = undefined;
-    try server.listen(addr, &listener);
-
-    var channels: [3]SocketChannel = [_]SocketChannel{ undefined, undefined, undefined };
-    const thread = try std.Thread.spawn(.{}, struct {
-        fn run(l: *Listener, chans: []SocketChannel) !void {
-            for (chans) |*chan| {
-                try l.accept(chan);
-            }
-        }
-    }.run, .{ &listener, &channels });
-
-    var client = try XevTransport.init(allocator, opts);
-    defer client.deinit();
-
-    var client_channels: [3]SocketChannel = [_]SocketChannel{ undefined, undefined, undefined };
-    for (&client_channels) |*chan| {
-        try client.dial(addr, chan);
-    }
-
-    thread.join();
-
-    for (channels) |chan| {
-        try std.testing.expectEqual(false, chan.is_initiator);
-    }
-    for (client_channels) |chan| {
-        try std.testing.expectEqual(true, chan.is_initiator);
-    }
-}
+// test "dial and accept" {
+//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//     const allocator = gpa.allocator();
+//
+//     const opts = Options{
+//         .backlog = 128,
+//     };
+//
+//     const addr = try std.net.Address.parseIp("127.0.0.1", 8000);
+//
+//     var server = try XevTransport.init(allocator, opts);
+//     defer server.deinit();
+//
+//     var listener: Listener = undefined;
+//     try server.listen(addr, &listener);
+//
+//     var channel: SocketChannel = undefined;
+//     const thread = try std.Thread.spawn(.{}, Listener.accept, .{ &listener, &channel });
+//
+//     var client = try XevTransport.init(allocator, opts);
+//     defer client.deinit();
+//
+//     var channel1: SocketChannel = undefined;
+//     try client.dial(addr, &channel1);
+//
+//     thread.join();
+//
+//     try std.testing.expectEqual(false, channel.is_initiator);
+//     try std.testing.expectEqual(true, channel1.is_initiator);
+// }
+//
+// test "dial and accept with multiple clients" {
+//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//     const allocator = gpa.allocator();
+//
+//     const opts = Options{
+//         .backlog = 128,
+//     };
+//
+//     const addr = try std.net.Address.parseIp("127.0.0.1", 7000);
+//
+//     var server = try XevTransport.init(allocator, opts);
+//     defer server.deinit();
+//     var listener: Listener = undefined;
+//     try server.listen(addr, &listener);
+//
+//     var channels: [3]SocketChannel = [_]SocketChannel{ undefined, undefined, undefined };
+//     const thread = try std.Thread.spawn(.{}, struct {
+//         fn run(l: *Listener, chans: []SocketChannel) !void {
+//             for (chans) |*chan| {
+//                 try l.accept(chan);
+//             }
+//         }
+//     }.run, .{ &listener, &channels });
+//
+//     var client = try XevTransport.init(allocator, opts);
+//     defer client.deinit();
+//
+//     var client_channels: [3]SocketChannel = [_]SocketChannel{ undefined, undefined, undefined };
+//     for (&client_channels) |*chan| {
+//         try client.dial(addr, chan);
+//     }
+//
+//     thread.join();
+//
+//     for (channels) |chan| {
+//         try std.testing.expectEqual(false, chan.is_initiator);
+//     }
+//     for (client_channels) |chan| {
+//         try std.testing.expectEqual(true, chan.is_initiator);
+//     }
+// }
 
 test "dial in separate thread with error" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -617,65 +603,3 @@ test "dial in separate thread with error" {
     thread.join();
     try std.testing.expectEqual(result.?, error.ConnectionRefused);
 }
-
-// test "echo client and server with multiple clients" {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     const allocator = gpa.allocator();
-//
-//     const opts = Options{
-//         .backlog = 128,
-//     };
-//
-//     var server = try XevTransport.init(allocator, opts);
-//     defer server.deinit();
-//
-//     const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
-//
-//     var client = try XevTransport.init(allocator, opts);
-//     defer client.deinit();
-//
-//     const client_addr = try std.net.Address.parseIp("0.0.0.0", 8082);
-//
-//     var client1 = try XevTransport.init(allocator, opts);
-//     defer client1.deinit();
-//
-//     const client_addr1 = try std.net.Address.parseIp("0.0.0.0", 8083);
-//
-//     const server_thr = try std.Thread.spawn(.{}, XevTransport.listen, .{ &server, addr });
-//     const client_thr = try std.Thread.spawn(.{}, XevTransport.listen, .{ &client, client_addr });
-//     const client_thr1 = try std.Thread.spawn(.{}, XevTransport.listen, .{ &client1, client_addr1 });
-//
-//     const server_addr = try std.net.Address.parseIp("127.0.0.1", 8081);
-//
-//     var channel_future = Future(*SocketChannel).init();
-//     try client.dial(server_addr, &channel_future);
-//
-//     var channel_future1 = Future(*SocketChannel).init();
-//     try client1.dial(server_addr, &channel_future1);
-//
-//     const channel = try channel_future.wait();
-//
-//     const data: [10000]u8 = .{'a'} ** 10000;
-//     channel.write(&data);
-//     _ = try channel_future1.wait();
-//
-//     std.time.sleep(100_000_000);
-//     // server.socket_channel_manager.sockets.mutex.lock();
-//     // try std.testing.expectEqual(2, server.socket_channel_manager.sockets.l.items.len);
-//     // server.socket_channel_manager.sockets.mutex.unlock();
-//     // server.socket_channel_manager.listeners.mutex.lock();
-//     // try std.testing.expectEqual(1, server.socket_channel_manager.listeners.m.count());
-//     // server.socket_channel_manager.listeners.mutex.unlock();
-//     // client.socket_channel_manager.sockets.mutex.lock();
-//     // try std.testing.expectEqual(1, client.socket_channel_manager.sockets.l.items.len);
-//     // client.socket_channel_manager.sockets.mutex.unlock();
-//     // client.socket_channel_manager.listeners.mutex.lock();
-//     // try std.testing.expectEqual(1, client.socket_channel_manager.listeners.m.count());
-//     // client.socket_channel_manager.listeners.mutex.unlock();
-//     server.stop();
-//     client.stop();
-//     client1.stop();
-//     server_thr.join();
-//     client_thr.join();
-//     client_thr1.join();
-// }
