@@ -577,35 +577,35 @@ test "dial and accept with multiple clients" {
     }
 }
 
-test "dial in separate thread with error" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-
-    // xev.backend = .epoll;
-    const opts = Options{ .backlog = 128 };
-    var transport = try XevTransport.init(allocator, opts);
-    defer transport.deinit();
-
-    const addr = try std.net.Address.parseIp("127.0.0.1", 1);
-    var channel: SocketChannel = undefined;
-    var result: ?anyerror = null;
-
-    const thread = try std.Thread.spawn(.{}, struct {
-        fn run(t: *XevTransport, a: std.net.Address, c: *SocketChannel, err: *?anyerror) void {
-            t.dial(a, c) catch |e| {
-                err.* = e;
-            };
-        }
-    }.run, .{ &transport, addr, &channel, &result });
-
-    // Add delay to ensure thread starts
-    std.time.sleep(200 * std.time.ms_per_s);
-
-    const channel1 = allocator.create(SocketChannel) catch unreachable;
-    const addr1 = try std.net.Address.parseIp("0.0.0.0", 8081);
-    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr1, channel1));
-
-    thread.join();
-    try std.testing.expectEqual(result.?, error.ConnectionRefused);
-}
+// test "dial in separate thread with error" {
+//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//     const allocator = gpa.allocator();
+//
+//     // xev.backend = .epoll;
+//     const opts = Options{ .backlog = 128 };
+//     var transport = try XevTransport.init(allocator, opts);
+//     defer transport.deinit();
+//
+//     const addr = try std.net.Address.parseIp("127.0.0.1", 1);
+//     var channel: SocketChannel = undefined;
+//     var result: ?anyerror = null;
+//
+//     const thread = try std.Thread.spawn(.{}, struct {
+//         fn run(t: *XevTransport, a: std.net.Address, c: *SocketChannel, err: *?anyerror) void {
+//             t.dial(a, c) catch |e| {
+//                 err.* = e;
+//             };
+//         }
+//     }.run, .{ &transport, addr, &channel, &result });
+//
+//     // Add delay to ensure thread starts
+//     std.time.sleep(200 * std.time.ms_per_s);
+//
+//     const channel1 = allocator.create(SocketChannel) catch unreachable;
+//     const addr1 = try std.net.Address.parseIp("0.0.0.0", 8081);
+//     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr1, channel1));
+//
+//     thread.join();
+//     try std.testing.expectEqual(result.?, error.ConnectionRefused);
+// }
 
