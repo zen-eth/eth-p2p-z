@@ -1,5 +1,5 @@
 const std = @import("std");
-const xev = @import("xev");
+const xev = @import("xev").Dynamic;
 const Intrusive = @import("../../utils/queue_mpsc.zig").Intrusive;
 const IOQueue = Intrusive(AsyncIOQueueNode);
 const TCP = xev.TCP;
@@ -490,6 +490,7 @@ test "dial with error" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
+    xev.backend = .epoll;
     const opts = Options{
         .backlog = 128,
     };
