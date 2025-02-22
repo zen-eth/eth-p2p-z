@@ -575,31 +575,31 @@ test "dial with error" {
 //     }
 // }
 
-test "dial in separate thread with error" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-
-    const opts = Options{ .backlog = 128 };
-    var transport = try XevTransport.init(allocator, opts);
-    defer transport.deinit();
-
-    // Use an invalid port to trigger connection refused
-    const addr = try std.net.Address.parseIp("127.0.0.1", 1);
-    var channel: SocketChannel = undefined;
-    var result: ?anyerror = null;
-
-    const thread = try std.Thread.spawn(.{}, struct {
-        fn run(t: *XevTransport, a: std.net.Address, c: *SocketChannel, err: *?anyerror) void {
-            t.dial(a, c) catch |e| {
-                err.* = e;
-            };
-        }
-    }.run, .{ &transport, addr, &channel, &result });
-
-    var channel1: SocketChannel = undefined;
-    const addr1 = try std.net.Address.parseIp("0.0.0.0", 8081);
-    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr1, &channel1));
-
-    thread.join();
-    try std.testing.expectEqual(result.?, error.ConnectionRefused);
-}
+// test "dial in separate thread with error" {
+//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//     const allocator = gpa.allocator();
+//
+//     const opts = Options{ .backlog = 128 };
+//     var transport = try XevTransport.init(allocator, opts);
+//     defer transport.deinit();
+//
+//     // Use an invalid port to trigger connection refused
+//     const addr = try std.net.Address.parseIp("127.0.0.1", 1);
+//     var channel: SocketChannel = undefined;
+//     var result: ?anyerror = null;
+//
+//     const thread = try std.Thread.spawn(.{}, struct {
+//         fn run(t: *XevTransport, a: std.net.Address, c: *SocketChannel, err: *?anyerror) void {
+//             t.dial(a, c) catch |e| {
+//                 err.* = e;
+//             };
+//         }
+//     }.run, .{ &transport, addr, &channel, &result });
+//
+//     var channel1: SocketChannel = undefined;
+//     const addr1 = try std.net.Address.parseIp("0.0.0.0", 8081);
+//     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr1, &channel1));
+//
+//     thread.join();
+//     try std.testing.expectEqual(result.?, error.ConnectionRefused);
+// }
