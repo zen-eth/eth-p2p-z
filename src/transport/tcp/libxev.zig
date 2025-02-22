@@ -583,7 +583,6 @@ test "dial in separate thread with error" {
     var transport = try XevTransport.init(allocator, opts);
     defer transport.deinit();
 
-    // Use an invalid port to trigger connection refused
     const addr = try std.net.Address.parseIp("127.0.0.1", 1);
     var channel: SocketChannel = undefined;
     var result: ?anyerror = null;
@@ -596,6 +595,9 @@ test "dial in separate thread with error" {
         }
     }.run, .{ &transport, addr, &channel, &result });
 
+    // Add delay to ensure thread starts
+    std.time.sleep(10 * std.time.ns_per_ms);
+
     var channel1: SocketChannel = undefined;
     const addr1 = try std.net.Address.parseIp("0.0.0.0", 8081);
     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr1, &channel1));
@@ -603,3 +605,4 @@ test "dial in separate thread with error" {
     thread.join();
     try std.testing.expectEqual(result.?, error.ConnectionRefused);
 }
+
