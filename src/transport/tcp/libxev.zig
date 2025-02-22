@@ -1,6 +1,6 @@
 const std = @import("std");
-// const xev = @import("xev").Dynamic;
-const xev = @import("xev");
+const xev = @import("xev").Dynamic;
+// const xev = @import("xev");
 const Intrusive = @import("../../utils/queue_mpsc.zig").Intrusive;
 const IOQueue = Intrusive(AsyncIOQueueNode);
 const TCP = xev.TCP;
@@ -347,7 +347,7 @@ pub const XevTransport = struct {
 
     pub fn dial(self: *XevTransport, addr: std.net.Address, channel: *SocketChannel) !void {
         var socket = TCP.init(addr) catch unreachable;
-
+        std.debug.print("dialing {}\n", .{socket.fd});
         var err: ?anyerror = null;
         var connect_cb_data = OpenChannelCallbackData{
             .transport = self,
@@ -538,7 +538,7 @@ pub const XevTransport = struct {
 test "dial and accept with multiple clients" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-
+    xev.backend = .epoll;
     const opts = Options{
         .backlog = 128,
     };
