@@ -272,7 +272,7 @@ pub const Listener = struct {
         var c: xev.Completion = undefined;
         var l = XevTransport.getLoop();
         self.server.accept(&l, &c, OpenChannelCallbackData, &connect_cb_data, acceptCallback);
-        try l.run(.once);
+        try l.run(.until_done);
         if (err) |e| {
             return e;
         }
@@ -357,7 +357,7 @@ pub const XevTransport = struct {
         var c: xev.Completion = undefined;
         var l = getLoop();
         socket.connect(&l, &c, addr, OpenChannelCallbackData, &connect_cb_data, connectCallback);
-        try l.run(.once);
+        try l.run(.until_done);
         if (err) |e| {
             return e;
         }
