@@ -139,7 +139,7 @@ pub const SocketChannel = struct {
         c: *xev.Completion,
         socket: xev.TCP,
         buf: xev.ReadBuffer,
-        r: xev.TCP.ReadError!usize,
+        r: xev.ReadError!usize,
     ) xev.CallbackAction {
         const self = self_.?;
         const n = r catch |err| switch (err) {
@@ -178,7 +178,7 @@ pub const SocketChannel = struct {
         c: *xev.Completion,
         socket: xev.TCP,
         buf: xev.ReadBuffer,
-        r: xev.TCP.ReadError!usize,
+        r: xev.ReadError!usize,
     ) xev.CallbackAction {
         const self = self_.?;
         const n = r catch |err| switch (err) {
@@ -217,7 +217,7 @@ pub const SocketChannel = struct {
         c: *xev.Completion,
         s: xev.TCP,
         _: xev.WriteBuffer,
-        r: xev.TCP.WriteError!usize,
+        r: xev.WriteError!usize,
     ) xev.CallbackAction {
         std.debug.print("write callback\n", .{});
         _ = l;
@@ -242,7 +242,7 @@ pub const SocketChannel = struct {
         l: *xev.Loop,
         c: *xev.Completion,
         s: xev.TCP,
-        r: xev.TCP.ShutdownError!void,
+        r: xev.ShutdownError!void,
     ) xev.CallbackAction {
         _ = r catch |err| {
             std.debug.print("Error shutting down: {}\n", .{err});
@@ -258,7 +258,7 @@ pub const SocketChannel = struct {
         l: *xev.Loop,
         c: *xev.Completion,
         socket: xev.TCP,
-        r: xev.TCP.CloseError!void,
+        r: xev.CloseError!void,
     ) xev.CallbackAction {
         std.debug.print("close callback\n", .{});
         _ = l;
@@ -507,7 +507,7 @@ pub const XevTransport = struct {
         _: *xev.Loop,
         c: *xev.Completion,
         socket: xev.TCP,
-        r: xev.TCP.ConnectError!void,
+        r: xev.ConnectError!void,
     ) xev.CallbackAction {
         const self = self_.?;
         defer self.transport.allocator.destroy(c);
@@ -538,7 +538,7 @@ pub const XevTransport = struct {
         self_: ?*XevTransport,
         _: *xev.Loop,
         _: *xev.Completion,
-        r: xev.TCP.AcceptError!xev.TCP,
+        r: xev.AcceptError!xev.TCP,
     ) xev.CallbackAction {
         const self = self_.?;
         _ = r catch |err| {
