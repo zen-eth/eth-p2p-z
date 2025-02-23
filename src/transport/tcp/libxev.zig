@@ -505,7 +505,8 @@ test "dial with error" {
     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel));
 
     var channel1: SocketChannel = undefined;
-    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel1));
+    const addr1 = try std.net.Address.parseIp("0.0.0.0", 8001);
+    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr1, &channel1));
 }
 
 // test "dial and accept" {
