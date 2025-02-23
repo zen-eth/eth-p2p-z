@@ -346,7 +346,7 @@ pub const XevTransport = struct {
     }
 
     pub fn dial(self: *XevTransport, addr: std.net.Address, channel: *SocketChannel) !void {
-        const socket=try self.allocator.create(xev.TCP) catch unreachable;
+        const socket = try self.allocator.create(xev.TCP);
         socket.* = TCP.init(addr) catch unreachable;
         std.debug.print("dialing {*}\n", .{socket});
         var err: ?anyerror = null;
@@ -612,4 +612,3 @@ test "dial with error" {
 //     thread.join();
 //     try std.testing.expectEqual(result.?, error.ConnectionRefused);
 // }
-
