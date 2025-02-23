@@ -346,8 +346,9 @@ pub const XevTransport = struct {
     }
 
     pub fn dial(self: *XevTransport, addr: std.net.Address, channel: *SocketChannel) !void {
-        var socket = TCP.init(addr) catch unreachable;
-        std.debug.print("dialing {*}\n", .{&socket});
+        const socket=try self.allocator.create(xev.TCP) catch unreachable;
+        socket.* = TCP.init(addr) catch unreachable;
+        std.debug.print("dialing {*}\n", .{socket});
         var err: ?anyerror = null;
         var connect_cb_data = OpenChannelCallbackData{
             .transport = self,
