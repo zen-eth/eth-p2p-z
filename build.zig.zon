@@ -32,8 +32,8 @@
         //     .hash = "1220fd9f66231bcae161c8ef630a528179d6435e4e083f784e8ff0cd46c0990ed9b5",
         // },
         .libxev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.zip",
-            .hash = "1220d220fe297775b574b0312faaf5afcc0044cbda650d0558ec2dda8fb1a6dc1228",
+            .url = "git+https://github.com/mitchellh/libxev#c6e8719a321088691829e2e4bf4d13eed5d4fb69",
+            .hash = "122040cf4300fa02f4ebade2c68d94d04f4e97dab3ca75d2a6935fb022c1af2f2bcb",
         },
     },
     .paths = .{
