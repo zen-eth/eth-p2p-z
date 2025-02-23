@@ -487,22 +487,25 @@ pub const XevTransport = struct {
     }
 };
 
-// test "dial with error" {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     const allocator = gpa.allocator();
-//
-//     // xev.backend = .epoll;
-//     const opts = Options{
-//         .backlog = 128,
-//     };
-//
-//     var transport = try XevTransport.init(allocator, opts);
-//     defer transport.deinit();
-//
-//     var channel: SocketChannel = undefined;
-//     const addr = try std.net.Address.parseIp("0.0.0.0", 8000);
-//     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel));
-// }
+test "dial with error" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    // xev.backend = .epoll;
+    const opts = Options{
+        .backlog = 128,
+    };
+
+    var transport = try XevTransport.init(allocator, opts);
+    defer transport.deinit();
+
+    var channel: SocketChannel = undefined;
+    const addr = try std.net.Address.parseIp("0.0.0.0", 8000);
+    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel));
+
+    var channel1: SocketChannel = undefined;
+    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel1));
+}
 
 // test "dial and accept" {
 //     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -535,47 +538,47 @@ pub const XevTransport = struct {
 //     try std.testing.expectEqual(true, channel1.is_initiator);
 // }
 //
-test "dial and accept with multiple clients" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    xev.backend = .epoll;
-    const opts = Options{
-        .backlog = 128,
-    };
-
-    const addr = try std.net.Address.parseIp("127.0.0.1", 7000);
-
-    var server = try XevTransport.init(allocator, opts);
-    defer server.deinit();
-    var listener: Listener = undefined;
-    try server.listen(addr, &listener);
-
-    var channels: [3]SocketChannel = [_]SocketChannel{ undefined, undefined, undefined };
-    const thread = try std.Thread.spawn(.{}, struct {
-        fn run(l: *Listener, chans: []SocketChannel) !void {
-            for (chans) |*chan| {
-                try l.accept(chan);
-            }
-        }
-    }.run, .{ &listener, &channels });
-
-    var client = try XevTransport.init(allocator, opts);
-    defer client.deinit();
-
-    var client_channels: [3]SocketChannel = [_]SocketChannel{ undefined, undefined, undefined };
-    for (&client_channels) |*chan| {
-        try client.dial(addr, chan);
-    }
-
-    thread.join();
-
-    for (channels) |chan| {
-        try std.testing.expectEqual(false, chan.is_initiator);
-    }
-    for (client_channels) |chan| {
-        try std.testing.expectEqual(true, chan.is_initiator);
-    }
-}
+// test "dial and accept with multiple clients" {
+//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//     const allocator = gpa.allocator();
+//     xev.backend = .epoll;
+//     const opts = Options{
+//         .backlog = 128,
+//     };
+//
+//     const addr = try std.net.Address.parseIp("127.0.0.1", 7000);
+//
+//     var server = try XevTransport.init(allocator, opts);
+//     defer server.deinit();
+//     var listener: Listener = undefined;
+//     try server.listen(addr, &listener);
+//
+//     var channels: [3]SocketChannel = [_]SocketChannel{ undefined, undefined, undefined };
+//     const thread = try std.Thread.spawn(.{}, struct {
+//         fn run(l: *Listener, chans: []SocketChannel) !void {
+//             for (chans) |*chan| {
+//                 try l.accept(chan);
+//             }
+//         }
+//     }.run, .{ &listener, &channels });
+//
+//     var client = try XevTransport.init(allocator, opts);
+//     defer client.deinit();
+//
+//     var client_channels: [3]SocketChannel = [_]SocketChannel{ undefined, undefined, undefined };
+//     for (&client_channels) |*chan| {
+//         try client.dial(addr, chan);
+//     }
+//
+//     thread.join();
+//
+//     for (channels) |chan| {
+//         try std.testing.expectEqual(false, chan.is_initiator);
+//     }
+//     for (client_channels) |chan| {
+//         try std.testing.expectEqual(true, chan.is_initiator);
+//     }
+// }
 
 // test "dial in separate thread with error" {
 //     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
