@@ -1,6 +1,6 @@
 const std = @import("std");
-const xev = @import("xev").Dynamic;
-// const xev = @import("xev");
+// const xev = @import("xev").Dynamic;
+const xev = @import("xev");
 const Intrusive = @import("../../utils/queue_mpsc.zig").Intrusive;
 const IOQueue = Intrusive(AsyncIOQueueNode);
 const TCP = xev.TCP;
@@ -14,17 +14,19 @@ const TCPPool = std.heap.MemoryPool(xev.TCP);
 
 /// SocketChannel represents a socket channel. It is used to send and receive messages.
 pub const SocketChannel = struct {
-    socket: TCP,
+    socket: *TCP,
     transport: *XevTransport,
     is_initiator: bool,
 
-    pub fn init(self: *SocketChannel, socket: TCP, transport: *XevTransport, is_initiator: bool) void {
+    pub fn init(self: *SocketChannel, socket: *TCP, transport: *XevTransport, is_initiator: bool) void {
         self.socket = socket;
         self.transport = transport;
         self.is_initiator = is_initiator;
     }
 
-    pub fn deinit(_: *SocketChannel) void {}
+    pub fn deinit(self: *SocketChannel) void {
+        self.transport.allocator.destroy(self.socket);
+    }
 
     // pub fn write(self: *SocketChannel, buf: []const u8) void {
     //     if (self.transport.isInLoopThread()) {
@@ -286,13 +288,17 @@ pub const Listener = struct {
         r: xev.AcceptError!xev.TCP,
     ) xev.CallbackAction {
         const self = self_.?;
+
         const socket = r catch |err| {
             std.debug.print("Error accepting: {}\n", .{err});
             self.err.* = err;
             return .disarm;
         };
 
-        self.channel.init(socket, self.transport, false);
+        const s=self.transport.allocator.create(TCP) catch unreachable;
+        s.* = socket;
+
+        self.channel.init(s, self.transport, false);
 
         return .disarm;
     }
@@ -482,7 +488,9 @@ pub const XevTransport = struct {
             return .disarm;
         };
 
-        self.channel.init(socket, self.transport, true);
+        const s=self.transport.allocator.create(TCP) catch unreachable;
+        s.* = socket;
+        self.channel.init(s, self.transport, true);
 
         return .disarm;
     }
@@ -501,10 +509,13 @@ test "dial with error" {
     defer transport.deinit();
 
     var channel: SocketChannel = undefined;
+    // var c=&channel;
+    // defer c.deinit();
     const addr = try std.net.Address.parseIp("0.0.0.0", 8000);
     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel));
 
     var channel1: SocketChannel = undefined;
+    // defer channel1.deinit();
     const addr1 = try std.net.Address.parseIp("0.0.0.0", 8001);
     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr1, &channel1));
 }
