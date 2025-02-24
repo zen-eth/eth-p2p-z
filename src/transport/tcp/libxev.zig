@@ -7,10 +7,6 @@ const Allocator = std.mem.Allocator;
 const ThreadPool = xev.ThreadPool;
 const ResetEvent = std.Thread.ResetEvent;
 
-/// Memory pools for things that need stable pointers
-const CompletionPool = std.heap.MemoryPool(xev.Completion);
-const TCPPool = std.heap.MemoryPool(xev.TCP);
-
 /// SocketChannel represents a socket channel. It is used to send and receive messages.
 pub const SocketChannel = struct {
     socket: TCP,
@@ -27,183 +23,62 @@ pub const SocketChannel = struct {
         // self.transport.destroySocket(self.socket);
     }
 
-    // pub fn write(self: *SocketChannel, buf: []const u8) void {
-    //     if (self.transport.isInLoopThread()) {
-    //         const c = self.transport.allocator.create(xev.Completion) catch unreachable;
-    //         self.socket.write(&self.transport.loop, c, .{ .slice = buf }, SocketChannel, self, writeCallback);
-    //     } else {
-    //         const node = self.transport.allocator.create(AsyncIOQueueNode) catch unreachable;
-    //         node.* = AsyncIOQueueNode{
-    //             .next = null,
-    //             .op = .{ .write = .{ .channel = self, .buffer = buf } },
-    //         };
-    //         self.transport.async_task_queue.push(node);
-    //         self.transport.async_io_notifier.notify() catch |err| {
-    //             std.debug.print("Error notifying async io: {}\n", .{err});
-    //         };
-    //     }
-    // }
-    //
-    // pub fn read(self: *SocketChannel, buf: []u8) void {
-    //     if (self.transport.isInLoopThread()) {
-    //         std.debug.print("read called from loop thread\n", .{});
-    //         const c = self.transport.allocator.create(xev.Completion) catch unreachable;
-    //         if (self.is_initiator) {
-    //             self.socket.read(&self.transport.loop, c, .{ .slice = buf }, SocketChannel, self, SocketChannel.outboundChannelReadCallback);
-    //         } else {
-    //             self.socket.read(&self.transport.loop, c, .{ .slice = buf }, SocketChannel, self, SocketChannel.inboundChannelReadCallback);
-    //         }
-    //         return;
-    //     } else {
-    //         const node = self.transport.allocator.create(AsyncIOQueueNode) catch unreachable;
-    //         node.* = AsyncIOQueueNode{
-    //             .next = null,
-    //             .op = .{ .read = .{ .channel = self } },
-    //         };
-    //
-    //         self.transport.async_task_queue.push(node);
-    //
-    //         self.transport.async_io_notifier.notify() catch |err| {
-    //             std.debug.print("Error notifying async io: {}\n", .{err});
-    //         };
-    //     }
-    // }
-    //
-    // fn outboundChannelReadCallback(
-    //     self_: ?*SocketChannel,
-    //     loop: *xev.Loop,
-    //     c: *xev.Completion,
-    //     socket: xev.TCP,
-    //     buf: xev.ReadBuffer,
-    //     r: xev.TCP.ReadError!usize,
-    // ) xev.CallbackAction {
-    //     const self = self_.?;
-    //     const n = r catch |err| switch (err) {
-    //         error.EOF => {
-    //             const c_shutdown = self.transport.completion_pool.create() catch unreachable;
-    //             socket.shutdown(loop, c_shutdown, SocketChannel, self, shutdownCallback);
-    //             return .disarm;
-    //         },
-    //
-    //         else => {
-    //             if (self.transport.handler.io_error) |cb| {
-    //                 cb(self, err);
-    //             }
-    //             const c_shutdown = self.transport.completion_pool.create() catch unreachable;
-    //             socket.shutdown(loop, c_shutdown, SocketChannel, self, shutdownCallback);
-    //             std.log.warn("server read unexpected err={}", .{err});
-    //             return .disarm;
-    //         },
-    //     };
-    //
-    //     if (self.is_auto_read) {
-    //         return .rearm;
-    //     } else {
-    //         self.transport.allocator.destroy(c);
-    //         return .disarm;
-    //     }
-    // }
-    //
-    // fn inboundChannelReadCallback(
-    //     self_: ?*SocketChannel,
-    //     loop: *xev.Loop,
-    //     c: *xev.Completion,
-    //     socket: xev.TCP,
-    //     buf: xev.ReadBuffer,
-    //     r: xev.TCP.ReadError!usize,
-    // ) xev.CallbackAction {
-    //     const self = self_.?;
-    //     const n = r catch |err| switch (err) {
-    //         error.EOF => {
-    //             const c_shutdown = self.transport.completion_pool.create() catch unreachable;
-    //             socket.shutdown(loop, c_shutdown, SocketChannel, self, shutdownCallback);
-    //             return .disarm;
-    //         },
-    //
-    //         else => {
-    //             const c_shutdown = self.transport.completion_pool.create() catch unreachable;
-    //             socket.shutdown(loop, c_shutdown, SocketChannel, self, shutdownCallback);
-    //             std.log.warn("server read unexpected err={}", .{err});
-    //             return .disarm;
-    //         },
-    //     };
-    //
-    //     if (self.transport.handler.inbound_channel_read) |cb| {
-    //         cb(self, buf.slice[0..n]);
-    //     }
-    //
-    //     if (self.is_auto_read) {
-    //         return .rearm;
-    //     } else {
-    //         self.transport.allocator.destroy(c);
-    //         return .disarm;
-    //     }
-    // }
-    //
-    // fn writeCallback(
-    //     self_: ?*SocketChannel,
-    //     l: *xev.Loop,
-    //     c: *xev.Completion,
-    //     s: xev.TCP,
-    //     _: xev.WriteBuffer,
-    //     r: xev.TCP.WriteError!usize,
-    // ) xev.CallbackAction {
-    //     std.debug.print("write callback\n", .{});
-    //     _ = l;
-    //     _ = s;
-    //     _ = r catch |err| {
-    //         std.debug.print("Error writing: {}\n", .{err});
-    //     };
-    //
-    //     // We do nothing for write, just put back objects into the pool.
-    //     const self = self_.?;
-    //     self.transport.allocator.destroy(c);
-    //     return .disarm;
-    // }
-
-    fn shutdownCallback(
-        self_: ?*SocketChannel,
-        l: *xev.Loop,
-        c: *xev.Completion,
-        s: xev.TCP,
-        r: xev.TCP.ShutdownError!void,
-    ) xev.CallbackAction {
-        _ = r catch |err| {
-            std.debug.print("Error shutting down: {}\n", .{err});
+    pub fn write(self: *SocketChannel, buf: []const u8) !void {
+        const reset_event = try self.transport.allocator.create(ResetEvent);
+        errdefer self.transport.allocator.destroy(reset_event);
+        reset_event.* = ResetEvent{};
+        const write_err = try self.transport.allocator.create(?anyerror);
+        errdefer self.transport.allocator.destroy(write_err);
+        write_err.* = null;
+        const node = self.transport.allocator.create(AsyncIOQueueNode) catch unreachable;
+        node.* = AsyncIOQueueNode{
+            .next = null,
+            .op = .{ .write = .{
+                .channel = self,
+                .buffer = buf,
+                .reset_event = reset_event,
+                .err = write_err,
+            } },
         };
+        self.transport.async_task_queue.push(node);
+        try self.transport.async_io_notifier.notify();
 
-        const self = self_.?;
-        s.close(l, c, SocketChannel, self, closeCallback);
-        return .disarm;
+        reset_event.wait();
+        if (write_err.*) |err| {
+            return err;
+        }
     }
 
-    fn closeCallback(
-        self_: ?*SocketChannel,
-        l: *xev.Loop,
-        c: *xev.Completion,
-        socket: xev.TCP,
-        r: xev.TCP.CloseError!void,
-    ) xev.CallbackAction {
-        std.debug.print("close callback\n", .{});
-        _ = l;
-        _ = r catch unreachable;
-        _ = socket;
+    pub fn read(self: *SocketChannel, buf: []u8) !usize {
+        const reset_event = try self.transport.allocator.create(ResetEvent);
+        errdefer self.transport.allocator.destroy(reset_event);
+        reset_event.* = ResetEvent{};
+        const read_err = try self.transport.allocator.create(?anyerror);
+        errdefer self.transport.allocator.destroy(read_err);
+        read_err.* = null;
+        const bytes_read = try self.transport.allocator.create(usize);
+        errdefer self.transport.allocator.destroy(bytes_read);
+        const node = self.transport.allocator.create(AsyncIOQueueNode) catch unreachable;
+        node.* = AsyncIOQueueNode{
+            .next = null,
+            .op = .{ .read = .{
+                .channel = self,
+                .buffer = buf,
+                .reset_event = reset_event,
+                .err = read_err,
+                .bytes_read = bytes_read,
+            } },
+        };
 
-        const self = self_.?;
+        self.transport.async_task_queue.push(node);
 
-        self.deinit();
-        // self.transport.socket_channel_manager.sockets.mutex.lock();
-        // for (self.transport.socket_channel_manager.sockets.l.items, 0..) |s, i| {
-        //     if (s == self) {
-        //         _ = self.transport.socket_channel_manager.sockets.l.swapRemove(i);
-        //         self.transport.socket_channel_manager.channel_pool.destroy(s);
-        //         break;
-        //     }
-        // }
-        // self.transport.socket_channel_manager.sockets.mutex.unlock();
-        // self.transport.channel_pool.destroy(self);
-        self.transport.completion_pool.destroy(c);
-        return .disarm;
+        try self.transport.async_io_notifier.notify();
+
+        reset_event.wait();
+        if (read_err.*) |err| {
+            return err;
+        }
+        return bytes_read.*;
     }
 };
 
@@ -229,14 +104,19 @@ pub const AsyncIOQueueNode = struct {
             reset_event: *ResetEvent,
             err: *?anyerror,
         },
-        // write: struct {
-        //     buffer: []const u8,
-        //     channel: *SocketChannel,
-        // },
-        // read: struct {
-        //     channel: *SocketChannel,
-        //     buffer: []u8,
-        // },
+        write: struct {
+            buffer: []const u8,
+            channel: *SocketChannel,
+            reset_event: *ResetEvent,
+            err: *?anyerror,
+        },
+        read: struct {
+            channel: *SocketChannel,
+            buffer: []u8,
+            reset_event: *ResetEvent,
+            err: *?anyerror,
+            bytes_read: *usize,
+        },
     },
 };
 
@@ -245,6 +125,21 @@ const OpenChannelCallbackData = struct {
     channel: *SocketChannel,
     err: *?anyerror,
     reset_event: *ResetEvent,
+};
+
+const WriteCallbackData = struct {
+    channel: *SocketChannel,
+    buffer: []const u8,
+    reset_event: *ResetEvent,
+    err: *?anyerror,
+};
+
+const ReadCallbackData = struct {
+    channel: *SocketChannel,
+    buffer: []u8,
+    reset_event: *ResetEvent,
+    err: *?anyerror,
+    bytes_read: *usize,
 };
 
 pub const Listener = struct {
@@ -418,23 +313,35 @@ pub const XevTransport = struct {
                     };
                     server.accept(loop, c, OpenChannelCallbackData, accept_cb_data, acceptCallback);
                 },
-                // .write => |*w| {
-                //     const c = self.allocator.create(xev.Completion) catch unreachable;
-                //     const channel = w.channel;
-                //     const buffer = w.buffer;
-                //
-                //     channel.socket.write(loop, c, .{ .slice = buffer }, SocketChannel, channel, SocketChannel.writeCallback);
-                // },
-                // .read => |*read| {
-                //     const channel = read.channel;
-                //     const c = if (channel.is_auto_read) channel.auto_read_c.? else self.allocator.create(xev.Completion) catch unreachable;
-                //
-                //     if (channel.is_initiator) {
-                //         channel.socket.read(loop, c, .{ .slice = channel.read_buf[0..] }, SocketChannel, channel, SocketChannel.outboundChannelReadCallback);
-                //     } else {
-                //         channel.socket.read(loop, c, .{ .slice = channel.read_buf[0..] }, SocketChannel, channel, SocketChannel.inboundChannelReadCallback);
-                //     }
-                // },
+                .write => |*w| {
+                    const c = self.allocator.create(xev.Completion) catch unreachable;
+                    const channel = w.channel;
+                    const buffer = w.buffer;
+                    const write_cb_data = self.allocator.create(WriteCallbackData) catch unreachable;
+                    write_cb_data.* = WriteCallbackData{
+                        .buffer = buffer,
+                        .channel = channel,
+                        .reset_event = w.reset_event,
+                        .err = w.err,
+                    };
+
+                    channel.socket.write(loop, c, .{ .slice = buffer }, WriteCallbackData, write_cb_data, writeCallback);
+                },
+                .read => |*read| {
+                    const channel = read.channel;
+                    const buffer = read.buffer;
+                    const c = self.allocator.create(xev.Completion) catch unreachable;
+                    const read_cb_data = self.allocator.create(ReadCallbackData) catch unreachable;
+                    read_cb_data.* = ReadCallbackData{
+                        .buffer = buffer,
+                        .channel = channel,
+                        .reset_event = read.reset_event,
+                        .err = read.err,
+                        .bytes_read = read.bytes_read,
+                    };
+
+                    channel.socket.read(loop, c, .{ .slice = buffer }, ReadCallbackData, read_cb_data, readCallback);
+                },
             }
 
             self.allocator.destroy(node);
@@ -486,7 +393,6 @@ pub const XevTransport = struct {
         r: xev.AcceptError!xev.TCP,
     ) xev.CallbackAction {
         const self = self_.?;
-        // defer self.transport.allocator.destroy(c);
         defer self.transport.allocator.destroy(self);
         const socket = r catch |err| {
             std.debug.print("Error accepting: {}\n", .{err});
@@ -502,52 +408,128 @@ pub const XevTransport = struct {
         return .disarm;
     }
 
-    fn destroyBuf(self: *XevTransport, buf: []const u8) void {
-        self.buffer_pool.destroy(
-            @alignCast(
-                @as(*[4096]u8, @ptrFromInt(@intFromPtr(buf.ptr))),
-            ),
-        );
+    fn writeCallback(
+        self_: ?*WriteCallbackData,
+        _: *xev.Loop,
+        c: *xev.Completion,
+        _: xev.TCP,
+        _: xev.WriteBuffer,
+        r: xev.WriteError!usize,
+    ) xev.CallbackAction {
+        const self = self_.?;
+        defer self.channel.transport.allocator.destroy(self);
+        _ = r catch |err| {
+            std.debug.print("Error writing: {}\n", .{err});
+            self.err.* = err;
+            self.reset_event.set();
+            return .disarm;
+        };
+
+        self.channel.transport.allocator.destroy(c);
+
+        self.reset_event.set();
+
+        return .disarm;
     }
 
-    // fn destroySocket(self: *XevTransport, socket: *xev.TCP) void {
-    //     self.socket_pool.destroy(
-    //         @alignCast(socket),
-    //     );
-    // }
+    fn readCallback(
+        self_: ?*ReadCallbackData,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        socket: xev.TCP,
+        _: xev.ReadBuffer,
+        r: xev.ReadError!usize,
+    ) xev.CallbackAction {
+        const self = self_.?;
+        defer self.channel.transport.allocator.destroy(self);
+        const n = r catch |err| switch (err) {
+            error.EOF => {
+                socket.shutdown(loop, c, SocketChannel, self.channel, shutdownCallback);
+                self.err.* = err;
+                self.reset_event.set();
+                return .disarm;
+            },
+
+            else => {
+                socket.shutdown(loop, c, SocketChannel, self.channel, shutdownCallback);
+                std.log.warn("server read unexpected err={}", .{err});
+                self.err.* = err;
+                self.reset_event.set();
+                return .disarm;
+            },
+        };
+
+        self.bytes_read.* = n;
+        self.channel.transport.allocator.destroy(c);
+        self.reset_event.set();
+        return .disarm;
+    }
+
+    fn shutdownCallback(
+        self_: ?*SocketChannel,
+        l: *xev.Loop,
+        c: *xev.Completion,
+        s: xev.TCP,
+        r: xev.ShutdownError!void,
+    ) xev.CallbackAction {
+        _ = r catch |err| {
+            std.debug.print("Error shutting down: {}\n", .{err});
+        };
+
+        const self = self_.?;
+        s.close(l, c, SocketChannel, self, closeCallback);
+        return .disarm;
+    }
+
+    fn closeCallback(
+        self_: ?*SocketChannel,
+        l: *xev.Loop,
+        c: *xev.Completion,
+        socket: xev.TCP,
+        r: xev.CloseError!void,
+    ) xev.CallbackAction {
+        std.debug.print("close callback\n", .{});
+        _ = l;
+        _ = r catch unreachable;
+        _ = socket;
+
+        const self = self_.?;
+        self.transport.allocator.destroy(c);
+        return .disarm;
+    }
 };
 
-// test "dial connection refused" {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     const allocator = gpa.allocator();
-//
-//     const opts = Options{
-//         .backlog = 128,
-//     };
-//
-//     var transport = try XevTransport.init(allocator, opts);
-//     defer transport.deinit();
-//
-//     const thread = try std.Thread.spawn(.{}, XevTransport.start, .{&transport});
-//
-//     var channel: SocketChannel = undefined;
-//     const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
-//     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel));
-//
-//     var channel1: SocketChannel = undefined;
-//     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel1));
-//
-//     const thread2 = try std.Thread.spawn(.{}, struct {
-//         fn run(t: *XevTransport, a: std.net.Address) !void {
-//             var ch: SocketChannel = undefined;
-//             try std.testing.expectError(error.ConnectionRefused, t.dial(a, &ch));
-//         }
-//     }.run, .{ &transport, addr });
-//
-//     thread2.join();
-//     transport.stop();
-//     thread.join();
-// }
+test "dial connection refused" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    const opts = Options{
+        .backlog = 128,
+    };
+
+    var transport = try XevTransport.init(allocator, opts);
+    defer transport.deinit();
+
+    const thread = try std.Thread.spawn(.{}, XevTransport.start, .{&transport});
+
+    var channel: SocketChannel = undefined;
+    const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
+    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel));
+
+    var channel1: SocketChannel = undefined;
+    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel1));
+
+    const thread2 = try std.Thread.spawn(.{}, struct {
+        fn run(t: *XevTransport, a: std.net.Address) !void {
+            var ch: SocketChannel = undefined;
+            try std.testing.expectError(error.ConnectionRefused, t.dial(a, &ch));
+        }
+    }.run, .{ &transport, addr });
+
+    thread2.join();
+    transport.stop();
+    thread.join();
+}
 
 test "dial and accept" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -563,7 +545,7 @@ test "dial and accept" {
     const thread = try std.Thread.spawn(.{}, XevTransport.start, .{&transport});
 
     var listener: Listener = undefined;
-    const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
+    const addr = try std.net.Address.parseIp("0.0.0.0", 8082);
     try transport.listen(addr, &listener);
 
     var channel: SocketChannel = undefined;
@@ -593,6 +575,61 @@ test "dial and accept" {
     accept_thread.join();
     client.stop();
     transport.stop();
+    thread1.join();
+    thread.join();
+}
+
+test "echo read and write" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    const opts = Options{
+        .backlog = 128,
+    };
+
+    var server = try XevTransport.init(allocator, opts);
+    defer server.deinit();
+
+    const thread = try std.Thread.spawn(.{}, XevTransport.start, .{&server});
+
+    var listener: Listener = undefined;
+    const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
+    try server.listen(addr, &listener);
+
+    const accept_thread = try std.Thread.spawn(.{}, struct {
+        fn run(l: *Listener, alloc: Allocator) !void {
+            var accepted_channel: SocketChannel = undefined;
+            try l.accept(&accepted_channel);
+            try std.testing.expect(!accepted_channel.is_initiator);
+
+            const buf = try alloc.alloc(u8, 1024);
+            defer alloc.free(buf);
+            const n = try accepted_channel.read(buf);
+            try std.testing.expectStringStartsWith(buf, "buf: []const u8");
+
+            try std.testing.expect(n == 15);
+            try accepted_channel.write(buf[0..n]);
+        }
+    }.run, .{ &listener, allocator });
+
+    var client = try XevTransport.init(allocator, opts);
+    defer client.deinit();
+
+    const thread1 = try std.Thread.spawn(.{}, XevTransport.start, .{&client});
+    var channel1: SocketChannel = undefined;
+    try client.dial(addr, &channel1);
+    try std.testing.expect(channel1.is_initiator);
+
+    try channel1.write("buf: []const u8");
+    const buf = try allocator.alloc(u8, 1024);
+    defer allocator.free(buf);
+    const n = try channel1.read(buf);
+    try std.testing.expectStringStartsWith(buf, "buf: []const u8");
+    try std.testing.expect(n == 15);
+
+    accept_thread.join();
+    client.stop();
+    server.stop();
     thread1.join();
     thread.join();
 }
