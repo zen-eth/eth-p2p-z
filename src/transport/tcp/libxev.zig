@@ -9,37 +9,48 @@ const ResetEvent = std.Thread.ResetEvent;
 
 /// SocketChannel represents a socket channel. It is used to send and receive messages.
 pub const SocketChannel = struct {
+    /// The underlying socket.
     socket: TCP,
+
+    /// The transport that created this channel.
     transport: *XevTransport,
+
+    /// Whether this channel is the initiator of the connection. If true, this channel is the client. If false, this channel is the server.
     is_initiator: bool,
 
+    /// Initialize the channel with the given socket and transport.
     pub fn init(self: *SocketChannel, socket: TCP, transport: *XevTransport, is_initiator: bool) void {
         self.socket = socket;
         self.transport = transport;
         self.is_initiator = is_initiator;
     }
 
+    /// Deinitialize the channel.
     pub fn deinit(_: *SocketChannel) void {
-        // self.transport.destroySocket(self.socket);
+        // TODO: should we close the socket here?
     }
 
+    /// Write sends the buffer to the other end of the channel. It blocks until the write is complete. If an error occurs, it returns the error.
     pub fn write(self: *SocketChannel, buf: []const u8) !void {
         const reset_event = try self.transport.allocator.create(ResetEvent);
         errdefer self.transport.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
+
         const write_err = try self.transport.allocator.create(?anyerror);
         errdefer self.transport.allocator.destroy(write_err);
         write_err.* = null;
+
         const node = self.transport.allocator.create(AsyncIOQueueNode) catch unreachable;
         node.* = AsyncIOQueueNode{
             .next = null,
-            .op = .{ .write = .{
+            .io_action = .{ .write = .{
                 .channel = self,
                 .buffer = buf,
                 .reset_event = reset_event,
                 .err = write_err,
             } },
         };
+
         self.transport.async_task_queue.push(node);
         try self.transport.async_io_notifier.notify();
 
@@ -49,19 +60,24 @@ pub const SocketChannel = struct {
         }
     }
 
+    /// Read reads from the channel into the buffer. It blocks until the read is complete. If an error occurs, it returns the error.
     pub fn read(self: *SocketChannel, buf: []u8) !usize {
         const reset_event = try self.transport.allocator.create(ResetEvent);
         errdefer self.transport.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
+
         const read_err = try self.transport.allocator.create(?anyerror);
         errdefer self.transport.allocator.destroy(read_err);
         read_err.* = null;
+
         const bytes_read = try self.transport.allocator.create(usize);
         errdefer self.transport.allocator.destroy(bytes_read);
+        bytes_read.* = 0;
+
         const node = self.transport.allocator.create(AsyncIOQueueNode) catch unreachable;
         node.* = AsyncIOQueueNode{
             .next = null,
-            .op = .{ .read = .{
+            .io_action = .{ .read = .{
                 .channel = self,
                 .buffer = buf,
                 .reset_event = reset_event,
@@ -84,37 +100,55 @@ pub const SocketChannel = struct {
 
 /// Options for the transport.
 pub const Options = struct {
+    /// The maximum number of pending connections.
     backlog: u31,
 };
 
-/// AsyncIOQueueNode is used to store the operation to be performed on the transport.
+/// AsyncIOQueueNode is used to store the operation to be performed on the transport. It is used to perform asynchronous I/O operations.
 pub const AsyncIOQueueNode = struct {
     const Self = @This();
     next: ?*Self = null,
-    op: union(enum) {
+    io_action: union(enum) {
         connect: struct {
+            /// The address to connect to.
             address: std.net.Address,
+            /// The channel to connect.
             channel: *SocketChannel,
+            /// The reset event to signal when the operation is complete.
             reset_event: *ResetEvent,
+            /// The error that occurred during the operation.
             err: *?anyerror,
         },
         accept: struct {
+            /// The server to accept from.
             server: TCP,
+            /// The channel to accept.
             channel: *SocketChannel,
+            /// The reset event to signal when the operation is complete.
             reset_event: *ResetEvent,
+            /// The error that occurred during the operation.
             err: *?anyerror,
         },
         write: struct {
+            /// The buffer to write.
             buffer: []const u8,
+            /// The channel to write to.
             channel: *SocketChannel,
+            /// The reset event to signal when the operation is complete.
             reset_event: *ResetEvent,
+            /// The error that occurred during the operation.
             err: *?anyerror,
         },
         read: struct {
+            /// The channel to read from.
             channel: *SocketChannel,
+            /// The buffer to read into.
             buffer: []u8,
+            /// The reset event to signal when the operation is complete.
             reset_event: *ResetEvent,
+            /// The error that occurred during the operation.
             err: *?anyerror,
+            /// The number of bytes read.
             bytes_read: *usize,
         },
     },
@@ -142,11 +176,16 @@ const ReadCallbackData = struct {
     bytes_read: *usize,
 };
 
+/// Listener listens for incoming connections. It is used to accept connections.
 pub const Listener = struct {
+    /// The address to listen on.
     address: std.net.Address,
+    /// The server to accept connections from.
     server: TCP,
+    /// The transport that created this listener.
     transport: *XevTransport,
 
+    /// Initialize the listener with the given address, backlog, and transport.
     pub fn init(self: *Listener, address: std.net.Address, backlog: u31, transport: *XevTransport) !void {
         const server = try TCP.init(address);
         try server.bind(address);
@@ -157,25 +196,32 @@ pub const Listener = struct {
         self.transport = transport;
     }
 
-    pub fn deinit(_: *Listener) void {}
+    /// Deinitialize the listener.
+    pub fn deinit(_: *Listener) void {
+        // TODO: should we close the server here?
+    }
 
+    /// Accept accepts a connection from the listener. It blocks until a connection is accepted. If an error occurs, it returns the error.
     pub fn accept(self: *Listener, channel: *SocketChannel) !void {
         const reset_event = try self.transport.allocator.create(ResetEvent);
         errdefer self.transport.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
+
         const accept_err = try self.transport.allocator.create(?anyerror);
         errdefer self.transport.allocator.destroy(accept_err);
         accept_err.* = null;
-        const node = self.transport.allocator.create(AsyncIOQueueNode) catch unreachable;
+
+        const node = try self.transport.allocator.create(AsyncIOQueueNode);
         node.* = AsyncIOQueueNode{
             .next = null,
-            .op = .{ .accept = .{
+            .io_action = .{ .accept = .{
                 .server = self.server,
                 .channel = channel,
                 .reset_event = reset_event,
                 .err = accept_err,
             } },
         };
+
         self.transport.async_task_queue.push(node);
         try self.transport.async_io_notifier.notify();
 
@@ -186,16 +232,26 @@ pub const Listener = struct {
     }
 };
 
+/// XevTransport is a transport that uses the xev library for asynchronous I/O operations.
 pub const XevTransport = struct {
+    /// The event loop.
     loop: xev.Loop,
+    /// The options for the transport.
     options: Options,
+    /// The stop notifier.
     stop_notifier: xev.Async,
+    /// The async I/O notifier.
     async_io_notifier: xev.Async,
+    /// The async task queue.
     async_task_queue: *IOQueue,
+    /// The completion for stopping the transport.
     c_stop: xev.Completion,
+    /// The completion for async I/O operations.
     c_async: xev.Completion,
+    /// The allocator.
     allocator: Allocator,
 
+    /// Initialize the transport with the given allocator and options.
     pub fn init(allocator: Allocator, opts: Options) !XevTransport {
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
@@ -221,6 +277,7 @@ pub const XevTransport = struct {
         };
     }
 
+    /// Deinitialize the transport.
     pub fn deinit(self: *XevTransport) void {
         self.loop.deinit();
         self.stop_notifier.deinit();
@@ -228,17 +285,20 @@ pub const XevTransport = struct {
         self.allocator.destroy(self.async_task_queue);
     }
 
+    /// Dial connects to the given address and creates a channel for communication. It blocks until the connection is established. If an error occurs, it returns the error.
     pub fn dial(self: *XevTransport, addr: std.net.Address, channel: *SocketChannel) !void {
         const reset_event = try self.allocator.create(std.Thread.ResetEvent);
         errdefer self.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
+
         const connect_error = try self.allocator.create(?anyerror);
         errdefer self.allocator.destroy(connect_error);
         connect_error.* = null;
+
         const node = try self.allocator.create(AsyncIOQueueNode);
         node.* = AsyncIOQueueNode{
             .next = null,
-            .op = .{
+            .io_action = .{
                 .connect = .{
                     .address = addr,
                     .channel = channel,
@@ -249,7 +309,6 @@ pub const XevTransport = struct {
         };
 
         self.async_task_queue.push(node);
-
         try self.async_io_notifier.notify();
 
         reset_event.wait();
@@ -258,10 +317,12 @@ pub const XevTransport = struct {
         }
     }
 
+    /// Listen listens for incoming connections on the given address. It blocks until the listener is initialized. If an error occurs, it returns the error.
     pub fn listen(self: *XevTransport, addr: std.net.Address, listener: *Listener) !void {
         try listener.init(addr, self.options.backlog, self);
     }
 
+    /// Start starts the transport. It blocks until the transport is stopped.
     pub fn start(self: *XevTransport) !void {
         self.stop_notifier.wait(&self.loop, &self.c_stop, XevTransport, self, &stopCallback);
 
@@ -270,6 +331,7 @@ pub const XevTransport = struct {
         try self.loop.run(.until_done);
     }
 
+    /// Stop stops the transport.
     pub fn stop(self: *XevTransport) void {
         self.stop_notifier.notify() catch |err| {
             std.debug.print("Error notifying stop: {}\n", .{err});
@@ -286,7 +348,7 @@ pub const XevTransport = struct {
         const self = self_.?;
 
         while (self.async_task_queue.pop()) |node| {
-            switch (node.op) {
+            switch (node.io_action) {
                 .connect => |*conn| {
                     const address = conn.address;
                     var socket = TCP.init(address) catch unreachable;
@@ -372,7 +434,6 @@ pub const XevTransport = struct {
         r: xev.ConnectError!void,
     ) xev.CallbackAction {
         const self = self_.?;
-        // defer self.transport.allocator.destroy(c);
         defer self.transport.allocator.destroy(self);
         _ = r catch |err| {
             std.debug.print("Error connecting: {}\n", .{err});
