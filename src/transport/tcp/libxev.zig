@@ -1,6 +1,6 @@
 const std = @import("std");
 const xev = @import("xev");
-const Intrusive = @import("../../utils/queue_mpsc.zig").Intrusive;
+const Intrusive = @import("../../queue_mpsc.zig").Intrusive;
 const IOQueue = Intrusive(AsyncIOQueueNode);
 const TCP = xev.TCP;
 const Allocator = std.mem.Allocator;
@@ -25,11 +25,6 @@ pub const SocketChannel = struct {
         self.is_initiator = is_initiator;
     }
 
-    /// Deinitialize the channel.
-    pub fn deinit(_: *SocketChannel) void {
-        // TODO: should we close the socket here?
-    }
-
     /// Write sends the buffer to the other end of the channel. It blocks until the write is complete. If an error occurs, it returns the error.
     pub fn write(self: *SocketChannel, buf: []const u8) !void {
         const reset_event = try self.transport.allocator.create(ResetEvent);
@@ -42,7 +37,6 @@ pub const SocketChannel = struct {
 
         const node = self.transport.allocator.create(AsyncIOQueueNode) catch unreachable;
         node.* = AsyncIOQueueNode{
-            .next = null,
             .io_action = .{ .write = .{
                 .channel = self,
                 .buffer = buf,
@@ -76,7 +70,6 @@ pub const SocketChannel = struct {
 
         const node = self.transport.allocator.create(AsyncIOQueueNode) catch unreachable;
         node.* = AsyncIOQueueNode{
-            .next = null,
             .io_action = .{ .read = .{
                 .channel = self,
                 .buffer = buf,
@@ -96,12 +89,11 @@ pub const SocketChannel = struct {
         }
         return bytes_read.*;
     }
-};
 
-/// Options for the transport.
-pub const Options = struct {
-    /// The maximum number of pending connections.
-    backlog: u31,
+    /// Close closes the channel. It blocks until the close is complete.
+    pub fn close(_: *SocketChannel) void {
+        // TODO: we should close the socket here
+    }
 };
 
 /// AsyncIOQueueNode is used to store the operation to be performed on the transport. It is used to perform asynchronous I/O operations.
@@ -213,7 +205,6 @@ pub const Listener = struct {
 
         const node = try self.transport.allocator.create(AsyncIOQueueNode);
         node.* = AsyncIOQueueNode{
-            .next = null,
             .io_action = .{ .accept = .{
                 .server = self.server,
                 .channel = channel,
@@ -250,6 +241,12 @@ pub const XevTransport = struct {
     c_async: xev.Completion,
     /// The allocator.
     allocator: Allocator,
+
+    /// Options for the transport.
+    pub const Options = struct {
+        /// The maximum number of pending connections.
+        backlog: u31,
+    };
 
     /// Initialize the transport with the given allocator and options.
     pub fn init(allocator: Allocator, opts: Options) !XevTransport {
@@ -291,18 +288,17 @@ pub const XevTransport = struct {
         errdefer self.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
 
-        const connect_error = try self.allocator.create(?anyerror);
-        errdefer self.allocator.destroy(connect_error);
-        connect_error.* = null;
+        const connect_err = try self.allocator.create(?anyerror);
+        errdefer self.allocator.destroy(connect_err);
+        connect_err.* = null;
 
         const node = try self.allocator.create(AsyncIOQueueNode);
         node.* = AsyncIOQueueNode{
-            .next = null,
             .io_action = .{
                 .connect = .{
                     .address = addr,
                     .channel = channel,
-                    .err = connect_error,
+                    .err = connect_err,
                     .reset_event = reset_event,
                 },
             },
@@ -312,7 +308,7 @@ pub const XevTransport = struct {
         try self.async_io_notifier.notify();
 
         reset_event.wait();
-        if (connect_error.*) |err| {
+        if (connect_err.*) |err| {
             return err;
         }
     }
@@ -564,7 +560,7 @@ test "dial connection refused" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    const opts = Options{
+    const opts = XevTransport.Options{
         .backlog = 128,
     };
 
@@ -596,7 +592,7 @@ test "dial and accept" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    const opts = Options{
+    const opts = XevTransport.Options{
         .backlog = 128,
     };
 
@@ -644,7 +640,7 @@ test "echo read and write" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    const opts = Options{
+    const opts = XevTransport.Options{
         .backlog = 128,
     };
 
