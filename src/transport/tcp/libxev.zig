@@ -239,6 +239,8 @@ pub const XevTransport = struct {
     c_stop: xev.Completion,
     /// The completion for async I/O operations.
     c_async: xev.Completion,
+    /// The thread for the event loop.
+    loop_thread: std.Thread,
     /// The allocator.
     allocator: Allocator,
 
@@ -249,7 +251,7 @@ pub const XevTransport = struct {
     };
 
     /// Initialize the transport with the given allocator and options.
-    pub fn init(allocator: Allocator, opts: Options) !XevTransport {
+    pub fn init(self: *XevTransport, allocator: Allocator, opts: Options) !void {
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
 
@@ -262,7 +264,7 @@ pub const XevTransport = struct {
         var io_queue = try allocator.create(IOQueue);
         io_queue.init();
         errdefer allocator.destroy(io_queue);
-        return XevTransport{
+        self.* = XevTransport{
             .loop = loop,
             .options = opts,
             .stop_notifier = stop_notifier,
@@ -270,8 +272,12 @@ pub const XevTransport = struct {
             .async_task_queue = io_queue,
             .c_stop = .{},
             .c_async = .{},
+            .loop_thread = undefined,
             .allocator = allocator,
         };
+
+        const thread = try std.Thread.spawn(.{}, start, .{self});
+        self.loop_thread = thread;
     }
 
     /// Deinitialize the transport.
@@ -319,6 +325,7 @@ pub const XevTransport = struct {
     }
 
     /// Start starts the transport. It blocks until the transport is stopped.
+    /// It is recommended to call this function in a separate thread.
     pub fn start(self: *XevTransport) !void {
         self.stop_notifier.wait(&self.loop, &self.c_stop, XevTransport, self, &stopCallback);
 
@@ -327,11 +334,13 @@ pub const XevTransport = struct {
         try self.loop.run(.until_done);
     }
 
-    /// Stop stops the transport.
-    pub fn stop(self: *XevTransport) void {
+    /// Close closes the transport.
+    pub fn close(self: *XevTransport) void {
         self.stop_notifier.notify() catch |err| {
             std.debug.print("Error notifying stop: {}\n", .{err});
         };
+
+        self.loop_thread.join();
     }
 
     fn asyncIOCallback(
@@ -564,10 +573,9 @@ test "dial connection refused" {
         .backlog = 128,
     };
 
-    var transport = try XevTransport.init(allocator, opts);
+    var transport: XevTransport = undefined;
+    try transport.init(allocator, opts);
     defer transport.deinit();
-
-    const thread = try std.Thread.spawn(.{}, XevTransport.start, .{&transport});
 
     var channel: SocketChannel = undefined;
     const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
@@ -584,8 +592,7 @@ test "dial connection refused" {
     }.run, .{ &transport, addr });
 
     thread2.join();
-    transport.stop();
-    thread.join();
+    transport.close();
 }
 
 test "dial and accept" {
@@ -596,10 +603,9 @@ test "dial and accept" {
         .backlog = 128,
     };
 
-    var transport = try XevTransport.init(allocator, opts);
+    var transport: XevTransport = undefined;
+    try transport.init(allocator, opts);
     defer transport.deinit();
-
-    const thread = try std.Thread.spawn(.{}, XevTransport.start, .{&transport});
 
     var listener: Listener = undefined;
     const addr = try std.net.Address.parseIp("0.0.0.0", 8082);
@@ -617,10 +623,10 @@ test "dial and accept" {
         }
     }.run, .{ &listener, &channel });
 
-    var client = try XevTransport.init(allocator, opts);
+    var client: XevTransport = undefined;
+    try client.init(allocator, opts);
     defer client.deinit();
 
-    const thread1 = try std.Thread.spawn(.{}, XevTransport.start, .{&client});
     var channel1: SocketChannel = undefined;
     try client.dial(addr, &channel1);
     try std.testing.expect(channel1.is_initiator);
@@ -630,10 +636,8 @@ test "dial and accept" {
     try std.testing.expect(channel2.is_initiator);
 
     accept_thread.join();
-    client.stop();
-    transport.stop();
-    thread1.join();
-    thread.join();
+    client.close();
+    transport.close();
 }
 
 test "echo read and write" {
@@ -644,10 +648,9 @@ test "echo read and write" {
         .backlog = 128,
     };
 
-    var server = try XevTransport.init(allocator, opts);
+    var server: XevTransport = undefined;
+    try server.init(allocator, opts);
     defer server.deinit();
-
-    const thread = try std.Thread.spawn(.{}, XevTransport.start, .{&server});
 
     var listener: Listener = undefined;
     const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
@@ -669,10 +672,10 @@ test "echo read and write" {
         }
     }.run, .{ &listener, allocator });
 
-    var client = try XevTransport.init(allocator, opts);
+    var client: XevTransport = undefined;
+    try client.init(allocator, opts);
     defer client.deinit();
 
-    const thread1 = try std.Thread.spawn(.{}, XevTransport.start, .{&client});
     var channel1: SocketChannel = undefined;
     try client.dial(addr, &channel1);
     try std.testing.expect(channel1.is_initiator);
@@ -685,8 +688,6 @@ test "echo read and write" {
     try std.testing.expect(n == 15);
 
     accept_thread.join();
-    client.stop();
-    server.stop();
-    thread1.join();
-    thread.join();
+    client.close();
+    server.close();
 }
