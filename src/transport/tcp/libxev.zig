@@ -9,6 +9,11 @@ const ResetEvent = std.Thread.ResetEvent;
 
 /// SocketChannel represents a socket channel. It is used to send and receive messages.
 pub const SocketChannel = struct {
+    /// The direction of the channel.
+    pub const DIRECTION = enum {
+        INBOUND,
+        OUTBOUND,
+    };
     /// The underlying socket.
     socket: TCP,
 
@@ -16,13 +21,13 @@ pub const SocketChannel = struct {
     transport: *XevTransport,
 
     /// Whether this channel is the initiator of the connection. If true, this channel is the client. If false, this channel is the server.
-    is_initiator: bool,
+    direction: DIRECTION,
 
     /// Initialize the channel with the given socket and transport.
-    pub fn init(self: *SocketChannel, socket: TCP, transport: *XevTransport, is_initiator: bool) void {
+    pub fn init(self: *SocketChannel, socket: TCP, transport: *XevTransport, direction: DIRECTION) void {
         self.socket = socket;
         self.transport = transport;
-        self.is_initiator = is_initiator;
+        self.direction = direction;
     }
 
     /// Write sends the buffer to the other end of the channel. It blocks until the write is complete. If an error occurs, it returns the error.
@@ -35,7 +40,7 @@ pub const SocketChannel = struct {
         errdefer self.transport.allocator.destroy(write_err);
         write_err.* = null;
 
-        const node = self.transport.allocator.create(AsyncIOQueueNode) catch unreachable;
+        const node = try self.transport.allocator.create(AsyncIOQueueNode);
         node.* = AsyncIOQueueNode{
             .io_action = .{ .write = .{
                 .channel = self,
@@ -68,7 +73,7 @@ pub const SocketChannel = struct {
         errdefer self.transport.allocator.destroy(bytes_read);
         bytes_read.* = 0;
 
-        const node = self.transport.allocator.create(AsyncIOQueueNode) catch unreachable;
+        const node = try self.transport.allocator.create(AsyncIOQueueNode);
         node.* = AsyncIOQueueNode{
             .io_action = .{ .read = .{
                 .channel = self,
@@ -447,7 +452,7 @@ pub const XevTransport = struct {
             return .disarm;
         };
 
-        self.channel.init(socket, self.transport, true);
+        self.channel.init(socket, self.transport, .OUTBOUND);
         self.reset_event.set();
         return .disarm;
     }
@@ -467,7 +472,7 @@ pub const XevTransport = struct {
             return .disarm;
         };
 
-        self.channel.init(socket, self.transport, false);
+        self.channel.init(socket, self.transport, .INBOUND);
 
         self.reset_event.set();
 
@@ -618,7 +623,7 @@ test "dial and accept" {
             while (accepted_count < 2) : (accepted_count += 1) {
                 var accepted_channel: SocketChannel = undefined;
                 try l.accept(&accepted_channel);
-                try std.testing.expect(!accepted_channel.is_initiator);
+                try std.testing.expectEqual(accepted_channel.direction, .INBOUND);
             }
         }
     }.run, .{ &listener, &channel });
@@ -629,11 +634,11 @@ test "dial and accept" {
 
     var channel1: SocketChannel = undefined;
     try client.dial(addr, &channel1);
-    try std.testing.expect(channel1.is_initiator);
+    try std.testing.expectEqual(channel1.direction, .OUTBOUND);
 
     var channel2: SocketChannel = undefined;
     try client.dial(addr, &channel2);
-    try std.testing.expect(channel2.is_initiator);
+    try std.testing.expectEqual(channel2.direction, .OUTBOUND);
 
     accept_thread.join();
     client.close();
@@ -660,7 +665,7 @@ test "echo read and write" {
         fn run(l: *Listener, alloc: Allocator) !void {
             var accepted_channel: SocketChannel = undefined;
             try l.accept(&accepted_channel);
-            try std.testing.expect(!accepted_channel.is_initiator);
+            try std.testing.expectEqual(accepted_channel.direction, .INBOUND);
 
             const buf = try alloc.alloc(u8, 1024);
             defer alloc.free(buf);
@@ -678,7 +683,7 @@ test "echo read and write" {
 
     var channel1: SocketChannel = undefined;
     try client.dial(addr, &channel1);
-    try std.testing.expect(channel1.is_initiator);
+    try std.testing.expectEqual(channel1.direction, .OUTBOUND);
 
     try channel1.write("buf: []const u8");
     const buf = try allocator.alloc(u8, 1024);
