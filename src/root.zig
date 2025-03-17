@@ -4,6 +4,9 @@
 const std = @import("std");
 const testing = std.testing;
 
+pub const xev_transport = @import("transport/tcp/libxev.zig");
+pub const queue = @import("queue_mpsc.zig");
+
 test {
     std.testing.refAllDeclsRecursive(@This());
 }
