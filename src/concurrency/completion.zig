@@ -1,4 +1,4 @@
-const std=@import("std");
+const std = @import("std");
 const testing = std.testing;
 
 pub const Completion = struct {
@@ -118,7 +118,7 @@ test "Completion - concurrent access" {
                     comp.setError(error.OutOfMemory);
                 }
             }
-        }.run, .{&completion, i});
+        }.run, .{ &completion, i });
     }
 
     // Wait for all threads to complete
