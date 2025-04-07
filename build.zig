@@ -15,69 +15,53 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    // const libuv_dep = b.dependency("libuv", .{});
-    // const libuv_module = libuv_dep.module("libuv");
-    //
-    // const multiformats_zig_dep = b.dependency("multiformats-zig", .{});
-    // const multiformats_zig_module = multiformats_zig_dep.module("multiformats-zig");
-
     const libxev_dep = b.dependency("libxev", .{
         .target = target,
         .optimize = optimize,
     });
     const libxev_module = libxev_dep.module("xev");
 
-    // get the "zig-aio" dependency from "build.zig.zon"
-    // const zig_aio = b.dependency("zig-aio", .{});
-    //
-    // const zig_aio_module = zig_aio.module("aio");
-    // const zig_coro_module = zig_aio.module("coro");
+    const concurrency_module = b.addModule("zig-libp2p/concurrency", .{
+        .root_source_file = b.path("src/concurrency/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
-    const lib = b.addStaticLibrary(.{
-        .name = "zig-libp2p2",
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
+    const root_module = b.addModule("zig-libp2p/root", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // lib.root_module.addImport("libuv", libuv_module);
-    // lib.root_module.addImport("multiformats-zig", multiformats_zig_module);
+    const libp2p_lib = b.addLibrary(.{
+        .name = "zig-libp2p",
+        // In this case the main source file is merely a path, however, in more
+        // complicated build scripts, this could be a generated file.
+        .root_module = root_module,
+        .linkage = .static,
+    });
 
-    lib.root_module.addImport("xev", libxev_module);
-    // This declares intent for the library to be installed into the standard
-    // location when the user invokes the "install" step (the default step when
-    // running `zig build`).
-    // // for exe, lib, tests, etc.
-    // lib.root_module.addImport("aio", zig_aio_module);
-    // // for coroutines api
-    // lib.root_module.addImport("coro", zig_coro_module);
-    b.installArtifact(lib);
+    libp2p_lib.root_module.addImport("xev", libxev_module);
+    libp2p_lib.root_module.addImport("concurrency", concurrency_module);
 
-    const exe = b.addExecutable(.{
-        .name = "zig-libp2p2",
+    b.installArtifact(libp2p_lib);
+
+    const libp2p_exe = b.addExecutable(.{
+        .name = "zig-libp2p",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // exe.root_module.addImport("libuv", libuv_module);
-    // exe.root_module.addImport("multiformats-zig", multiformats_zig_module);
-    exe.root_module.addImport("xev", libxev_module);
-    // // for exe, lib, tests, etc.
-    // exe.root_module.addImport("aio", zig_aio_module);
-    // // for coroutines api
-    // exe.root_module.addImport("coro", zig_coro_module);
-    // This declares intent for the executable to be installed into the
-    // standard location when the user invokes the "install" step (the default
-    // step when running `zig build`).
-    b.installArtifact(exe);
+    libp2p_exe.root_module.addImport("xev", libxev_module);
+    libp2p_exe.root_module.addImport("concurrency", concurrency_module);
+
+    b.installArtifact(libp2p_exe);
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.
-    const run_cmd = b.addRunArtifact(exe);
+    const run_cmd = b.addRunArtifact(libp2p_exe);
 
     // By making the run step depend on the install step, it will be run from the
     // installation directory rather than directly from within the cache directory.
@@ -99,24 +83,29 @@ pub fn build(b: *std.Build) void {
 
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
-    const lib_unit_tests = b.addTest(.{
+    const concurrency_module_unit_tests = b.addTest(.{
+        .root_source_file = b.path("src/concurrency/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const libp2p_lib_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // lib_unit_tests.root_module.addImport("libuv", libuv_module);
-    // lib_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
-
-    lib_unit_tests.root_module.addImport("xev", libxev_module);
+    libp2p_lib_unit_tests.root_module.addImport("xev", libxev_module);
+    libp2p_lib_unit_tests.root_module.addImport("concurrency", concurrency_module);
 
     // // for exe, lib, tests, etc.
     // lib_unit_tests.root_module.addImport("aio", zig_aio_module);
     // // for coroutines api
     // lib_unit_tests.root_module.addImport("coro", zig_coro_module);
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+    const run_concurrency_module_unit_tests = b.addRunArtifact(concurrency_module_unit_tests);
+    const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
 
-    const exe_unit_tests = b.addTest(.{
+    const libp2p_exe_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -124,17 +113,20 @@ pub fn build(b: *std.Build) void {
 
     // exe_unit_tests.root_module.addImport("libuv", libuv_module);
     // exe_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
-    exe_unit_tests.root_module.addImport("xev", libxev_module);
+    libp2p_exe_unit_tests.root_module.addImport("xev", libxev_module);
+    libp2p_exe_unit_tests.root_module.addImport("concurrency", concurrency_module);
     // // for exe, lib, tests, etc.
     // exe_unit_tests.root_module.addImport("aio", zig_aio_module);
     // // for coroutines api
     // exe_unit_tests.root_module.addImport("coro", zig_coro_module);
-    const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+    const run_libp2p_exe_unit_tests = b.addRunArtifact(libp2p_exe_unit_tests);
 
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
-    test_step.dependOn(&run_exe_unit_tests.step);
+
+    test_step.dependOn(&run_concurrency_module_unit_tests.step);
+    test_step.dependOn(&run_libp2p_lib_unit_tests.step);
+    test_step.dependOn(&run_libp2p_exe_unit_tests.step);
 }
