@@ -128,9 +128,9 @@ pub fn build(b: *std.Build) void {
 
     const run_concurrency_module_unit_tests = b.addRunArtifact(concurrency_module_unit_tests);
     const run_connection_module_unit_tests = b.addRunArtifact(connection_module_unit_tests);
-    run_connection_module_unit_tests.has_side_effects=true;
+    run_connection_module_unit_tests.has_side_effects = true;
     const run_muxer_module_unit_tests = b.addRunArtifact(muxer_module_unit_tests);
-    run_muxer_module_unit_tests.has_side_effects=true;
+    run_muxer_module_unit_tests.has_side_effects = true;
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
 
     const libp2p_exe_unit_tests = b.addTest(.{
