@@ -322,22 +322,22 @@ pub fn createPipeConnPair() !struct { client: PipeConn, server: PipeConn } {
     };
 }
 
-// test "PipeConn direct usage" {
-//     var pipes = try createPipeConnPair();
-//     defer {
-//         pipes.client.deinit();
-//         pipes.server.deinit();
-//     }
-//
-//     const message = "Hello through pipe!";
-//     try testing.expectEqual(message.len, try pipes.client.write(message));
-//
-//     var buffer: [128]u8 = undefined;
-//     const bytes_read = try pipes.server.read(&buffer);
-//     try testing.expectEqual(message.len, bytes_read);
-//     try testing.expectEqualStrings(message, buffer[0..bytes_read]);
-// }
-//
+test "PipeConn direct usage" {
+    var pipes = try createPipeConnPair();
+    defer {
+        pipes.client.deinit();
+        pipes.server.deinit();
+    }
+
+    const message = "Hello through pipe!";
+    try testing.expectEqual(message.len, try pipes.client.write(message));
+
+    var buffer: [128]u8 = undefined;
+    const bytes_read = try pipes.server.read(&buffer);
+    try testing.expectEqual(message.len, bytes_read);
+    try testing.expectEqualStrings(message, buffer[0..bytes_read]);
+}
+
 // test "PipeConn with GenericConn" {
 //     var pipes = try createPipeConnPair();
 //     defer {
