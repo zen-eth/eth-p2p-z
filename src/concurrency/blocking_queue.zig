@@ -433,3 +433,186 @@ test "blockingPop after a full queue is drained" {
     // Queue should be empty again
     try testing.expect(q.blockingPop(.{ .instant = {} }) == null);
 }
+
+test "drain empty queue" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Q = BlockingQueue(u64);
+    const q = try Q.create(alloc, 4);
+    defer q.destroy(alloc);
+
+    // Drain empty queue
+    var it = q.drain();
+    try testing.expect(it.next() == null);
+    it.deinit();
+
+    // Verify queue still works after drain
+    try testing.expectEqual(@as(Q.Size, 1), q.push(42, .{ .instant = {} }));
+    try testing.expectEqual(@as(u64, 42), q.pop().?);
+}
+
+test "drain partially filled queue" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Q = BlockingQueue(u64);
+    const q = try Q.create(alloc, 4);
+    defer q.destroy(alloc);
+
+    // Fill queue partially
+    try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 2), q.push(2, .{ .instant = {} }));
+
+    // Drain and verify values
+    var it = q.drain();
+    try testing.expectEqual(@as(u64, 1), it.next().?);
+    try testing.expectEqual(@as(u64, 2), it.next().?);
+    try testing.expect(it.next() == null); // No more items
+    it.deinit();
+
+    // Queue should be empty now
+    try testing.expect(q.pop() == null);
+}
+
+test "drain full queue" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Q = BlockingQueue(u64);
+    const q = try Q.create(alloc, 4);
+    defer q.destroy(alloc);
+
+    // Fill queue completely
+    try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 2), q.push(2, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 3), q.push(3, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 4), q.push(4, .{ .instant = {} }));
+
+    // Drain and verify values
+    var it = q.drain();
+    try testing.expectEqual(@as(u64, 1), it.next().?);
+    try testing.expectEqual(@as(u64, 2), it.next().?);
+    try testing.expectEqual(@as(u64, 3), it.next().?);
+    try testing.expectEqual(@as(u64, 4), it.next().?);
+    try testing.expect(it.next() == null);
+    it.deinit();
+
+    // After drain, should be able to push again
+    try testing.expectEqual(@as(Q.Size, 1), q.push(5, .{ .instant = {} }));
+}
+
+test "drain with waiting producer" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Q = BlockingQueue(u64);
+    const q = try Q.create(alloc, 2);
+    defer q.destroy(alloc);
+
+    // Fill queue
+    try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 2), q.push(2, .{ .instant = {} }));
+
+    var push_done = std.atomic.Value(bool).init(false);
+
+    // Create a thread that will try to push to the full queue
+    const producer = try std.Thread.spawn(.{}, struct {
+        fn run(queue: *Q, done: *std.atomic.Value(bool)) void {
+            // This will block until the queue has space
+            _ = queue.push(3, .{ .forever = {} });
+            done.store(true, .release);
+        }
+    }.run, .{ q, &push_done });
+
+    // Give the producer time to start waiting
+    std.time.sleep(10 * std.time.ns_per_ms);
+
+    // At this point, producer should be waiting
+    try testing.expect(!push_done.load(.acquire));
+
+    // Drain queue which should free space and unblock producer
+    var it = q.drain();
+    try testing.expectEqual(@as(u64, 1), it.next().?);
+    try testing.expectEqual(@as(u64, 2), it.next().?);
+    it.deinit();
+
+    // Give the producer time to complete
+    std.time.sleep(10 * std.time.ns_per_ms);
+
+    try testing.expect(push_done.load(.acquire));
+    producer.join();
+
+    // Verify the pushed value is in the queue
+    try testing.expectEqual(@as(u64, 3), q.pop().?);
+}
+
+test "drain with wrap-around buffer" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Q = BlockingQueue(u64);
+    const q = try Q.create(alloc, 4);
+    defer q.destroy(alloc);
+
+    // Create a wrap-around by pushing and popping to advance read/write pointers
+    try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 2), q.push(2, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 3), q.push(3, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 4), q.push(4, .{ .instant = {} }));
+
+    // Pop some values
+    try testing.expectEqual(@as(u64, 1), q.pop().?);
+    try testing.expectEqual(@as(u64, 2), q.pop().?);
+
+    // Push more values (these should wrap around)
+    try testing.expectEqual(@as(Q.Size, 3), q.push(5, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 4), q.push(6, .{ .instant = {} }));
+
+    // Drain should correctly handle the wrap-around
+    var it = q.drain();
+    try testing.expectEqual(@as(u64, 3), it.next().?);
+    try testing.expectEqual(@as(u64, 4), it.next().?);
+    try testing.expectEqual(@as(u64, 5), it.next().?);
+    try testing.expectEqual(@as(u64, 6), it.next().?);
+    try testing.expect(it.next() == null);
+    it.deinit();
+
+    // Queue should be empty
+    try testing.expect(q.pop() == null);
+}
+
+test "interleaved drain and push operations" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Q = BlockingQueue(u64);
+    const q = try Q.create(alloc, 4);
+    defer q.destroy(alloc);
+
+    // Initial data
+    try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 2), q.push(2, .{ .instant = {} }));
+
+    // Partial drain
+    var it1 = q.drain();
+    try testing.expectEqual(@as(u64, 1), it1.next().?);
+    it1.deinit();
+
+    // Push more data
+    try testing.expectEqual(@as(Q.Size, 2), q.push(3, .{ .instant = {} }));
+
+    // Another partial drain
+    var it2 = q.drain();
+    try testing.expectEqual(@as(u64, 2), it2.next().?);
+    it2.deinit();
+
+    // One more push and final drain
+    try testing.expectEqual(@as(Q.Size, 2), q.push(4, .{ .instant = {} }));
+
+    var it3 = q.drain();
+    try testing.expectEqual(@as(u64, 3), it3.next().?);
+    try testing.expectEqual(@as(u64, 4), it3.next().?);
+    try testing.expect(it3.next() == null);
+    it3.deinit();
+}
