@@ -338,35 +338,35 @@ test "PipeConn direct usage" {
     try testing.expectEqualStrings(message, buffer[0..bytes_read]);
 }
 
-// test "PipeConn with GenericConn" {
-//     var pipes = try createPipeConnPair();
-//     defer {
-//         pipes.client.deinit();
-//         pipes.server.deinit();
-//     }
-//
-//     var client_conn = pipes.client.conn();
-//     var server_conn = pipes.server.conn();
-//
-//     const message = "Hello GenericConn!";
-//     try testing.expectEqual(message.len, try client_conn.write(message));
-//
-//     var buffer: [128]u8 = undefined;
-//     const bytes_read = try server_conn.read(&buffer);
-//     try testing.expectEqual(message.len, bytes_read);
-//     try testing.expectEqualStrings(message, buffer[0..bytes_read]);
-//
-//     // Test reader/writer interfaces
-//     var client_writer = client_conn.writer();
-//     var server_reader = server_conn.reader();
-//
-//     try client_writer.writeAll("Line test\n");
-//
-//     var line_buffer: [20]u8 = undefined;
-//     const line = try server_reader.readUntilDelimiter(&line_buffer, '\n');
-//     try testing.expectEqualStrings("Line test", line);
-// }
-//
+test "PipeConn with GenericConn" {
+    var pipes = try createPipeConnPair();
+    defer {
+        pipes.client.deinit();
+        pipes.server.deinit();
+    }
+
+    var client_conn = pipes.client.conn();
+    var server_conn = pipes.server.conn();
+
+    const message = "Hello GenericConn!";
+    try testing.expectEqual(message.len, try client_conn.write(message));
+
+    var buffer: [128]u8 = undefined;
+    const bytes_read = try server_conn.read(&buffer);
+    try testing.expectEqual(message.len, bytes_read);
+    try testing.expectEqualStrings(message, buffer[0..bytes_read]);
+
+    // Test reader/writer interfaces
+    var client_writer = client_conn.writer();
+    var server_reader = server_conn.reader();
+
+    try client_writer.writeAll("Line test\n");
+
+    var line_buffer: [20]u8 = undefined;
+    const line = try server_reader.readUntilDelimiter(&line_buffer, '\n');
+    try testing.expectEqualStrings("Line test", line);
+}
+
 // test "PipeConn with AnyConn" {
 //     var pipes = try createPipeConnPair();
 //     defer {
