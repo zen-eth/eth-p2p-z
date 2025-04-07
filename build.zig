@@ -27,11 +27,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const root_module = b.addModule("zig-libp2p/root", .{
+    const muxer_module = b.addModule("zig-libp2p/muxer", .{
+        .root_source_file = b.path("src/muxer/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    muxer_module.addImport("concurrency", concurrency_module);
+
+    const root_module = b.addModule("zig-libp2p", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    root_module.addImport("xev", libxev_module);
+    root_module.addImport("concurrency", concurrency_module);
+    root_module.addImport("muxer", muxer_module);
 
     const libp2p_lib = b.addLibrary(.{
         .name = "zig-libp2p",
@@ -40,9 +50,6 @@ pub fn build(b: *std.Build) void {
         .root_module = root_module,
         .linkage = .static,
     });
-
-    libp2p_lib.root_module.addImport("xev", libxev_module);
-    libp2p_lib.root_module.addImport("concurrency", concurrency_module);
 
     b.installArtifact(libp2p_lib);
 
@@ -55,6 +62,7 @@ pub fn build(b: *std.Build) void {
 
     libp2p_exe.root_module.addImport("xev", libxev_module);
     libp2p_exe.root_module.addImport("concurrency", concurrency_module);
+    libp2p_exe.root_module.addImport("muxer", muxer_module);
 
     b.installArtifact(libp2p_exe);
 
@@ -89,20 +97,25 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const muxer_module_unit_tests = b.addTest(.{
+        .root_source_file = b.path("src/muxer/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    muxer_module_unit_tests.root_module.addImport("concurrency", concurrency_module);
+
     const libp2p_lib_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/root.zig"),
+        .root_module = root_module,
         .target = target,
         .optimize = optimize,
     });
 
     libp2p_lib_unit_tests.root_module.addImport("xev", libxev_module);
     libp2p_lib_unit_tests.root_module.addImport("concurrency", concurrency_module);
+    libp2p_lib_unit_tests.root_module.addImport("muxer", muxer_module);
 
-    // // for exe, lib, tests, etc.
-    // lib_unit_tests.root_module.addImport("aio", zig_aio_module);
-    // // for coroutines api
-    // lib_unit_tests.root_module.addImport("coro", zig_coro_module);
     const run_concurrency_module_unit_tests = b.addRunArtifact(concurrency_module_unit_tests);
+    const run_muxer_module_unit_tests = b.addRunArtifact(muxer_module_unit_tests);
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
 
     const libp2p_exe_unit_tests = b.addTest(.{
@@ -115,6 +128,7 @@ pub fn build(b: *std.Build) void {
     // exe_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
     libp2p_exe_unit_tests.root_module.addImport("xev", libxev_module);
     libp2p_exe_unit_tests.root_module.addImport("concurrency", concurrency_module);
+    libp2p_exe_unit_tests.root_module.addImport("muxer", muxer_module);
     // // for exe, lib, tests, etc.
     // exe_unit_tests.root_module.addImport("aio", zig_aio_module);
     // // for coroutines api
@@ -127,6 +141,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
 
     test_step.dependOn(&run_concurrency_module_unit_tests.step);
+    test_step.dependOn(&run_muxer_module_unit_tests.step);
     test_step.dependOn(&run_libp2p_lib_unit_tests.step);
     test_step.dependOn(&run_libp2p_exe_unit_tests.step);
 }
