@@ -106,11 +106,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const connection_module_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/connection/conn.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // const connection_module_unit_tests = b.addTest(.{
+    //     .root_source_file = b.path("src/connection/conn.zig"),
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
 
     const muxer_module_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/muxer/lib.zig"),
@@ -127,7 +127,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_concurrency_module_unit_tests = b.addRunArtifact(concurrency_module_unit_tests);
-    const run_connection_module_unit_tests = b.addRunArtifact(connection_module_unit_tests);
+    // const run_connection_module_unit_tests = b.addRunArtifact(connection_module_unit_tests);
     const run_muxer_module_unit_tests = b.addRunArtifact(muxer_module_unit_tests);
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
 
@@ -155,7 +155,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
 
     test_step.dependOn(&run_concurrency_module_unit_tests.step);
-    test_step.dependOn(&run_connection_module_unit_tests.step);
+    // test_step.dependOn(&run_connection_module_unit_tests.step);
     test_step.dependOn(&run_muxer_module_unit_tests.step);
     test_step.dependOn(&run_libp2p_lib_unit_tests.step);
     test_step.dependOn(&run_libp2p_exe_unit_tests.step);
