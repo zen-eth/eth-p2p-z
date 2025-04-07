@@ -540,8 +540,8 @@ pub const Session = struct {
 test "Session.send using PipeConn" {
     var pipes = try conn.createPipeConnPair();
     defer {
-        pipes.client.deinit();
-        pipes.server.deinit();
+        pipes.client.close();
+        pipes.server.close();
     }
 
     const client_conn = pipes.client.conn().any();
@@ -587,8 +587,8 @@ test "Session.send using PipeConn" {
 test "Session.send using PipeConn timeout" {
     var pipes = try conn.createPipeConnPair();
     defer {
-        pipes.client.deinit();
-        pipes.server.deinit();
+        pipes.client.close();
+        pipes.server.close();
     }
 
     const client_conn = pipes.client.conn().any();
@@ -627,8 +627,8 @@ test "Session.send using PipeConn timeout" {
 test "Session.send after shutdown" {
     var pipes = try conn.createPipeConnPair();
     defer {
-        pipes.client.deinit();
-        pipes.server.deinit();
+        pipes.client.close();
+        pipes.server.close();
     }
 
     const client_conn = pipes.client.conn().any();
@@ -664,8 +664,8 @@ test "Session.send after shutdown" {
 test "Session shutdown during active sendAndWait operations" {
     var pipes = try conn.createPipeConnPair();
     defer {
-        pipes.client.deinit();
-        pipes.server.deinit();
+        pipes.client.close();
+        pipes.server.close();
     }
 
     const client_conn = pipes.client.conn().any();
@@ -737,8 +737,8 @@ test "Session shutdown during active sendAndWait operations" {
 test "Session shutdown during active send operations" {
     var pipes = try conn.createPipeConnPair();
     defer {
-        pipes.client.deinit();
-        pipes.server.deinit();
+        pipes.client.close();
+        pipes.server.close();
     }
 
     const client_conn = pipes.client.conn().any();

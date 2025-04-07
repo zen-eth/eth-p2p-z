@@ -304,13 +304,8 @@ test "GenericConn with std.net.Stream" {
     client_stream.close();
 }
 
-var pipe_mutex: std.Thread.Mutex = .{};
-
 /// Creates a pair of connected PipeConn instances with non-blocking pipes
 pub fn createPipeConnPair() !struct { client: PipeConn, server: PipeConn } {
-    pipe_mutex.lock();
-    defer pipe_mutex.unlock();
-
     // Add a random delay to help avoid exact timing collisions
     const rand_ns = @as(u64, @truncate(@abs(std.time.nanoTimestamp()))) % 1_000_000;
     std.time.sleep(rand_ns);
@@ -342,11 +337,57 @@ pub fn createPipeConnPair() !struct { client: PipeConn, server: PipeConn } {
         },
     };
 }
+
+test "PipeConn direct usage" {
+    var pipes = try createPipeConnPair();
+    defer {
+        pipes.client.close();
+        pipes.server.close();
+    }
+
+    const message = "Hello through pipe!";
+    try testing.expectEqual(message.len, try pipes.client.write(message));
+
+    var buffer: [128]u8 = undefined;
+    const bytes_read = try pipes.server.read(&buffer);
+    try testing.expectEqual(message.len, bytes_read);
+    try testing.expectEqualStrings(message, buffer[0..bytes_read]);
+}
+
+test "PipeConn with GenericConn" {
+    var pipes = try createPipeConnPair();
+    defer {
+        pipes.client.close();
+        pipes.server.close();
+    }
+
+    var client_conn = pipes.client.conn();
+    var server_conn = pipes.server.conn();
+
+    const message = "Hello GenericConn!";
+    try testing.expectEqual(message.len, try client_conn.write(message));
+
+    var buffer: [128]u8 = undefined;
+    const bytes_read = try server_conn.read(&buffer);
+    try testing.expectEqual(message.len, bytes_read);
+    try testing.expectEqualStrings(message, buffer[0..bytes_read]);
+
+    // Test reader/writer interfaces
+    var client_writer = client_conn.writer();
+    var server_reader = server_conn.reader();
+
+    try client_writer.writeAll("Line test\n");
+
+    var line_buffer: [20]u8 = undefined;
+    const line = try server_reader.readUntilDelimiter(&line_buffer, '\n');
+    try testing.expectEqualStrings("Line test", line);
+}
+
 test "PipeConn with AnyConn" {
     var pipes = try createPipeConnPair();
     defer {
-        pipes.client.deinit();
-        pipes.server.deinit();
+        pipes.client.close();
+        pipes.server.close();
     }
 
     var client_conn = pipes.client.conn();
@@ -367,8 +408,8 @@ test "PipeConn with AnyConn" {
 test "PipeConn bidirectional communication" {
     var pipes = try createPipeConnPair();
     defer {
-        pipes.client.deinit();
-        pipes.server.deinit();
+        pipes.client.close();
+        pipes.server.close();
     }
 
     var client_conn = pipes.client.conn();
