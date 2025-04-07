@@ -2,7 +2,6 @@ const std = @import("std");
 const mem = std.mem;
 const assert = std.debug.assert;
 const testing = std.testing;
-const builtin = @import("builtin");
 const net = std.net;
 const posix = std.posix;
 const Thread = std.Thread;
@@ -307,11 +306,9 @@ test "GenericConn with std.net.Stream" {
 
 /// Creates a pair of connected PipeConn instances with non-blocking pipes
 pub fn createPipeConnPair() !struct { client: PipeConn, server: PipeConn } {
-    if (builtin.is_test) {
-        // Add a random delay to help avoid exact timing collisions
-        const rand_ns = @as(u64, @truncate(@abs(std.time.nanoTimestamp()))) % 1_000_000;
-        std.time.sleep(rand_ns);
-    }
+    // Add a random delay to help avoid exact timing collisions
+    const rand_ns = @as(u64, @truncate(@abs(std.time.nanoTimestamp()))) % 1_000_000;
+    std.time.sleep(rand_ns);
 
     // Create pipes with non-blocking flag
     const fds1 = try posix.pipe2(.{ .NONBLOCK = true });
