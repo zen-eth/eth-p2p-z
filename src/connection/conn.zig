@@ -306,9 +306,6 @@ test "GenericConn with std.net.Stream" {
 
 var pipe_mutex: std.Thread.Mutex = .{};
 
-/// Creates a pair of connected PipeConn instances
-/// Creates a pair of connected PipeConn instances with non-blocking pipes
-/// Creates a pair of connected PipeConn instances with non-blocking pipes
 /// Creates a pair of connected PipeConn instances with non-blocking pipes
 pub fn createPipeConnPair() !struct { client: PipeConn, server: PipeConn } {
     pipe_mutex.lock();
