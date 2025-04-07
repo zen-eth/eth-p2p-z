@@ -126,11 +126,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    libp2p_lib_unit_tests.root_module.addImport("xev", libxev_module);
-    libp2p_lib_unit_tests.root_module.addImport("concurrency", concurrency_module);
-    libp2p_lib_unit_tests.root_module.addImport("connection", connection_module);
-    libp2p_lib_unit_tests.root_module.addImport("muxer", muxer_module);
-
     const run_concurrency_module_unit_tests = b.addRunArtifact(concurrency_module_unit_tests);
     const run_connection_module_unit_tests = b.addRunArtifact(connection_module_unit_tests);
     const run_muxer_module_unit_tests = b.addRunArtifact(muxer_module_unit_tests);
