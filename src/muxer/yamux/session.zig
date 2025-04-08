@@ -2,12 +2,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const frame = @import("frame.zig");
 const Stream = @import("stream.zig").Stream;
-const conn = @import("connection");
+const conn = @import("../../conn.zig");
 const AnyConn = conn.AnyConn;
 const Config = @import("Config.zig");
 const testing = std.testing;
 const ThreadPool = std.Thread.Pool;
-const BlockingQueue = @import("concurrency").BlockingQueue;
+const BlockingQueue = @import("../../concurrent/blocking_queue.zig").BlockingQueue;
 
 pub const Error = error{ SessionShutdown, ConnectionWriteTimeout, OutOfMemory, RemoteGoAway, StreamsExhausted, DuplicateStream } || frame.Error;
 pub const SendQueue = std.SinglyLinkedList(*SendReady);
