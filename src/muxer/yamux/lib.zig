@@ -5,6 +5,7 @@ pub const frame = @import("frame.zig");
 pub const stream = @import("stream.zig");
 pub const Config = @import("Config.zig");
 pub const session = @import("session.zig");
+pub const TimerManager = @import("TimerManager.zig");
 
 test {
     std.testing.refAllDeclsRecursive(@This());

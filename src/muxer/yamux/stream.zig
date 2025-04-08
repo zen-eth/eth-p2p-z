@@ -63,11 +63,7 @@ pub const Stream = struct {
     write_deadline: std.atomic.Value(i64),
 
     // For establishment notification
-    establish_notify: struct {
-        mutex: std.Thread.Mutex,
-        cond: std.Thread.Condition,
-        signaled: bool,
-    },
+    establish_completion: std.Thread.ResetEvent = .{},
 
     // Set with state_mutex held to honor the StreamCloseTimeout
     close_timer: ?std.time.Timer = null,
@@ -102,11 +98,6 @@ pub const Stream = struct {
                 .signaled = false,
             },
             .send_notify = .{
-                .mutex = .{},
-                .cond = .{},
-                .signaled = false,
-            },
-            .establish_notify = .{
                 .mutex = .{},
                 .cond = .{},
                 .signaled = false,

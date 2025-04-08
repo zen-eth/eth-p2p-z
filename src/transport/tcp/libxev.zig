@@ -1,6 +1,6 @@
 const std = @import("std");
 const xev = @import("xev");
-const Intrusive = @import("../../concurrent/queue_mpsc.zig").Intrusive;
+const Intrusive = @import("../../concurrent/mpsc_queue.zig").Intrusive;
 const IOQueue = Intrusive(AsyncIOQueueNode);
 const TCP = xev.TCP;
 const Allocator = std.mem.Allocator;
