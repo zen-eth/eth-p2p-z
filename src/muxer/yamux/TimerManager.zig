@@ -76,6 +76,9 @@ pub fn deinit(self: *TimerManager) void {
     self.loop.deinit();
     self.stop_notifier.deinit();
     self.async_notifier.deinit();
+    while (self.timer_queue.pop()) |node| {
+        self.allocator.destroy(node);
+    }
     self.allocator.destroy(self.timer_queue);
     self.completion_pool.deinit();
 }
@@ -102,6 +105,7 @@ pub fn addTimer(
     timeout_ms: u64,
 ) !void {
     const timer_node = try self.allocator.create(TimerQueueNode);
+    errdefer self.allocator.destroy(timer_node);
     timer_node.* = .{
         .stream = stream,
         .timeout_ms = timeout_ms,
