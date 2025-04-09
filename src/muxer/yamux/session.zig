@@ -9,7 +9,7 @@ const testing = std.testing;
 const ThreadPool = std.Thread.Pool;
 const BlockingQueue = @import("../../concurrent/blocking_queue.zig").BlockingQueue;
 
-pub const Error = error{ SessionShutdown, ConnectionWriteTimeout, OutOfMemory, RemoteGoAway, StreamsExhausted, DuplicateStream } || frame.Error;
+pub const Error = error{ SessionShutdown, ConnectionWriteTimeout, OutOfMemory, RemoteGoAway, StreamsExhausted, DuplicateStream, GoAwayProtocolError, GoAwayInternalError, UnexpectedGoAwayError } || frame.Error;
 pub const SendQueue = std.SinglyLinkedList(*SendReady);
 
 const SentCompletion = struct {
@@ -92,7 +92,7 @@ pub const Session = struct {
     buf_read: std.io.AnyReader,
 
     // pings is used to track inflight pings
-    pings: std.AutoHashMap(u32, std.Thread.ResetEvent),
+    pings: std.AutoHashMap(u32, *std.Thread.ResetEvent),
     ping_id: u32 = 0,
     ping_mutex: std.Thread.Mutex = .{},
 
@@ -153,7 +153,7 @@ pub const Session = struct {
             .allocator = allocator,
             .accept_queue = try BlockingQueue(*Stream).create(allocator, config.accept_backlog),
             .send_queue = .{},
-            .pings = std.AutoHashMap(u32, std.Thread.ResetEvent).init(allocator),
+            .pings = std.AutoHashMap(u32, *std.Thread.ResetEvent).init(allocator),
             .streams = std.AutoHashMap(u32, *Stream).init(allocator),
             .inflight = std.AutoHashMap(u32, void).init(allocator),
             .scheduler = scheduler,
@@ -382,7 +382,37 @@ pub const Session = struct {
         self.send_queue_sync.mutex.unlock();
     }
 
-    pub fn createInboundStream(self: *Session, id: u32) !void {
+    fn handlePing(self: *Session, hdr: frame.Header) Error!void {
+        const flags= hdr.flags;
+        const ping_id = hdr.length;
+
+        if(flags&frame.FrameFlags.SYN==frame.FrameFlags.SYN){
+            const syn_hdr= try self.allocator.alloc(u8, frame.Header.SIZE);
+            defer self.allocator.free(syn_hdr);
+            try frame.Header.init(frame.FrameType.PING, frame.FrameFlags.ACK, 0, ping_id).encode(syn_hdr);
+            try self.send(syn_hdr, null);
+            return;
+        }
+
+        self.ping_mutex.lock();
+        if (self.pings.get(ping_id))|ping_notification|{
+            ping_notification.set();
+            self.pings.remove(ping_id);
+        }
+        self.ping_mutex.unlock();
+    }
+
+    fn handleGoAway(self: *Session, hdr: frame.Header) Error!void {
+        const code = hdr.length;
+        switch (code) {
+            frame.GoAwayCode.NORMAL => self.remote_go_away.swap(1, .acq_rel),
+            frame.GoAwayCode.PROTOCOL_ERROR => return Error.GoAwayProtocolError,
+            frame.GoAwayCode.INTERNAL_ERROR => return Error.GoAwayInternalError,
+            else => return Error.UnexpectedGoAwayError,
+        }
+    }
+
+    fn createInboundStream(self: *Session, id: u32) !void {
         // Reject immediately if we are doing a go away
         if (self.local_go_away.load(.acquire) == 1) {
             const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
