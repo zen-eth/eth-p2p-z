@@ -323,9 +323,6 @@ pub fn createPipeConnPair() !struct { client: PipeConn, server: PipeConn } {
         posix.close(fds2[1]);
     }
 
-    // Include process ID in debug output to distinguish between test runs
-    std.debug.print("Created pipe pair: [{d}, {d}], [{d}, {d}]\n", .{ fds1[0], fds1[1], fds2[0], fds2[1] });
-
     return .{
         .client = .{
             .reader_fd = fds1[0],

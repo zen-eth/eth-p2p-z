@@ -4,12 +4,16 @@ const xev = @import("xev");
 const Intrusive = @import("../../concurrent/mpsc_queue.zig").Intrusive;
 const Completion = @import("../../concurrent/completion.zig").Completion;
 const Stream = @import("stream.zig").Stream;
+const conn = @import("../../conn.zig");
+const Config = @import("Config.zig");
+const session = @import("session.zig");
 
 const TimerQueueNode = struct {
     const Self = @This();
     stream: *Stream,
     timeout_ms: u64,
     next: ?*Self = null,
+    timer_manager: ?*TimerManager = null,
 };
 
 /// The event loop.
@@ -29,6 +33,10 @@ loop_thread: std.Thread,
 /// The allocator.
 allocator: Allocator,
 
+completion_pool: CompletionPool,
+
+const CompletionPool = std.heap.MemoryPool(xev.Completion);
+
 const TimerManager = @This();
 
 pub fn init(self: *TimerManager, allocator: Allocator) !void {
@@ -44,6 +52,10 @@ pub fn init(self: *TimerManager, allocator: Allocator) !void {
     var timer_queue = try allocator.create(Intrusive(TimerQueueNode));
     timer_queue.init();
     errdefer allocator.destroy(timer_queue);
+
+    var completion_pool = CompletionPool.init(allocator);
+    errdefer completion_pool.deinit();
+
     self.* = TimerManager{
         .loop = loop,
         .stop_notifier = stop_notifier,
@@ -53,6 +65,7 @@ pub fn init(self: *TimerManager, allocator: Allocator) !void {
         .c_async = .{},
         .loop_thread = undefined,
         .allocator = allocator,
+        .completion_pool = completion_pool,
     };
 
     const thread = try std.Thread.spawn(.{}, start, .{self});
@@ -64,6 +77,7 @@ pub fn deinit(self: *TimerManager) void {
     self.stop_notifier.deinit();
     self.async_notifier.deinit();
     self.allocator.destroy(self.timer_queue);
+    self.completion_pool.deinit();
 }
 
 pub fn start(self: *TimerManager) !void {
@@ -80,6 +94,23 @@ pub fn close(self: *TimerManager) void {
     };
 
     self.loop_thread.join();
+}
+
+pub fn addTimer(
+    self: *TimerManager,
+    stream: *Stream,
+    timeout_ms: u64,
+) !void {
+    const timer_node = try self.allocator.create(TimerQueueNode);
+    timer_node.* = .{
+        .stream = stream,
+        .timeout_ms = timeout_ms,
+        .timer_manager = self,
+    };
+
+    self.timer_queue.push(timer_node);
+
+    try self.async_notifier.notify();
 }
 
 fn stopCallback(
@@ -107,16 +138,20 @@ fn asyncCallback(
 
     while (self.timer_queue.pop()) |node| {
         const timer = xev.Timer.init() catch unreachable;
-        var c1: xev.Completion = undefined;
-        timer.run(loop, &c1, node.timeout_ms, TimerQueueNode, node, (struct {
+        const c1 = self.completion_pool.create() catch unreachable;
+        node.timer_manager = self;
+        timer.run(loop, c1, node.timeout_ms, TimerQueueNode, node, (struct {
             fn callback(
                 ud: ?*TimerQueueNode,
                 _: *xev.Loop,
-                _: *xev.Completion,
+                c: *xev.Completion,
                 tr: xev.Timer.RunError!void,
             ) xev.CallbackAction {
                 _ = tr catch unreachable;
                 const n = ud.?;
+                defer n.timer_manager.?.allocator.destroy(n);
+                defer n.timer_manager.?.completion_pool.destroy(c);
+
                 if (n.stream.session.isClosed()) {
                     return .disarm;
                 }
@@ -130,9 +165,83 @@ fn asyncCallback(
                 return .disarm;
             }
         }).callback);
-
-        self.allocator.destroy(node);
     }
 
     return .rearm;
+}
+
+test "TimerManager add timer for stream" {
+    const allocator = std.testing.allocator;
+    var timer_manager: TimerManager = undefined;
+    try timer_manager.init(allocator);
+    defer timer_manager.deinit();
+
+    // Create a test session and stream for timer
+    var pipes = try conn.createPipeConnPair();
+    defer {
+        pipes.client.close();
+        pipes.server.close();
+    }
+
+    const client_conn = pipes.client.conn().any();
+    var config = Config.defaultConfig();
+
+    var pool: std.Thread.Pool = undefined;
+    try std.Thread.Pool.init(&pool, .{ .allocator = allocator });
+    defer pool.deinit();
+
+    var test_session: session.Session = undefined;
+    try session.Session.init(allocator, &config, client_conn, &test_session, &pool);
+    defer test_session.deinit();
+
+    var test_stream: Stream = undefined;
+    try Stream.init(&test_stream, &test_session, 1, .init, allocator);
+    defer test_stream.deinit();
+
+    try timer_manager.addTimer(&test_stream, 100);
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+
+    try std.testing.expect(test_session.isClosed());
+
+    timer_manager.close();
+}
+
+test "TimerManager add timer for stream establish completion" {
+    const allocator = std.testing.allocator;
+    var timer_manager: TimerManager = undefined;
+    try timer_manager.init(allocator);
+    defer timer_manager.deinit();
+
+    // Create a test session and stream for timer
+    var pipes = try conn.createPipeConnPair();
+    defer {
+        pipes.client.close();
+        pipes.server.close();
+    }
+
+    const client_conn = pipes.client.conn().any();
+    var config = Config.defaultConfig();
+
+    var pool: std.Thread.Pool = undefined;
+    try std.Thread.Pool.init(&pool, .{ .allocator = allocator });
+    defer pool.deinit();
+
+    var test_session: session.Session = undefined;
+    try session.Session.init(allocator, &config, client_conn, &test_session, &pool);
+    defer test_session.deinit();
+
+    var test_stream: Stream = undefined;
+    try Stream.init(&test_stream, &test_session, 1, .init, allocator);
+    defer test_stream.deinit();
+
+    try timer_manager.addTimer(&test_stream, 100);
+
+    test_stream.establish_completion.set();
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+
+    try std.testing.expect(!test_session.isClosed());
+
+    timer_manager.close();
 }
