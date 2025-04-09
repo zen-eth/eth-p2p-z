@@ -383,11 +383,11 @@ pub const Session = struct {
     }
 
     fn handlePing(self: *Session, hdr: frame.Header) Error!void {
-        const flags= hdr.flags;
+        const flags = hdr.flags;
         const ping_id = hdr.length;
 
-        if(flags&frame.FrameFlags.SYN==frame.FrameFlags.SYN){
-            const syn_hdr= try self.allocator.alloc(u8, frame.Header.SIZE);
+        if (flags & frame.FrameFlags.SYN == frame.FrameFlags.SYN) {
+            const syn_hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
             defer self.allocator.free(syn_hdr);
             try frame.Header.init(frame.FrameType.PING, frame.FrameFlags.ACK, 0, ping_id).encode(syn_hdr);
             try self.send(syn_hdr, null);
@@ -395,7 +395,7 @@ pub const Session = struct {
         }
 
         self.ping_mutex.lock();
-        if (self.pings.get(ping_id))|ping_notification|{
+        if (self.pings.get(ping_id)) |ping_notification| {
             ping_notification.set();
             self.pings.remove(ping_id);
         }
