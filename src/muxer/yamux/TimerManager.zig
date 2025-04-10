@@ -16,6 +16,60 @@ const TimerQueueNode = struct {
     timer_manager: ?*TimerManager = null,
 };
 
+pub fn TimerRun(comptime Userdata: type) type {
+    return struct {
+        next_ms: u64,
+        timer: *xev.Timer,
+        userdata: ?*Userdata,
+        cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c: *xev.Completion,
+            r: xev.Timer.RunError!void,
+        ) xev.CallbackAction,
+    };
+}
+
+pub fn TimerReset(comptime Userdata: type) type {
+    return struct {
+        next_ms: u64,
+        timer: *xev.Timer,
+        userdata: ?*Userdata,
+        cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c: *xev.Completion,
+            r: xev.Timer.RunError!void,
+        ) xev.CallbackAction,
+    };
+}
+
+pub fn TimerCancel(comptime Userdata: type) type {
+    return struct {
+        timer: *xev.Timer,
+        userdata: ?*Userdata,
+        cb: *const fn (
+            ud: ?*Userdata,
+            l: *xev.Loop,
+            c: *xev.Completion,
+            r: xev.Timer.CancelError!void,
+        ) xev.CallbackAction,
+    };
+}
+
+pub fn QueueNode(comptime Userdata: type) type {
+    return struct {
+        const Self = @This();
+        next: ?*Self = null,
+        userdata: ?*Userdata,
+        timer_action: union(enum) {
+            run: TimerRun(Userdata),
+            reset: TimerReset(Userdata),
+            cancel: TimerCancel(Userdata),
+        },
+    };
+}
+
 /// The event loop.
 loop: xev.Loop,
 /// The stop notifier.

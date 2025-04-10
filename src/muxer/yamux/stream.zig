@@ -4,6 +4,7 @@ const LinearFifo = std.fifo.LinearFifo;
 const frame = @import("frame.zig");
 const session = @import("session.zig");
 const Config = @import("Config.zig");
+const xev = @import("xev");
 
 pub const StreamState = enum {
     init,
@@ -66,7 +67,7 @@ pub const Stream = struct {
     establish_completion: std.Thread.ResetEvent = .{},
 
     // Set with state_mutex held to honor the StreamCloseTimeout
-    close_timer: ?std.time.Timer = null,
+    close_timer: ?*xev.Timer = null,
 
     allocator: std.mem.Allocator,
 
@@ -283,4 +284,37 @@ pub const Stream = struct {
 
         return flags;
     }
+
+    // fn processFlags(self: *Stream, flags: u16) void {
+    //     self.state_mutex.lock();
+    //     defer self.state_mutex.unlock();
+    //
+    //     var close_stream = false;
+    //     defer {
+    //         if(close_stream) {
+    //             if(self.close_timer) |timer| {
+    //                 timer.deinit();
+    //                 self.session.allocator.destroy(timer);
+    //             }
+    //             self.state = .closed;
+    //         }
+    //     }
+    //     if (flags & frame.FrameFlags.SYN) |syn| {
+    //         if (syn) |syn| {
+    //             self.state = .syn_received;
+    //         }
+    //     }
+    //
+    //     if (flags & frame.FrameFlags.ACK) |ack| {
+    //         if (ack) |ack| {
+    //             self.state = .established;
+    //         }
+    //     }
+    //
+    //     if (flags & frame.FrameFlags.FIN) |fin| {
+    //         if (fin) |fin| {
+    //             self.state = .remote_close;
+    //         }
+    //     }
+    // }
 };

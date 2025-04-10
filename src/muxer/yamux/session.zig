@@ -382,6 +382,35 @@ pub const Session = struct {
         self.send_queue_sync.mutex.unlock();
     }
 
+    fn handleStreamMessage(self: *Session, hdr: frame.Header) Error!void {
+        const stream_id = hdr.stream_id;
+        const flags = hdr.flags;
+
+        if (flags & frame.FrameFlags.SYN == frame.FrameFlags.SYN) {
+            // Handle SYN
+            try self.createInboundStream(stream_id);
+            return;
+        }
+
+        self.stream_mutex.lock();
+        const stream = self.streams.get(stream_id);
+        self.stream_mutex.unlock();
+
+        if (stream == null) {
+            if (hdr.frame_type == frame.FrameType.DATA and hdr.length > 0) {
+                std.debug.print("discarding data for stream {} with length {}\n", .{ stream_id, hdr.length });
+                self.buf_read.skipBytes(hdr.length, .{}) catch |err| {
+                    std.debug.print("error skipping bytes: {}\n", .{err});
+                    return;
+                };
+            } else {
+                std.debug.print("frame for missing stream {}\n", .{hdr});
+            }
+
+            return;
+        }
+    }
+
     fn handlePing(self: *Session, hdr: frame.Header) Error!void {
         const flags = hdr.flags;
         const ping_id = hdr.length;
@@ -397,6 +426,7 @@ pub const Session = struct {
         self.ping_mutex.lock();
         if (self.pings.get(ping_id)) |ping_notification| {
             ping_notification.set();
+            // TODO: Check how we can free this
             self.pings.remove(ping_id);
         }
         self.ping_mutex.unlock();
