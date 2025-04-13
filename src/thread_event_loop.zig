@@ -160,50 +160,51 @@ pub const ThreadEventLoop = struct {
         };
         const self = self_.?;
 
-        while (self.timer_queue.pop()) |node| {
-            switch (node.action) {
-                .run_open_stream_timer => |*msg| {
+        while (self.timer_queue.pop()) |m| {
+            switch (m.action) {
+                .run_open_stream_timer => {
                     const timer = xev.Timer.init() catch unreachable;
                     const c_timer = self.completion_pool.create() catch unreachable;
-                    msg.l = self;
-                    timer.run(loop, c_timer, msg.timeout_ms, IOMessage.RunOpenStreamTimer, msg, (struct {
-                        fn callback(
-                            ud: ?*IOMessage.RunOpenStreamTimer,
-                            _: *xev.Loop,
-                            c: *xev.Completion,
-                            tr: xev.Timer.RunError!void,
-                        ) xev.CallbackAction {
-                            tr catch |err| {
-                                if (err != xev.Timer.RunError.Canceled) {
-                                    std.debug.print("Error in timer callback: {}\n", .{err});
-                                }
-                                return .disarm;
-                            };
-
-                            const n = ud.?;
-                            defer n.l.?.completion_pool.destroy(c);
-
-                            if (n.stream.session.isClosed()) {
-                                return .disarm;
-                            }
-
-                            if (n.stream.establish_completion.isSet()) {
-                                return .disarm;
-                            }
-
-                            // timer expired
-                            n.stream.session.close();
-                            return .disarm;
-                        }
-                    }).callback);
+                    m.action.run_open_stream_timer.l = self;
+                    timer.run(loop, c_timer, m.action.run_open_stream_timer.timeout_ms, IOMessage, m, run_open_stream_timer_cb);
                 },
                 .run_close_stream_timer => {},
                 .cancel_close_stream_timer => {},
             }
-            self.allocator.destroy(node);
         }
 
         return .rearm;
+    }
+
+    fn run_open_stream_timer_cb(
+        ud: ?*IOMessage,
+        _: *xev.Loop,
+        c: *xev.Completion,
+        tr: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        tr catch |err| {
+            if (err != xev.Timer.RunError.Canceled) {
+                std.debug.print("Error in timer callback: {}\n", .{err});
+            }
+            return .disarm;
+        };
+
+        const n = ud.?;
+        const action = n.action.run_open_stream_timer;
+        defer action.l.?.completion_pool.destroy(c);
+        defer action.l.?.allocator.destroy(n);
+
+        if (action.stream.session.isClosed()) {
+            return .disarm;
+        }
+
+        if (action.stream.establish_completion.isSet()) {
+            return .disarm;
+        }
+
+        // timer expired
+        action.stream.session.close();
+        return .disarm;
     }
 };
 
