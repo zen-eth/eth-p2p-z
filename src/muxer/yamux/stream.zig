@@ -48,17 +48,9 @@ pub const Stream = struct {
     send_mutex: std.Thread.Mutex,
 
     // Notification channels implemented with condition variables
-    recv_notify: struct {
-        mutex: std.Thread.Mutex,
-        cond: std.Thread.Condition,
-        signaled: bool,
-    },
+    recv_completion: std.Thread.ResetEvent = .{},
 
-    send_notify: struct {
-        mutex: std.Thread.Mutex,
-        cond: std.Thread.Condition,
-        signaled: bool,
-    },
+    send_completion: std.Thread.ResetEvent = .{},
 
     read_deadline: std.atomic.Value(i64),
     write_deadline: std.atomic.Value(i64),
@@ -68,6 +60,8 @@ pub const Stream = struct {
 
     // Set with state_mutex held to honor the StreamCloseTimeout
     close_timer: ?*xev.Timer = null,
+
+    c_close_timer: ?*xev.Completion = null,
 
     allocator: std.mem.Allocator,
 
@@ -93,16 +87,6 @@ pub const Stream = struct {
             .send_mutex = .{},
             .recv_window = Config.initial_stream_window,
             .send_window = std.atomic.Value(u32).init(Config.initial_stream_window),
-            .recv_notify = .{
-                .mutex = .{},
-                .cond = .{},
-                .signaled = false,
-            },
-            .send_notify = .{
-                .mutex = .{},
-                .cond = .{},
-                .signaled = false,
-            },
             .read_deadline = std.atomic.Value(i64).init(0),
             .write_deadline = std.atomic.Value(i64).init(0),
             .allocator = alloc,
@@ -117,6 +101,13 @@ pub const Stream = struct {
             buf.deinit();
             self.allocator.destroy(buf);
         }
+        if (self.close_timer) |timer| {
+            timer.deinit();
+            self.allocator.destroy(timer);
+        }
+        if (self.c_close_timer) |c| {
+            self.allocator.destroy(c);
+        }
     }
 
     /// Reads data from the stream into the provided buffer
@@ -124,10 +115,7 @@ pub const Stream = struct {
     pub fn read(self: *Stream, buf: []u8) !usize {
         // Notify receivers when done
         defer {
-            self.recv_notify.mutex.lock();
-            defer self.recv_notify.mutex.unlock();
-            self.recv_notify.signaled = true;
-            self.recv_notify.cond.broadcast();
+            self.recv_completion.set();
         }
 
         while (true) {
@@ -175,23 +163,10 @@ pub const Stream = struct {
                     const timeout_ns = deadline - now;
 
                     // Wait with timeout
-                    self.recv_notify.mutex.lock();
-                    if (!self.recv_notify.signaled) {
-                        self.recv_notify.cond.timedWait(&self.recv_notify.mutex, @intCast(timeout_ns)) catch {
-                            self.recv_notify.mutex.unlock();
-                            return Error.ReadTimeout;
-                        };
-                    }
-                    self.recv_notify.signaled = false;
-                    self.recv_notify.mutex.unlock();
+                    try self.recv_completion.timedWait(@intCast(timeout_ns));
                 } else {
                     // Wait without timeout
-                    self.recv_notify.mutex.lock();
-                    if (!self.recv_notify.signaled) {
-                        self.recv_notify.cond.wait(&self.recv_notify.mutex);
-                    }
-                    self.recv_notify.signaled = false;
-                    self.recv_notify.mutex.unlock();
+                    self.recv_completion.wait();
                 }
 
                 // Continue to start of loop
@@ -261,6 +236,34 @@ pub const Stream = struct {
         };
 
         return;
+    }
+
+    pub fn forceClose(self: *Stream) void {
+        self.state_mutex.lock();
+        self.state = .closed;
+        self.state_mutex.unlock();
+        self.notifyWaiters();
+    }
+
+    pub fn notifyWaiters(self: *Stream) void {
+        self.recv_completion.set();
+        self.send_completion.set();
+        self.establish_completion.set();
+    }
+
+    pub fn closeTimeout(self: *Stream) void {
+        self.forceClose();
+
+        self.session.closeStream(self.id);
+
+        self.send_mutex.lock();
+        defer self.send_mutex.unlock();
+        const hdr = self.allocator.alloc(u8, frame.Header.SIZE) catch unreachable;
+        defer self.allocator.free(hdr);
+        frame.Header.init(frame.FrameType.WINDOW_UPDATE, frame.FrameFlags.RST, self.id, 0).encode(hdr) catch unreachable;
+        self.session.send(hdr, null) catch |err| {
+            std.debug.print("Error sending close stream message: {}\n", .{err});
+        };
     }
 
     /// Determines any flags that are appropriate based on the current stream state.

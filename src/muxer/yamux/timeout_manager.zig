@@ -7,6 +7,7 @@ const Stream = stream.Stream;
 const conn = @import("../../conn.zig");
 const Config = @import("Config.zig");
 const session = @import("session.zig");
+const xev = @import("xev");
 
 pub const TimeoutManager = struct {
     loop: *EventLoop,
@@ -24,9 +25,39 @@ pub const TimeoutManager = struct {
     ) !void {
         const message = IOMessage{
             .action = .{
-                .run_open_stream_timer = IOMessage.RunOpenStreamTimer{
+                .run_open_stream_timer = .{
                     .stream = s,
                     .timeout_ms = timeout_ms,
+                },
+            },
+        };
+        try self.loop.queueMessage(message);
+    }
+
+    pub fn start_close_stream_timer(
+        self: *Self,
+        s: *Stream,
+        timeout_ms: u64,
+    ) !void {
+        const message = IOMessage{
+            .action = .{
+                .run_close_stream_timer = .{
+                    .stream = s,
+                    .timeout_ms = timeout_ms,
+                },
+            },
+        };
+        try self.loop.queueMessage(message);
+    }
+
+    pub fn cancel_close_stream_timer(
+        self: *Self,
+        s: *Stream,
+    ) !void {
+        const message = IOMessage{
+            .action = .{
+                .cancel_close_stream_timer = .{
+                    .stream = s,
                 },
             },
         };
@@ -110,6 +141,99 @@ test "TimeoutManager start_open_stream_timer, stream establish completion before
     std.time.sleep(200 * std.time.ns_per_ms);
 
     try std.testing.expect(!test_session.isClosed());
+
+    l.close();
+}
+
+test "TimeoutManager start_close_stream_timer" {
+    const allocator = std.testing.allocator;
+    var l: EventLoop = undefined;
+    try l.init(allocator);
+    defer l.deinit();
+
+    // Create a test session and stream for timer
+    var pipes = try conn.createPipeConnPair();
+    defer {
+        pipes.client.close();
+        pipes.server.close();
+    }
+
+    const client_conn = pipes.client.conn().any();
+    var config = Config.defaultConfig();
+
+    var pool: std.Thread.Pool = undefined;
+    try std.Thread.Pool.init(&pool, .{ .allocator = allocator });
+    defer pool.deinit();
+
+    var test_session: session.Session = undefined;
+    try session.Session.init(allocator, &config, client_conn, &test_session, &pool);
+    defer test_session.deinit();
+
+    var test_stream: Stream = undefined;
+    try Stream.init(&test_stream, &test_session, 1, .init, allocator);
+    defer test_stream.deinit();
+
+    var tm: TimeoutManager = undefined;
+    TimeoutManager.init(&tm, &l);
+    var close_timer = try xev.Timer.init();
+    test_stream.close_timer = &close_timer;
+    const c_close_timer = try test_stream.allocator.create(xev.Completion);
+    c_close_timer.* = .{};
+    test_stream.c_close_timer = c_close_timer;
+    try tm.start_close_stream_timer(&test_stream, 100);
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+
+    try std.testing.expect(test_stream.establish_completion.isSet());
+    try std.testing.expect(test_stream.state == .closed);
+
+    l.close();
+}
+
+test "TimeoutManager cancel_close_stream_timer" {
+    const allocator = std.testing.allocator;
+    var l: EventLoop = undefined;
+    try l.init(allocator);
+    defer l.deinit();
+
+    // Create a test session and stream for timer
+    var pipes = try conn.createPipeConnPair();
+    defer {
+        pipes.client.close();
+        pipes.server.close();
+    }
+
+    const client_conn = pipes.client.conn().any();
+    var config = Config.defaultConfig();
+
+    var pool: std.Thread.Pool = undefined;
+    try std.Thread.Pool.init(&pool, .{ .allocator = allocator });
+    defer pool.deinit();
+
+    var test_session: session.Session = undefined;
+    try session.Session.init(allocator, &config, client_conn, &test_session, &pool);
+    defer test_session.deinit();
+
+    var test_stream: Stream = undefined;
+    try Stream.init(&test_stream, &test_session, 1, .init, allocator);
+    defer test_stream.deinit();
+
+    var tm: TimeoutManager = undefined;
+    TimeoutManager.init(&tm, &l);
+    var close_timer = try xev.Timer.init();
+    test_stream.close_timer = &close_timer;
+    const c_close_timer = try test_stream.allocator.create(xev.Completion);
+    c_close_timer.* = .{};
+    test_stream.c_close_timer = c_close_timer;
+    try tm.start_close_stream_timer(&test_stream, 1000);
+
+    std.time.sleep(100 * std.time.ns_per_ms);
+    try tm.cancel_close_stream_timer(&test_stream);
+
+    std.time.sleep(1000 * std.time.ns_per_ms);
+
+    try std.testing.expect(!test_stream.establish_completion.isSet());
+    try std.testing.expect(test_stream.state != .closed);
 
     l.close();
 }

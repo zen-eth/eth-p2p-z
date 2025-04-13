@@ -11,26 +11,22 @@ const session = @import("muxer/yamux/session.zig");
 pub const IOMessage = struct {
     const Self = @This();
 
-    pub const RunOpenStreamTimer = struct {
-        stream: *Stream,
-        timeout_ms: u64,
-        l: ?*ThreadEventLoop = null,
-    };
-
     next: ?*Self = null,
 
     action: union(enum) {
-        run_open_stream_timer: RunOpenStreamTimer,
+        run_open_stream_timer: struct {
+            stream: *Stream,
+            timeout_ms: u64,
+            l: ?*ThreadEventLoop = null,
+        },
         run_close_stream_timer: struct {
             stream: *Stream,
             timeout_ms: u64,
-            timer: *xev.Timer,
-            c_timer: *xev.Completion,
+            l: ?*ThreadEventLoop = null,
         },
         cancel_close_stream_timer: struct {
             stream: *Stream,
-            timer: *xev.Timer,
-            c_timer: *xev.Completion,
+            l: ?*ThreadEventLoop = null,
         },
     },
 };
@@ -168,8 +164,20 @@ pub const ThreadEventLoop = struct {
                     m.action.run_open_stream_timer.l = self;
                     timer.run(loop, c_timer, m.action.run_open_stream_timer.timeout_ms, IOMessage, m, run_open_stream_timer_cb);
                 },
-                .run_close_stream_timer => {},
-                .cancel_close_stream_timer => {},
+                .run_close_stream_timer => {
+                    const timer = m.action.run_close_stream_timer.stream.close_timer.?;
+                    const c_timer = m.action.run_close_stream_timer.stream.c_close_timer.?;
+                    m.action.run_close_stream_timer.l = self;
+                    timer.run(loop, c_timer, m.action.run_close_stream_timer.timeout_ms, IOMessage, m, run_close_stream_timer_cb);
+                },
+                .cancel_close_stream_timer => {
+                    const timer = m.action.cancel_close_stream_timer.stream.close_timer.?;
+                    const c_timer = m.action.cancel_close_stream_timer.stream.c_close_timer.?;
+                    const c_cancel_timer = self.completion_pool.create() catch unreachable;
+                    c_cancel_timer.* = .{};
+                    m.action.cancel_close_stream_timer.l = self;
+                    timer.cancel(loop, c_timer, c_cancel_timer, IOMessage, m, cancel_close_stream_timer_cb);
+                },
             }
         }
 
@@ -182,17 +190,17 @@ pub const ThreadEventLoop = struct {
         c: *xev.Completion,
         tr: xev.Timer.RunError!void,
     ) xev.CallbackAction {
+        const n = ud.?;
+        const action = n.action.run_open_stream_timer;
+        defer action.l.?.completion_pool.destroy(c);
+        defer action.l.?.allocator.destroy(n);
+
         tr catch |err| {
             if (err != xev.Timer.RunError.Canceled) {
                 std.debug.print("Error in timer callback: {}\n", .{err});
             }
             return .disarm;
         };
-
-        const n = ud.?;
-        const action = n.action.run_open_stream_timer;
-        defer action.l.?.completion_pool.destroy(c);
-        defer action.l.?.allocator.destroy(n);
 
         if (action.stream.session.isClosed()) {
             return .disarm;
@@ -204,6 +212,47 @@ pub const ThreadEventLoop = struct {
 
         // timer expired
         action.stream.session.close();
+        return .disarm;
+    }
+
+    fn run_close_stream_timer_cb(
+        ud: ?*IOMessage,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        tr: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        const n = ud.?;
+        const action = n.action.run_close_stream_timer;
+        defer action.l.?.allocator.destroy(n);
+
+        tr catch |err| {
+            if (err != xev.Timer.RunError.Canceled) {
+                std.debug.print("Error in timer callback: {}\n", .{err});
+            }
+            return .disarm;
+        };
+
+        // timer expired
+        action.stream.closeTimeout();
+        return .disarm;
+    }
+
+    fn cancel_close_stream_timer_cb(
+        ud: ?*IOMessage,
+        _: *xev.Loop,
+        c: *xev.Completion,
+        tr: xev.Timer.CancelError!void,
+    ) xev.CallbackAction {
+        const n = ud.?;
+        const action = n.action.cancel_close_stream_timer;
+        defer action.l.?.completion_pool.destroy(c);
+        defer action.l.?.allocator.destroy(n);
+
+        tr catch |err| {
+            std.debug.print("Error in timer callback: {}\n", .{err});
+            return .disarm;
+        };
+
         return .disarm;
     }
 };
@@ -238,7 +287,7 @@ test "TimerManager add timer for stream" {
 
     const message = IOMessage{
         .action = .{
-            .run_open_stream_timer = IOMessage.RunOpenStreamTimer{
+            .run_open_stream_timer = .{
                 .stream = &test_stream,
                 .timeout_ms = 100,
             },
