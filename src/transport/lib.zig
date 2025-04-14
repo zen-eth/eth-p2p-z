@@ -1,7 +1,7 @@
 const std = @import("std");
 const conn = @import("../conn.zig");
 
-pub const tcp = @import("tcp/libxev.zig");
+pub const tcp = @import("tcp/xev.zig");
 
 pub fn GenericListener(
     comptime Context: type,

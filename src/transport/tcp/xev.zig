@@ -6,10 +6,13 @@ const TCP = xev.TCP;
 const Allocator = std.mem.Allocator;
 const ThreadPool = xev.ThreadPool;
 const ResetEvent = std.Thread.ResetEvent;
+const common_conn = @import("../../conn.zig");
 
 pub const DialError = error{};
 /// SocketChannel represents a socket channel. It is used to send and receive messages.
 pub const SocketChannel = struct {
+    pub const WriteError = Allocator.Error || xev.WriteError || error{MachMsgFailed};
+    pub const ReadError = Allocator.Error || xev.ReadError || error{MachMsgFailed};
     /// The direction of the channel.
     pub const DIRECTION = enum {
         INBOUND,
@@ -19,25 +22,25 @@ pub const SocketChannel = struct {
     socket: TCP,
 
     /// The transport that created this channel.
-    transport: *XevTransport,
+    transport: *Transport,
 
     /// Whether this channel is the initiator of the connection. If true, this channel is the client. If false, this channel is the server.
     direction: DIRECTION,
 
     /// Initialize the channel with the given socket and transport.
-    pub fn init(self: *SocketChannel, socket: TCP, transport: *XevTransport, direction: DIRECTION) void {
+    pub fn init(self: *SocketChannel, socket: TCP, transport: *Transport, direction: DIRECTION) void {
         self.socket = socket;
         self.transport = transport;
         self.direction = direction;
     }
 
     /// Write sends the buffer to the other end of the channel. It blocks until the write is complete. If an error occurs, it returns the error.
-    pub fn write(self: *SocketChannel, buf: []const u8) !void {
+    pub fn write(self: SocketChannel, buf: []const u8) WriteError!usize {
         const reset_event = try self.transport.allocator.create(ResetEvent);
         errdefer self.transport.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
 
-        const write_err = try self.transport.allocator.create(?anyerror);
+        const write_err = try self.transport.allocator.create(?SocketChannel.WriteError);
         errdefer self.transport.allocator.destroy(write_err);
         write_err.* = null;
 
@@ -58,15 +61,18 @@ pub const SocketChannel = struct {
         if (write_err.*) |err| {
             return err;
         }
+
+        // TODO: we should check the number of bytes written
+        return 0;
     }
 
     /// Read reads from the channel into the buffer. It blocks until the read is complete. If an error occurs, it returns the error.
-    pub fn read(self: *SocketChannel, buf: []u8) !usize {
+    pub fn read(self: SocketChannel, buf: []u8) ReadError!usize {
         const reset_event = try self.transport.allocator.create(ResetEvent);
         errdefer self.transport.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
 
-        const read_err = try self.transport.allocator.create(?anyerror);
+        const read_err = try self.transport.allocator.create(?SocketChannel.ReadError);
         errdefer self.transport.allocator.destroy(read_err);
         read_err.* = null;
 
@@ -97,8 +103,19 @@ pub const SocketChannel = struct {
     }
 
     /// Close closes the channel. It blocks until the close is complete.
-    pub fn close(_: *SocketChannel) void {
+    pub fn close(_: SocketChannel) void {
         // TODO: we should close the socket here
+    }
+
+    pub fn toConn(self: SocketChannel) common_conn.GenericConn(
+        SocketChannel,
+        SocketChannel.ReadError,
+        SocketChannel.WriteError,
+        read,
+        write,
+        close,
+    ) {
+        return .{ .context = self };
     }
 };
 
@@ -131,21 +148,21 @@ pub const AsyncIOQueueNode = struct {
             /// The buffer to write.
             buffer: []const u8,
             /// The channel to write to.
-            channel: *SocketChannel,
+            channel: SocketChannel,
             /// The reset event to signal when the operation is complete.
             reset_event: *ResetEvent,
             /// The error that occurred during the operation.
-            err: *?anyerror,
+            err: *?SocketChannel.WriteError,
         },
         read: struct {
             /// The channel to read from.
-            channel: *SocketChannel,
+            channel: SocketChannel,
             /// The buffer to read into.
             buffer: []u8,
             /// The reset event to signal when the operation is complete.
             reset_event: *ResetEvent,
             /// The error that occurred during the operation.
-            err: *?anyerror,
+            err: *?SocketChannel.ReadError,
             /// The number of bytes read.
             bytes_read: *usize,
         },
@@ -153,24 +170,24 @@ pub const AsyncIOQueueNode = struct {
 };
 
 const OpenChannelCallbackData = struct {
-    transport: *XevTransport,
+    transport: *Transport,
     channel: *SocketChannel,
     err: *?anyerror,
     reset_event: *ResetEvent,
 };
 
 const WriteCallbackData = struct {
-    channel: *SocketChannel,
+    channel: SocketChannel,
     buffer: []const u8,
     reset_event: *ResetEvent,
-    err: *?anyerror,
+    err: *?SocketChannel.WriteError,
 };
 
 const ReadCallbackData = struct {
-    channel: *SocketChannel,
+    channel: SocketChannel,
     buffer: []u8,
     reset_event: *ResetEvent,
-    err: *?anyerror,
+    err: *?SocketChannel.ReadError,
     bytes_read: *usize,
 };
 
@@ -181,10 +198,10 @@ pub const Listener = struct {
     /// The server to accept connections from.
     server: TCP,
     /// The transport that created this listener.
-    transport: *XevTransport,
+    transport: *Transport,
 
     /// Initialize the listener with the given address, backlog, and transport.
-    pub fn init(self: *Listener, address: std.net.Address, backlog: u31, transport: *XevTransport) !void {
+    pub fn init(self: *Listener, address: std.net.Address, backlog: u31, transport: *Transport) !void {
         const server = try TCP.init(address);
         try server.bind(address);
         try server.listen(backlog);
@@ -229,8 +246,8 @@ pub const Listener = struct {
     }
 };
 
-/// XevTransport is a transport that uses the xev library for asynchronous I/O operations.
-pub const XevTransport = struct {
+/// Transport is a transport that uses the xev library for asynchronous I/O operations.
+pub const Transport = struct {
     /// The event loop.
     loop: xev.Loop,
     /// The options for the transport.
@@ -257,7 +274,7 @@ pub const XevTransport = struct {
     };
 
     /// Initialize the transport with the given allocator and options.
-    pub fn init(self: *XevTransport, allocator: Allocator, opts: Options) !void {
+    pub fn init(self: *Transport, allocator: Allocator, opts: Options) !void {
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
 
@@ -270,7 +287,7 @@ pub const XevTransport = struct {
         var io_queue = try allocator.create(IOQueue);
         io_queue.init();
         errdefer allocator.destroy(io_queue);
-        self.* = XevTransport{
+        self.* = Transport{
             .loop = loop,
             .options = opts,
             .stop_notifier = stop_notifier,
@@ -287,7 +304,7 @@ pub const XevTransport = struct {
     }
 
     /// Deinitialize the transport.
-    pub fn deinit(self: *XevTransport) void {
+    pub fn deinit(self: *Transport) void {
         self.loop.deinit();
         self.stop_notifier.deinit();
         self.async_io_notifier.deinit();
@@ -295,7 +312,7 @@ pub const XevTransport = struct {
     }
 
     /// Dial connects to the given address and creates a channel for communication. It blocks until the connection is established. If an error occurs, it returns the error.
-    pub fn dial(self: *XevTransport, addr: std.net.Address, channel: *SocketChannel) !void {
+    pub fn dial(self: *Transport, addr: std.net.Address, channel: *SocketChannel) !void {
         const reset_event = try self.allocator.create(std.Thread.ResetEvent);
         errdefer self.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
@@ -326,22 +343,22 @@ pub const XevTransport = struct {
     }
 
     /// Listen listens for incoming connections on the given address. It blocks until the listener is initialized. If an error occurs, it returns the error.
-    pub fn listen(self: *XevTransport, addr: std.net.Address, listener: *Listener) !void {
+    pub fn listen(self: *Transport, addr: std.net.Address, listener: *Listener) !void {
         try listener.init(addr, self.options.backlog, self);
     }
 
     /// Start starts the transport. It blocks until the transport is stopped.
     /// It is recommended to call this function in a separate thread.
-    pub fn start(self: *XevTransport) !void {
-        self.stop_notifier.wait(&self.loop, &self.c_stop, XevTransport, self, &stopCallback);
+    pub fn start(self: *Transport) !void {
+        self.stop_notifier.wait(&self.loop, &self.c_stop, Transport, self, &stopCallback);
 
-        self.async_io_notifier.wait(&self.loop, &self.c_async, XevTransport, self, &asyncIOCallback);
+        self.async_io_notifier.wait(&self.loop, &self.c_async, Transport, self, &asyncIOCallback);
 
         try self.loop.run(.until_done);
     }
 
     /// Close closes the transport.
-    pub fn close(self: *XevTransport) void {
+    pub fn close(self: *Transport) void {
         self.stop_notifier.notify() catch |err| {
             std.debug.print("Error notifying stop: {}\n", .{err});
         };
@@ -350,7 +367,7 @@ pub const XevTransport = struct {
     }
 
     fn asyncIOCallback(
-        self_: ?*XevTransport,
+        self_: ?*Transport,
         loop: *xev.Loop,
         _: *xev.Completion,
         r: xev.Async.WaitError!void,
@@ -424,7 +441,7 @@ pub const XevTransport = struct {
     }
 
     fn stopCallback(
-        self_: ?*XevTransport,
+        self_: ?*Transport,
         loop: *xev.Loop,
         _: *xev.Completion,
         r: xev.Async.WaitError!void,
@@ -516,14 +533,14 @@ pub const XevTransport = struct {
         defer self.channel.transport.allocator.destroy(self);
         const n = r catch |err| switch (err) {
             error.EOF => {
-                socket.shutdown(loop, c, SocketChannel, self.channel, shutdownCallback);
+                socket.shutdown(loop, c, SocketChannel, &self.channel, shutdownCallback);
                 self.err.* = err;
                 self.reset_event.set();
                 return .disarm;
             },
 
             else => {
-                socket.shutdown(loop, c, SocketChannel, self.channel, shutdownCallback);
+                socket.shutdown(loop, c, SocketChannel, &self.channel, shutdownCallback);
                 std.log.warn("server read unexpected err={}", .{err});
                 self.err.* = err;
                 self.reset_event.set();
@@ -544,6 +561,7 @@ pub const XevTransport = struct {
         s: xev.TCP,
         r: xev.ShutdownError!void,
     ) xev.CallbackAction {
+        std.debug.print("shutdown callback\n", .{});
         _ = r catch |err| {
             std.debug.print("Error shutting down: {}\n", .{err});
         };
@@ -575,11 +593,11 @@ test "dial connection refused" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    const opts = XevTransport.Options{
+    const opts = Transport.Options{
         .backlog = 128,
     };
 
-    var transport: XevTransport = undefined;
+    var transport: Transport = undefined;
     try transport.init(allocator, opts);
     defer transport.deinit();
 
@@ -591,7 +609,7 @@ test "dial connection refused" {
     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel1));
 
     const thread2 = try std.Thread.spawn(.{}, struct {
-        fn run(t: *XevTransport, a: std.net.Address) !void {
+        fn run(t: *Transport, a: std.net.Address) !void {
             var ch: SocketChannel = undefined;
             try std.testing.expectError(error.ConnectionRefused, t.dial(a, &ch));
         }
@@ -605,11 +623,11 @@ test "dial and accept" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    const opts = XevTransport.Options{
+    const opts = Transport.Options{
         .backlog = 128,
     };
 
-    var transport: XevTransport = undefined;
+    var transport: Transport = undefined;
     try transport.init(allocator, opts);
     defer transport.deinit();
 
@@ -629,7 +647,7 @@ test "dial and accept" {
         }
     }.run, .{ &listener, &channel });
 
-    var client: XevTransport = undefined;
+    var client: Transport = undefined;
     try client.init(allocator, opts);
     defer client.deinit();
 
@@ -650,11 +668,11 @@ test "echo read and write" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    const opts = XevTransport.Options{
+    const opts = Transport.Options{
         .backlog = 128,
     };
 
-    var server: XevTransport = undefined;
+    var server: Transport = undefined;
     try server.init(allocator, opts);
     defer server.deinit();
 
@@ -674,11 +692,11 @@ test "echo read and write" {
             try std.testing.expectStringStartsWith(buf, "buf: []const u8");
 
             try std.testing.expect(n == 15);
-            try accepted_channel.write(buf[0..n]);
+            _ = try accepted_channel.write(buf[0..n]);
         }
     }.run, .{ &listener, allocator });
 
-    var client: XevTransport = undefined;
+    var client: Transport = undefined;
     try client.init(allocator, opts);
     defer client.deinit();
 
@@ -686,7 +704,7 @@ test "echo read and write" {
     try client.dial(addr, &channel1);
     try std.testing.expectEqual(channel1.direction, .OUTBOUND);
 
-    try channel1.write("buf: []const u8");
+    _ = try channel1.write("buf: []const u8");
     const buf = try allocator.alloc(u8, 1024);
     defer allocator.free(buf);
     const n = try channel1.read(buf);
