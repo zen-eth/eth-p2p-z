@@ -234,7 +234,7 @@ pub const ThreadEventLoop = struct {
                 .accept => {
                     const server = m.action.accept.server;
                     const c = self.completion_pool.create() catch unreachable;
-                    server.accept(loop, c, IOMessage, m,  acceptCB);
+                    server.accept(loop, c, IOMessage, m, acceptCB);
                 },
                 .write => {
                     const c = self.completion_pool.create() catch unreachable;
@@ -243,7 +243,7 @@ pub const ThreadEventLoop = struct {
 
                     channel.socket.write(loop, c, .{ .slice = buffer }, IOMessage, m, writeCB);
                 },
-                .read =>  {
+                .read => {
                     const channel = m.action.read.channel;
                     const buffer = m.action.read.buffer;
                     const c = self.completion_pool.create() catch unreachable;
@@ -416,7 +416,7 @@ pub const ThreadEventLoop = struct {
 
         const read = r catch |err| switch (err) {
             error.EOF => {
-                const c_eof_error= action.channel.transport.allocator.create(xev.Completion) catch unreachable;
+                const c_eof_error = action.channel.transport.allocator.create(xev.Completion) catch unreachable;
                 socket.shutdown(loop, c_eof_error, xev_tcp.SocketChannel, action.channel, shutdownCB);
                 action.completion.setError(err);
 
@@ -424,7 +424,7 @@ pub const ThreadEventLoop = struct {
             },
 
             else => {
-                const c_error= action.channel.transport.allocator.create(xev.Completion) catch unreachable;
+                const c_error = action.channel.transport.allocator.create(xev.Completion) catch unreachable;
                 socket.shutdown(loop, c_error, xev_tcp.SocketChannel, action.channel, shutdownCB);
                 std.log.warn("server read unexpected err={}", .{err});
                 action.completion.setError(err);
