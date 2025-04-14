@@ -7,8 +7,36 @@ const Allocator = std.mem.Allocator;
 const ThreadPool = xev.ThreadPool;
 const ResetEvent = std.Thread.ResetEvent;
 const p2p_conn = @import("../../conn.zig");
+const p2p_transport = @import("../../transport.zig");
 
-pub const DialError = error{};
+pub const DialError = Allocator.Error || xev.ConnectError || error{MachMsgFailed};
+pub const AcceptError = Allocator.Error || xev.AcceptError || error{MachMsgFailed};
+
+pub const OpenConnectError = DialError || AcceptError;
+
+pub const GenericConnection = p2p_conn.GenericConn(
+    *SocketChannel,
+    SocketChannel.ReadError,
+    SocketChannel.WriteError,
+    SocketChannel.read,
+    SocketChannel.write,
+    SocketChannel.close,
+);
+
+pub const GenericListener = p2p_transport.GenericListener(
+    *Listener,
+    OpenConnectError,
+    Listener.accept,
+);
+
+pub const GenericTransport = p2p_transport.GenericTransport(
+    *Transport,
+    DialError,
+    AcceptError,
+    Transport.dial,
+    Transport.listen,
+);
+
 /// SocketChannel represents a socket channel. It is used to send and receive messages.
 pub const SocketChannel = struct {
     pub const WriteError = Allocator.Error || xev.WriteError || error{MachMsgFailed};
@@ -107,14 +135,7 @@ pub const SocketChannel = struct {
         // TODO: we should close the socket here
     }
 
-    pub fn toConn(self: *SocketChannel) p2p_conn.GenericConn(
-        *SocketChannel,
-        SocketChannel.ReadError,
-        SocketChannel.WriteError,
-        read,
-        write,
-        close,
-    ) {
+    pub fn toConn(self: *SocketChannel) GenericConnection {
         return .{ .context = self };
     }
 };
@@ -132,7 +153,7 @@ pub const AsyncIOQueueNode = struct {
             /// The reset event to signal when the operation is complete.
             reset_event: *ResetEvent,
             /// The error that occurred during the operation.
-            err: *?anyerror,
+            err: *?OpenConnectError,
         },
         accept: struct {
             /// The server to accept from.
@@ -142,7 +163,7 @@ pub const AsyncIOQueueNode = struct {
             /// The reset event to signal when the operation is complete.
             reset_event: *ResetEvent,
             /// The error that occurred during the operation.
-            err: *?anyerror,
+            err: *?OpenConnectError,
         },
         write: struct {
             /// The buffer to write.
@@ -172,7 +193,7 @@ pub const AsyncIOQueueNode = struct {
 const OpenChannelCallbackData = struct {
     transport: *Transport,
     channel: *SocketChannel,
-    err: *?anyerror,
+    err: *?OpenConnectError,
     reset_event: *ResetEvent,
 };
 
@@ -217,12 +238,12 @@ pub const Listener = struct {
     }
 
     /// Accept accepts a connection from the listener. It blocks until a connection is accepted. If an error occurs, it returns the error.
-    pub fn accept(self: *Listener, channel: *SocketChannel) !void {
+    pub fn accept(self: *Listener, channel: anytype) OpenConnectError!void {
         const reset_event = try self.transport.allocator.create(ResetEvent);
         errdefer self.transport.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
 
-        const accept_err = try self.transport.allocator.create(?anyerror);
+        const accept_err = try self.transport.allocator.create(?OpenConnectError);
         errdefer self.transport.allocator.destroy(accept_err);
         accept_err.* = null;
 
@@ -312,12 +333,12 @@ pub const Transport = struct {
     }
 
     /// Dial connects to the given address and creates a channel for communication. It blocks until the connection is established. If an error occurs, it returns the error.
-    pub fn dial(self: *Transport, addr: std.net.Address, channel: *SocketChannel) !void {
+    pub fn dial(self: *Transport, addr: std.net.Address, channel: anytype) OpenConnectError!void {
         const reset_event = try self.allocator.create(std.Thread.ResetEvent);
         errdefer self.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
 
-        const connect_err = try self.allocator.create(?anyerror);
+        const connect_err = try self.allocator.create(?OpenConnectError);
         errdefer self.allocator.destroy(connect_err);
         connect_err.* = null;
 

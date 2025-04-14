@@ -5,8 +5,9 @@ const conn = @import("../../conn.zig");
 pub const Transport = union(enum) {
     xev: xev_provider.Transport,
 
-    pub const DialError = xev_provider.DialError;
-    // pub fn dial(self:*Transport, addr:std.net.Address, connection:*conn.AnyConn) DialError!void {
-    //     return self.xev.dial(addr, connection);
-    // }
+    pub const OpenConnectError = xev_provider.OpenConnectError;
+
+    pub fn dial(self: *Transport, addr: std.net.Address, connection: anytype) OpenConnectError!void {
+        return self.xev.dial(addr, connection);
+    }
 };
