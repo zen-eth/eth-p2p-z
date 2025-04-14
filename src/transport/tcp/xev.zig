@@ -6,7 +6,7 @@ const TCP = xev.TCP;
 const Allocator = std.mem.Allocator;
 const ThreadPool = xev.ThreadPool;
 const ResetEvent = std.Thread.ResetEvent;
-const common_conn = @import("../../conn.zig");
+const p2p_conn = @import("../../conn.zig");
 
 pub const DialError = error{};
 /// SocketChannel represents a socket channel. It is used to send and receive messages.
@@ -35,7 +35,7 @@ pub const SocketChannel = struct {
     }
 
     /// Write sends the buffer to the other end of the channel. It blocks until the write is complete. If an error occurs, it returns the error.
-    pub fn write(self: SocketChannel, buf: []const u8) WriteError!usize {
+    pub fn write(self: *SocketChannel, buf: []const u8) WriteError!usize {
         const reset_event = try self.transport.allocator.create(ResetEvent);
         errdefer self.transport.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
@@ -62,12 +62,12 @@ pub const SocketChannel = struct {
             return err;
         }
 
-        // TODO: we should check the number of bytes written
+        //TODO: we should check the number of bytes written
         return 0;
     }
 
     /// Read reads from the channel into the buffer. It blocks until the read is complete. If an error occurs, it returns the error.
-    pub fn read(self: SocketChannel, buf: []u8) ReadError!usize {
+    pub fn read(self: *SocketChannel, buf: []u8) ReadError!usize {
         const reset_event = try self.transport.allocator.create(ResetEvent);
         errdefer self.transport.allocator.destroy(reset_event);
         reset_event.* = ResetEvent{};
@@ -103,12 +103,12 @@ pub const SocketChannel = struct {
     }
 
     /// Close closes the channel. It blocks until the close is complete.
-    pub fn close(_: SocketChannel) void {
+    pub fn close(_: *SocketChannel) void {
         // TODO: we should close the socket here
     }
 
-    pub fn toConn(self: SocketChannel) common_conn.GenericConn(
-        SocketChannel,
+    pub fn toConn(self: *SocketChannel) p2p_conn.GenericConn(
+        *SocketChannel,
         SocketChannel.ReadError,
         SocketChannel.WriteError,
         read,
@@ -148,7 +148,7 @@ pub const AsyncIOQueueNode = struct {
             /// The buffer to write.
             buffer: []const u8,
             /// The channel to write to.
-            channel: SocketChannel,
+            channel: *SocketChannel,
             /// The reset event to signal when the operation is complete.
             reset_event: *ResetEvent,
             /// The error that occurred during the operation.
@@ -156,7 +156,7 @@ pub const AsyncIOQueueNode = struct {
         },
         read: struct {
             /// The channel to read from.
-            channel: SocketChannel,
+            channel: *SocketChannel,
             /// The buffer to read into.
             buffer: []u8,
             /// The reset event to signal when the operation is complete.
@@ -177,14 +177,14 @@ const OpenChannelCallbackData = struct {
 };
 
 const WriteCallbackData = struct {
-    channel: SocketChannel,
+    channel: *SocketChannel,
     buffer: []const u8,
     reset_event: *ResetEvent,
     err: *?SocketChannel.WriteError,
 };
 
 const ReadCallbackData = struct {
-    channel: SocketChannel,
+    channel: *SocketChannel,
     buffer: []u8,
     reset_event: *ResetEvent,
     err: *?SocketChannel.ReadError,
@@ -533,14 +533,14 @@ pub const Transport = struct {
         defer self.channel.transport.allocator.destroy(self);
         const n = r catch |err| switch (err) {
             error.EOF => {
-                socket.shutdown(loop, c, SocketChannel, &self.channel, shutdownCallback);
+                socket.shutdown(loop, c, SocketChannel, self.channel, shutdownCallback);
                 self.err.* = err;
                 self.reset_event.set();
                 return .disarm;
             },
 
             else => {
-                socket.shutdown(loop, c, SocketChannel, &self.channel, shutdownCallback);
+                socket.shutdown(loop, c, SocketChannel, self.channel, shutdownCallback);
                 std.log.warn("server read unexpected err={}", .{err});
                 self.err.* = err;
                 self.reset_event.set();
@@ -561,7 +561,6 @@ pub const Transport = struct {
         s: xev.TCP,
         r: xev.ShutdownError!void,
     ) xev.CallbackAction {
-        std.debug.print("shutdown callback\n", .{});
         _ = r catch |err| {
             std.debug.print("Error shutting down: {}\n", .{err});
         };
