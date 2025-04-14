@@ -35,43 +35,43 @@ pub const IOMessage = struct {
             /// The address to connect to.
             address: std.net.Address,
             /// The channel to connect.
-            channel: *xev_tcp.SocketChannel,
+            channel: *xev_tcp.XevSocketChannel,
             /// The completion for the connection.
-            completion: *Completion1(void, xev_tcp.DialError),
+            completion: *Completion1(void, xev_tcp.Transport.DialError),
             /// The loop reference.
             l: ?*ThreadEventLoop = null,
             /// The transport reference.
-            transport: ?*xev_tcp.Transport = null,
+            transport: ?*xev_tcp.XevTransport = null,
         },
         accept: struct {
             /// The server to accept from.
             server: xev.TCP,
             /// The channel to accept.
-            channel: *xev_tcp.SocketChannel,
+            channel: *xev_tcp.XevSocketChannel,
             /// The completion for the connection.
-            completion: *Completion1(void, xev_tcp.AcceptError),
+            completion: *Completion1(void, xev_tcp.Listener.AcceptError),
             /// The loop reference.
             l: ?*ThreadEventLoop = null,
             /// The transport reference.
-            transport: ?*xev_tcp.Transport = null,
+            transport: ?*xev_tcp.XevTransport = null,
         },
         write: struct {
             /// The buffer to write.
             buffer: []const u8,
             /// The channel to write to.
-            channel: *xev_tcp.SocketChannel,
+            channel: *xev_tcp.XevSocketChannel,
             /// The completion for the write.
-            completion: *Completion1(usize, xev_tcp.SocketChannel.WriteError),
+            completion: *Completion1(usize, xev_tcp.Connection.WriteError),
             /// The loop reference.
             l: ?*ThreadEventLoop = null,
         },
         read: struct {
             /// The channel to read from.
-            channel: *xev_tcp.SocketChannel,
+            channel: *xev_tcp.XevSocketChannel,
             /// The buffer to read into.
             buffer: []u8,
             /// The completion for the read.
-            completion: *Completion1(usize, xev_tcp.SocketChannel.ReadError),
+            completion: *Completion1(usize, xev_tcp.Connection.ReadError),
             /// The loop reference.
             l: ?*ThreadEventLoop = null,
         },
@@ -229,25 +229,27 @@ pub const ThreadEventLoop = struct {
                     const address = m.action.connect.address;
                     var socket = xev.TCP.init(address) catch unreachable;
                     const c = self.completion_pool.create() catch unreachable;
+                    m.action.connect.l = self;
                     socket.connect(loop, c, address, IOMessage, m, connectCB);
                 },
                 .accept => {
                     const server = m.action.accept.server;
                     const c = self.completion_pool.create() catch unreachable;
+                    m.action.accept.l = self;
                     server.accept(loop, c, IOMessage, m, acceptCB);
                 },
                 .write => {
                     const c = self.completion_pool.create() catch unreachable;
                     const channel = m.action.write.channel;
                     const buffer = m.action.write.buffer;
-
+                    m.action.write.l = self;
                     channel.socket.write(loop, c, .{ .slice = buffer }, IOMessage, m, writeCB);
                 },
                 .read => {
                     const channel = m.action.read.channel;
                     const buffer = m.action.read.buffer;
                     const c = self.completion_pool.create() catch unreachable;
-
+                    m.action.read.l = self;
                     channel.socket.read(loop, c, .{ .slice = buffer }, IOMessage, m, readCB);
                 },
             }
@@ -417,7 +419,7 @@ pub const ThreadEventLoop = struct {
         const read = r catch |err| switch (err) {
             error.EOF => {
                 const c_eof_error = action.channel.transport.allocator.create(xev.Completion) catch unreachable;
-                socket.shutdown(loop, c_eof_error, xev_tcp.SocketChannel, action.channel, shutdownCB);
+                socket.shutdown(loop, c_eof_error, xev_tcp.XevSocketChannel, action.channel, shutdownCB);
                 action.completion.setError(err);
 
                 return .disarm;
@@ -425,7 +427,7 @@ pub const ThreadEventLoop = struct {
 
             else => {
                 const c_error = action.channel.transport.allocator.create(xev.Completion) catch unreachable;
-                socket.shutdown(loop, c_error, xev_tcp.SocketChannel, action.channel, shutdownCB);
+                socket.shutdown(loop, c_error, xev_tcp.XevSocketChannel, action.channel, shutdownCB);
                 std.log.warn("server read unexpected err={}", .{err});
                 action.completion.setError(err);
 
@@ -439,7 +441,7 @@ pub const ThreadEventLoop = struct {
     }
 
     fn shutdownCB(
-        ud: ?*xev_tcp.SocketChannel,
+        ud: ?*xev_tcp.XevSocketChannel,
         l: *xev.Loop,
         c: *xev.Completion,
         s: xev.TCP,
@@ -452,12 +454,12 @@ pub const ThreadEventLoop = struct {
         };
 
         const self = ud.?;
-        s.close(l, c, xev_tcp.SocketChannel, self, closeCB);
+        s.close(l, c, xev_tcp.XevSocketChannel, self, closeCB);
         return .disarm;
     }
 
     fn closeCB(
-        ud: ?*xev_tcp.SocketChannel,
+        ud: ?*xev_tcp.XevSocketChannel,
         _: *xev.Loop,
         c: *xev.Completion,
         _: xev.TCP,

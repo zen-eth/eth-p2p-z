@@ -3,10 +3,10 @@ const testing = std.testing;
 
 pub fn Completion1(comptime ValueType: type, comptime ErrorType: type) type {
     return struct {
-        done: std.Thread.ResetEvent,
-        rwlock: std.Thread.RwLock,
-        value: ?ValueType,
-        err: ?ErrorType,
+        done: std.Thread.ResetEvent = .{},
+        rwlock: std.Thread.RwLock = .{},
+        value: ?ValueType = null,
+        err: ?ErrorType = null,
 
         pub const Self = @This();
 
