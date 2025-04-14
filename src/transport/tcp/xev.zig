@@ -9,8 +9,8 @@ const ResetEvent = std.Thread.ResetEvent;
 const p2p_conn = @import("../../conn.zig");
 const p2p_transport = @import("../../transport.zig");
 
-pub const DialError = Allocator.Error || xev.ConnectError || error{MachMsgFailed};
-pub const AcceptError = Allocator.Error || xev.AcceptError || error{MachMsgFailed};
+pub const DialError = Allocator.Error || xev.ConnectError || error{AsyncNotifyFailed};
+pub const AcceptError = Allocator.Error || xev.AcceptError || error{AsyncNotifyFailed};
 
 pub const OpenConnectError = DialError || AcceptError;
 
@@ -39,8 +39,8 @@ pub const GenericTransport = p2p_transport.GenericTransport(
 
 /// SocketChannel represents a socket channel. It is used to send and receive messages.
 pub const SocketChannel = struct {
-    pub const WriteError = Allocator.Error || xev.WriteError || error{MachMsgFailed};
-    pub const ReadError = Allocator.Error || xev.ReadError || error{MachMsgFailed};
+    pub const WriteError = Allocator.Error || xev.WriteError || error{AsyncNotifyFailed};
+    pub const ReadError = Allocator.Error || xev.ReadError || error{AsyncNotifyFailed};
     /// The direction of the channel.
     pub const DIRECTION = enum {
         INBOUND,
@@ -83,7 +83,10 @@ pub const SocketChannel = struct {
         };
 
         self.transport.async_task_queue.push(node);
-        try self.transport.async_io_notifier.notify();
+        self.transport.async_io_notifier.notify() catch |err| {
+            std.debug.print("Error notifying async I/O: {}\n", .{err});
+            return error.AsyncNotifyFailed;
+        };
 
         reset_event.wait();
         if (write_err.*) |err| {
@@ -121,7 +124,10 @@ pub const SocketChannel = struct {
 
         self.transport.async_task_queue.push(node);
 
-        try self.transport.async_io_notifier.notify();
+        self.transport.async_io_notifier.notify() catch |err| {
+            std.debug.print("Error notifying async I/O: {}\n", .{err});
+            return error.AsyncNotifyFailed;
+        };
 
         reset_event.wait();
         if (read_err.*) |err| {
@@ -258,7 +264,10 @@ pub const Listener = struct {
         };
 
         self.transport.async_task_queue.push(node);
-        try self.transport.async_io_notifier.notify();
+        self.transport.async_io_notifier.notify() catch |err| {
+            std.debug.print("Error notifying async I/O: {}\n", .{err});
+            return error.AsyncNotifyFailed;
+        };
 
         reset_event.wait();
         if (accept_err.*) |err| {
@@ -355,7 +364,11 @@ pub const Transport = struct {
         };
 
         self.async_task_queue.push(node);
-        try self.async_io_notifier.notify();
+
+        self.async_io_notifier.notify() catch |err| {
+            std.debug.print("Error notifying async I/O: {}\n", .{err});
+            return error.AsyncNotifyFailed;
+        };
 
         reset_event.wait();
         if (connect_err.*) |err| {
