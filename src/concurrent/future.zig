@@ -1,15 +1,29 @@
+//! A simple implementation of a Future type in Zig.
+//! This implementation uses a read-write lock to allow multiple readers and a single writer.
+//! It also uses a reset event to signal when the future is done.
+
 const std = @import("std");
 const testing = std.testing;
 
+/// A generic Future type that allows asynchronous setting and retrieval of a value or error.
+/// This implementation ensures thread safety using a read-write lock and a reset event.
 pub fn Future(comptime ValueType: type, comptime ErrorType: type) type {
     return struct {
+        /// A reset event used to signal when the Future is completed.
         done: std.Thread.ResetEvent = .{},
+
+        /// A read-write lock to ensure thread-safe access to the value and error.
         rwlock: std.Thread.RwLock = .{},
+
+        /// The value held by the Future, or `null` if not set.
         value: ?ValueType = null,
+
+        /// The error held by the Future, or `null` if not set.
         err: ?ErrorType = null,
 
         pub const Self = @This();
 
+        /// Sets an error for the Future. If an error is already set, this call has no effect.
         pub fn setError(self: *Self, err: ErrorType) void {
             self.rwlock.lock();
             if (self.err == null) {
@@ -20,6 +34,7 @@ pub fn Future(comptime ValueType: type, comptime ErrorType: type) type {
             self.setDone();
         }
 
+        /// Sets a value for the Future. If a value is already set, this call has no effect.
         pub fn setValue(self: *Self, value: ValueType) void {
             self.rwlock.lock();
             if (self.value == null) {
@@ -30,6 +45,7 @@ pub fn Future(comptime ValueType: type, comptime ErrorType: type) type {
             self.setDone();
         }
 
+        /// Retrieves the error set in the Future, or `null` if no error is set.
         pub fn getErr(self: *Self) ?ErrorType {
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
@@ -37,6 +53,7 @@ pub fn Future(comptime ValueType: type, comptime ErrorType: type) type {
             return self.err;
         }
 
+        /// Retrieves the value set in the Future, or `null` if no value is set.
         pub fn getValue(self: *Self) ?ValueType {
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
@@ -44,14 +61,17 @@ pub fn Future(comptime ValueType: type, comptime ErrorType: type) type {
             return self.value;
         }
 
+        /// Marks the Future as completed by signaling the reset event.
         pub fn setDone(self: *Self) void {
             self.done.set();
         }
 
+        /// Waits for the Future to be completed. This call blocks until the reset event is signaled.
         pub fn wait(self: *Self) void {
             self.done.wait();
         }
 
+        /// Waits for the Future to be completed with a timeout.
         pub fn timedWait(self: *Self, timeout_ns: u64) error{Timeout}!void {
             return self.done.timedWait(timeout_ns);
         }

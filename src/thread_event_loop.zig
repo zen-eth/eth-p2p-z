@@ -9,75 +9,95 @@ const Config = @import("muxer/yamux/Config.zig");
 const session = @import("muxer/yamux/session.zig");
 const xev_tcp = @import("transport/tcp/xev.zig");
 
+/// Represents a message for I/O operations in the event loop.
 pub const IOMessage = struct {
     const Self = @This();
 
+    /// Pointer to the next message in the queue.
     next: ?*Self = null,
 
+    /// The action to be performed, represented as a union of possible operations.
     action: union(enum) {
+        /// Starts a timer for opening a stream.
         run_open_stream_timer: struct {
+            /// The stream associated with the timer.
             stream: *Stream,
+            /// The timeout duration in milliseconds.
             timeout_ms: u64,
+            /// The event loop reference.
             io_loop: ?*ThreadEventLoop = null,
         },
+        /// Starts a timer for closing a stream.
         run_close_stream_timer: struct {
+            /// The stream associated with the timer.
             stream: *Stream,
+            /// The timeout duration in milliseconds.
             timeout_ms: u64,
+            /// The event loop reference.
             io_loop: ?*ThreadEventLoop = null,
         },
+        /// Cancels the timer for closing a stream.
         cancel_close_stream_timer: struct {
+            /// The stream associated with the timer.
             stream: *Stream,
+            /// The event loop reference.
             io_loop: ?*ThreadEventLoop = null,
         },
+        /// Initiates a connection to a specified address.
         connect: struct {
             /// The address to connect to.
             address: std.net.Address,
             /// The channel to connect.
             channel: *xev_tcp.XevSocketChannel,
-            /// The completion for the connection.
+            /// The completion object for the connection.
             future: *Future(void, xev_tcp.Transport.DialError),
-            /// The loop reference.
+            /// The event loop reference.
             io_loop: ?*ThreadEventLoop = null,
             /// The transport reference.
             transport: ?*xev_tcp.XevTransport = null,
         },
+        /// Accepts a connection from a server.
         accept: struct {
-            /// The server to accept from.
+            /// The server to accept the connection from.
             server: xev.TCP,
-            /// The channel to accept.
+            /// The channel to accept the connection on.
             channel: *xev_tcp.XevSocketChannel,
-            /// The completion for the connection.
+            /// The completion object for the connection.
             future: *Future(void, xev_tcp.Listener.AcceptError),
-            /// The loop reference.
+            /// The event loop reference.
             io_loop: ?*ThreadEventLoop = null,
             /// The transport reference.
             transport: ?*xev_tcp.XevTransport = null,
         },
+        /// Writes data to a channel.
         write: struct {
-            /// The buffer to write.
+            /// The buffer containing the data to write.
             buffer: []const u8,
-            /// The channel to write to.
+            /// The channel to write the data to.
             channel: *xev_tcp.XevSocketChannel,
-            /// The completion for the write.
+            /// The completion object for the write operation.
             future: *Future(usize, xev_tcp.Connection.WriteError),
-            /// The loop reference.
+            /// The event loop reference.
             io_loop: ?*ThreadEventLoop = null,
         },
+        /// Reads data from a channel.
         read: struct {
-            /// The channel to read from.
+            /// The channel to read data from.
             channel: *xev_tcp.XevSocketChannel,
-            /// The buffer to read into.
+            /// The buffer to store the read data.
             buffer: []u8,
-            /// The completion for the read.
+            /// The completion object for the read operation.
             future: *Future(usize, xev_tcp.Connection.ReadError),
-            /// The loop reference.
+            /// The event loop reference.
             io_loop: ?*ThreadEventLoop = null,
         },
     },
 };
 
+/// A memory pool for managing `xev.Completion` objects.
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
 
+/// Represents a thread-based event loop for managing asynchronous I/O operations.
 pub const ThreadEventLoop = struct {
     /// The event loop.
     loop: xev.Loop,
@@ -95,11 +115,12 @@ pub const ThreadEventLoop = struct {
     loop_thread: std.Thread,
     /// The allocator.
     allocator: Allocator,
-
+    /// The memory pool for managing completion objects.
     completion_pool: CompletionPool,
 
     const Self = @This();
 
+    /// Initializes the event loop.
     pub fn init(self: *Self, allocator: Allocator) !void {
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
@@ -133,6 +154,7 @@ pub const ThreadEventLoop = struct {
         self.loop_thread = thread;
     }
 
+    /// Deinitializes the event loop, releasing all resources.
     pub fn deinit(self: *Self) void {
         self.loop.deinit();
         self.stop_notifier.deinit();
@@ -144,6 +166,7 @@ pub const ThreadEventLoop = struct {
         self.completion_pool.deinit();
     }
 
+    /// Starts the event loop.
     pub fn start(self: *Self) !void {
         self.stop_notifier.wait(&self.loop, &self.c_stop, ThreadEventLoop, self, &stopCallback);
 
@@ -152,6 +175,7 @@ pub const ThreadEventLoop = struct {
         try self.loop.run(.until_done);
     }
 
+    /// Stops the event loop and joins the thread.
     pub fn close(self: *Self) void {
         self.stop_notifier.notify() catch |err| {
             std.debug.print("Error notifying stop: {}\n", .{err});
@@ -160,6 +184,7 @@ pub const ThreadEventLoop = struct {
         self.loop_thread.join();
     }
 
+    /// Queues a message for processing in the event loop.
     pub fn queueMessage(
         self: *Self,
         message: IOMessage,
@@ -173,6 +198,7 @@ pub const ThreadEventLoop = struct {
         try self.async_notifier.notify();
     }
 
+    /// Callback for handling the stop notifier.
     fn stopCallback(
         _: ?*Self,
         loop: *xev.Loop,
@@ -189,6 +215,7 @@ pub const ThreadEventLoop = struct {
         return .disarm;
     }
 
+    /// Callback for handling the async notifier.
     fn asyncCallback(
         self_: ?*Self,
         loop: *xev.Loop,
@@ -256,6 +283,8 @@ pub const ThreadEventLoop = struct {
         return .rearm;
     }
 
+    /// Callback executed when the open stream timer expires.
+    /// This is used to handle timeouts when establishing a new stream connection.
     fn runOpenStreamTimerCB(
         ud: ?*IOMessage,
         _: *xev.Loop,
@@ -287,6 +316,8 @@ pub const ThreadEventLoop = struct {
         return .disarm;
     }
 
+    /// Callback executed when the close stream timer expires.
+    /// This is used to handle timeouts when closing a stream connection.
     fn runCloseStreamTimerCB(
         ud: ?*IOMessage,
         _: *xev.Loop,
@@ -309,6 +340,8 @@ pub const ThreadEventLoop = struct {
         return .disarm;
     }
 
+    /// Callback executed when a close stream timer is canceled.
+    /// This is used to clean up resources when a timer is canceled before expiry.
     fn cancelCloseStreamTimerCB(
         ud: ?*IOMessage,
         _: *xev.Loop,
@@ -328,6 +361,8 @@ pub const ThreadEventLoop = struct {
         return .disarm;
     }
 
+    /// Callback executed when a connection attempt completes.
+    /// This handles the result of trying to connect to a remote address.
     fn connectCB(
         ud: ?*IOMessage,
         _: *xev.Loop,
@@ -353,6 +388,8 @@ pub const ThreadEventLoop = struct {
         return .disarm;
     }
 
+    /// Callback executed when an accept operation completes.
+    /// This handles incoming connections on a listening socket.
     fn acceptCB(
         ud: ?*IOMessage,
         _: *xev.Loop,
@@ -377,6 +414,8 @@ pub const ThreadEventLoop = struct {
         return .disarm;
     }
 
+    /// Callback executed when a write operation completes.
+    /// This handles the result of writing data to a socket.
     fn writeCB(
         ud: ?*IOMessage,
         _: *xev.Loop,
@@ -401,6 +440,9 @@ pub const ThreadEventLoop = struct {
         return .disarm;
     }
 
+    /// Callback executed when a read operation completes.
+    /// This handles the result of reading data from a socket.
+    /// If EOF or another error is encountered, it initiates a graceful shutdown.
     fn readCB(
         ud: ?*IOMessage,
         loop: *xev.Loop,
@@ -438,6 +480,8 @@ pub const ThreadEventLoop = struct {
         return .disarm;
     }
 
+    /// Callback executed when a socket shutdown operation completes.
+    /// This initiates a full socket close after the shutdown completes.
     fn shutdownCB(
         ud: ?*xev_tcp.XevSocketChannel,
         l: *xev.Loop,
@@ -456,6 +500,8 @@ pub const ThreadEventLoop = struct {
         return .disarm;
     }
 
+    /// Callback executed when a socket close operation completes.
+    /// This is the final step in the socket cleanup process.
     fn closeCB(
         ud: ?*xev_tcp.XevSocketChannel,
         _: *xev.Loop,
