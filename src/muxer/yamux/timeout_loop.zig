@@ -76,7 +76,7 @@ pub const TimeoutLoop = struct {
     }
 };
 
-test "TimeoutManager start_open_stream_timer" {
+test "TimeoutLoop start_open_stream_timer" {
     const allocator = std.testing.allocator;
     var l: IOEventLoop = undefined;
     try l.init(allocator);
@@ -115,7 +115,7 @@ test "TimeoutManager start_open_stream_timer" {
     l.close();
 }
 
-test "TimeoutManager start_open_stream_timer, stream establish completion before timeout" {
+test "TimeoutLoop start_open_stream_timer, stream establish completion before timeout" {
     const allocator = std.testing.allocator;
     var l: IOEventLoop = undefined;
     try l.init(allocator);
@@ -156,7 +156,7 @@ test "TimeoutManager start_open_stream_timer, stream establish completion before
     l.close();
 }
 
-test "TimeoutManager start_close_stream_timer" {
+test "TimeoutLoop start_close_stream_timer" {
     const allocator = std.testing.allocator;
     var l: IOEventLoop = undefined;
     try l.init(allocator);
@@ -201,7 +201,7 @@ test "TimeoutManager start_close_stream_timer" {
     l.close();
 }
 
-test "TimeoutManager cancel_close_stream_timer" {
+test "TimeoutLoop cancel_close_stream_timer" {
     const allocator = std.testing.allocator;
     var l: IOEventLoop = undefined;
     try l.init(allocator);

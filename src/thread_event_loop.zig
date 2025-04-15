@@ -106,7 +106,7 @@ pub const ThreadEventLoop = struct {
     /// The async notifier.
     async_notifier: xev.Async,
     /// The async task queue.
-    timer_queue: *Intrusive(IOMessage),
+    task_queue: *Intrusive(IOMessage),
     /// The completion for stopping the transport.
     c_stop: xev.Completion,
     /// The completion for async I/O operations.
@@ -131,9 +131,9 @@ pub const ThreadEventLoop = struct {
         var async_notifier = try xev.Async.init();
         errdefer async_notifier.deinit();
 
-        var timer_queue = try allocator.create(Intrusive(IOMessage));
-        timer_queue.init();
-        errdefer allocator.destroy(timer_queue);
+        var task_queue = try allocator.create(Intrusive(IOMessage));
+        task_queue.init();
+        errdefer allocator.destroy(task_queue);
 
         var completion_pool = CompletionPool.init(allocator);
         errdefer completion_pool.deinit();
@@ -142,7 +142,7 @@ pub const ThreadEventLoop = struct {
             .loop = loop,
             .stop_notifier = stop_notifier,
             .async_notifier = async_notifier,
-            .timer_queue = timer_queue,
+            .task_queue = task_queue,
             .c_stop = .{},
             .c_async = .{},
             .loop_thread = undefined,
@@ -159,10 +159,10 @@ pub const ThreadEventLoop = struct {
         self.loop.deinit();
         self.stop_notifier.deinit();
         self.async_notifier.deinit();
-        while (self.timer_queue.pop()) |node| {
+        while (self.task_queue.pop()) |node| {
             self.allocator.destroy(node);
         }
-        self.allocator.destroy(self.timer_queue);
+        self.allocator.destroy(self.task_queue);
         self.completion_pool.deinit();
     }
 
@@ -190,10 +190,9 @@ pub const ThreadEventLoop = struct {
         message: IOMessage,
     ) !void {
         const m = try self.allocator.create(IOMessage);
-        errdefer self.allocator.destroy(m);
         m.* = message;
 
-        self.timer_queue.push(m);
+        self.task_queue.push(m);
 
         try self.async_notifier.notify();
     }
@@ -228,7 +227,7 @@ pub const ThreadEventLoop = struct {
         };
         const self = self_.?;
 
-        while (self.timer_queue.pop()) |m| {
+        while (self.task_queue.pop()) |m| {
             switch (m.action) {
                 .run_open_stream_timer => {
                     const timer = xev.Timer.init() catch unreachable;

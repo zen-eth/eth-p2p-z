@@ -21,6 +21,7 @@ pub const Connection = p2p_conn.GenericConn(
 pub const Listener = p2p_transport.GenericListener(
     *XevListener,
     XevListener.AcceptError,
+    *XevSocketChannel,
     XevListener.accept,
 );
 
@@ -28,6 +29,8 @@ pub const Transport = p2p_transport.GenericTransport(
     *XevTransport,
     XevTransport.DialError,
     XevListener.ListenError,
+    *XevListener,
+    *XevSocketChannel,
     XevTransport.dial,
     XevTransport.listen,
 );
@@ -148,7 +151,7 @@ pub const XevListener = struct {
     }
 
     /// Accept accepts a connection from the listener. It blocks until a connection is accepted. If an error occurs, it returns the error.
-    pub fn accept(self: *XevListener, channel: anytype) AcceptError!void {
+    pub fn accept(self: *XevListener, channel: *XevSocketChannel) AcceptError!void {
         const f = try self.transport.allocator.create(Future(void, AcceptError));
         f.* = .{};
         defer self.transport.allocator.destroy(f);
@@ -165,6 +168,10 @@ pub const XevListener = struct {
         if (f.getErr()) |err| {
             return err;
         }
+    }
+
+    pub fn toListener(self: *XevListener) Listener {
+        return .{ .context = self };
     }
 };
 
@@ -199,7 +206,7 @@ pub const XevTransport = struct {
     pub fn deinit(_: *XevTransport) void {}
 
     /// Dial connects to the given address and creates a channel for communication. It blocks until the connection is established. If an error occurs, it returns the error.
-    pub fn dial(self: *XevTransport, addr: std.net.Address, channel: anytype) DialError!void {
+    pub fn dial(self: *XevTransport, addr: std.net.Address, channel: *XevSocketChannel) DialError!void {
         const f = try self.allocator.create(Future(void, DialError));
         f.* = .{};
         defer self.allocator.destroy(f);
@@ -224,7 +231,7 @@ pub const XevTransport = struct {
     }
 
     /// Listen listens for incoming connections on the given address. It blocks until the listener is initialized. If an error occurs, it returns the error.
-    pub fn listen(self: *XevTransport, addr: std.net.Address, listener: anytype) XevListener.ListenError!void {
+    pub fn listen(self: *XevTransport, addr: std.net.Address, listener: *XevListener) XevListener.ListenError!void {
         try listener.init(addr, self.options.backlog, self);
     }
 
@@ -234,6 +241,10 @@ pub const XevTransport = struct {
 
     /// Close closes the transport.
     pub fn close(_: *XevTransport) void {}
+
+    pub fn toTransport(self: *XevTransport) Transport {
+        return .{ .context = self };
+    }
 };
 
 test "dial connection refused" {
