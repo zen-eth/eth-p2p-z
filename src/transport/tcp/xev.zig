@@ -405,3 +405,143 @@ test "echo read and write" {
     client.close();
     server.close();
 }
+
+test "generic transport dial and accept" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    // Server setup
+    var server_loop: io_loop.ThreadEventLoop = undefined;
+    try server_loop.init(allocator);
+    defer {
+        server_loop.close();
+        server_loop.deinit();
+    }
+
+    const opts = XevTransport.Options{
+        .backlog = 128,
+    };
+
+    var xev_server: XevTransport = undefined;
+    try xev_server.init(&server_loop, allocator, opts);
+    defer xev_server.deinit();
+
+    // Get the generic transport interface
+    const server = xev_server.toTransport();
+
+    // Listener setup
+    var xev_listener: XevListener = undefined;
+    const addr = try std.net.Address.parseIp("0.0.0.0", 8083);
+    try server.listen(addr, &xev_listener);
+    const listener = xev_listener.toListener();
+
+    // Accept thread using the generic interfaces
+    const accept_thread = try std.Thread.spawn(.{}, struct {
+        fn run(l: Listener) !void {
+            var accepted_channel: XevSocketChannel = undefined;
+            try l.accept(&accepted_channel);
+            std.debug.print("Server accepted connection\n", .{});
+            try std.testing.expectEqual(accepted_channel.direction, .INBOUND);
+        }
+    }.run, .{listener});
+
+    // Client setup
+    var client_loop: io_loop.ThreadEventLoop = undefined;
+    try client_loop.init(allocator);
+    defer {
+        client_loop.close();
+        client_loop.deinit();
+    }
+
+    var xev_client: XevTransport = undefined;
+    try xev_client.init(&client_loop, allocator, opts);
+    defer xev_client.deinit();
+
+    // Get the generic transport interface
+    const client = xev_client.toTransport();
+
+    // Dialing using the generic interface
+    var channel: XevSocketChannel = undefined;
+    try client.dial(addr, &channel);
+    std.debug.print("Client connected\n", .{});
+    try std.testing.expectEqual(channel.direction, .OUTBOUND);
+
+    accept_thread.join();
+}
+
+test "generic transport echo read and write" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    const opts = XevTransport.Options{
+        .backlog = 128,
+    };
+
+    var sl: io_loop.ThreadEventLoop = undefined;
+    try sl.init(allocator);
+    defer {
+        sl.close();
+        sl.deinit();
+    }
+
+    var server: XevTransport = undefined;
+    try server.init(&sl, allocator, opts);
+    defer server.deinit();
+
+    // Get the generic transport interface
+    const server_transport = server.toTransport();
+
+    var listener: XevListener = undefined;
+    const addr = try std.net.Address.parseIp("0.0.0.0", 8084);
+    try server_transport.listen(addr, &listener);
+
+    const server_listener = listener.toListener();
+
+    const accept_thread = try std.Thread.spawn(.{}, struct {
+        fn run(l: Listener, alloc: Allocator) !void {
+            var accepted_channel: XevSocketChannel = undefined;
+            try l.accept(&accepted_channel);
+            try std.testing.expectEqual(accepted_channel.direction, .INBOUND);
+
+            const accepted_conn = accepted_channel.toConn();
+
+            const buf = try alloc.alloc(u8, 1024);
+            defer alloc.free(buf);
+            const n = try accepted_conn.read(buf);
+            try std.testing.expectStringStartsWith(buf, "buf: []const u8");
+
+            try std.testing.expect(n == 15);
+            _ = try accepted_conn.write(buf[0..n]);
+        }
+    }.run, .{ server_listener, allocator });
+
+    var cl: io_loop.ThreadEventLoop = undefined;
+    try cl.init(allocator);
+    defer {
+        cl.close();
+        cl.deinit();
+    }
+    var client: XevTransport = undefined;
+    try client.init(&cl, allocator, opts);
+    defer client.deinit();
+
+    // Get the generic transport interface
+    const client_transport = client.toTransport();
+
+    var channel1: XevSocketChannel = undefined;
+    try client_transport.dial(addr, &channel1);
+    try std.testing.expectEqual(channel1.direction, .OUTBOUND);
+
+    // Write and read using the generic interface
+    const conn = channel1.toConn();
+    _ = try conn.write("buf: []const u8");
+    const buf = try allocator.alloc(u8, 1024);
+    defer allocator.free(buf);
+    const n = try conn.read(buf);
+    try std.testing.expectStringStartsWith(buf, "buf: []const u8");
+    try std.testing.expect(n == 15);
+
+    accept_thread.join();
+    client.close();
+    server.close();
+}
