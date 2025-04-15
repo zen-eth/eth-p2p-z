@@ -1,6 +1,6 @@
 const std = @import("std");
 const event_loop = @import("../../thread_event_loop.zig");
-const EventLoop = event_loop.ThreadEventLoop;
+const IOEventLoop = event_loop.ThreadEventLoop;
 const IOMessage = event_loop.IOMessage;
 const stream = @import("stream.zig");
 const Stream = stream.Stream;
@@ -9,15 +9,22 @@ const Config = @import("Config.zig");
 const session = @import("session.zig");
 const xev = @import("xev");
 
-pub const TimeoutManager = struct {
-    loop: *EventLoop,
+/// The `TimeoutLoop` is responsible for managing stream-related timeouts
+/// in the context of an I/O event loop. It provides functionality to start
+/// and cancel timers for opening and closing streams.
+pub const TimeoutLoop = struct {
+    /// Reference to the I/O event loop used for managing asynchronous operations.
+    io_event_loop: *IOEventLoop,
 
     const Self = @This();
 
-    pub fn init(self: *Self, loop: *EventLoop) void {
-        self.loop = loop;
+    /// Initializes the `TimeoutLoop` with the given I/O event loop.
+    pub fn init(self: *Self, loop: *IOEventLoop) void {
+        self.io_event_loop = loop;
     }
 
+    /// Starts a timer for opening a stream. If the timer expires before the
+    /// stream is established, the associated session will be closed.
     pub fn start_open_stream_timer(
         self: *Self,
         s: *Stream,
@@ -31,9 +38,11 @@ pub const TimeoutManager = struct {
                 },
             },
         };
-        try self.loop.queueMessage(message);
+        try self.io_event_loop.queueMessage(message);
     }
 
+    /// Starts a timer for closing a stream. If the timer expires before the
+    /// stream is closed, the stream will be forcefully closed.
     pub fn start_close_stream_timer(
         self: *Self,
         s: *Stream,
@@ -47,9 +56,11 @@ pub const TimeoutManager = struct {
                 },
             },
         };
-        try self.loop.queueMessage(message);
+        try self.io_event_loop.queueMessage(message);
     }
 
+    /// Cancels the timer for closing a stream. This prevents the stream from
+    /// being forcefully closed if the timer was still active.
     pub fn cancel_close_stream_timer(
         self: *Self,
         s: *Stream,
@@ -61,13 +72,13 @@ pub const TimeoutManager = struct {
                 },
             },
         };
-        try self.loop.queueMessage(message);
+        try self.io_event_loop.queueMessage(message);
     }
 };
 
 test "TimeoutManager start_open_stream_timer" {
     const allocator = std.testing.allocator;
-    var l: EventLoop = undefined;
+    var l: IOEventLoop = undefined;
     try l.init(allocator);
     defer l.deinit();
 
@@ -93,8 +104,8 @@ test "TimeoutManager start_open_stream_timer" {
     try Stream.init(&test_stream, &test_session, 1, .init, allocator);
     defer test_stream.deinit();
 
-    var tm: TimeoutManager = undefined;
-    TimeoutManager.init(&tm, &l);
+    var tm: TimeoutLoop = undefined;
+    TimeoutLoop.init(&tm, &l);
     try tm.start_open_stream_timer(&test_stream, 100);
 
     std.time.sleep(200 * std.time.ns_per_ms);
@@ -106,7 +117,7 @@ test "TimeoutManager start_open_stream_timer" {
 
 test "TimeoutManager start_open_stream_timer, stream establish completion before timeout" {
     const allocator = std.testing.allocator;
-    var l: EventLoop = undefined;
+    var l: IOEventLoop = undefined;
     try l.init(allocator);
     defer l.deinit();
 
@@ -132,8 +143,8 @@ test "TimeoutManager start_open_stream_timer, stream establish completion before
     try Stream.init(&test_stream, &test_session, 1, .init, allocator);
     defer test_stream.deinit();
 
-    var tm: TimeoutManager = undefined;
-    TimeoutManager.init(&tm, &l);
+    var tm: TimeoutLoop = undefined;
+    TimeoutLoop.init(&tm, &l);
     try tm.start_open_stream_timer(&test_stream, 100);
 
     test_stream.establish_completion.set();
@@ -147,7 +158,7 @@ test "TimeoutManager start_open_stream_timer, stream establish completion before
 
 test "TimeoutManager start_close_stream_timer" {
     const allocator = std.testing.allocator;
-    var l: EventLoop = undefined;
+    var l: IOEventLoop = undefined;
     try l.init(allocator);
     defer l.deinit();
 
@@ -173,8 +184,8 @@ test "TimeoutManager start_close_stream_timer" {
     try Stream.init(&test_stream, &test_session, 1, .init, allocator);
     defer test_stream.deinit();
 
-    var tm: TimeoutManager = undefined;
-    TimeoutManager.init(&tm, &l);
+    var tm: TimeoutLoop = undefined;
+    TimeoutLoop.init(&tm, &l);
     var close_timer = try xev.Timer.init();
     test_stream.close_timer = &close_timer;
     const c_close_timer = try test_stream.allocator.create(xev.Completion);
@@ -192,7 +203,7 @@ test "TimeoutManager start_close_stream_timer" {
 
 test "TimeoutManager cancel_close_stream_timer" {
     const allocator = std.testing.allocator;
-    var l: EventLoop = undefined;
+    var l: IOEventLoop = undefined;
     try l.init(allocator);
     defer l.deinit();
 
@@ -218,8 +229,8 @@ test "TimeoutManager cancel_close_stream_timer" {
     try Stream.init(&test_stream, &test_session, 1, .init, allocator);
     defer test_stream.deinit();
 
-    var tm: TimeoutManager = undefined;
-    TimeoutManager.init(&tm, &l);
+    var tm: TimeoutLoop = undefined;
+    TimeoutLoop.init(&tm, &l);
     var close_timer = try xev.Timer.init();
     test_stream.close_timer = &close_timer;
     const c_close_timer = try test_stream.allocator.create(xev.Completion);
