@@ -50,7 +50,7 @@ pub const IOMessage = struct {
             /// The channel to connect.
             channel: *xev_tcp.XevSocketChannel,
             /// The completion object for the connection.
-            future: *Future(void, xev_tcp.Transport.DialError),
+            future: *Future(void, xev_tcp.XevTransport.DialError),
             /// The event loop reference.
             io_loop: ?*ThreadEventLoop = null,
             /// The transport reference.
@@ -63,7 +63,7 @@ pub const IOMessage = struct {
             /// The channel to accept the connection on.
             channel: *xev_tcp.XevSocketChannel,
             /// The completion object for the connection.
-            future: *Future(void, xev_tcp.Listener.AcceptError),
+            future: *Future(void, xev_tcp.XevListener.AcceptError),
             /// The event loop reference.
             io_loop: ?*ThreadEventLoop = null,
             /// The transport reference.
@@ -76,7 +76,7 @@ pub const IOMessage = struct {
             /// The channel to write the data to.
             channel: *xev_tcp.XevSocketChannel,
             /// The completion object for the write operation.
-            future: *Future(usize, xev_tcp.Connection.WriteError),
+            future: *Future(usize, xev_tcp.XevSocketChannel.WriteError),
             /// The event loop reference.
             io_loop: ?*ThreadEventLoop = null,
         },
@@ -87,7 +87,7 @@ pub const IOMessage = struct {
             /// The buffer to store the read data.
             buffer: []u8,
             /// The completion object for the read operation.
-            future: *Future(usize, xev_tcp.Connection.ReadError),
+            future: *Future(usize, xev_tcp.XevSocketChannel.ReadError),
             /// The event loop reference.
             io_loop: ?*ThreadEventLoop = null,
         },

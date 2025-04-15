@@ -122,12 +122,8 @@ pub const XevSocketChannel = struct {
 /// Listener listens for incoming connections. It is used to accept connections.
 pub const XevListener = struct {
     pub const AcceptError = Allocator.Error || xev.AcceptError || error{AsyncNotifyFailed};
-
-    pub const ListenError = error{
-        BindFailed,
-        ListenFailed,
-        InitTCPFailed,
-    };
+    /// The error type returned by the `init` function. Want to remain the underlying error type, so we used `anyerror`.
+    pub const ListenError = anyerror;
     /// The address to listen on.
     address: std.net.Address,
     /// The server to accept connections from.
@@ -137,18 +133,9 @@ pub const XevListener = struct {
 
     /// Initialize the listener with the given address, backlog, and transport.
     pub fn init(self: *XevListener, address: std.net.Address, backlog: u31, transport: *XevTransport) ListenError!void {
-        const server = TCP.init(address) catch |err| {
-            std.debug.print("Error initializing TCP: {}\n", .{err});
-            return ListenError.InitTCPFailed;
-        };
-        server.bind(address) catch |err| {
-            std.debug.print("Error binding to address: {}\n", .{err});
-            return ListenError.BindFailed;
-        };
-        server.listen(backlog) catch |err| {
-            std.debug.print("Error listening on address: {}\n", .{err});
-            return ListenError.ListenFailed;
-        };
+        const server = try TCP.init(address);
+        try server.bind(address);
+        try server.listen(backlog);
 
         self.address = address;
         self.server = server;
