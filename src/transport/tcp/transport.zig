@@ -1,13 +1,15 @@
 const std = @import("std");
-const xev_provider = @import("xev.zig");
+const xev_tcp = @import("xev.zig");
 const conn = @import("../../conn.zig");
 
 pub const Transport = union(enum) {
-    xev: xev_provider.Transport,
+    xev: xev_tcp.Transport,
 
-    pub const OpenConnectError = xev_provider.OpenConnectError;
+    pub const DialError = xev_tcp.Transport.DialError || error{};
 
-    pub fn dial(self: *Transport, addr: std.net.Address, connection: anytype) OpenConnectError!void {
-        return self.xev.dial(addr, connection);
+    pub fn dial(self: *Transport, addr: std.net.Address, connection: anytype) DialError!void {
+        switch (self.*) {
+            .xev => |*x| return x.dial(addr, connection),
+        }
     }
 };
