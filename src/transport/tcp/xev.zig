@@ -7,7 +7,7 @@ const ResetEvent = std.Thread.ResetEvent;
 const p2p_conn = @import("../../conn.zig");
 const p2p_transport = @import("../../transport.zig");
 const io_loop = @import("../../thread_event_loop.zig");
-const Completion = @import("../../concurrent/lib.zig").Completion1;
+const Future = @import("../../concurrent/lib.zig").Future;
 
 pub const Connection = p2p_conn.GenericConn(
     *XevSocketChannel,
@@ -59,14 +59,14 @@ pub const XevSocketChannel = struct {
 
     /// Write sends the buffer to the other end of the channel. It blocks until the write is complete. If an error occurs, it returns the error.
     pub fn write(self: *XevSocketChannel, buf: []const u8) WriteError!usize {
-        const c = try self.transport.allocator.create(Completion(usize, WriteError));
-        c.* = .{};
-        defer self.transport.allocator.destroy(c);
+        const f = try self.transport.allocator.create(Future(usize, WriteError));
+        f.* = .{};
+        defer self.transport.allocator.destroy(f);
         const message = io_loop.IOMessage{
             .action = .{ .write = .{
                 .channel = self,
                 .buffer = buf,
-                .completion = c,
+                .future = f,
             } },
         };
 
@@ -75,24 +75,24 @@ pub const XevSocketChannel = struct {
             return error.AsyncNotifyFailed;
         };
 
-        c.wait();
-        if (c.getErr()) |err| {
+        f.wait();
+        if (f.getErr()) |err| {
             return err;
         }
 
-        return c.getValue().?;
+        return f.getValue().?;
     }
 
     /// Read reads from the channel into the buffer. It blocks until the read is complete. If an error occurs, it returns the error.
     pub fn read(self: *XevSocketChannel, buf: []u8) ReadError!usize {
-        const c = try self.transport.allocator.create(Completion(usize, ReadError));
-        c.* = .{};
-        defer self.transport.allocator.destroy(c);
+        const f = try self.transport.allocator.create(Future(usize, ReadError));
+        f.* = .{};
+        defer self.transport.allocator.destroy(f);
         const message = io_loop.IOMessage{
             .action = .{ .read = .{
                 .channel = self,
                 .buffer = buf,
-                .completion = c,
+                .future = f,
             } },
         };
 
@@ -101,12 +101,12 @@ pub const XevSocketChannel = struct {
             return error.AsyncNotifyFailed;
         };
 
-        c.wait();
-        if (c.getErr()) |err| {
+        f.wait();
+        if (f.getErr()) |err| {
             return err;
         }
 
-        return c.getValue().?;
+        return f.getValue().?;
     }
 
     /// Close closes the channel. It blocks until the close is complete.
@@ -162,11 +162,11 @@ pub const XevListener = struct {
 
     /// Accept accepts a connection from the listener. It blocks until a connection is accepted. If an error occurs, it returns the error.
     pub fn accept(self: *XevListener, channel: anytype) AcceptError!void {
-        const c = try self.transport.allocator.create(Completion(void, AcceptError));
-        c.* = .{};
-        defer self.transport.allocator.destroy(c);
+        const f = try self.transport.allocator.create(Future(void, AcceptError));
+        f.* = .{};
+        defer self.transport.allocator.destroy(f);
         const message = io_loop.IOMessage{
-            .action = .{ .accept = .{ .channel = channel, .server = self.server, .completion = c, .transport = self.transport } },
+            .action = .{ .accept = .{ .channel = channel, .server = self.server, .future = f, .transport = self.transport } },
         };
 
         self.transport.io_event_loop.queueMessage(message) catch |err| {
@@ -174,8 +174,8 @@ pub const XevListener = struct {
             return error.AsyncNotifyFailed;
         };
 
-        c.wait();
-        if (c.getErr()) |err| {
+        f.wait();
+        if (f.getErr()) |err| {
             return err;
         }
     }
@@ -213,15 +213,15 @@ pub const XevTransport = struct {
 
     /// Dial connects to the given address and creates a channel for communication. It blocks until the connection is established. If an error occurs, it returns the error.
     pub fn dial(self: *XevTransport, addr: std.net.Address, channel: anytype) DialError!void {
-        const c = try self.allocator.create(Completion(void, DialError));
-        c.* = .{};
-        defer self.allocator.destroy(c);
+        const f = try self.allocator.create(Future(void, DialError));
+        f.* = .{};
+        defer self.allocator.destroy(f);
         const message = io_loop.IOMessage{
             .action = .{ .connect = .{
                 .address = addr,
                 .channel = channel,
                 .transport = self,
-                .completion = c,
+                .future = f,
             } },
         };
 
@@ -230,8 +230,8 @@ pub const XevTransport = struct {
             return error.AsyncNotifyFailed;
         };
 
-        c.wait();
-        if (c.getErr()) |err| {
+        f.wait();
+        if (f.getErr()) |err| {
             return err;
         }
     }

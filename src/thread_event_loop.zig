@@ -2,9 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const xev = @import("xev");
 const Intrusive = @import("concurrent/mpsc_queue.zig").Intrusive;
-const completion = @import("concurrent/completion.zig");
-const Completion = completion.Completion;
-const Completion1 = completion.Completion1;
+const Future = @import("concurrent/future.zig").Future;
 const Stream = @import("muxer/yamux/stream.zig").Stream;
 const conn = @import("conn.zig");
 const Config = @import("muxer/yamux/Config.zig");
@@ -20,16 +18,16 @@ pub const IOMessage = struct {
         run_open_stream_timer: struct {
             stream: *Stream,
             timeout_ms: u64,
-            l: ?*ThreadEventLoop = null,
+            io_loop: ?*ThreadEventLoop = null,
         },
         run_close_stream_timer: struct {
             stream: *Stream,
             timeout_ms: u64,
-            l: ?*ThreadEventLoop = null,
+            io_loop: ?*ThreadEventLoop = null,
         },
         cancel_close_stream_timer: struct {
             stream: *Stream,
-            l: ?*ThreadEventLoop = null,
+            io_loop: ?*ThreadEventLoop = null,
         },
         connect: struct {
             /// The address to connect to.
@@ -37,9 +35,9 @@ pub const IOMessage = struct {
             /// The channel to connect.
             channel: *xev_tcp.XevSocketChannel,
             /// The completion for the connection.
-            completion: *Completion1(void, xev_tcp.Transport.DialError),
+            future: *Future(void, xev_tcp.Transport.DialError),
             /// The loop reference.
-            l: ?*ThreadEventLoop = null,
+            io_loop: ?*ThreadEventLoop = null,
             /// The transport reference.
             transport: ?*xev_tcp.XevTransport = null,
         },
@@ -49,9 +47,9 @@ pub const IOMessage = struct {
             /// The channel to accept.
             channel: *xev_tcp.XevSocketChannel,
             /// The completion for the connection.
-            completion: *Completion1(void, xev_tcp.Listener.AcceptError),
+            future: *Future(void, xev_tcp.Listener.AcceptError),
             /// The loop reference.
-            l: ?*ThreadEventLoop = null,
+            io_loop: ?*ThreadEventLoop = null,
             /// The transport reference.
             transport: ?*xev_tcp.XevTransport = null,
         },
@@ -61,9 +59,9 @@ pub const IOMessage = struct {
             /// The channel to write to.
             channel: *xev_tcp.XevSocketChannel,
             /// The completion for the write.
-            completion: *Completion1(usize, xev_tcp.Connection.WriteError),
+            future: *Future(usize, xev_tcp.Connection.WriteError),
             /// The loop reference.
-            l: ?*ThreadEventLoop = null,
+            io_loop: ?*ThreadEventLoop = null,
         },
         read: struct {
             /// The channel to read from.
@@ -71,9 +69,9 @@ pub const IOMessage = struct {
             /// The buffer to read into.
             buffer: []u8,
             /// The completion for the read.
-            completion: *Completion1(usize, xev_tcp.Connection.ReadError),
+            future: *Future(usize, xev_tcp.Connection.ReadError),
             /// The loop reference.
-            l: ?*ThreadEventLoop = null,
+            io_loop: ?*ThreadEventLoop = null,
         },
     },
 };
@@ -208,13 +206,13 @@ pub const ThreadEventLoop = struct {
                 .run_open_stream_timer => {
                     const timer = xev.Timer.init() catch unreachable;
                     const c_timer = self.completion_pool.create() catch unreachable;
-                    m.action.run_open_stream_timer.l = self;
+                    m.action.run_open_stream_timer.io_loop = self;
                     timer.run(loop, c_timer, m.action.run_open_stream_timer.timeout_ms, IOMessage, m, runOpenStreamTimerCB);
                 },
                 .run_close_stream_timer => {
                     const timer = m.action.run_close_stream_timer.stream.close_timer.?;
                     const c_timer = m.action.run_close_stream_timer.stream.c_close_timer.?;
-                    m.action.run_close_stream_timer.l = self;
+                    m.action.run_close_stream_timer.io_loop = self;
                     timer.run(loop, c_timer, m.action.run_close_stream_timer.timeout_ms, IOMessage, m, runCloseStreamTimerCB);
                 },
                 .cancel_close_stream_timer => {
@@ -222,34 +220,34 @@ pub const ThreadEventLoop = struct {
                     const c_timer = m.action.cancel_close_stream_timer.stream.c_close_timer.?;
                     const c_cancel_timer = self.completion_pool.create() catch unreachable;
                     c_cancel_timer.* = .{};
-                    m.action.cancel_close_stream_timer.l = self;
+                    m.action.cancel_close_stream_timer.io_loop = self;
                     timer.cancel(loop, c_timer, c_cancel_timer, IOMessage, m, cancelCloseStreamTimerCB);
                 },
                 .connect => {
                     const address = m.action.connect.address;
                     var socket = xev.TCP.init(address) catch unreachable;
                     const c = self.completion_pool.create() catch unreachable;
-                    m.action.connect.l = self;
+                    m.action.connect.io_loop = self;
                     socket.connect(loop, c, address, IOMessage, m, connectCB);
                 },
                 .accept => {
                     const server = m.action.accept.server;
                     const c = self.completion_pool.create() catch unreachable;
-                    m.action.accept.l = self;
+                    m.action.accept.io_loop = self;
                     server.accept(loop, c, IOMessage, m, acceptCB);
                 },
                 .write => {
                     const c = self.completion_pool.create() catch unreachable;
                     const channel = m.action.write.channel;
                     const buffer = m.action.write.buffer;
-                    m.action.write.l = self;
+                    m.action.write.io_loop = self;
                     channel.socket.write(loop, c, .{ .slice = buffer }, IOMessage, m, writeCB);
                 },
                 .read => {
                     const channel = m.action.read.channel;
                     const buffer = m.action.read.buffer;
                     const c = self.completion_pool.create() catch unreachable;
-                    m.action.read.l = self;
+                    m.action.read.io_loop = self;
                     channel.socket.read(loop, c, .{ .slice = buffer }, IOMessage, m, readCB);
                 },
             }
@@ -266,8 +264,8 @@ pub const ThreadEventLoop = struct {
     ) xev.CallbackAction {
         const n = ud.?;
         const action = n.action.run_open_stream_timer;
-        defer action.l.?.completion_pool.destroy(c);
-        defer action.l.?.allocator.destroy(n);
+        defer action.io_loop.?.completion_pool.destroy(c);
+        defer action.io_loop.?.allocator.destroy(n);
 
         tr catch |err| {
             if (err != xev.Timer.RunError.Canceled) {
@@ -297,7 +295,7 @@ pub const ThreadEventLoop = struct {
     ) xev.CallbackAction {
         const n = ud.?;
         const action = n.action.run_close_stream_timer;
-        defer action.l.?.allocator.destroy(n);
+        defer action.io_loop.?.allocator.destroy(n);
 
         tr catch |err| {
             if (err != xev.Timer.RunError.Canceled) {
@@ -319,8 +317,8 @@ pub const ThreadEventLoop = struct {
     ) xev.CallbackAction {
         const n = ud.?;
         const action = n.action.cancel_close_stream_timer;
-        defer action.l.?.completion_pool.destroy(c);
-        defer action.l.?.allocator.destroy(n);
+        defer action.io_loop.?.completion_pool.destroy(c);
+        defer action.io_loop.?.allocator.destroy(n);
 
         tr catch |err| {
             std.debug.print("Error in timer callback: {}\n", .{err});
@@ -339,18 +337,18 @@ pub const ThreadEventLoop = struct {
     ) xev.CallbackAction {
         const n = ud.?;
         const action = n.action.connect;
-        defer action.l.?.completion_pool.destroy(c);
-        defer action.l.?.allocator.destroy(n);
+        defer action.io_loop.?.completion_pool.destroy(c);
+        defer action.io_loop.?.allocator.destroy(n);
 
         _ = r catch |err| {
             std.debug.print("Error connecting: {}\n", .{err});
-            action.completion.setError(err);
+            action.future.setError(err);
 
             return .disarm;
         };
 
         action.channel.init(socket, action.transport.?, .OUTBOUND);
-        action.completion.setDone();
+        action.future.setDone();
 
         return .disarm;
     }
@@ -363,18 +361,18 @@ pub const ThreadEventLoop = struct {
     ) xev.CallbackAction {
         const n = ud.?;
         const action = n.action.accept;
-        defer action.l.?.completion_pool.destroy(c);
-        defer action.l.?.allocator.destroy(n);
+        defer action.io_loop.?.completion_pool.destroy(c);
+        defer action.io_loop.?.allocator.destroy(n);
 
         const socket = r catch |err| {
             std.debug.print("Error accepting: {}\n", .{err});
-            action.completion.setError(err);
+            action.future.setError(err);
 
             return .disarm;
         };
 
         action.channel.init(socket, action.transport.?, .INBOUND);
-        action.completion.setDone();
+        action.future.setDone();
 
         return .disarm;
     }
@@ -389,16 +387,16 @@ pub const ThreadEventLoop = struct {
     ) xev.CallbackAction {
         const n = ud.?;
         const action = n.action.write;
-        defer action.l.?.completion_pool.destroy(c);
-        defer action.l.?.allocator.destroy(n);
+        defer action.io_loop.?.completion_pool.destroy(c);
+        defer action.io_loop.?.allocator.destroy(n);
 
         const written = r catch |err| {
             std.debug.print("Error writing: {}\n", .{err});
-            action.completion.setError(err);
+            action.future.setError(err);
             return .disarm;
         };
 
-        action.completion.setValue(written);
+        action.future.setValue(written);
 
         return .disarm;
     }
@@ -413,14 +411,14 @@ pub const ThreadEventLoop = struct {
     ) xev.CallbackAction {
         const n = ud.?;
         const action = n.action.read;
-        defer action.l.?.completion_pool.destroy(c);
-        defer action.l.?.allocator.destroy(n);
+        defer action.io_loop.?.completion_pool.destroy(c);
+        defer action.io_loop.?.allocator.destroy(n);
 
         const read = r catch |err| switch (err) {
             error.EOF => {
                 const c_eof_error = action.channel.transport.allocator.create(xev.Completion) catch unreachable;
                 socket.shutdown(loop, c_eof_error, xev_tcp.XevSocketChannel, action.channel, shutdownCB);
-                action.completion.setError(err);
+                action.future.setError(err);
 
                 return .disarm;
             },
@@ -429,13 +427,13 @@ pub const ThreadEventLoop = struct {
                 const c_error = action.channel.transport.allocator.create(xev.Completion) catch unreachable;
                 socket.shutdown(loop, c_error, xev_tcp.XevSocketChannel, action.channel, shutdownCB);
                 std.log.warn("server read unexpected err={}", .{err});
-                action.completion.setError(err);
+                action.future.setError(err);
 
                 return .disarm;
             },
         };
 
-        action.completion.setValue(read);
+        action.future.setValue(read);
 
         return .disarm;
     }
