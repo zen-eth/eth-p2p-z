@@ -266,6 +266,10 @@ pub const Stream = struct {
         };
     }
 
+    pub fn incrSendWindow(_: *Stream, _: frame.Header, _: u16) Error!void {}
+
+    pub fn readData(_: *Stream, _: frame.Header, _: u16, _: anytype) Error!void {}
+
     /// Determines any flags that are appropriate based on the current stream state.
     /// Must be called with state_mutex held.
     fn sendFlags(self: *Stream) u16 {

@@ -92,14 +92,14 @@ pub const Session = struct {
     buf_read: std.io.AnyReader,
 
     // pings is used to track inflight pings
-    pings: std.AutoHashMap(u32, *std.Thread.ResetEvent),
+    pings: std.AutoHashMap(u32, std.Thread.ResetEvent),
     ping_id: u32 = 0,
     ping_mutex: std.Thread.Mutex = .{},
 
     // streams maps a stream id to a stream, and inflight has an entry
     // for any outgoing stream that has not yet been established.
     // Both are protected by stream_mutex.
-    streams: std.AutoHashMap(u32, *Stream),
+    streams: std.AutoHashMap(u32, Stream),
     inflight: std.AutoHashMap(u32, void),
     stream_mutex: std.Thread.Mutex = .{},
 
@@ -141,6 +141,10 @@ pub const Session = struct {
 
     shutdown_completion: std.Thread.ResetEvent = .{},
 
+    shutdown_err: ?Error = null,
+
+    shutdown_err_mutex: std.Thread.Mutex = .{},
+
     allocator: Allocator,
 
     scheduler: *ThreadPool,
@@ -153,8 +157,8 @@ pub const Session = struct {
             .allocator = allocator,
             .accept_queue = try BlockingQueue(*Stream).create(allocator, config.accept_backlog),
             .send_queue = .{},
-            .pings = std.AutoHashMap(u32, *std.Thread.ResetEvent).init(allocator),
-            .streams = std.AutoHashMap(u32, *Stream).init(allocator),
+            .pings = std.AutoHashMap(u32, std.Thread.ResetEvent).init(allocator),
+            .streams = std.AutoHashMap(u32, Stream).init(allocator),
             .inflight = std.AutoHashMap(u32, void).init(allocator),
             .scheduler = scheduler,
         };
@@ -292,7 +296,7 @@ pub const Session = struct {
         return self.streams.count();
     }
 
-    pub fn openStream(self: *Session) !*Stream {
+    pub fn openStream(self: *Session) !Stream {
         if (self.isClosed()) {
             return Error.SessionShutdown;
         }
@@ -309,8 +313,8 @@ pub const Session = struct {
 
         const id = try self.getNextStreamId();
 
-        const stream = try self.allocator.create(Stream);
-        try Stream.init(stream, self, id, .init, self.allocator);
+        var stream: Stream = undefined;
+        try Stream.init(&stream, self, id, .init, self.allocator);
         errdefer stream.deinit();
 
         self.stream_mutex.lock();
@@ -334,13 +338,13 @@ pub const Session = struct {
         return stream;
     }
 
-    fn setOpenTimeoutInThread(self: *Session, stream: *Stream) void {
+    fn setOpenTimeoutInThread(self: *Session, stream: Stream) void {
         self.setOpenTimeout(stream) catch |err| {
             std.debug.print("setOpenTimeout error: {}\n", .{err});
         };
     }
 
-    fn setOpenTimeout(self: *Session, _: *Stream) !void {
+    fn setOpenTimeout(self: *Session, _: Stream) !void {
         const start_time = std.time.nanoTimestamp();
         const timeout_ns = self.config.stream_open_timeout;
 
@@ -382,6 +386,37 @@ pub const Session = struct {
         self.send_queue_sync.mutex.unlock();
     }
 
+    fn recv(self: *Session) void {
+        self.recvLoop() catch |err| {
+            self.setExitErr(err);
+        };
+    }
+
+    fn recvLoop(self: *Session) !void {
+        defer self.recv_done.cond.broadcast();
+        const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
+        while (true) {
+            try self.buf_read.readNoEof(hdr);
+
+            const header = try frame.Header.decode(hdr);
+            if (header.version != frame.PROTOCOL_VERSION) {
+                return frame.Error.InvalidProtocolVersion;
+            }
+
+            const msg_type = header.frame_type;
+            if (msg_type < .DATA or msg_type > .GO_AWAY) {
+                return frame.Error.InvalidFrameType;
+            }
+
+            switch (hdr.frame_type) {
+                .DATA => self.handleStreamMessage(hdr),
+                .PING => self.handlePing(hdr),
+                .WINDOW_UPDATE => self.handleStreamMessage(hdr),
+                .GO_AWAY => self.handleGoAway(hdr),
+            }
+        }
+    }
+
     fn handleStreamMessage(self: *Session, hdr: frame.Header) Error!void {
         const stream_id = hdr.stream_id;
         const flags = hdr.flags;
@@ -389,7 +424,6 @@ pub const Session = struct {
         if (flags & frame.FrameFlags.SYN == frame.FrameFlags.SYN) {
             // Handle SYN
             try self.createInboundStream(stream_id);
-            return;
         }
 
         self.stream_mutex.lock();
@@ -398,17 +432,45 @@ pub const Session = struct {
 
         if (stream == null) {
             if (hdr.frame_type == frame.FrameType.DATA and hdr.length > 0) {
-                std.debug.print("discarding data for stream {} with length {}\n", .{ stream_id, hdr.length });
+                std.log.warn("discarding data for stream {} with length {}\n", .{ stream_id, hdr.length });
                 self.buf_read.skipBytes(hdr.length, .{}) catch |err| {
-                    std.debug.print("error skipping bytes: {}\n", .{err});
+                    std.log.err("error skipping bytes: {}\n", .{err});
                     return;
                 };
             } else {
-                std.debug.print("frame for missing stream {}\n", .{hdr});
+                std.log.err("frame for missing stream {}\n", .{hdr});
             }
 
             return;
         }
+
+        if (hdr.frame_type == .WINDOW_UPDATE) {
+            stream.?.incrSendWindow(hdr, flags) catch |err| {
+                std.log.err("handleStreamMessage: incrSendWindow error: {}\n", .{err});
+                const goaway_hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
+                defer self.allocator.free(goaway_hdr);
+                self.goAway(@intFromEnum(frame.GoAwayCode.PROTOCOL_ERROR), hdr) catch |goaway_err| {
+                    std.log.err("createInboundStream: goAway error: {}\n", .{goaway_err});
+                };
+                self.send(goaway_hdr, null) catch |send_err| {
+                    std.log.err("createInboundStream: send error: {}\n", .{send_err});
+                };
+                return err;
+            };
+        }
+
+        stream.?.readData(hdr, flags, self.buf_read) catch |err| {
+            std.log.err("handleStreamMessage: readData error: {}\n", .{err});
+            const goaway_hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
+            defer self.allocator.free(goaway_hdr);
+            self.goAway(@intFromEnum(frame.GoAwayCode.PROTOCOL_ERROR), hdr) catch |goaway_err| {
+                std.log.err("createInboundStream: goAway error: {}\n", .{goaway_err});
+            };
+            self.send(goaway_hdr, null) catch |send_err| {
+                std.log.err("createInboundStream: send error: {}\n", .{send_err});
+            };
+            return err;
+        };
     }
 
     fn handlePing(self: *Session, hdr: frame.Header) Error!void {
@@ -418,15 +480,18 @@ pub const Session = struct {
         if (flags & frame.FrameFlags.SYN == frame.FrameFlags.SYN) {
             const syn_hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
             defer self.allocator.free(syn_hdr);
-            try frame.Header.init(frame.FrameType.PING, frame.FrameFlags.ACK, 0, ping_id).encode(syn_hdr);
-            try self.send(syn_hdr, null);
+            frame.Header.init(frame.FrameType.PING, frame.FrameFlags.ACK, 0, ping_id).encode(syn_hdr) catch |err| {
+                std.log.err("handlePing: encode error: {}\n", .{err});
+            };
+            self.send(syn_hdr, null) catch |err| {
+                std.log.err("handlePing: send error: {}\n", .{err});
+            };
             return;
         }
 
         self.ping_mutex.lock();
         if (self.pings.get(ping_id)) |ping_notification| {
             ping_notification.set();
-            // TODO: Check how we can free this
             self.pings.remove(ping_id);
         }
         self.ping_mutex.unlock();
@@ -442,7 +507,7 @@ pub const Session = struct {
         }
     }
 
-    fn createInboundStream(self: *Session, id: u32) !void {
+    fn createInboundStream(self: *Session, id: u32) Error!void {
         // Reject immediately if we are doing a go away
         if (self.local_go_away.load(.acquire) == 1) {
             const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
@@ -451,8 +516,8 @@ pub const Session = struct {
             return self.send(hdr, null);
         }
 
-        const stream = try self.allocator.create(Stream);
-        try Stream.init(stream, self, id, .syn_received, self.allocator);
+        const stream: Stream = undefined;
+        try Stream.init(&stream, self, id, .syn_received, self.allocator);
         errdefer stream.deinit();
 
         self.stream_mutex.lock();
@@ -460,30 +525,30 @@ pub const Session = struct {
 
         // Check if the stream is already established
         if (self.streams.contains(id)) {
-            std.debug.print("createInboundStream: stream already exists\n", .{});
+            std.log.err("createInboundStream: stream already exists\n", .{});
             const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
             defer self.allocator.free(hdr);
             self.goAway(@intFromEnum(frame.GoAwayCode.PROTOCOL_ERROR), hdr) catch |err| {
-                std.debug.print("createInboundStream: goAway error: {}\n", .{err});
+                std.log.err("createInboundStream: goAway error: {}\n", .{err});
             };
             self.send(hdr, null) catch |err| {
-                std.debug.print("createInboundStream: send error: {}\n", .{err});
+                std.log.err("createInboundStream: send error: {}\n", .{err});
             };
             return Error.DuplicateStream;
         }
 
         try self.streams.put(id, stream);
 
-        if (self.accept_queue.push(stream, .{ .instant = {} }) == 0) {
-            std.debug.print("createInboundStream: accept_queue push failed since queue is full\n", .{});
+        if (self.accept_queue.push(self.streams.getPtr(id).?, .{ .instant = {} }) == 0) {
+            std.log.err("ccreateInboundStream: accept_queue push failed since queue is full\n", .{});
             _ = self.streams.remove(id);
             const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
             defer self.allocator.free(hdr);
             frame.Header.init(frame.FrameType.WINDOW_UPDATE, frame.FrameFlags.RST, id, 0).encode(hdr) catch |err| {
-                std.debug.print("createInboundStream: encode error: {}\n", .{err});
+                std.log.err("createInboundStream: encode error: {}\n", .{err});
             };
             self.send(hdr, null) catch |err| {
-                std.debug.print("createInboundStream: send error: {}\n", .{err});
+                std.log.err("createInboundStream: send error: {}\n", .{err});
             };
         }
     }
@@ -503,7 +568,7 @@ pub const Session = struct {
         if (self.inflight.contains(id)) {
             _ = self.inflight.remove(id);
         } else {
-            std.debug.print("establishStream: stream not found\n", .{});
+            std.log.err("establishStream: stream not found in inflight\n", .{});
         }
         self.syn_semaphore.post();
         self.stream_mutex.unlock();
@@ -524,9 +589,18 @@ pub const Session = struct {
         return Error.SessionShutdown;
     }
 
-    fn goAway(self: *Session, reason: u32, hdr: []u8) !void {
+    fn goAway(self: *Session, reason: u32, hdr: []u8) Error!void {
         _ = self.local_go_away.swap(1, .acq_rel);
         try frame.Header.init(frame.FrameType.GO_AWAY, 0, 0, reason).encode(hdr);
+    }
+
+    fn setExitErr(self: *Session, err: Error) void {
+        self.shutdown_err_mutex.lock();
+        if (self.shutdown_err == null) {
+            self.shutdown_err = err;
+        }
+        self.shutdown_err_mutex.unlock();
+        self.close();
     }
 
     fn waitEnqueue(self: *Session, send_ready: *SendReady, timeout_ns: u64) Error!void {
