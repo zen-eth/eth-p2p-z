@@ -9,7 +9,7 @@ const testing = std.testing;
 const ThreadPool = std.Thread.Pool;
 const BlockingQueue = @import("../../concurrent/blocking_queue.zig").BlockingQueue;
 
-pub const Error = error{ SessionShutdown, ConnectionWriteTimeout, OutOfMemory, RemoteGoAway, StreamsExhausted, DuplicateStream, GoAwayProtocolError, GoAwayInternalError, UnexpectedGoAwayError } || frame.Error;
+pub const Error = error{ KeepAliveTimeout, SessionShutdown, ConnectionWriteTimeout, OutOfMemory, RemoteGoAway, StreamsExhausted, DuplicateStream, GoAwayProtocolError, GoAwayInternalError, UnexpectedGoAwayError } || frame.Error;
 pub const SendQueue = std.SinglyLinkedList(*SendReady);
 
 const SentCompletion = struct {
@@ -140,6 +140,8 @@ pub const Session = struct {
     } = .{},
 
     shutdown_completion: std.Thread.ResetEvent = .{},
+
+    shutdown_mutex: std.Thread.Mutex = .{},
 
     shutdown_err: ?Error = null,
 
@@ -379,11 +381,82 @@ pub const Session = struct {
     }
 
     pub fn close(self: *Session) void {
+        self.shutdown_mutex.lock();
+        defer self.shutdown_mutex.unlock();
+
+        self.shutdown_err_mutex.lock();
+        if (self.shutdown_err == null) {
+            self.shutdown_err = Error.SessionShutdown;
+        }
+        self.shutdown_err_mutex.unlock();
+
         self.shutdown_completion.set();
+
+        self.conn.close() catch |err| {
+            std.log.err("close: conn close error: {}\n", .{err});
+        };
+        self.recv_done.cond.broadcast();
+
+        self.stream_mutex.lock();
+        var iter = self.streams.valueIterator();
+        while (iter.next()) |stream| {
+            stream.forceClose();
+        }
+        self.stream_mutex.unlock();
+        self.send_done.cond.broadcast();
+
         self.send_queue_sync.mutex.lock();
         self.send_queue_sync.not_empty_cond.broadcast();
         self.send_queue_sync.not_full_cond.broadcast();
         self.send_queue_sync.mutex.unlock();
+    }
+
+    pub fn ping(self: *Session) !u64 {
+        var ping_notification: std.Thread.ResetEvent = .{};
+        self.ping_mutex.lock();
+        const ping_id = self.ping_id;
+        self.ping_id += 1;
+        try self.pings.put(ping_id, ping_notification);
+        self.ping_mutex.unlock();
+
+        const ping_hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
+        defer self.allocator.free(ping_hdr);
+
+        try frame.Header.init(frame.FrameType.PING, frame.FrameFlags.SYN, 0, ping_id).encode(ping_hdr);
+        try self.sendAndWait(ping_hdr, null);
+
+        const start = std.time.nanoTimestamp();
+        ping_notification.timedWait(self.config.connection_write_timeout) catch |err| {
+            if (self.shutdown_completion.isSet()) {
+                return Error.SessionShutdown;
+            }
+            self.ping_mutex.lock();
+            _ = self.pings.remove(ping_id);
+            self.ping_mutex.unlock();
+            return err;
+        };
+
+        if (self.shutdown_completion.isSet()) {
+            return Error.SessionShutdown;
+        }
+
+        return @as(u64, @intCast(std.time.nanoTimestamp() - start));
+    }
+
+    fn keepalive(self: *Session) void {
+        while (!self.shutdown_completion.isSet()) {
+            std.time.sleep(self.config.keep_alive_interval);
+            if (self.shutdown_completion.isSet()) {
+                return;
+            }
+            self.ping() catch |err| {
+                if (err != Error.SessionShutdown) {
+                    std.log.err("keepalive: ping error: {}\n", .{err});
+                    self.setExitErr(Error.KeepAliveTimeout);
+                }
+                return;
+            };
+        }
     }
 
     fn recv(self: *Session) void {
