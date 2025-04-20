@@ -21,12 +21,19 @@ pub fn build(b: *std.Build) void {
     });
     const libxev_module = libxev_dep.module("xev");
 
+    const noiz_dep = b.dependency("noiz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const noiz_module = noiz_dep.module("noiz");
+
     const root_module = b.addModule("zig-libp2p", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     root_module.addImport("xev", libxev_module);
+    root_module.addImport("noiz", noiz_module);
 
     const libp2p_lib = b.addLibrary(.{
         .name = "zig-libp2p",
@@ -46,6 +53,7 @@ pub fn build(b: *std.Build) void {
     });
 
     libp2p_exe.root_module.addImport("xev", libxev_module);
+    libp2p_exe.root_module.addImport("noiz", noiz_module);
 
     b.installArtifact(libp2p_exe);
 
@@ -91,6 +99,7 @@ pub fn build(b: *std.Build) void {
     // exe_unit_tests.root_module.addImport("libuv", libuv_module);
     // exe_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
     libp2p_exe_unit_tests.root_module.addImport("xev", libxev_module);
+    libp2p_exe_unit_tests.root_module.addImport("noiz", noiz_module);
     // // for exe, lib, tests, etc.
     // exe_unit_tests.root_module.addImport("aio", zig_aio_module);
     // // for coroutines api
