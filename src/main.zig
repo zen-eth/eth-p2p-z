@@ -9,10 +9,8 @@ pub fn main() !void {
     // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
 
-    // Try to use a function from the noise module
     const allocator = std.heap.page_allocator;
 
-    // This should cause a compilation error if the KeyPar typo exists
     const dummy_conn = try noise.toConn(allocator, undefined, true);
     _ = dummy_conn;
 
