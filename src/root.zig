@@ -10,7 +10,7 @@ pub const muxer = @import("muxer/lib.zig");
 pub const thread_event_loop = @import("thread_event_loop.zig");
 pub const p2p_transport = @import("transport.zig");
 pub const transport = @import("transport/lib.zig");
-
+pub const security = @import("security/lib.zig");
 test {
     std.testing.refAllDeclsRecursive(@This());
 }
