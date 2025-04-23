@@ -111,11 +111,6 @@ pub const NoiseConn = struct {
         return self.conn.writer().write(slice);
     }
 
-    /// Close the underlying connection
-    pub fn close(self: *NoiseConn) void {
-        self.conn.close() catch {};
-    }
-
     /// Support GenericReader
     pub inline fn reader(self: *NoiseConn) std.io.GenericReader(
         *NoiseConn,
