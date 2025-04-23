@@ -8,6 +8,45 @@ const Thread = std.Thread;
 const STDReadError = std.net.Stream.ReadError;
 const STDWriteError = std.net.Stream.WriteError;
 
+pub fn GenericHandler(
+    comptime Context: type,
+    comptime OnReadError: type,
+    comptime onReadFn: fn (context: Context, buffer: []u8, read: OnReadError!usize) void,
+) type {
+    return struct {
+        context: Context,
+
+        const Self = @This();
+
+        pub inline fn onRead(self: Self, buffer: []u8, read: OnReadError!usize) void {
+            return onReadFn(self.context, buffer, read);
+        }
+
+        pub inline fn any(self: *const Self) AnyHandler {
+            return .{
+                .context = @ptrCast(&self.context),
+                .onReadFn = typeErasedOnReadFn,
+            };
+        }
+        fn typeErasedOnReadFn(context: *const anyopaque, buffer: []u8, read: OnReadError!usize) void {
+            const ptr: *const Context = @alignCast(@ptrCast(context));
+            return onReadFn(ptr.*, buffer, read);
+        }
+    };
+}
+
+pub const AnyHandler = struct {
+    context: *const anyopaque,
+    onReadFn: *const fn (context: *const anyopaque, buffer: []u8, read: anyerror!usize) void,
+
+    const Self = @This();
+    pub const Error = anyerror;
+
+    pub fn onRead(self: Self, buffer: []u8, read: Error!usize) void {
+        return self.onReadFn(self.context, buffer, read);
+    }
+};
+
 /// GenericConn provides a generic connection interface that implements read, write, and close methods
 /// It follows the pattern of GenericReader and GenericWriter in the standard library
 pub fn GenericConn(

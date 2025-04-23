@@ -2,14 +2,17 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const frame = @import("frame.zig");
 const Stream = @import("stream.zig").Stream;
+const StreamError = @import("stream.zig").Error;
 const conn = @import("../../conn.zig");
 const AnyConn = conn.AnyConn;
 const Config = @import("Config.zig");
 const testing = std.testing;
 const ThreadPool = std.Thread.Pool;
 const BlockingQueue = @import("../../concurrent/blocking_queue.zig").BlockingQueue;
+const xev = @import("xev");
+const HeaderPool = std.heap.MemoryPool([frame.Header.SIZE]u8);
 
-pub const Error = error{ KeepAliveTimeout, SessionShutdown, ConnectionWriteTimeout, OutOfMemory, RemoteGoAway, StreamsExhausted, DuplicateStream, GoAwayProtocolError, GoAwayInternalError, UnexpectedGoAwayError } || frame.Error;
+pub const Error = error{ KeepAliveTimeout, SessionShutdown, ConnectionWriteTimeout, OutOfMemory, RemoteGoAway, StreamsExhausted, DuplicateStream, GoAwayProtocolError, GoAwayInternalError, UnexpectedGoAwayError } || frame.Error || StreamError;
 pub const SendQueue = std.SinglyLinkedList(*SendReady);
 
 const SentCompletion = struct {
@@ -68,6 +71,8 @@ pub const SendReady = struct {
         }
     }
 };
+
+// pub const SessionHandler= conn.GenericHandler(comptime Context: type, comptime onReadFn: fn(context:Context, buffer:[]u8)void)
 
 pub const Session = struct {
     // remoteGoAway indicates the remote side does not want further connections.
@@ -139,11 +144,15 @@ pub const Session = struct {
         done: bool = false,
     } = .{},
 
+    inbound_buffer: std.fifo.LinearFifo(u8, .Dynamic),
+
+    header_pool: HeaderPool,
+
     shutdown_completion: std.Thread.ResetEvent = .{},
 
     shutdown_mutex: std.Thread.Mutex = .{},
 
-    shutdown_err: ?Error = null,
+    shutdown_err: ?anyerror = null,
 
     shutdown_err_mutex: std.Thread.Mutex = .{},
 
@@ -163,6 +172,8 @@ pub const Session = struct {
             .streams = std.AutoHashMap(u32, Stream).init(allocator),
             .inflight = std.AutoHashMap(u32, void).init(allocator),
             .scheduler = scheduler,
+            .inbound_buffer = std.fifo.LinearFifo(u8, .Dynamic).init(allocator),
+            .header_pool = HeaderPool.init(allocator),
         };
     }
 
@@ -188,6 +199,8 @@ pub const Session = struct {
             self.allocator.destroy(node);
         }
         self.send_queue_sync.mutex.unlock();
+        self.header_pool.deinit();
+        self.inbound_buffer.deinit();
     }
 
     pub fn sendAndWait(self: *Session, hdr: []u8, body: ?[]u8) !void {
@@ -465,6 +478,76 @@ pub const Session = struct {
         };
     }
 
+    pub fn onRead(self: *Session, buffer: []u8, bytes_read: anyerror!usize) !void {
+        const n = bytes_read catch |err| {
+            if (err != xev.ReadError.EOF) {
+                std.log.err("onRead: read error: {}\n", .{err});
+            }
+            self.setExitErr(err);
+            return err;
+        };
+
+        if (n == 0) {
+            return;
+        }
+
+        self.inbound_buffer.write(buffer[0..n]) catch |err| {
+            std.log.err("onRead: write inbound buffer error: {}\n", .{err});
+            self.setExitErr(err);
+            return err;
+        };
+
+        while (true) {
+            const available = self.inbound_buffer.readableSlice(0);
+            if (available.len < frame.Header.SIZE) {
+                return;
+            }
+
+            var temp_stream = std.io.fixedBufferStream(available);
+            const reader = temp_stream.reader();
+
+            var hdr_buf: [frame.Header.SIZE]u8 = undefined;
+            reader.readNoEof(&hdr_buf) catch |err| {
+                self.setExitErr(err);
+                return err;
+            };
+
+            const header = frame.Header.decode(&hdr_buf) catch |err| {
+                self.setExitErr(err);
+                return err; // Propagate error
+            };
+
+            if (header.version != frame.PROTOCOL_VERSION) {
+                self.setExitErr(Error.InvalidProtocolVersion);
+                return Error.InvalidProtocolVersion;
+            }
+
+            const msg_type = header.frame_type;
+            if (@intFromEnum(msg_type) < @intFromEnum(frame.FrameType.DATA) or @intFromEnum(msg_type) > @intFromEnum(frame.FrameType.GO_AWAY)) {
+                self.setExitErr(Error.InvalidFrameType);
+                return frame.Error.InvalidFrameType;
+            }
+
+            const frame_size = frame.Header.SIZE + header.length;
+            if (available.len < frame_size) {
+                return;
+            }
+
+            var body_slice: ?[]const u8 = null;
+            if (header.length > 0) {
+                const body_data = available[frame.Header.SIZE..frame_size];
+                body_slice = body_data;
+            }
+
+            switch (header.frame_type) {
+                .DATA, .WINDOW_UPDATE => try self.handleStreamMessage(header, body_slice),
+                .PING => try self.handlePing(header),
+                .GO_AWAY => try self.handleGoAway(header),
+            }
+
+            self.inbound_buffer.discard(frame_size);
+        }
+    }
     fn recvLoop(self: *Session) !void {
         defer self.recv_done.cond.broadcast();
         const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
@@ -490,7 +573,7 @@ pub const Session = struct {
         }
     }
 
-    fn handleStreamMessage(self: *Session, hdr: frame.Header) Error!void {
+    fn handleStreamMessage(self: *Session, hdr: frame.Header, _: ?[]const u8) Error!void {
         const stream_id = hdr.stream_id;
         const flags = hdr.flags;
 
@@ -500,7 +583,7 @@ pub const Session = struct {
         }
 
         self.stream_mutex.lock();
-        const stream = self.streams.get(stream_id);
+        var stream = self.streams.get(stream_id);
         self.stream_mutex.unlock();
 
         if (stream == null) {
@@ -522,7 +605,7 @@ pub const Session = struct {
                 std.log.err("handleStreamMessage: incrSendWindow error: {}\n", .{err});
                 const goaway_hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
                 defer self.allocator.free(goaway_hdr);
-                self.goAway(@intFromEnum(frame.GoAwayCode.PROTOCOL_ERROR), hdr) catch |goaway_err| {
+                self.goAway(@intFromEnum(frame.GoAwayCode.PROTOCOL_ERROR), goaway_hdr) catch |goaway_err| {
                     std.log.err("createInboundStream: goAway error: {}\n", .{goaway_err});
                 };
                 self.send(goaway_hdr, null) catch |send_err| {
@@ -536,7 +619,7 @@ pub const Session = struct {
             std.log.err("handleStreamMessage: readData error: {}\n", .{err});
             const goaway_hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
             defer self.allocator.free(goaway_hdr);
-            self.goAway(@intFromEnum(frame.GoAwayCode.PROTOCOL_ERROR), hdr) catch |goaway_err| {
+            self.goAway(@intFromEnum(frame.GoAwayCode.PROTOCOL_ERROR), goaway_hdr) catch |goaway_err| {
                 std.log.err("createInboundStream: goAway error: {}\n", .{goaway_err});
             };
             self.send(goaway_hdr, null) catch |send_err| {
@@ -563,20 +646,22 @@ pub const Session = struct {
         }
 
         self.ping_mutex.lock();
-        if (self.pings.get(ping_id)) |ping_notification| {
+        if (self.pings.getPtr(ping_id)) |ping_notification| {
             ping_notification.set();
-            self.pings.remove(ping_id);
+            _ = self.pings.remove(ping_id);
         }
         self.ping_mutex.unlock();
     }
 
     fn handleGoAway(self: *Session, hdr: frame.Header) Error!void {
         const code = hdr.length;
-        switch (code) {
-            frame.GoAwayCode.NORMAL => self.remote_go_away.swap(1, .acq_rel),
+        switch (@as(frame.GoAwayCode, @enumFromInt(code))) {
+            frame.GoAwayCode.NORMAL => {
+                _ = self.remote_go_away.swap(1, .acq_rel);
+                return;
+            },
             frame.GoAwayCode.PROTOCOL_ERROR => return Error.GoAwayProtocolError,
             frame.GoAwayCode.INTERNAL_ERROR => return Error.GoAwayInternalError,
-            else => return Error.UnexpectedGoAwayError,
         }
     }
 
@@ -589,7 +674,7 @@ pub const Session = struct {
             return self.send(hdr, null);
         }
 
-        const stream: Stream = undefined;
+        var stream: Stream = undefined;
         try Stream.init(&stream, self, id, .syn_received, self.allocator);
         errdefer stream.deinit();
 
@@ -667,7 +752,7 @@ pub const Session = struct {
         try frame.Header.init(frame.FrameType.GO_AWAY, 0, 0, reason).encode(hdr);
     }
 
-    fn setExitErr(self: *Session, err: Error) void {
+    fn setExitErr(self: *Session, err: anyerror) void {
         self.shutdown_err_mutex.lock();
         if (self.shutdown_err == null) {
             self.shutdown_err = err;
