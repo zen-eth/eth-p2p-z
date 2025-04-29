@@ -21,10 +21,10 @@ pub fn Future(comptime ValueType: type, comptime ErrorType: type) type {
         /// The error held by the Future, or `null` if not set.
         err: ?ErrorType = null,
 
-        pub const Self = @This();
+        // pub const Self = @This();
 
         /// Sets an error for the Future. If an error is already set, this call has no effect.
-        pub fn setError(self: *Self, err: ErrorType) void {
+        pub fn setError(self: *Future(ValueType, ErrorType), err: ErrorType) void {
             self.rwlock.lock();
             if (self.err == null) {
                 self.err = err;
@@ -35,7 +35,7 @@ pub fn Future(comptime ValueType: type, comptime ErrorType: type) type {
         }
 
         /// Sets a value for the Future. If a value is already set, this call has no effect.
-        pub fn setValue(self: *Self, value: ValueType) void {
+        pub fn setValue(self: *Future(ValueType, ErrorType), value: ValueType) void {
             self.rwlock.lock();
             if (self.value == null) {
                 self.value = value;
@@ -46,7 +46,7 @@ pub fn Future(comptime ValueType: type, comptime ErrorType: type) type {
         }
 
         /// Retrieves the error set in the Future, or `null` if no error is set.
-        pub fn getErr(self: *Self) ?ErrorType {
+        pub fn getErr(self: *Future(ValueType, ErrorType)) ?ErrorType {
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
 
@@ -54,7 +54,7 @@ pub fn Future(comptime ValueType: type, comptime ErrorType: type) type {
         }
 
         /// Retrieves the value set in the Future, or `null` if no value is set.
-        pub fn getValue(self: *Self) ?ValueType {
+        pub fn getValue(self: *Future(ValueType, ErrorType)) ?ValueType {
             self.rwlock.lockShared();
             defer self.rwlock.unlockShared();
 
@@ -62,18 +62,23 @@ pub fn Future(comptime ValueType: type, comptime ErrorType: type) type {
         }
 
         /// Marks the Future as completed by signaling the reset event.
-        pub fn setDone(self: *Self) void {
+        pub fn setDone(self: *Future(ValueType, ErrorType)) void {
             self.done.set();
         }
 
         /// Waits for the Future to be completed. This call blocks until the reset event is signaled.
-        pub fn wait(self: *Self) void {
+        pub fn wait(self: *Future(ValueType, ErrorType)) void {
             self.done.wait();
         }
 
         /// Waits for the Future to be completed with a timeout.
-        pub fn timedWait(self: *Self, timeout_ns: u64) error{Timeout}!void {
+        pub fn timedWait(self: *Future(ValueType, ErrorType), timeout_ns: u64) error{Timeout}!void {
             return self.done.timedWait(timeout_ns);
+        }
+
+        /// Checks if the Future is completed.
+        pub fn isDone(self: *Future(ValueType, ErrorType)) bool {
+            return self.done.isSet();
         }
     };
 }

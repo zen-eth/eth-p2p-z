@@ -3,11 +3,73 @@ const Allocator = std.mem.Allocator;
 const xev = @import("xev");
 const Intrusive = @import("concurrent/mpsc_queue.zig").Intrusive;
 const Future = @import("concurrent/future.zig").Future;
-const Stream = @import("muxer/yamux/stream.zig").Stream;
+// const Stream = @import("muxer/yamux/stream.zig").Stream;
 const conn = @import("conn.zig");
-const Config = @import("muxer/yamux/Config.zig");
-const session = @import("muxer/yamux/session.zig");
+// const Config = @import("muxer/yamux/Config.zig");
+// const session = @import("muxer/yamux/session.zig");
 const xev_tcp = @import("transport/tcp/xev.zig");
+const pipeline = @import("pipeline.zig");
+// const yamux_timer = @import("muxer/yamux/timeout_loop.zig");
+
+pub const IOAction = union(enum) {
+    // run_open_stream_timer: struct {
+    //     stream: *Stream,
+    //     timeout_ms: u64,
+    //     io_loop: ?*ThreadEventLoop = null,
+    // },
+    // run_close_stream_timer: struct {
+    //     stream: *Stream,
+    //     timeout_ms: u64,
+    //     io_loop: ?*ThreadEventLoop = null,
+    // },
+    // cancel_close_stream_timer: struct {
+    //     stream: *Stream,
+    //     io_loop: ?*ThreadEventLoop = null,
+    // },
+    connect: struct {
+        address: std.net.Address,
+        channel: *conn.AnyRxConn,
+        future: *Future(void, anyerror),
+        transport: ?*xev_tcp.XevTransport = null,
+        timeout_ms: u64,
+    },
+    // accept: struct {
+    //     server: xev.TCP,
+    //     channel: *xev_tcp.XevSocketChannel,
+    //     future: *Future(void, xev_tcp.XevListener.AcceptError),
+    //     io_loop: ?*ThreadEventLoop = null,
+    //     transport: ?*xev_tcp.XevTransport = null,
+    // },
+    // write: struct {
+    //     buffer: []const u8,
+    //     channel: *xev_tcp.XevSocketChannel,
+    //     future: *Future(usize, xev_tcp.XevSocketChannel.WriteError),
+    //     io_loop: ?*ThreadEventLoop = null,
+    // },
+    // read: struct {
+    //     channel: *xev_tcp.XevSocketChannel,
+    //     buffer: []u8,
+    //     future: *Future(usize, xev_tcp.XevSocketChannel.ReadError),
+    //     io_loop: ?*ThreadEventLoop = null,
+    // },
+};
+
+pub const ConnectTimeout = struct {
+    socket: xev.TCP,
+    /// The future for the connection result.
+    future: *Future(void, anyerror),
+    /// The transport used for the connection.
+    transport: ?*xev_tcp.XevTransport = null,
+};
+
+pub const Connect = struct {
+    /// The future for the connection result.
+    future: *Future(void, anyerror),
+    /// The transport used for the connection.
+    transport: ?*xev_tcp.XevTransport = null,
+
+    channel: *conn.AnyRxConn,
+};
 
 /// Represents a message for I/O operations in the event loop.
 pub const IOMessage = struct {
@@ -17,85 +79,15 @@ pub const IOMessage = struct {
     next: ?*Self = null,
 
     /// The action to be performed, represented as a union of possible operations.
-    action: union(enum) {
-        /// Starts a timer for opening a stream.
-        run_open_stream_timer: struct {
-            /// The stream associated with the timer.
-            stream: *Stream,
-            /// The timeout duration in milliseconds.
-            timeout_ms: u64,
-            /// The event loop reference.
-            io_loop: ?*ThreadEventLoop = null,
-        },
-        /// Starts a timer for closing a stream.
-        run_close_stream_timer: struct {
-            /// The stream associated with the timer.
-            stream: *Stream,
-            /// The timeout duration in milliseconds.
-            timeout_ms: u64,
-            /// The event loop reference.
-            io_loop: ?*ThreadEventLoop = null,
-        },
-        /// Cancels the timer for closing a stream.
-        cancel_close_stream_timer: struct {
-            /// The stream associated with the timer.
-            stream: *Stream,
-            /// The event loop reference.
-            io_loop: ?*ThreadEventLoop = null,
-        },
-        /// Initiates a connection to a specified address.
-        connect: struct {
-            /// The address to connect to.
-            address: std.net.Address,
-            /// The channel to connect.
-            channel: *xev_tcp.XevSocketChannel,
-            /// The completion object for the connection.
-            future: *Future(void, xev_tcp.XevTransport.DialError),
-            /// The event loop reference.
-            io_loop: ?*ThreadEventLoop = null,
-            /// The transport reference.
-            transport: ?*xev_tcp.XevTransport = null,
-        },
-        /// Accepts a connection from a server.
-        accept: struct {
-            /// The server to accept the connection from.
-            server: xev.TCP,
-            /// The channel to accept the connection on.
-            channel: *xev_tcp.XevSocketChannel,
-            /// The completion object for the connection.
-            future: *Future(void, xev_tcp.XevListener.AcceptError),
-            /// The event loop reference.
-            io_loop: ?*ThreadEventLoop = null,
-            /// The transport reference.
-            transport: ?*xev_tcp.XevTransport = null,
-        },
-        /// Writes data to a channel.
-        write: struct {
-            /// The buffer containing the data to write.
-            buffer: []const u8,
-            /// The channel to write the data to.
-            channel: *xev_tcp.XevSocketChannel,
-            /// The completion object for the write operation.
-            future: *Future(usize, xev_tcp.XevSocketChannel.WriteError),
-            /// The event loop reference.
-            io_loop: ?*ThreadEventLoop = null,
-        },
-        /// Reads data from a channel.
-        read: struct {
-            /// The channel to read data from.
-            channel: *xev_tcp.XevSocketChannel,
-            /// The buffer to store the read data.
-            buffer: []u8,
-            /// The completion object for the read operation.
-            future: *Future(usize, xev_tcp.XevSocketChannel.ReadError),
-            /// The event loop reference.
-            io_loop: ?*ThreadEventLoop = null,
-        },
-    },
+    action: IOAction,
 };
 
 /// A memory pool for managing `xev.Completion` objects.
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
+const ConnectPool = std.heap.MemoryPool(Connect);
+const ConnectTimeoutPool = std.heap.MemoryPool(ConnectTimeout);
+const XevSocketChannelPool = std.heap.MemoryPool(xev_tcp.XevSocketChannel);
+const HandlerPipelinePool = std.heap.MemoryPool(pipeline.HandlerPipeline);
 
 /// Represents a thread-based event loop for managing asynchronous I/O operations.
 pub const ThreadEventLoop = struct {
@@ -118,10 +110,22 @@ pub const ThreadEventLoop = struct {
     /// The memory pool for managing completion objects.
     completion_pool: CompletionPool,
 
+    connect_pool: ConnectPool,
+
+    connect_timeout_pool: ConnectTimeoutPool,
+
+    channel_pool: XevSocketChannelPool,
+
+    handler_pipeline_pool: HandlerPipelinePool,
+
+    conn_initializer: conn.AnyConnInitializer,
+
+    loop_thread_id: std.Thread.Id,
+
     const Self = @This();
 
     /// Initializes the event loop.
-    pub fn init(self: *Self, allocator: Allocator) !void {
+    pub fn init(self: *Self, allocator: Allocator, conn_initializer: conn.AnyConnInitializer) !void {
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
 
@@ -138,6 +142,18 @@ pub const ThreadEventLoop = struct {
         var completion_pool = CompletionPool.init(allocator);
         errdefer completion_pool.deinit();
 
+        var connect_timeout_pool = ConnectTimeoutPool.init(allocator);
+        errdefer connect_timeout_pool.deinit();
+
+        var connect_pool = ConnectPool.init(allocator);
+        errdefer connect_pool.deinit();
+
+        var channel_pool = XevSocketChannelPool.init(allocator);
+        errdefer channel_pool.deinit();
+
+        var handler_pipeline_pool = HandlerPipelinePool.init(allocator);
+        errdefer handler_pipeline_pool.deinit();
+
         self.* = .{
             .loop = loop,
             .stop_notifier = stop_notifier,
@@ -146,8 +162,14 @@ pub const ThreadEventLoop = struct {
             .c_stop = .{},
             .c_async = .{},
             .loop_thread = undefined,
+            .loop_thread_id = undefined,
             .allocator = allocator,
             .completion_pool = completion_pool,
+            .connect_pool = connect_pool,
+            .connect_timeout_pool = connect_timeout_pool,
+            .channel_pool = channel_pool,
+            .handler_pipeline_pool = handler_pipeline_pool,
+            .conn_initializer = conn_initializer,
         };
 
         const thread = try std.Thread.spawn(.{}, start, .{self});
@@ -164,10 +186,16 @@ pub const ThreadEventLoop = struct {
         }
         self.allocator.destroy(self.task_queue);
         self.completion_pool.deinit();
+        self.connect_pool.deinit();
+        self.connect_timeout_pool.deinit();
+        self.channel_pool.deinit();
+        self.handler_pipeline_pool.deinit();
     }
 
     /// Starts the event loop.
     pub fn start(self: *Self) !void {
+        self.loop_thread_id = std.Thread.getCurrentId();
+
         self.stop_notifier.wait(&self.loop, &self.c_stop, ThreadEventLoop, self, &stopCallback);
 
         self.async_notifier.wait(&self.loop, &self.c_async, ThreadEventLoop, self, &asyncCallback);
@@ -195,6 +223,10 @@ pub const ThreadEventLoop = struct {
         self.task_queue.push(m);
 
         try self.async_notifier.notify();
+    }
+
+    pub fn inEventLoopThread(self: *Self) bool {
+        return self.loop_thread_id == std.Thread.getCurrentId();
     }
 
     /// Callback for handling the stop notifier.
@@ -229,53 +261,65 @@ pub const ThreadEventLoop = struct {
 
         while (self.task_queue.pop()) |m| {
             switch (m.action) {
-                .run_open_stream_timer => {
-                    const timer = xev.Timer.init() catch unreachable;
-                    const c_timer = self.completion_pool.create() catch unreachable;
-                    m.action.run_open_stream_timer.io_loop = self;
-                    timer.run(loop, c_timer, m.action.run_open_stream_timer.timeout_ms, IOMessage, m, runOpenStreamTimerCB);
-                },
-                .run_close_stream_timer => {
-                    const timer = m.action.run_close_stream_timer.stream.close_timer.?;
-                    const c_timer = m.action.run_close_stream_timer.stream.c_close_timer.?;
-                    m.action.run_close_stream_timer.io_loop = self;
-                    timer.run(loop, c_timer, m.action.run_close_stream_timer.timeout_ms, IOMessage, m, runCloseStreamTimerCB);
-                },
-                .cancel_close_stream_timer => {
-                    const timer = m.action.cancel_close_stream_timer.stream.close_timer.?;
-                    const c_timer = m.action.cancel_close_stream_timer.stream.c_close_timer.?;
-                    const c_cancel_timer = self.completion_pool.create() catch unreachable;
-                    c_cancel_timer.* = .{};
-                    m.action.cancel_close_stream_timer.io_loop = self;
-                    timer.cancel(loop, c_timer, c_cancel_timer, IOMessage, m, cancelCloseStreamTimerCB);
-                },
-                .connect => {
-                    const address = m.action.connect.address;
+                // .run_open_stream_timer => |*action_data| {
+                //     const timer = xev.Timer.init() catch unreachable;
+                //     const c_timer = self.completion_pool.create() catch unreachable;
+                //     timer.run(loop, c_timer, action_data.timeout_ms, IOAction, m.action, yamux_timer.TimeoutLoop.runOpenStreamTimerCB);
+                // },
+                // .run_close_stream_timer => |*action_data| {
+                //     const timer = action_data.stream.close_timer.?;
+                //     const c_timer = action_data.stream.c_close_timer.?;
+                //     timer.run(loop, c_timer, action_data.timeout_ms, IOAction, m.action, yamux_timer.TimeoutLoop.runCloseStreamTimerCB);
+                // },
+                // .cancel_close_stream_timer => |*action_data| {
+                //     const timer = action_data.stream.close_timer.?;
+                //     const c_timer = action_data.stream.c_close_timer.?;
+                //     const c_cancel_timer = self.completion_pool.create() catch unreachable;
+                //     c_cancel_timer.* = .{};
+                //     timer.cancel(loop, c_timer, c_cancel_timer, IOAction, m.action, yamux_timer.TimeoutLoop.cancelCloseStreamTimerCB);
+                // },
+                .connect => |action_data| {
+                    const address = action_data.address;
                     var socket = xev.TCP.init(address) catch unreachable;
                     const c = self.completion_pool.create() catch unreachable;
-                    m.action.connect.io_loop = self;
-                    socket.connect(loop, c, address, IOMessage, m, connectCB);
+                    const timer = xev.Timer.init() catch unreachable;
+                    const c_timer = self.completion_pool.create() catch unreachable;
+                    const connect_timeout = action_data.timeout_ms;
+                    const connect_ud = self.connect_pool.create() catch unreachable;
+                    connect_ud.* = .{
+                        .future = action_data.future,
+                        .transport = action_data.transport,
+                        .channel = action_data.channel,
+                    };
+                    const connect_timeout_ud = self.connect_timeout_pool.create() catch unreachable;
+                    connect_timeout_ud.* = .{
+                        .future = action_data.future,
+                        .transport = action_data.transport,
+                        .socket = socket,
+                    };
+                    socket.connect(loop, c, address, Connect, connect_ud, xev_tcp.XevTransport.connectCB);
+                    timer.run(loop, c_timer, connect_timeout, ConnectTimeout, connect_timeout_ud, xev_tcp.XevTransport.connectTimeoutCB);
                 },
-                .accept => {
-                    const server = m.action.accept.server;
-                    const c = self.completion_pool.create() catch unreachable;
-                    m.action.accept.io_loop = self;
-                    server.accept(loop, c, IOMessage, m, acceptCB);
-                },
-                .write => {
-                    const c = self.completion_pool.create() catch unreachable;
-                    const channel = m.action.write.channel;
-                    const buffer = m.action.write.buffer;
-                    m.action.write.io_loop = self;
-                    channel.socket.write(loop, c, .{ .slice = buffer }, IOMessage, m, writeCB);
-                },
-                .read => {
-                    const channel = m.action.read.channel;
-                    const buffer = m.action.read.buffer;
-                    const c = self.completion_pool.create() catch unreachable;
-                    m.action.read.io_loop = self;
-                    channel.socket.read(loop, c, .{ .slice = buffer }, IOMessage, m, readCB);
-                },
+                // .accept => {
+                //     const server = m.action.accept.server;
+                //     const c = self.completion_pool.create() catch unreachable;
+                //     m.action.accept.io_loop = self;
+                //     server.accept(loop, c, IOMessage, m, acceptCB);
+                // },
+                // .write => {
+                //     const c = self.completion_pool.create() catch unreachable;
+                //     const channel = m.action.write.channel;
+                //     const buffer = m.action.write.buffer;
+                //     m.action.write.io_loop = self;
+                //     channel.socket.write(loop, c, .{ .slice = buffer }, IOMessage, m, writeCB);
+                // },
+                // .read => {
+                //     const channel = m.action.read.channel;
+                //     const buffer = m.action.read.buffer;
+                //     const c = self.completion_pool.create() catch unreachable;
+                //     m.action.read.io_loop = self;
+                //     channel.socket.read(loop, c, .{ .slice = buffer }, IOMessage, m, readCB);
+                // },
             }
         }
 
@@ -285,19 +329,18 @@ pub const ThreadEventLoop = struct {
     /// Callback executed when the open stream timer expires.
     /// This is used to handle timeouts when establishing a new stream connection.
     fn runOpenStreamTimerCB(
-        ud: ?*IOMessage,
+        ud: ?*IOAction,
         _: *xev.Loop,
         c: *xev.Completion,
         tr: xev.Timer.RunError!void,
     ) xev.CallbackAction {
-        const n = ud.?;
-        const action = n.action.run_open_stream_timer;
+        const action = ud.?.run_open_stream_timer;
         defer action.io_loop.?.completion_pool.destroy(c);
-        defer action.io_loop.?.allocator.destroy(n);
+        defer action.io_loop.?.allocator.destroy(action);
 
         tr catch |err| {
             if (err != xev.Timer.RunError.Canceled) {
-                std.debug.print("Error in timer callback: {}\n", .{err});
+                std.log.err("Error in timer callback: {}\n", .{err});
             }
             return .disarm;
         };
@@ -381,7 +424,7 @@ pub const ThreadEventLoop = struct {
             return .disarm;
         };
 
-        action.channel.init(socket, action.transport.?, .OUTBOUND);
+        action.channel.init(socket, action.transport.?, conn.Direction.OUTBOUND);
         action.future.setDone();
 
         return .disarm;
@@ -521,47 +564,47 @@ pub const ThreadEventLoop = struct {
     }
 };
 
-test "TimerManager add timer for stream" {
-    const allocator = std.testing.allocator;
-    var event_loop: ThreadEventLoop = undefined;
-    try event_loop.init(allocator);
-    defer event_loop.deinit();
+// test "TimerManager add timer for stream" {
+//     const allocator = std.testing.allocator;
+//     var event_loop: ThreadEventLoop = undefined;
+//     try event_loop.init(allocator);
+//     defer event_loop.deinit();
 
-    // Create a test session and stream for timer
-    var pipes = try conn.createPipeConnPair();
-    defer {
-        pipes.client.close();
-        pipes.server.close();
-    }
+//     // Create a test session and stream for timer
+//     var pipes = try conn.createPipeConnPair();
+//     defer {
+//         pipes.client.close();
+//         pipes.server.close();
+//     }
 
-    const client_conn = pipes.client.conn().any();
-    var config = Config.defaultConfig();
+//     const client_conn = pipes.client.conn().any();
+//     var config = Config.defaultConfig();
 
-    var pool: std.Thread.Pool = undefined;
-    try std.Thread.Pool.init(&pool, .{ .allocator = allocator });
-    defer pool.deinit();
+//     var pool: std.Thread.Pool = undefined;
+//     try std.Thread.Pool.init(&pool, .{ .allocator = allocator });
+//     defer pool.deinit();
 
-    var test_session: session.Session = undefined;
-    try session.Session.init(allocator, &config, client_conn, &test_session, &pool);
-    defer test_session.deinit();
+//     var test_session: session.Session = undefined;
+//     try session.Session.init(allocator, &config, client_conn, &test_session, &pool);
+//     defer test_session.deinit();
 
-    var test_stream: Stream = undefined;
-    try Stream.init(&test_stream, &test_session, 1, .init, allocator);
-    defer test_stream.deinit();
+//     var test_stream: Stream = undefined;
+//     try Stream.init(&test_stream, &test_session, 1, .init, allocator);
+//     defer test_stream.deinit();
 
-    const message = IOMessage{
-        .action = .{
-            .run_open_stream_timer = .{
-                .stream = &test_stream,
-                .timeout_ms = 100,
-            },
-        },
-    };
-    try event_loop.queueMessage(message);
+//     const message = IOMessage{
+//         .action = .{
+//             .run_open_stream_timer = .{
+//                 .stream = &test_stream,
+//                 .timeout_ms = 100,
+//             },
+//         },
+//     };
+//     try event_loop.queueMessage(message);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+//     std.time.sleep(200 * std.time.ns_per_ms);
 
-    try std.testing.expect(test_session.isClosed());
+//     try std.testing.expect(test_session.isClosed());
 
-    event_loop.close();
-}
+//     event_loop.close();
+// }
