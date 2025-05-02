@@ -8,7 +8,7 @@ pub fn GenericListener(
     /// The error type that can be returned by the `accept` function.
     comptime AcceptE: type,
     /// A function pointer that defines how to accept a connection.
-    comptime acceptFn: fn (context: Context, connection: *conn.AnyConn) AcceptE!void,
+    comptime acceptFn: fn (context: Context, connection: *conn.AnyRxConn) AcceptE!void,
 ) type {
     return struct {
         /// The context associated with the listener.
@@ -20,7 +20,7 @@ pub fn GenericListener(
         const Self = @This();
 
         /// Accepts a connection using the provided `acceptFn`.
-        pub inline fn accept(self: Self, connection: *conn.AnyConn) AcceptError!void {
+        pub inline fn accept(self: Self, connection: *conn.AnyRxConn) AcceptError!void {
             return acceptFn(self.context, connection);
         }
 
@@ -33,7 +33,7 @@ pub fn GenericListener(
         }
 
         /// A type-erased accept function used by `AnyListener`.
-        fn typeErasedAcceptFn(context: *const anyopaque, connection: *conn.AnyConn) anyerror!void {
+        fn typeErasedAcceptFn(context: *const anyopaque, connection: *conn.AnyRxConn) anyerror!void {
             const ptr: *const Context = @alignCast(@ptrCast(context));
             return acceptFn(ptr.*, connection);
         }

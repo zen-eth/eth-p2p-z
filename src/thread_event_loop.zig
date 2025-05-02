@@ -33,19 +33,18 @@ pub const IOAction = union(enum) {
         transport: ?*xev_tcp.XevTransport = null,
         timeout_ms: u64,
     },
-    // accept: struct {
-    //     server: xev.TCP,
-    //     channel: *xev_tcp.XevSocketChannel,
-    //     future: *Future(void, xev_tcp.XevListener.AcceptError),
-    //     io_loop: ?*ThreadEventLoop = null,
-    //     transport: ?*xev_tcp.XevTransport = null,
-    // },
-    // write: struct {
-    //     buffer: []const u8,
-    //     channel: *xev_tcp.XevSocketChannel,
-    //     future: *Future(usize, xev_tcp.XevSocketChannel.WriteError),
-    //     io_loop: ?*ThreadEventLoop = null,
-    // },
+    accept: struct {
+        server: xev.TCP,
+        channel: *conn.AnyRxConn,
+        future: *Future(void, xev_tcp.XevListener.AcceptError),
+        transport: ?*xev_tcp.XevTransport = null,
+    },
+    write: struct {
+        buffer: []const u8,
+        channel: *xev_tcp.XevSocketChannel,
+        future: *Future(usize, xev_tcp.XevSocketChannel.WriteError),
+        timeout_ms: u64,
+    },
     // read: struct {
     //     channel: *xev_tcp.XevSocketChannel,
     //     buffer: []u8,
@@ -71,6 +70,27 @@ pub const Connect = struct {
     channel: *conn.AnyRxConn,
 };
 
+pub const Write = struct {
+    future: *Future(usize, xev_tcp.XevSocketChannel.WriteError),
+
+    transport: ?*xev_tcp.XevTransport = null,
+};
+
+pub const ReadOrClose = struct {
+    channel: *conn.AnyRxConn,
+
+    transport: *xev_tcp.XevTransport,
+};
+
+pub const Accept = struct {
+    /// The future for the accept result.
+    future: *Future(void, anyerror),
+    /// The transport used for the accept operation.
+    transport: ?*xev_tcp.XevTransport = null,
+
+    conn: *conn.AnyRxConn,
+};
+
 /// Represents a message for I/O operations in the event loop.
 pub const IOMessage = struct {
     const Self = @This();
@@ -87,7 +107,13 @@ const CompletionPool = std.heap.MemoryPool(xev.Completion);
 const ConnectPool = std.heap.MemoryPool(Connect);
 const ConnectTimeoutPool = std.heap.MemoryPool(ConnectTimeout);
 const XevSocketChannelPool = std.heap.MemoryPool(xev_tcp.XevSocketChannel);
-const HandlerPipelinePool = std.heap.MemoryPool(pipeline.HandlerPipeline);
+const HandlerPipelinePool = std.heap.MemoryPool(conn.HandlerPipeline);
+const WritePool = std.heap.MemoryPool(Write);
+const WriteFuturePool = std.heap.MemoryPool(Future(usize, xev_tcp.XevSocketChannel.WriteError));
+const AcceptPool = std.heap.MemoryPool(Accept);
+const RxConnPool = std.heap.MemoryPool(xev_tcp.RxConn);
+const ReadBufferPool = std.heap.MemoryPool([64 * 1024]u8);
+const ReadPool = std.heap.MemoryPool(ReadOrClose);
 
 /// Represents a thread-based event loop for managing asynchronous I/O operations.
 pub const ThreadEventLoop = struct {
@@ -117,6 +143,18 @@ pub const ThreadEventLoop = struct {
     channel_pool: XevSocketChannelPool,
 
     handler_pipeline_pool: HandlerPipelinePool,
+
+    write_pool: WritePool,
+
+    write_future_pool: WriteFuturePool,
+
+    accept_pool: AcceptPool,
+
+    rx_conn_pool: RxConnPool,
+
+    read_buffer_pool: ReadBufferPool,
+
+    read_pool: ReadPool,
 
     conn_initializer: conn.AnyConnInitializer,
 
@@ -154,6 +192,24 @@ pub const ThreadEventLoop = struct {
         var handler_pipeline_pool = HandlerPipelinePool.init(allocator);
         errdefer handler_pipeline_pool.deinit();
 
+        var write_pool = WritePool.init(allocator);
+        errdefer write_pool.deinit();
+
+        var write_future_pool = WriteFuturePool.init(allocator);
+        errdefer write_future_pool.deinit();
+
+        var accept_pool = AcceptPool.init(allocator);
+        errdefer accept_pool.deinit();
+
+        var rx_conn_pool = RxConnPool.init(allocator);
+        errdefer rx_conn_pool.deinit();
+
+        var read_buffer_pool = ReadBufferPool.init(allocator);
+        errdefer read_buffer_pool.deinit();
+
+        var read_pool = ReadPool.init(allocator);
+        errdefer read_pool.deinit();
+
         self.* = .{
             .loop = loop,
             .stop_notifier = stop_notifier,
@@ -169,6 +225,12 @@ pub const ThreadEventLoop = struct {
             .connect_timeout_pool = connect_timeout_pool,
             .channel_pool = channel_pool,
             .handler_pipeline_pool = handler_pipeline_pool,
+            .write_pool = write_pool,
+            .write_future_pool = write_future_pool,
+            .accept_pool = accept_pool,
+            .rx_conn_pool = rx_conn_pool,
+            .read_buffer_pool = read_buffer_pool,
+            .read_pool = read_pool,
             .conn_initializer = conn_initializer,
         };
 
@@ -190,6 +252,12 @@ pub const ThreadEventLoop = struct {
         self.connect_timeout_pool.deinit();
         self.channel_pool.deinit();
         self.handler_pipeline_pool.deinit();
+        self.write_pool.deinit();
+        self.write_future_pool.deinit();
+        self.accept_pool.deinit();
+        self.rx_conn_pool.deinit();
+        self.read_buffer_pool.deinit();
+        self.read_pool.deinit();
     }
 
     /// Starts the event loop.
@@ -300,19 +368,23 @@ pub const ThreadEventLoop = struct {
                     socket.connect(loop, c, address, Connect, connect_ud, xev_tcp.XevTransport.connectCB);
                     timer.run(loop, c_timer, connect_timeout, ConnectTimeout, connect_timeout_ud, xev_tcp.XevTransport.connectTimeoutCB);
                 },
-                // .accept => {
-                //     const server = m.action.accept.server;
-                //     const c = self.completion_pool.create() catch unreachable;
-                //     m.action.accept.io_loop = self;
-                //     server.accept(loop, c, IOMessage, m, acceptCB);
-                // },
-                // .write => {
-                //     const c = self.completion_pool.create() catch unreachable;
-                //     const channel = m.action.write.channel;
-                //     const buffer = m.action.write.buffer;
-                //     m.action.write.io_loop = self;
-                //     channel.socket.write(loop, c, .{ .slice = buffer }, IOMessage, m, writeCB);
-                // },
+                .accept => |action_data| {
+                    const server = action_data.accept.server;
+                    const c = self.completion_pool.create() catch unreachable;
+
+                    server.accept(loop, c, IOMessage, m, acceptCB);
+                },
+                .write => |action_data| {
+                    const c = self.completion_pool.create() catch unreachable;
+                    const channel = action_data.channel;
+                    const buffer = action_data.buffer;
+                    const write_ud = self.write_pool.create() catch unreachable;
+                    write_ud.* = .{
+                        .transport = action_data.channel.transport,
+                        .future = action_data.future,
+                    };
+                    channel.socket.write(loop, c, .{ .slice = buffer }, Write, write_ud, xev_tcp.XevSocketChannel.writeCB);
+                },
                 // .read => {
                 //     const channel = m.action.read.channel;
                 //     const buffer = m.action.read.buffer;
