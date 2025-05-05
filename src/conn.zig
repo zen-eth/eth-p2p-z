@@ -14,7 +14,7 @@ pub const ConnInitializerVTable = struct {
     initConnFn: *const fn (instance: *anyopaque, conn: *AnyRxConn) anyerror!void,
 };
 
-/// ConnInitializer is a struct that holds the instance and vtable for the ConnInitializer interface.
+/// AnyConnInitializer is a struct that holds the instance and vtable for the ConnInitializer interface.
 /// It is used to initialize connections before they are used.
 pub const AnyConnInitializer = struct {
     instance: *anyopaque,
