@@ -10,6 +10,7 @@ pub const conn = @import("conn.zig");
 // pub const concurrent = @import("concurrent/lib.zig");
 pub const p2p_transport = @import("transport.zig");
 // pub const thread_event_loop = @import("thread_event_loop.zig");
+pub const transport = @import("transport/lib.zig");
 
 test {
     std.testing.refAllDeclsRecursive(@This());

@@ -9,31 +9,6 @@ const p2p_transport = @import("../../transport.zig");
 const io_loop = @import("../../thread_event_loop.zig");
 const Future = @import("../../concurrent/lib.zig").Future;
 
-pub const RxConn = p2p_conn.GenericRxConn(
-    *XevSocketChannel,
-    XevSocketChannel.WriteError,
-    XevSocketChannel.CloseError,
-    XevSocketChannel.write,
-    XevSocketChannel.close,
-    XevSocketChannel.handlerPipeline,
-    XevSocketChannel.connDirection,
-);
-
-pub const Listener = p2p_transport.GenericListener(
-    *XevListener,
-    XevListener.AcceptError,
-    *XevSocketChannel,
-    XevListener.accept,
-);
-
-pub const Transport = p2p_transport.GenericTransport(
-    *XevTransport,
-    XevTransport.DialError,
-    XevListener.ListenError,
-    XevTransport.dial,
-    XevTransport.listen,
-);
-
 /// SocketChannel represents a socket channel. It is used to send and receive messages.
 pub const XevSocketChannel = struct {
     pub const WriteError = Allocator.Error || xev.WriteError || error{AsyncNotifyFailed};
@@ -63,8 +38,9 @@ pub const XevSocketChannel = struct {
     }
 
     /// Write sends the buffer to the other end of the channel. It blocks until the write is complete. If an error occurs, it returns the error.
-    pub fn write(self: *XevSocketChannel, msg: []const u8) WriteError!usize {
+    pub fn write(self: *XevSocketChannel, msg: []const u8) !usize {
         const f = self.transport.io_event_loop.write_future_pool.create() catch unreachable;
+        defer self.transport.io_event_loop.write_future_pool.destroy(f);
         f.* = .{};
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
@@ -100,12 +76,20 @@ pub const XevSocketChannel = struct {
     }
 
     /// Close closes the channel. It blocks until the close is complete.
-    pub fn close(_: *XevSocketChannel) !void {
-        // TODO: we should close the socket here
-    }
+    pub fn close(self: *XevSocketChannel) !void {
+        if (self.transport.io_event_loop.inEventLoopThread()) {
+            const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
+            self.socket.shutdown(&self.transport.io_event_loop.loop, c, XevSocketChannel, self, shutdownCB);
+        } else {
+            const message = io_loop.IOMessage{
+                .action = .{ .close = .{ .channel = self, .timeout_ms = 30000 } },
+            };
 
-    pub fn toConn(self: *XevSocketChannel) RxConn {
-        return .{ .context = self };
+            self.transport.io_event_loop.queueMessage(message) catch |err| {
+                std.debug.print("Error queuing message: {}\n", .{err});
+                return error.AsyncNotifyFailed;
+            };
+        }
     }
 
     pub fn connDirection(self: *XevSocketChannel) p2p_conn.Direction {
@@ -114,6 +98,36 @@ pub const XevSocketChannel = struct {
 
     pub fn handlerPipeline(self: *XevSocketChannel) *p2p_conn.HandlerPipeline {
         return self.handler_pipeline;
+    }
+
+    // --- Static Wrapper Functions ---
+    fn vtableWriteFn(instance: *anyopaque, buffer: []const u8) anyerror!usize {
+        const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
+        return self.write(buffer);
+    }
+    fn vtableCloseFn(instance: *anyopaque) anyerror!void {
+        const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
+        return self.close();
+    }
+    fn vtableGetPipelineFn(instance: *anyopaque) *p2p_conn.HandlerPipeline {
+        const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
+        return self.handlerPipeline();
+    }
+    fn vtableDirectionFn(instance: *anyopaque) p2p_conn.Direction {
+        const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
+        return self.connDirection();
+    }
+
+    // --- Static VTable Instance ---
+    const vtable_instance = p2p_conn.RxConnVTable{
+        .writeFn = vtableWriteFn,
+        .closeFn = vtableCloseFn,
+        .getPipelineFn = vtableGetPipelineFn,
+        .directionFn = vtableDirectionFn,
+    };
+
+    pub fn any(self: *XevSocketChannel) p2p_conn.AnyRxConn {
+        return .{ .instance = self, .vtable = &vtable_instance };
     }
 
     pub fn writeCB(
@@ -141,44 +155,44 @@ pub const XevSocketChannel = struct {
     }
 
     fn readCB(
-        ud: ?*io_loop.ReadOrClose,
+        ud: ?*XevSocketChannel,
         loop: *xev.Loop,
         c: *xev.Completion,
         socket: xev.TCP,
         rb: xev.ReadBuffer,
         r: xev.ReadError!usize,
     ) xev.CallbackAction {
-        const read_or_close = ud.?;
-        const transport = read_or_close.transport;
+        const channel = ud.?;
+        const transport = channel.transport;
 
         const read_bytes = r catch |err| switch (err) {
             error.EOF => {
-                read_or_close.channel.getPipeline().fireReadComplete();
+                channel.handlerPipeline().fireReadComplete();
                 transport.io_event_loop.read_buffer_pool.destroy(
                     @alignCast(
-                        @as(*[4096]u8, @ptrFromInt(@intFromPtr(rb.slice.ptr))),
+                        @as(*[io_loop.BUFFER_SIZE]u8, @ptrFromInt(@intFromPtr(rb.slice.ptr))),
                     ),
                 );
-                socket.shutdown(loop, c, io_loop.ReadOrClose, read_or_close, shutdownCB);
+                socket.shutdown(loop, c, XevSocketChannel, channel, shutdownCB);
 
                 return .disarm;
             },
 
             else => {
-                read_or_close.channel.getPipeline().fireErrorCaught(err);
+                channel.handlerPipeline().fireErrorCaught(err);
                 transport.io_event_loop.read_buffer_pool.destroy(
                     @alignCast(
-                        @as(*[4096]u8, @ptrFromInt(@intFromPtr(rb.slice.ptr))),
+                        @as(*[io_loop.BUFFER_SIZE]u8, @ptrFromInt(@intFromPtr(rb.slice.ptr))),
                     ),
                 );
-                socket.shutdown(loop, c, io_loop.ReadOrClose, read_or_close, shutdownCB);
+                socket.shutdown(loop, c, XevSocketChannel, channel, shutdownCB);
 
                 return .disarm;
             },
         };
 
         if (read_bytes > 0) {
-            read_or_close.channel.getPipeline().fireRead(rb.slice[0..read_bytes]);
+            channel.handlerPipeline().fireRead(rb.slice[0..read_bytes]);
         }
 
         return .rearm;
@@ -187,7 +201,7 @@ pub const XevSocketChannel = struct {
     /// Callback executed when a socket shutdown operation completes.
     /// This initiates a full socket close after the shutdown completes.
     fn shutdownCB(
-        ud: ?*io_loop.ReadOrClose,
+        ud: ?*XevSocketChannel,
         l: *xev.Loop,
         c: *xev.Completion,
         s: xev.TCP,
@@ -198,37 +212,33 @@ pub const XevSocketChannel = struct {
         };
 
         const self = ud.?;
-        s.close(l, c, io_loop.ReadOrClose, self, closeCB);
+        s.close(l, c, XevSocketChannel, self, closeCB);
         return .disarm;
     }
 
     /// Callback executed when a socket close operation completes.
     /// This is the final step in the socket cleanup process.
     fn closeCB(
-        ud: ?*io_loop.ReadOrClose,
+        ud: ?*XevSocketChannel,
         _: *xev.Loop,
         c: *xev.Completion,
         _: xev.TCP,
         r: xev.CloseError!void,
     ) xev.CallbackAction {
-        const read_or_close = ud.?;
-        const transport = read_or_close.transport;
+        const channel = ud.?;
+        const transport = channel.transport;
         defer {
-            const p = read_or_close.channel.getPipeline();
+            const p = channel.handlerPipeline();
             p.deinit();
             transport.io_event_loop.handler_pipeline_pool.destroy(p);
 
-            const generic_conn: *const *RxConn = @alignCast(@ptrCast(read_or_close.channel.context));
-            transport.io_event_loop.rx_conn_pool.destroy(generic_conn);
-            transport.io_event_loop.channel_pool.destroy(generic_conn.context);
-
-            transport.io_event_loop.read_pool.destroy(read_or_close);
+            transport.allocator.destroy(channel);
             transport.io_event_loop.completion_pool.destroy(c);
         }
 
         _ = r catch unreachable;
 
-        read_or_close.channel.getPipeline().fireInactive();
+        channel.handlerPipeline().fireInactive();
 
         return .disarm;
     }
@@ -263,30 +273,30 @@ pub const XevListener = struct {
     }
 
     /// Accept accepts a connection from the listener. It blocks until a connection is accepted. If an error occurs, it returns the error.
-    pub fn accept(self: *XevListener, channel: *p2p_conn.AnyRxConn) AcceptError!void {
+    pub fn accept(self: *XevListener, channel: *p2p_conn.AnyRxConn) !void {
+        const f = try self.transport.allocator.create(Future(void, anyerror));
+        defer self.transport.allocator.destroy(f);
+        f.* = .{};
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
-            const a = self.transport.io_event_loop.accept_pool.create() catch unreachable;
+            const accept_ud = self.transport.io_event_loop.accept_pool.create() catch unreachable;
 
-            a.* = .{
+            accept_ud.* = .{
                 .transport = self.transport,
-                .future = channel,
+                .future = f,
+                .conn = channel,
             };
-            self.server.accept(&self.transport.io_event_loop.loop, c, a, acceptCB);
-            return;
+            self.server.accept(&self.transport.io_event_loop.loop, c, io_loop.Accept, accept_ud, acceptCB);
+        } else {
+            const message = io_loop.IOMessage{
+                .action = .{ .accept = .{ .channel = channel, .server = self.server, .future = f, .transport = self.transport, .timeout_ms = 30000 } },
+            };
+
+            self.transport.io_event_loop.queueMessage(message) catch |err| {
+                std.debug.print("Error queuing message: {}\n", .{err});
+                return error.AsyncNotifyFailed;
+            };
         }
-
-        const f = try self.transport.allocator.create(Future(void, AcceptError));
-        f.* = .{};
-        defer self.transport.allocator.destroy(f);
-        const message = io_loop.IOMessage{
-            .action = .{ .accept = .{ .channel = channel, .server = self.server, .future = f, .transport = self.transport } },
-        };
-
-        self.transport.io_event_loop.queueMessage(message) catch |err| {
-            std.debug.print("Error queuing message: {}\n", .{err});
-            return error.AsyncNotifyFailed;
-        };
 
         f.wait();
         if (f.getErr()) |err| {
@@ -294,8 +304,20 @@ pub const XevListener = struct {
         }
     }
 
-    pub fn toListener(self: *XevListener) Listener {
-        return .{ .context = self };
+    // --- Static Wrapper Function for ListenerVTable ---
+    fn vtableAcceptFn(instance: *anyopaque, connection: *p2p_conn.AnyRxConn) anyerror!void {
+        const self: *XevListener = @ptrCast(@alignCast(instance));
+        return self.accept(connection);
+    }
+
+    // --- Static VTable Instance ---
+    const vtable_instance = p2p_transport.ListenerVTable{
+        .acceptFn = vtableAcceptFn,
+    };
+
+    // --- any() method ---
+    pub fn any(self: *XevListener) p2p_transport.AnyListener {
+        return .{ .instance = self, .vtable = &vtable_instance };
     }
 
     pub fn acceptCB(
@@ -306,6 +328,7 @@ pub const XevListener = struct {
     ) xev.CallbackAction {
         const accept_ud = ud.?;
         const transport = accept_ud.transport.?;
+        defer transport.io_event_loop.completion_pool.destroy(c);
         defer transport.io_event_loop.accept_pool.destroy(accept_ud);
 
         const socket = r catch |err| {
@@ -315,31 +338,33 @@ pub const XevListener = struct {
             return .disarm;
         };
 
-        const channel = transport.io_event_loop.channel_pool.create() catch unreachable;
+        const channel = transport.allocator.create(XevSocketChannel) catch unreachable;
         channel.init(socket, transport, p2p_conn.Direction.INBOUND);
-        const rx_conn = channel.toConn();
-        const any_rx_conn = rx_conn.any();
+        const any_rx_conn = channel.any();
         accept_ud.conn.* = any_rx_conn;
 
-        transport.io_event_loop.conn_initializer.init(accept_ud.conn) catch |err| {
+        transport.io_event_loop.conn_initializer.initConn(accept_ud.conn) catch |err| {
             std.debug.print("Error initializing connection: {}\n", .{err});
+            transport.allocator.destroy(channel);
             accept_ud.future.setError(err);
             return .disarm;
         };
 
         const p = transport.io_event_loop.handler_pipeline_pool.create() catch unreachable;
-        p.init(transport.allocator, accept_ud.conn);
+        p.init(transport.allocator, any_rx_conn) catch |err| {
+            std.debug.print("Error creating handler pipeline: {}\n", .{err});
+            transport.allocator.destroy(channel);
+            transport.io_event_loop.handler_pipeline_pool.destroy(p);
+            accept_ud.future.setError(err);
+            return .disarm;
+        };
         channel.handler_pipeline = p;
 
         p.fireActive();
 
         const read_buf = transport.io_event_loop.read_buffer_pool.create() catch unreachable;
-        const read_ud = transport.io_event_loop.read_pool.create() catch unreachable;
-        read_ud.* = .{
-            .transport = transport,
-            .channel = accept_ud.conn,
-        };
-        socket.read(l, c, .{ .slice = read_buf }, io_loop.ReadOrClose, read_ud, XevSocketChannel.readCB);
+        const read_c = transport.io_event_loop.completion_pool.create() catch unreachable;
+        socket.read(l, read_c, .{ .slice = read_buf }, XevSocketChannel, channel, XevSocketChannel.readCB);
         accept_ud.future.setDone();
 
         return .disarm;
@@ -377,8 +402,8 @@ pub const XevTransport = struct {
     pub fn deinit(_: *XevTransport) void {}
 
     /// Dial connects to the given address and creates a channel for communication. It blocks until the connection is established. If an error occurs, it returns the error.
-    pub fn dial(self: *XevTransport, addr: std.net.Address, channel: *p2p_conn.AnyRxConn) DialError!void {
-        const f = try self.allocator.create(Future(void, DialError));
+    pub fn dial(self: *XevTransport, addr: std.net.Address, channel: *p2p_conn.AnyRxConn) !void {
+        const f = try self.allocator.create(Future(void, anyerror));
         f.* = .{};
         defer self.allocator.destroy(f);
         const message = io_loop.IOMessage{
@@ -387,6 +412,7 @@ pub const XevTransport = struct {
                 .channel = channel,
                 .transport = self,
                 .future = f,
+                .timeout_ms = 30000,
             } },
         };
 
@@ -403,7 +429,31 @@ pub const XevTransport = struct {
 
     /// Listen listens for incoming connections on the given address. It blocks until the listener is initialized. If an error occurs, it returns the error.
     pub fn listen(self: *XevTransport, addr: std.net.Address, listener: *p2p_transport.AnyListener) XevListener.ListenError!void {
-        try listener.init(addr, self.options.backlog, self);
+        const l = try self.allocator.create(XevListener);
+        try l.init(addr, self.options.backlog, self);
+        listener.* = l.any();
+    }
+
+    // --- Static Wrapper Functions for TransportVTable ---
+    fn vtableDialFn(instance: *anyopaque, addr: std.net.Address, connection: *p2p_conn.AnyRxConn) anyerror!void {
+        const self: *XevTransport = @ptrCast(@alignCast(instance));
+        return self.dial(addr, connection);
+    }
+
+    fn vtableListenFn(instance: *anyopaque, addr: std.net.Address, listener: *p2p_transport.AnyListener) anyerror!void {
+        const self: *XevTransport = @ptrCast(@alignCast(instance));
+        return self.listen(addr, listener);
+    }
+
+    // --- Static VTable Instance ---
+    const vtable_instance = p2p_transport.TransportVTable{
+        .dialFn = vtableDialFn,
+        .listenFn = vtableListenFn,
+    };
+
+    // --- any() method ---
+    pub fn any(self: *XevTransport) p2p_transport.AnyTransport {
+        return .{ .instance = self, .vtable = &vtable_instance };
     }
 
     /// Start starts the transport. It blocks until the transport is stopped.
@@ -412,10 +462,6 @@ pub const XevTransport = struct {
 
     /// Close closes the transport.
     pub fn close(_: *XevTransport) void {}
-
-    pub fn toTransport(self: *XevTransport) Transport {
-        return .{ .context = self };
-    }
 
     /// Callback executed when a connection attempt completes.
     /// This handles the result of trying to connect to a remote address.
@@ -438,12 +484,18 @@ pub const XevTransport = struct {
             return .disarm;
         };
 
-        const channel = transport.io_event_loop.channel_pool.create() catch unreachable;
+        const channel = transport.allocator.create(XevSocketChannel) catch unreachable;
         channel.init(socket, transport, p2p_conn.Direction.OUTBOUND);
 
         const p = transport.io_event_loop.handler_pipeline_pool.create() catch unreachable;
-        const associated_conn = channel.toConn().any();
-        p.init(transport.allocator, associated_conn);
+        const associated_conn = channel.any();
+        p.init(transport.allocator, associated_conn) catch |err| {
+            std.debug.print("Error creating handler pipeline: {}\n", .{err});
+            transport.allocator.destroy(channel);
+            transport.io_event_loop.handler_pipeline_pool.destroy(p);
+            connect.future.setError(err);
+            return .disarm;
+        };
         channel.handler_pipeline = p;
 
         connect.channel.* = associated_conn;

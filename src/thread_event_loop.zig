@@ -8,7 +8,6 @@ const conn = @import("conn.zig");
 // const Config = @import("muxer/yamux/Config.zig");
 // const session = @import("muxer/yamux/session.zig");
 const xev_tcp = @import("transport/tcp/xev.zig");
-const pipeline = @import("pipeline.zig");
 // const yamux_timer = @import("muxer/yamux/timeout_loop.zig");
 
 pub const IOAction = union(enum) {
@@ -36,13 +35,18 @@ pub const IOAction = union(enum) {
     accept: struct {
         server: xev.TCP,
         channel: *conn.AnyRxConn,
-        future: *Future(void, xev_tcp.XevListener.AcceptError),
+        future: *Future(void, anyerror),
         transport: ?*xev_tcp.XevTransport = null,
+        timeout_ms: u64,
     },
     write: struct {
         buffer: []const u8,
         channel: *xev_tcp.XevSocketChannel,
-        future: *Future(usize, xev_tcp.XevSocketChannel.WriteError),
+        future: *Future(usize, anyerror),
+        timeout_ms: u64,
+    },
+    close: struct {
+        channel: *xev_tcp.XevSocketChannel,
         timeout_ms: u64,
     },
     // read: struct {
@@ -71,7 +75,7 @@ pub const Connect = struct {
 };
 
 pub const Write = struct {
-    future: *Future(usize, xev_tcp.XevSocketChannel.WriteError),
+    future: *Future(usize, anyerror),
 
     transport: ?*xev_tcp.XevTransport = null,
 };
@@ -106,13 +110,13 @@ pub const IOMessage = struct {
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
 const ConnectPool = std.heap.MemoryPool(Connect);
 const ConnectTimeoutPool = std.heap.MemoryPool(ConnectTimeout);
-const XevSocketChannelPool = std.heap.MemoryPool(xev_tcp.XevSocketChannel);
+// const XevSocketChannelPool = std.heap.MemoryPool(xev_tcp.XevSocketChannel);
 const HandlerPipelinePool = std.heap.MemoryPool(conn.HandlerPipeline);
 const WritePool = std.heap.MemoryPool(Write);
-const WriteFuturePool = std.heap.MemoryPool(Future(usize, xev_tcp.XevSocketChannel.WriteError));
+const WriteFuturePool = std.heap.MemoryPool(Future(usize, anyerror));
 const AcceptPool = std.heap.MemoryPool(Accept);
-const RxConnPool = std.heap.MemoryPool(xev_tcp.RxConn);
-const ReadBufferPool = std.heap.MemoryPool([64 * 1024]u8);
+pub const BUFFER_SIZE = 64 * 1024;
+const ReadBufferPool = std.heap.MemoryPool([BUFFER_SIZE]u8);
 const ReadPool = std.heap.MemoryPool(ReadOrClose);
 
 /// Represents a thread-based event loop for managing asynchronous I/O operations.
@@ -140,7 +144,7 @@ pub const ThreadEventLoop = struct {
 
     connect_timeout_pool: ConnectTimeoutPool,
 
-    channel_pool: XevSocketChannelPool,
+    // channel_pool: XevSocketChannelPool,
 
     handler_pipeline_pool: HandlerPipelinePool,
 
@@ -150,7 +154,7 @@ pub const ThreadEventLoop = struct {
 
     accept_pool: AcceptPool,
 
-    rx_conn_pool: RxConnPool,
+    // rx_conn_pool: RxConnPool,
 
     read_buffer_pool: ReadBufferPool,
 
@@ -186,8 +190,8 @@ pub const ThreadEventLoop = struct {
         var connect_pool = ConnectPool.init(allocator);
         errdefer connect_pool.deinit();
 
-        var channel_pool = XevSocketChannelPool.init(allocator);
-        errdefer channel_pool.deinit();
+        // var channel_pool = XevSocketChannelPool.init(allocator);
+        // errdefer channel_pool.deinit();
 
         var handler_pipeline_pool = HandlerPipelinePool.init(allocator);
         errdefer handler_pipeline_pool.deinit();
@@ -201,8 +205,8 @@ pub const ThreadEventLoop = struct {
         var accept_pool = AcceptPool.init(allocator);
         errdefer accept_pool.deinit();
 
-        var rx_conn_pool = RxConnPool.init(allocator);
-        errdefer rx_conn_pool.deinit();
+        // var rx_conn_pool = RxConnPool.init(allocator);
+        // errdefer rx_conn_pool.deinit();
 
         var read_buffer_pool = ReadBufferPool.init(allocator);
         errdefer read_buffer_pool.deinit();
@@ -223,12 +227,12 @@ pub const ThreadEventLoop = struct {
             .completion_pool = completion_pool,
             .connect_pool = connect_pool,
             .connect_timeout_pool = connect_timeout_pool,
-            .channel_pool = channel_pool,
+            // .channel_pool = channel_pool,
             .handler_pipeline_pool = handler_pipeline_pool,
             .write_pool = write_pool,
             .write_future_pool = write_future_pool,
             .accept_pool = accept_pool,
-            .rx_conn_pool = rx_conn_pool,
+            // .rx_conn_pool = rx_conn_pool,
             .read_buffer_pool = read_buffer_pool,
             .read_pool = read_pool,
             .conn_initializer = conn_initializer,
@@ -250,12 +254,10 @@ pub const ThreadEventLoop = struct {
         self.completion_pool.deinit();
         self.connect_pool.deinit();
         self.connect_timeout_pool.deinit();
-        self.channel_pool.deinit();
         self.handler_pipeline_pool.deinit();
         self.write_pool.deinit();
         self.write_future_pool.deinit();
         self.accept_pool.deinit();
-        self.rx_conn_pool.deinit();
         self.read_buffer_pool.deinit();
         self.read_pool.deinit();
     }
@@ -350,29 +352,34 @@ pub const ThreadEventLoop = struct {
                     const address = action_data.address;
                     var socket = xev.TCP.init(address) catch unreachable;
                     const c = self.completion_pool.create() catch unreachable;
-                    const timer = xev.Timer.init() catch unreachable;
-                    const c_timer = self.completion_pool.create() catch unreachable;
-                    const connect_timeout = action_data.timeout_ms;
+                    // const timer = xev.Timer.init() catch unreachable;
+                    // const c_timer = self.completion_pool.create() catch unreachable;
+                    // const connect_timeout = action_data.timeout_ms;
                     const connect_ud = self.connect_pool.create() catch unreachable;
                     connect_ud.* = .{
                         .future = action_data.future,
                         .transport = action_data.transport,
                         .channel = action_data.channel,
                     };
-                    const connect_timeout_ud = self.connect_timeout_pool.create() catch unreachable;
-                    connect_timeout_ud.* = .{
-                        .future = action_data.future,
-                        .transport = action_data.transport,
-                        .socket = socket,
-                    };
+                    // const connect_timeout_ud = self.connect_timeout_pool.create() catch unreachable;
+                    // connect_timeout_ud.* = .{
+                    //     .future = action_data.future,
+                    //     .transport = action_data.transport,
+                    //     .socket = socket,
+                    // };
                     socket.connect(loop, c, address, Connect, connect_ud, xev_tcp.XevTransport.connectCB);
-                    timer.run(loop, c_timer, connect_timeout, ConnectTimeout, connect_timeout_ud, xev_tcp.XevTransport.connectTimeoutCB);
+                    // timer.run(loop, c_timer, connect_timeout, ConnectTimeout, connect_timeout_ud, xev_tcp.XevTransport.connectTimeoutCB);
                 },
                 .accept => |action_data| {
-                    const server = action_data.accept.server;
+                    const server = action_data.server;
                     const c = self.completion_pool.create() catch unreachable;
-
-                    server.accept(loop, c, IOMessage, m, acceptCB);
+                    const accept_ud = self.accept_pool.create() catch unreachable;
+                    accept_ud.* = .{
+                        .future = action_data.future,
+                        .transport = action_data.transport,
+                        .conn = action_data.channel,
+                    };
+                    server.accept(loop, c, Accept, accept_ud, xev_tcp.XevListener.acceptCB);
                 },
                 .write => |action_data| {
                     const c = self.completion_pool.create() catch unreachable;
@@ -385,6 +392,11 @@ pub const ThreadEventLoop = struct {
                     };
                     channel.socket.write(loop, c, .{ .slice = buffer }, Write, write_ud, xev_tcp.XevSocketChannel.writeCB);
                 },
+                .close => |action_data| {
+                    const channel = action_data.channel;
+                    const c = self.completion_pool.create() catch unreachable;
+                    channel.socket.close(loop, c, xev_tcp.XevSocketChannel, channel, xev_tcp.XevSocketChannel.closeCB);
+                },
                 // .read => {
                 //     const channel = m.action.read.channel;
                 //     const buffer = m.action.read.buffer;
@@ -393,6 +405,7 @@ pub const ThreadEventLoop = struct {
                 //     channel.socket.read(loop, c, .{ .slice = buffer }, IOMessage, m, readCB);
                 // },
             }
+            self.allocator.destroy(m);
         }
 
         return .rearm;
