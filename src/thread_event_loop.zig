@@ -160,14 +160,14 @@ pub const ThreadEventLoop = struct {
 
     read_pool: ReadPool,
 
-    conn_initializer: conn.AnyConnInitializer,
+    conn_initializer: *conn.AnyConnInitializer,
 
     loop_thread_id: std.Thread.Id,
 
     const Self = @This();
 
     /// Initializes the event loop.
-    pub fn init(self: *Self, allocator: Allocator, conn_initializer: conn.AnyConnInitializer) !void {
+    pub fn init(self: *Self, allocator: Allocator, conn_initializer: *conn.AnyConnInitializer) !void {
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
 
@@ -395,7 +395,7 @@ pub const ThreadEventLoop = struct {
                 .close => |action_data| {
                     const channel = action_data.channel;
                     const c = self.completion_pool.create() catch unreachable;
-                    channel.socket.close(loop, c, xev_tcp.XevSocketChannel, channel, xev_tcp.XevSocketChannel.closeCB);
+                    channel.socket.shutdown(loop, c, xev_tcp.XevSocketChannel, channel, xev_tcp.XevSocketChannel.shutdownCB);
                 },
                 // .read => {
                 //     const channel = m.action.read.channel;

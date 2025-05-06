@@ -154,7 +154,7 @@ pub const XevSocketChannel = struct {
         return .disarm;
     }
 
-    fn readCB(
+    pub fn readCB(
         ud: ?*XevSocketChannel,
         loop: *xev.Loop,
         c: *xev.Completion,
@@ -200,7 +200,7 @@ pub const XevSocketChannel = struct {
 
     /// Callback executed when a socket shutdown operation completes.
     /// This initiates a full socket close after the shutdown completes.
-    fn shutdownCB(
+    pub fn shutdownCB(
         ud: ?*XevSocketChannel,
         l: *xev.Loop,
         c: *xev.Completion,
@@ -218,7 +218,7 @@ pub const XevSocketChannel = struct {
 
     /// Callback executed when a socket close operation completes.
     /// This is the final step in the socket cleanup process.
-    fn closeCB(
+    pub fn closeCB(
         ud: ?*XevSocketChannel,
         _: *xev.Loop,
         c: *xev.Completion,
@@ -584,99 +584,134 @@ pub const XevTransport = struct {
     }
 };
 
-// test "dial connection refused" {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     const allocator = gpa.allocator();
-//     var l: io_loop.ThreadEventLoop = undefined;
-//     try l.init(allocator);
-//     defer {
-//         l.close();
-//         l.deinit();
-//     }
+const MockConnInitializer = struct {
+    pub const Error = anyerror;
 
-//     const opts = XevTransport.Options{
-//         .backlog = 128,
-//     };
+    const Self = @This();
 
-//     var transport: XevTransport = undefined;
-//     try transport.init(&l, allocator, opts);
-//     defer transport.deinit();
+    // No-op implementation
+    pub fn initConnImpl(self: *Self, conn: *p2p_conn.AnyRxConn) Error!void {
+        _ = self; // Avoid unused self
+        _ = conn; // Avoid unused conn
+        // std.debug.print("MockConnInitializer.initConn called (no-op).\n", .{});
+        return; // Explicitly return void
+    }
 
-//     var channel: XevSocketChannel = undefined;
-//     const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
-//     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel));
+    // Static wrapper function for the VTable
+    fn vtableInitConnFn(instance: *anyopaque, conn: *p2p_conn.AnyRxConn) Error!void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.initConnImpl(conn);
+    }
 
-//     var channel1: XevSocketChannel = undefined;
-//     try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel1));
+    // Static VTable instance
+    const vtable_instance = p2p_conn.ConnInitializerVTable{
+        .initConnFn = vtableInitConnFn,
+    };
 
-//     const thread2 = try std.Thread.spawn(.{}, struct {
-//         fn run(t: *XevTransport, a: std.net.Address) !void {
-//             var ch: XevSocketChannel = undefined;
-//             try std.testing.expectError(error.ConnectionRefused, t.dial(a, &ch));
-//         }
-//     }.run, .{ &transport, addr });
+    // any() method to return the interface
+    pub fn any(self: *Self) p2p_conn.AnyConnInitializer {
+        return .{
+            .instance = self,
+            .vtable = &vtable_instance,
+        };
+    }
+};
 
-//     thread2.join();
-//     transport.close();
-// }
+test "dial connection refused" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    const opts = XevTransport.Options{
+        .backlog = 128,
+    };
 
-// test "dial and accept" {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     const allocator = gpa.allocator();
+    var mock_initializer = MockConnInitializer{};
+    var any_initializer = mock_initializer.any();
 
-//     var sl: io_loop.ThreadEventLoop = undefined;
-//     try sl.init(allocator);
-//     defer {
-//         sl.close();
-//         sl.deinit();
-//     }
+    var event_loop: io_loop.ThreadEventLoop = undefined;
+    try event_loop.init(allocator, &any_initializer);
+    defer {
+        event_loop.close();
+        event_loop.deinit();
+    }
 
-//     const opts = XevTransport.Options{
-//         .backlog = 128,
-//     };
+    var transport: XevTransport = undefined;
+    try transport.init(&event_loop, allocator, opts);
+    defer transport.deinit();
 
-//     var transport: XevTransport = undefined;
-//     try transport.init(&sl, allocator, opts);
-//     defer transport.deinit();
+    var channel: p2p_conn.AnyRxConn = undefined;
+    const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
+    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel));
 
-//     var listener: XevListener = undefined;
-//     const addr = try std.net.Address.parseIp("0.0.0.0", 8082);
-//     try transport.listen(addr, &listener);
+    var channel1: p2p_conn.AnyRxConn = undefined;
+    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel1));
 
-//     var channel: XevSocketChannel = undefined;
-//     const accept_thread = try std.Thread.spawn(.{}, struct {
-//         fn run(l: *XevListener, _: *XevSocketChannel) !void {
-//             var accepted_count: usize = 0;
-//             while (accepted_count < 2) : (accepted_count += 1) {
-//                 var accepted_channel: XevSocketChannel = undefined;
-//                 try l.accept(&accepted_channel);
-//                 try std.testing.expectEqual(accepted_channel.direction, .INBOUND);
-//             }
-//         }
-//     }.run, .{ &listener, &channel });
+    const thread2 = try std.Thread.spawn(.{}, struct {
+        fn run(t: *XevTransport, a: std.net.Address) !void {
+            var ch: p2p_conn.AnyRxConn = undefined;
+            try std.testing.expectError(error.ConnectionRefused, t.dial(a, &ch));
+        }
+    }.run, .{ &transport, addr });
 
-//     var cl: io_loop.ThreadEventLoop = undefined;
-//     try cl.init(allocator);
-//     defer {
-//         cl.close();
-//         cl.deinit();
-//     }
-//     var client: XevTransport = undefined;
-//     try client.init(&cl, allocator, opts);
-//     defer client.deinit();
+    thread2.join();
+}
 
-//     var channel1: XevSocketChannel = undefined;
-//     try client.dial(addr, &channel1);
-//     try std.testing.expectEqual(channel1.direction, .OUTBOUND);
+test "dial and accept" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
 
-//     var channel2: XevSocketChannel = undefined;
-//     try client.dial(addr, &channel2);
-//     try std.testing.expectEqual(channel2.direction, .OUTBOUND);
+    var mock_initializer = MockConnInitializer{};
+    var any_initializer = mock_initializer.any();
 
-//     accept_thread.join();
-//     client.close();
-//     transport.close();
-// }
+    var sl: io_loop.ThreadEventLoop = undefined;
+    try sl.init(allocator, &any_initializer);
+    defer {
+        sl.close();
+        sl.deinit();
+    }
+
+    const opts = XevTransport.Options{
+        .backlog = 128,
+    };
+
+    var transport: XevTransport = undefined;
+    try transport.init(&sl, allocator, opts);
+    defer transport.deinit();
+
+    var listener: p2p_transport.AnyListener = undefined;
+    const addr = try std.net.Address.parseIp("0.0.0.0", 8082);
+    try transport.listen(addr, &listener);
+
+    const accept_thread = try std.Thread.spawn(.{}, struct {
+        fn run(l: *p2p_transport.AnyListener) !void {
+            var accepted_count: usize = 0;
+            while (accepted_count < 2) : (accepted_count += 1) {
+                var accepted_channel: p2p_conn.AnyRxConn = undefined;
+                try l.accept(&accepted_channel);
+                try std.testing.expectEqual(accepted_channel.direction(), p2p_conn.Direction.INBOUND);
+            }
+        }
+    }.run, .{&listener});
+
+    var cl: io_loop.ThreadEventLoop = undefined;
+    try cl.init(allocator, &any_initializer);
+    defer {
+        cl.close();
+        cl.deinit();
+    }
+    var client: XevTransport = undefined;
+    try client.init(&cl, allocator, opts);
+    defer client.deinit();
+
+    var channel1: p2p_conn.AnyRxConn = undefined;
+    try client.dial(addr, &channel1);
+    try std.testing.expectEqual(channel1.direction(), p2p_conn.Direction.OUTBOUND);
+
+    var channel2: p2p_conn.AnyRxConn = undefined;
+    try client.dial(addr, &channel2);
+    try std.testing.expectEqual(channel2.direction(), p2p_conn.Direction.OUTBOUND);
+
+    accept_thread.join();
+}
 
 // test "echo read and write" {
 //     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
