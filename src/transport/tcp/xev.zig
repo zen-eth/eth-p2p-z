@@ -602,7 +602,7 @@ pub const XevTransport = struct {
     /// This handles the result of trying to connect to a remote address.
     pub fn connectCB(
         ud: ?*io_loop.Connect,
-        _: *xev.Loop,
+        l: *xev.Loop,
         c: *xev.Completion,
         socket: xev.TCP,
         r: xev.ConnectError!void,
@@ -642,6 +642,10 @@ pub const XevTransport = struct {
         };
 
         p.fireActive();
+
+        const read_buf = transport.io_event_loop.read_buffer_pool.create() catch unreachable;
+        const read_c = transport.io_event_loop.completion_pool.create() catch unreachable;
+        socket.read(l, read_c, .{ .slice = read_buf }, XevSocketChannel, channel, XevSocketChannel.readCB);
 
         connect.future.rwlock.lock();
         if (!connect.future.isDone()) {
@@ -914,15 +918,20 @@ test "dial and accept" {
 const ServerEchoHandler = struct {
     allocator: Allocator,
 
+    received_message: []u8,
+
     const Self = @This();
 
     pub fn create(alloc: Allocator) !*Self {
         const self = try alloc.create(Self);
-        self.* = .{ .allocator = alloc };
+        const received_message = try alloc.alloc(u8, 1024);
+        @memset(received_message, 0);
+        self.* = .{ .allocator = alloc, .received_message = received_message };
         return self;
     }
 
     pub fn destroy(self: *Self) void {
+        self.allocator.free(self.received_message);
         self.allocator.destroy(self);
     }
 
@@ -1027,15 +1036,22 @@ const ServerEchoHandler = struct {
 const ClientEchoHandler = struct {
     allocator: Allocator,
 
+    received_message: []u8,
+
+    read: std.Thread.ResetEvent = .{},
+
     const Self = @This();
 
     pub fn create(alloc: Allocator) !*Self {
         const self = try alloc.create(Self);
-        self.* = .{ .allocator = alloc };
+        const received_message = try alloc.alloc(u8, 1024);
+        @memset(received_message, 0);
+        self.* = .{ .allocator = alloc, .received_message = received_message };
         return self;
     }
 
     pub fn destroy(self: *Self) void {
+        self.allocator.free(self.received_message);
         self.allocator.destroy(self);
     }
 
@@ -1053,7 +1069,9 @@ const ClientEchoHandler = struct {
     }
 
     pub fn onReadImpl(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
-        _ = self;
+        const len = msg.len;
+        @memcpy(self.received_message[0..len], msg[0..len]);
+        self.read.set();
         std.debug.print("ClientEchoHandler ({s}): Received message: {s}\n", .{ ctx.name, msg });
         ctx.fireRead(msg);
     }
@@ -1195,6 +1213,9 @@ test "echo read and write" {
 
     const n = try channel1.write("buf: []const u8");
     try std.testing.expect(n == 15);
+
+    client_handler.read.wait();
+    try std.testing.expectEqualStrings("buf: []const u8", client_handler.received_message[0..n]);
     accept_thread.join();
 }
 
