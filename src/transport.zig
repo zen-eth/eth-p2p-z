@@ -3,7 +3,7 @@ const conn = @import("conn.zig");
 
 /// Listener interface for accepting incoming connections.
 pub const ListenerVTable = struct {
-    acceptFn: *const fn (instance: *anyopaque, connection: *conn.AnyRxConn) anyerror!void,
+    acceptFn: *const fn (instance: *anyopaque, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void) void,
 };
 
 /// AnyListener is a struct that uses the VTable pattern to provide a type-erased
@@ -17,9 +17,8 @@ pub const AnyListener = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    /// Accepts a new connection via the underlying listener implementation.
-    pub fn accept(self: Self, connection: *conn.AnyRxConn) Error!void {
-        return self.vtable.acceptFn(self.instance, connection);
+    pub fn accept(self: Self, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void) void {
+        self.vtable.acceptFn(self.instance, user_data, callback);
     }
 };
 

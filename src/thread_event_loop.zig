@@ -34,10 +34,10 @@ pub const IOAction = union(enum) {
     },
     accept: struct {
         server: xev.TCP,
-        channel: *conn.AnyRxConn,
-        future: *Future(void, anyerror),
-        transport: ?*xev_tcp.XevTransport = null,
+        transport: *xev_tcp.XevTransport,
         timeout_ms: u64,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void,
+        user_data: ?*anyopaque = null,
     },
     write: struct {
         buffer: []const u8,
@@ -100,12 +100,11 @@ pub const Close = struct {
 };
 
 pub const Accept = struct {
-    /// The future for the accept result.
-    future: *Future(void, anyerror),
-    /// The transport used for the accept operation.
-    transport: ?*xev_tcp.XevTransport = null,
+    transport: *xev_tcp.XevTransport,
 
-    conn: *conn.AnyRxConn,
+    user_data: ?*anyopaque = null,
+
+    callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void,
 };
 
 /// Represents a message for I/O operations in the event loop.
@@ -374,9 +373,9 @@ pub const ThreadEventLoop = struct {
                     const c = self.completion_pool.create() catch unreachable;
                     const accept_ud = self.accept_pool.create() catch unreachable;
                     accept_ud.* = .{
-                        .future = action_data.future,
+                        .callback = action_data.callback,
+                        .user_data = action_data.user_data,
                         .transport = action_data.transport,
-                        .conn = action_data.channel,
                     };
                     server.accept(loop, c, Accept, accept_ud, xev_tcp.XevListener.acceptCB);
                 },
