@@ -105,14 +105,13 @@ pub const IOMessage = struct {
     action: IOAction,
 };
 
-/// A memory pool for managing `xev.Completion` objects.
+pub const BUFFER_SIZE = 64 * 1024;
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
 const ConnectPool = std.heap.MemoryPool(Connect);
 const ConnectTimeoutPool = std.heap.MemoryPool(ConnectTimeout);
 const HandlerPipelinePool = std.heap.MemoryPool(conn.HandlerPipeline);
 const WritePool = std.heap.MemoryPool(Write);
 const AcceptPool = std.heap.MemoryPool(Accept);
-pub const BUFFER_SIZE = 64 * 1024;
 const ReadBufferPool = std.heap.MemoryPool([BUFFER_SIZE]u8);
 const ClosePool = std.heap.MemoryPool(Close);
 
@@ -140,8 +139,6 @@ pub const ThreadEventLoop = struct {
     connect_pool: ConnectPool,
 
     connect_timeout_pool: ConnectTimeoutPool,
-
-    // channel_pool: XevSocketChannelPool,
 
     handler_pipeline_pool: HandlerPipelinePool,
 
@@ -256,7 +253,7 @@ pub const ThreadEventLoop = struct {
     /// Stops the event loop and joins the thread.
     pub fn close(self: *Self) void {
         self.stop_notifier.notify() catch |err| {
-            std.debug.print("Error notifying stop: {}\n", .{err});
+            std.log.err("Error notifying stop: {}\n", .{err});
         };
 
         self.loop_thread.join();
@@ -287,7 +284,7 @@ pub const ThreadEventLoop = struct {
         r: xev.Async.WaitError!void,
     ) xev.CallbackAction {
         r catch |err| {
-            std.debug.print("Error in stop callback: {}\n", .{err});
+            std.log.err("Error in stop callback: {}\n", .{err});
             return .disarm;
         };
 
@@ -304,7 +301,7 @@ pub const ThreadEventLoop = struct {
         r: xev.Async.WaitError!void,
     ) xev.CallbackAction {
         r catch |err| {
-            std.debug.print("Error in async callback: {}\n", .{err});
+            std.log.err("Error in async callback: {}\n", .{err});
             return .disarm;
         };
         const self = self_.?;
@@ -398,285 +395,81 @@ pub const ThreadEventLoop = struct {
         return .rearm;
     }
 
-    /// Callback executed when the open stream timer expires.
-    /// This is used to handle timeouts when establishing a new stream connection.
-    fn runOpenStreamTimerCB(
-        ud: ?*IOAction,
-        _: *xev.Loop,
-        c: *xev.Completion,
-        tr: xev.Timer.RunError!void,
-    ) xev.CallbackAction {
-        const action = ud.?.run_open_stream_timer;
-        defer action.io_loop.?.completion_pool.destroy(c);
-        defer action.io_loop.?.allocator.destroy(action);
+    // /// Callback executed when the open stream timer expires.
+    // /// This is used to handle timeouts when establishing a new stream connection.
+    // fn runOpenStreamTimerCB(
+    //     ud: ?*IOAction,
+    //     _: *xev.Loop,
+    //     c: *xev.Completion,
+    //     tr: xev.Timer.RunError!void,
+    // ) xev.CallbackAction {
+    //     const action = ud.?.run_open_stream_timer;
+    //     defer action.io_loop.?.completion_pool.destroy(c);
+    //     defer action.io_loop.?.allocator.destroy(action);
 
-        tr catch |err| {
-            if (err != xev.Timer.RunError.Canceled) {
-                std.log.err("Error in timer callback: {}\n", .{err});
-            }
-            return .disarm;
-        };
+    //     tr catch |err| {
+    //         if (err != xev.Timer.RunError.Canceled) {
+    //             std.log.err("Error in timer callback: {}\n", .{err});
+    //         }
+    //         return .disarm;
+    //     };
 
-        if (action.stream.session.isClosed()) {
-            return .disarm;
-        }
+    //     if (action.stream.session.isClosed()) {
+    //         return .disarm;
+    //     }
 
-        if (action.stream.establish_completion.isSet()) {
-            return .disarm;
-        }
+    //     if (action.stream.establish_completion.isSet()) {
+    //         return .disarm;
+    //     }
 
-        // timer expired
-        action.stream.session.close();
-        return .disarm;
-    }
+    //     // timer expired
+    //     action.stream.session.close();
+    //     return .disarm;
+    // }
 
-    /// Callback executed when the close stream timer expires.
-    /// This is used to handle timeouts when closing a stream connection.
-    fn runCloseStreamTimerCB(
-        ud: ?*IOMessage,
-        _: *xev.Loop,
-        _: *xev.Completion,
-        tr: xev.Timer.RunError!void,
-    ) xev.CallbackAction {
-        const n = ud.?;
-        const action = n.action.run_close_stream_timer;
-        defer action.io_loop.?.allocator.destroy(n);
+    // /// Callback executed when the close stream timer expires.
+    // /// This is used to handle timeouts when closing a stream connection.
+    // fn runCloseStreamTimerCB(
+    //     ud: ?*IOMessage,
+    //     _: *xev.Loop,
+    //     _: *xev.Completion,
+    //     tr: xev.Timer.RunError!void,
+    // ) xev.CallbackAction {
+    //     const n = ud.?;
+    //     const action = n.action.run_close_stream_timer;
+    //     defer action.io_loop.?.allocator.destroy(n);
 
-        tr catch |err| {
-            if (err != xev.Timer.RunError.Canceled) {
-                std.debug.print("Error in timer callback: {}\n", .{err});
-            }
-            return .disarm;
-        };
+    //     tr catch |err| {
+    //         if (err != xev.Timer.RunError.Canceled) {
+    //             std.debug.print("Error in timer callback: {}\n", .{err});
+    //         }
+    //         return .disarm;
+    //     };
 
-        // timer expired
-        action.stream.closeTimeout();
-        return .disarm;
-    }
+    //     // timer expired
+    //     action.stream.closeTimeout();
+    //     return .disarm;
+    // }
 
-    /// Callback executed when a close stream timer is canceled.
-    /// This is used to clean up resources when a timer is canceled before expiry.
-    fn cancelCloseStreamTimerCB(
-        ud: ?*IOMessage,
-        _: *xev.Loop,
-        c: *xev.Completion,
-        tr: xev.Timer.CancelError!void,
-    ) xev.CallbackAction {
-        const n = ud.?;
-        const action = n.action.cancel_close_stream_timer;
-        defer action.io_loop.?.completion_pool.destroy(c);
-        defer action.io_loop.?.allocator.destroy(n);
+    // /// Callback executed when a close stream timer is canceled.
+    // /// This is used to clean up resources when a timer is canceled before expiry.
+    // fn cancelCloseStreamTimerCB(
+    //     ud: ?*IOMessage,
+    //     _: *xev.Loop,
+    //     c: *xev.Completion,
+    //     tr: xev.Timer.CancelError!void,
+    // ) xev.CallbackAction {
+    //     const n = ud.?;
+    //     const action = n.action.cancel_close_stream_timer;
+    //     defer action.io_loop.?.completion_pool.destroy(c);
+    //     defer action.io_loop.?.allocator.destroy(n);
 
-        tr catch |err| {
-            std.debug.print("Error in timer callback: {}\n", .{err});
-            return .disarm;
-        };
+    //     tr catch |err| {
+    //         std.debug.print("Error in timer callback: {}\n", .{err});
+    //         return .disarm;
+    //     };
 
-        return .disarm;
-    }
+    //     return .disarm;
+    // }
 
-    /// Callback executed when a connection attempt completes.
-    /// This handles the result of trying to connect to a remote address.
-    fn connectCB(
-        ud: ?*IOMessage,
-        _: *xev.Loop,
-        c: *xev.Completion,
-        socket: xev.TCP,
-        r: xev.ConnectError!void,
-    ) xev.CallbackAction {
-        const n = ud.?;
-        const action = n.action.connect;
-        defer action.io_loop.?.completion_pool.destroy(c);
-        defer action.io_loop.?.allocator.destroy(n);
-
-        _ = r catch |err| {
-            std.debug.print("Error connecting: {}\n", .{err});
-            action.future.setError(err);
-
-            return .disarm;
-        };
-
-        action.channel.init(socket, action.transport.?, conn.Direction.OUTBOUND);
-        action.future.setDone();
-
-        return .disarm;
-    }
-
-    /// Callback executed when an accept operation completes.
-    /// This handles incoming connections on a listening socket.
-    fn acceptCB(
-        ud: ?*IOMessage,
-        _: *xev.Loop,
-        c: *xev.Completion,
-        r: xev.AcceptError!xev.TCP,
-    ) xev.CallbackAction {
-        const n = ud.?;
-        const action = n.action.accept;
-        defer action.io_loop.?.completion_pool.destroy(c);
-        defer action.io_loop.?.allocator.destroy(n);
-
-        const socket = r catch |err| {
-            std.debug.print("Error accepting: {}\n", .{err});
-            action.future.setError(err);
-
-            return .disarm;
-        };
-
-        action.channel.init(socket, action.transport.?, .INBOUND);
-        action.future.setDone();
-
-        return .disarm;
-    }
-
-    /// Callback executed when a write operation completes.
-    /// This handles the result of writing data to a socket.
-    fn writeCB(
-        ud: ?*IOMessage,
-        _: *xev.Loop,
-        c: *xev.Completion,
-        _: xev.TCP,
-        _: xev.WriteBuffer,
-        r: xev.WriteError!usize,
-    ) xev.CallbackAction {
-        const n = ud.?;
-        const action = n.action.write;
-        defer action.io_loop.?.completion_pool.destroy(c);
-        defer action.io_loop.?.allocator.destroy(n);
-
-        const written = r catch |err| {
-            std.debug.print("Error writing: {}\n", .{err});
-            action.future.setError(err);
-            return .disarm;
-        };
-
-        action.future.setValue(written);
-
-        return .disarm;
-    }
-
-    /// Callback executed when a read operation completes.
-    /// This handles the result of reading data from a socket.
-    /// If EOF or another error is encountered, it initiates a graceful shutdown.
-    fn readCB(
-        ud: ?*IOMessage,
-        loop: *xev.Loop,
-        c: *xev.Completion,
-        socket: xev.TCP,
-        _: xev.ReadBuffer,
-        r: xev.ReadError!usize,
-    ) xev.CallbackAction {
-        const n = ud.?;
-        const action = n.action.read;
-        defer action.io_loop.?.completion_pool.destroy(c);
-        defer action.io_loop.?.allocator.destroy(n);
-
-        const read = r catch |err| switch (err) {
-            error.EOF => {
-                const c_eof_error = action.channel.transport.allocator.create(xev.Completion) catch unreachable;
-                socket.shutdown(loop, c_eof_error, xev_tcp.XevSocketChannel, action.channel, shutdownCB);
-                action.future.setError(err);
-
-                return .disarm;
-            },
-
-            else => {
-                const c_error = action.channel.transport.allocator.create(xev.Completion) catch unreachable;
-                socket.shutdown(loop, c_error, xev_tcp.XevSocketChannel, action.channel, shutdownCB);
-                std.log.warn("server read unexpected err={}", .{err});
-                action.future.setError(err);
-
-                return .disarm;
-            },
-        };
-
-        action.future.setValue(read);
-
-        return .disarm;
-    }
-
-    /// Callback executed when a socket shutdown operation completes.
-    /// This initiates a full socket close after the shutdown completes.
-    fn shutdownCB(
-        ud: ?*xev_tcp.XevSocketChannel,
-        l: *xev.Loop,
-        c: *xev.Completion,
-        s: xev.TCP,
-        r: xev.ShutdownError!void,
-    ) xev.CallbackAction {
-        _ = r catch |err| {
-            std.debug.print("Error shutting down: {}\n", .{err});
-
-            return .disarm;
-        };
-
-        const self = ud.?;
-        s.close(l, c, xev_tcp.XevSocketChannel, self, closeCB);
-        return .disarm;
-    }
-
-    /// Callback executed when a socket close operation completes.
-    /// This is the final step in the socket cleanup process.
-    fn closeCB(
-        ud: ?*xev_tcp.XevSocketChannel,
-        _: *xev.Loop,
-        c: *xev.Completion,
-        _: xev.TCP,
-        r: xev.CloseError!void,
-    ) xev.CallbackAction {
-        const n = ud.?;
-        defer n.transport.allocator.destroy(c);
-
-        _ = r catch |err| {
-            std.debug.print("Error close: {}\n", .{err});
-
-            return .disarm;
-        };
-
-        return .disarm;
-    }
 };
-
-// test "TimerManager add timer for stream" {
-//     const allocator = std.testing.allocator;
-//     var event_loop: ThreadEventLoop = undefined;
-//     try event_loop.init(allocator);
-//     defer event_loop.deinit();
-
-//     // Create a test session and stream for timer
-//     var pipes = try conn.createPipeConnPair();
-//     defer {
-//         pipes.client.close();
-//         pipes.server.close();
-//     }
-
-//     const client_conn = pipes.client.conn().any();
-//     var config = Config.defaultConfig();
-
-//     var pool: std.Thread.Pool = undefined;
-//     try std.Thread.Pool.init(&pool, .{ .allocator = allocator });
-//     defer pool.deinit();
-
-//     var test_session: session.Session = undefined;
-//     try session.Session.init(allocator, &config, client_conn, &test_session, &pool);
-//     defer test_session.deinit();
-
-//     var test_stream: Stream = undefined;
-//     try Stream.init(&test_stream, &test_session, 1, .init, allocator);
-//     defer test_stream.deinit();
-
-//     const message = IOMessage{
-//         .action = .{
-//             .run_open_stream_timer = .{
-//                 .stream = &test_stream,
-//                 .timeout_ms = 100,
-//             },
-//         },
-//     };
-//     try event_loop.queueMessage(message);
-
-//     std.time.sleep(200 * std.time.ns_per_ms);
-
-//     try std.testing.expect(test_session.isClosed());
-
-//     event_loop.close();
-// }
