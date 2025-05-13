@@ -532,20 +532,41 @@ pub const XevTransport = struct {
 
     /// Dial connects to the given address and creates a channel for communication. It blocks until the connection is established. If an error occurs, it returns the error.
     pub fn dial(self: *XevTransport, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyRxConn) void) void {
-        const message = io_loop.IOMessage{
-            .action = .{ .connect = .{
-                .address = addr,
+        if (self.io_event_loop.inEventLoopThread()) {
+            var socket = xev.TCP.init(addr) catch unreachable;
+            const c = self.io_event_loop.completion_pool.create() catch unreachable;
+            // const timer = xev.Timer.init() catch unreachable;
+            // const c_timer = self.completion_pool.create() catch unreachable;
+            // const connect_timeout = action_data.timeout_ms;
+            const connect_ud = self.io_event_loop.connect_pool.create() catch unreachable;
+            connect_ud.* = .{
                 .transport = self,
-                .timeout_ms = 30000,
-                .user_data = user_data,
                 .callback = callback,
-            } },
-        };
+                .user_data = user_data,
+            };
+            // const connect_timeout_ud = self.connect_timeout_pool.create() catch unreachable;
+            // connect_timeout_ud.* = .{
+            //     .future = action_data.future,
+            //     .transport = self,
+            //     .socket = socket,
+            // };
+            socket.connect(&self.io_event_loop.loop, c, addr, io_loop.Connect, connect_ud, connectCB);
+        } else {
+            const message = io_loop.IOMessage{
+                .action = .{ .connect = .{
+                    .address = addr,
+                    .transport = self,
+                    .timeout_ms = 30000,
+                    .user_data = user_data,
+                    .callback = callback,
+                } },
+            };
 
-        self.io_event_loop.queueMessage(message) catch |err| {
-            std.debug.print("Error queuing message: {}\n", .{err});
-            callback(user_data, err);
-        };
+            self.io_event_loop.queueMessage(message) catch |err| {
+                std.debug.print("Error queuing message: {}\n", .{err});
+                callback(user_data, err);
+            };
+        }
     }
 
     /// Listen listens for incoming connections on the given address. It blocks until the listener is initialized. If an error occurs, it returns the error.
@@ -833,10 +854,10 @@ test "dial connection refused" {
     };
 
     var mock_initializer = MockConnInitializer{};
-    var any_initializer = mock_initializer.any();
+    const any_initializer = mock_initializer.any();
 
     var event_loop: io_loop.ThreadEventLoop = undefined;
-    try event_loop.init(allocator, &any_initializer);
+    try event_loop.init(allocator, any_initializer);
     defer {
         event_loop.close();
         event_loop.deinit();
@@ -874,10 +895,10 @@ test "dial and accept" {
     const allocator = gpa.allocator();
 
     var mock_initializer = MockConnInitializer{};
-    var any_initializer = mock_initializer.any();
+    const any_initializer = mock_initializer.any();
 
     var sl: io_loop.ThreadEventLoop = undefined;
-    try sl.init(allocator, &any_initializer);
+    try sl.init(allocator, any_initializer);
     defer {
         sl.close();
         sl.deinit();
@@ -907,7 +928,7 @@ test "dial and accept" {
     }.run, .{&listener});
 
     var cl: io_loop.ThreadEventLoop = undefined;
-    try cl.init(allocator, &any_initializer);
+    try cl.init(allocator, any_initializer);
     defer {
         cl.close();
         cl.deinit();
@@ -1217,13 +1238,13 @@ test "echo read and write" {
     const client_handler_any = client_handler.any();
 
     var mock_client_initializer = MockConnInitializer1.init(client_handler_any, allocator);
-    var any_client_initializer = mock_client_initializer.any();
+    const any_client_initializer = mock_client_initializer.any();
 
     var mock_server_initializer = MockConnInitializer1.init(server_handler_any, allocator);
-    var any_server_initializer = mock_server_initializer.any();
+    const any_server_initializer = mock_server_initializer.any();
 
     var sl: io_loop.ThreadEventLoop = undefined;
-    try sl.init(allocator, &any_server_initializer);
+    try sl.init(allocator, any_server_initializer);
     defer {
         sl.close();
         sl.deinit();
@@ -1252,7 +1273,7 @@ test "echo read and write" {
     }.run, .{ &listener, server_handler });
 
     var cl: io_loop.ThreadEventLoop = undefined;
-    try cl.init(allocator, &any_client_initializer);
+    try cl.init(allocator, any_client_initializer);
     defer {
         cl.close();
         cl.deinit();

@@ -165,14 +165,14 @@ pub const ThreadEventLoop = struct {
 
     close_pool: ClosePool,
 
-    conn_initializer: *conn.AnyConnInitializer,
+    conn_initializer: conn.AnyConnInitializer,
 
     loop_thread_id: std.Thread.Id,
 
     const Self = @This();
 
     /// Initializes the event loop.
-    pub fn init(self: *Self, allocator: Allocator, conn_initializer: *conn.AnyConnInitializer) !void {
+    pub fn init(self: *Self, allocator: Allocator, conn_initializer: conn.AnyConnInitializer) !void {
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
 
@@ -194,9 +194,6 @@ pub const ThreadEventLoop = struct {
 
         var connect_pool = ConnectPool.init(allocator);
         errdefer connect_pool.deinit();
-
-        // var channel_pool = XevSocketChannelPool.init(allocator);
-        // errdefer channel_pool.deinit();
 
         var handler_pipeline_pool = HandlerPipelinePool.init(allocator);
         errdefer handler_pipeline_pool.deinit();
@@ -226,11 +223,9 @@ pub const ThreadEventLoop = struct {
             .completion_pool = completion_pool,
             .connect_pool = connect_pool,
             .connect_timeout_pool = connect_timeout_pool,
-            // .channel_pool = channel_pool,
             .handler_pipeline_pool = handler_pipeline_pool,
             .write_pool = write_pool,
             .accept_pool = accept_pool,
-            // .rx_conn_pool = rx_conn_pool,
             .read_buffer_pool = read_buffer_pool,
             .close_pool = close_pool,
             .conn_initializer = conn_initializer,

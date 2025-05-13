@@ -42,15 +42,32 @@ pub const AnyListener = struct {
 };
 
 /// Transport interface for dialing and listening on network addresses.
+/// This is a type-erased interface that allows different implementations of
+/// transports to be used interchangeably. It uses the VTable pattern to provide
+/// a consistent interface for dialing and listening on network addresses.
+/// The `dialFn` function pointer is used to call the appropriate implementation
+/// of the dial function for the specific transport instance.
+/// The `listenFn` function pointer is used to call the appropriate implementation
+/// of the listen function for the specific transport instance.
 pub const TransportVTable = struct {
     dialFn: *const fn (instance: *anyopaque, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void) void,
     listenFn: *const fn (instance: *anyopaque, addr: std.net.Address) anyerror!AnyListener,
 };
 
 /// AnyTransport is a struct that uses the VTable pattern to provide a type-erased
-/// interface for dialing and listening on network addresses. It contains a pointer
-/// to the underlying transport implementation and a pointer to the VTable that
-/// defines the interface for that implementation.
+/// interface for dialing and listening on network addresses. It contains a
+/// pointer to the underlying transport implementation and a pointer to the
+/// VTable that defines the interface for that implementation. The `instance`
+/// field is a pointer to the underlying transport instance, and the `vtable`
+/// field is a pointer to the VTable that defines the interface for that instance.
+/// The `dial` function is used to dial a remote address. It takes an address,
+/// an optional user-defined data pointer, and a callback function that is
+/// called when the dialing operation is complete. The callback function takes
+/// a user-defined data pointer and a result of type `anyerror!conn.AnyRxConn`,
+/// which represents the established connection. The `listen` function is used
+/// to start listening on a local address. It takes an address and returns an
+/// `anyerror!AnyListener`, which represents the listener that will accept
+/// incoming connections.
 pub const AnyTransport = struct {
     instance: *anyopaque,
     vtable: *const TransportVTable,
@@ -64,7 +81,6 @@ pub const AnyTransport = struct {
     }
 
     /// Starts listening on a local address via the underlying transport implementation.
-    /// The actual listener logic is provided via the `listener` argument.
     pub fn listen(self: Self, addr: std.net.Address) Error!AnyListener {
         return self.vtable.listenFn(self.instance, addr);
     }
