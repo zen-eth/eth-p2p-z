@@ -37,56 +37,52 @@ pub const XevSocketChannel = struct {
         self.direction = direction;
     }
 
-    pub fn write(self: *XevSocketChannel, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    pub fn write(self: *XevSocketChannel, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
             const w = self.transport.io_event_loop.write_pool.create() catch unreachable;
 
             w.* = .{
                 .transport = self.transport,
-                .user_data = erased_userdata,
-                .callback = wrapped_cb,
+                .user_data = user_data,
+                .callback = callback,
             };
-            std.debug.print("WriteCB called55555 {*}\n", .{w});
             self.socket.write(&self.transport.io_event_loop.loop, c, .{ .slice = buffer }, io_loop.Write, w, writeCB);
-            std.debug.print("WriteCB called66666 \n", .{});
         } else {
             const message = io_loop.IOMessage{
                 .action = .{ .write = .{
                     .channel = self,
                     .buffer = buffer,
-                    .user_data = erased_userdata,
-                    .callback = wrapped_cb,
+                    .user_data = user_data,
+                    .callback = callback,
                     .timeout_ms = self.write_timeout_ms,
                 } },
             };
 
             self.transport.io_event_loop.queueMessage(message) catch |err| {
-                std.debug.print("Error queuing message: {}\n", .{err});
-                wrapped_cb(erased_userdata, err);
+                callback(user_data, err);
             };
         }
     }
 
-    pub fn close(self: *XevSocketChannel, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    pub fn close(self: *XevSocketChannel, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
             const close_ud = self.transport.io_event_loop.close_pool.create() catch unreachable;
 
             close_ud.* = .{
                 .channel = self,
-                .user_data = erased_userdata,
-                .callback = wrapped_cb,
+                .user_data = user_data,
+                .callback = callback,
             };
             self.socket.shutdown(&self.transport.io_event_loop.loop, c, io_loop.Close, close_ud, shutdownCB);
         } else {
             const message = io_loop.IOMessage{
-                .action = .{ .close = .{ .channel = self, .user_data = erased_userdata, .callback = wrapped_cb, .timeout_ms = 30000 } },
+                .action = .{ .close = .{ .channel = self, .user_data = user_data, .callback = callback, .timeout_ms = 30000 } },
             };
 
             self.transport.io_event_loop.queueMessage(message) catch |err| {
-                std.debug.print("Error queuing message: {}\n", .{err});
-                wrapped_cb(erased_userdata, err);
+                callback(user_data, err);
             };
         }
     }
@@ -104,26 +100,29 @@ pub const XevSocketChannel = struct {
         const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
         return self.handlerPipeline();
     }
+
     fn vtableDirectionFn(instance: *anyopaque) p2p_conn.Direction {
         const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
         return self.connDirection();
     }
+
     fn vtableWriteFn(
         instance: *anyopaque,
         buffer: []const u8,
-        erased_userdata: ?*anyopaque,
-        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
+        user_data: ?*anyopaque,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void {
         const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
-        return self.write(buffer, erased_userdata, wrapped_cb);
+        return self.write(buffer, user_data, callback);
     }
+
     fn vtableCloseFn(
         instance: *anyopaque,
-        erased_userdata: ?*anyopaque,
-        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
+        user_data: ?*anyopaque,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {
         const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
-        return self.close(erased_userdata, wrapped_cb);
+        return self.close(user_data, callback);
     }
 
     // --- Static VTable Instance ---
@@ -146,7 +145,6 @@ pub const XevSocketChannel = struct {
         _: xev.WriteBuffer,
         r: xev.WriteError!usize,
     ) xev.CallbackAction {
-        std.debug.print("WriteCB called\n", .{});
         const w = ud.?;
         const transport = w.transport;
         defer transport.io_event_loop.completion_pool.destroy(c);
@@ -225,7 +223,6 @@ pub const XevSocketChannel = struct {
         const close_ud = ud.?;
 
         _ = r catch |err| {
-            std.log.err("Error shutting down: {}\n", .{err});
             close_ud.callback(close_ud.user_data, err);
 
             return .disarm;
@@ -260,7 +257,7 @@ pub const XevSocketChannel = struct {
         close_ud.callback(close_ud.user_data, r);
 
         _ = r catch |err| {
-            std.debug.print("Error closing: {}\n", .{err});
+            std.log.err("Error closing socket: {}\n", .{err});
             return .disarm;
         };
 
@@ -270,12 +267,10 @@ pub const XevSocketChannel = struct {
     }
 
     fn noopCloseCB(ud: ?*anyopaque, r: anyerror!void) void {
-        // No-op callback for close operation
         _ = ud;
         _ = r catch |err| {
-            std.debug.print("Error in no-op close callback: {}\n", .{err});
+            std.log.err("Error in no-op close callback: {}\n", .{err});
         };
-        std.debug.print("No-op close callback called.\n", .{});
     }
 };
 
@@ -309,7 +304,6 @@ pub const XevListener = struct {
 
     /// Accept asynchronously accept a connection from the listener. It does not block. If an error occurs, it returns the error.
     pub fn accept(self: *XevListener, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyRxConn) void) void {
-        std.debug.print("Accept called\n", .{});
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
             const accept_ud = self.transport.io_event_loop.accept_pool.create() catch unreachable;
@@ -321,13 +315,11 @@ pub const XevListener = struct {
             };
             self.server.accept(&self.transport.io_event_loop.loop, c, io_loop.Accept, accept_ud, acceptCB);
         } else {
-            std.debug.print("Accept called2222\n", .{});
             const message = io_loop.IOMessage{
                 .action = .{ .accept = .{ .server = self.server, .transport = self.transport, .user_data = user_data, .callback = callback, .timeout_ms = 30000 } },
             };
 
             self.transport.io_event_loop.queueMessage(message) catch |err| {
-                std.debug.print("Error queuing message: {}\n", .{err});
                 callback(user_data, err);
             };
         }
@@ -356,13 +348,11 @@ pub const XevListener = struct {
         r: xev.AcceptError!xev.TCP,
     ) xev.CallbackAction {
         const accept_ud = ud.?;
-        std.debug.print("AcceptCB called 1111222{}\n", .{accept_ud.*});
         const transport = accept_ud.transport;
         defer transport.io_event_loop.completion_pool.destroy(c);
         defer transport.io_event_loop.accept_pool.destroy(accept_ud);
 
         const socket = r catch |err| {
-            std.debug.print("Error accepting: {}\n", .{err});
             accept_ud.callback(accept_ud.user_data, err);
 
             return .disarm;
@@ -374,7 +364,6 @@ pub const XevListener = struct {
 
         const p = transport.io_event_loop.handler_pipeline_pool.create() catch unreachable;
         p.init(transport.allocator, any_rx_conn) catch |err| {
-            std.debug.print("Error creating handler pipeline: {}\n", .{err});
             transport.allocator.destroy(channel);
             transport.io_event_loop.handler_pipeline_pool.destroy(p);
             accept_ud.callback(accept_ud.user_data, err);
@@ -383,7 +372,6 @@ pub const XevListener = struct {
         channel.handler_pipeline = p;
 
         transport.io_event_loop.conn_initializer.initConn(any_rx_conn) catch |err| {
-            std.debug.print("Error initializing connection: {}\n", .{err});
             transport.allocator.destroy(channel);
             transport.io_event_loop.handler_pipeline_pool.destroy(p);
             accept_ud.callback(accept_ud.user_data, err);
@@ -464,7 +452,6 @@ pub const XevTransport = struct {
             };
 
             self.io_event_loop.queueMessage(message) catch |err| {
-                std.debug.print("Error queuing message: {}\n", .{err});
                 callback(user_data, err);
             };
         }
@@ -521,7 +508,6 @@ pub const XevTransport = struct {
         defer transport.io_event_loop.connect_pool.destroy(connect);
 
         _ = r catch |err| {
-            std.debug.print("Error connecting: {}\n", .{err});
             connect.callback(connect.user_data, err);
 
             return .disarm;
@@ -534,7 +520,6 @@ pub const XevTransport = struct {
         const associated_conn = channel.any();
 
         p.init(transport.allocator, associated_conn) catch |err| {
-            std.debug.print("Error creating handler pipeline: {}\n", .{err});
             transport.allocator.destroy(channel);
             transport.io_event_loop.handler_pipeline_pool.destroy(p);
             connect.callback(connect.user_data, err);
@@ -543,7 +528,6 @@ pub const XevTransport = struct {
         channel.handler_pipeline = p;
 
         transport.io_event_loop.conn_initializer.initConn(associated_conn) catch |err| {
-            std.debug.print("Error initializing connection: {}\n", .{err});
             transport.allocator.destroy(channel);
             transport.io_event_loop.handler_pipeline_pool.destroy(p);
             connect.callback(connect.user_data, err);
@@ -560,81 +544,40 @@ pub const XevTransport = struct {
         return .disarm;
     }
 
-    pub fn connectTimeoutCB(
-        ud: ?*io_loop.ConnectTimeout,
-        l: *xev.Loop,
-        c: *xev.Completion,
-        r: xev.Timer.RunError!void,
-    ) xev.CallbackAction {
-        const connect_timeout = ud.?;
-        const transport = connect_timeout.transport.?;
-        defer transport.io_event_loop.completion_pool.destroy(c);
-        defer transport.io_event_loop.connect_timeout_pool.destroy(connect_timeout);
+    // pub fn connectTimeoutCB(
+    //     ud: ?*io_loop.ConnectTimeout,
+    //     l: *xev.Loop,
+    //     c: *xev.Completion,
+    //     r: xev.Timer.RunError!void,
+    // ) xev.CallbackAction {
+    //     const connect_timeout = ud.?;
+    //     const transport = connect_timeout.transport.?;
+    //     defer transport.io_event_loop.completion_pool.destroy(c);
+    //     defer transport.io_event_loop.connect_timeout_pool.destroy(connect_timeout);
 
-        _ = r catch |err| {
-            std.debug.print("Error connecting: {}\n", .{err});
-            connect_timeout.future.rwlock.lock();
-            if (!connect_timeout.future.isDone()) {
-                connect_timeout.future.setError(err);
-                const shutdown_c = transport.io_event_loop.completion_pool.create() catch unreachable;
-                connect_timeout.socket.shutdown(l, shutdown_c, XevTransport, transport, shutdownCB);
-            }
-            connect_timeout.future.rwlock.unlock();
+    //     _ = r catch |err| {
+    //         connect_timeout.future.rwlock.lock();
+    //         if (!connect_timeout.future.isDone()) {
+    //             connect_timeout.future.setError(err);
+    //             const shutdown_c = transport.io_event_loop.completion_pool.create() catch unreachable;
+    //             connect_timeout.socket.shutdown(l, shutdown_c, XevTransport, transport, shutdownCB);
+    //         }
+    //         connect_timeout.future.rwlock.unlock();
 
-            return .disarm;
-        };
+    //         return .disarm;
+    //     };
 
-        connect_timeout.future.rwlock.lock();
-        if (!connect_timeout.future.isDone()) {
-            connect_timeout.future.setError(error.Timeout);
-            const shutdown_c = transport.io_event_loop.completion_pool.create() catch unreachable;
-            connect_timeout.socket.shutdown(l, shutdown_c, XevTransport, transport, shutdownCB);
-        }
-        connect_timeout.future.rwlock.unlock();
+    //     connect_timeout.future.rwlock.lock();
+    //     if (!connect_timeout.future.isDone()) {
+    //         connect_timeout.future.setError(error.Timeout);
+    //         const shutdown_c = transport.io_event_loop.completion_pool.create() catch unreachable;
+    //         connect_timeout.socket.shutdown(l, shutdown_c, XevTransport, transport, shutdownCB);
+    //     }
+    //     connect_timeout.future.rwlock.unlock();
 
-        return .disarm;
-    }
+    //     return .disarm;
+    // }
 
-    /// Callback executed when a socket shutdown operation completes.
-    /// This initiates a full socket close after the shutdown completes.
-    fn shutdownCB(
-        ud: ?*XevTransport,
-        l: *xev.Loop,
-        c: *xev.Completion,
-        s: xev.TCP,
-        r: xev.ShutdownError!void,
-    ) xev.CallbackAction {
-        _ = r catch |err| {
-            std.debug.print("Error shutting down: {}\n", .{err});
-
-            return .disarm;
-        };
-
-        const self = ud.?;
-        s.close(l, c, XevTransport, self, closeCB);
-        return .disarm;
-    }
-
-    /// Callback executed when a socket close operation completes.
-    /// This is the final step in the socket cleanup process.
-    fn closeCB(
-        ud: ?*XevTransport,
-        _: *xev.Loop,
-        c: *xev.Completion,
-        _: xev.TCP,
-        r: xev.CloseError!void,
-    ) xev.CallbackAction {
-        const transport = ud.?;
-        defer transport.io_event_loop.completion_pool.destroy(c);
-
-        _ = r catch |err| {
-            std.debug.print("Error close: {}\n", .{err});
-
-            return .disarm;
-        };
-
-        return .disarm;
-    }
 };
 
 const MockConnInitializer = struct {
@@ -642,12 +585,10 @@ const MockConnInitializer = struct {
 
     const Self = @This();
 
-    // No-op implementation
     pub fn initConnImpl(self: *Self, conn: p2p_conn.AnyRxConn) Error!void {
-        _ = self; // Avoid unused self
-        _ = conn; // Avoid unused conn
-        // std.debug.print("MockConnInitializer.initConn called (no-op).\n", .{});
-        return; // Explicitly return void
+        _ = self;
+        _ = conn;
+        return;
     }
 
     // Static wrapper function for the VTable
@@ -661,7 +602,6 @@ const MockConnInitializer = struct {
         .initConnFn = vtableInitConnFn,
     };
 
-    // any() method to return the interface
     pub fn any(self: *Self) p2p_conn.AnyConnInitializer {
         return .{
             .instance = self,
@@ -672,12 +612,11 @@ const MockConnInitializer = struct {
 
 const MockConnInitializer1 = struct {
     pub const Error = anyerror;
-    handler_to_add: ?p2p_conn.AnyHandler = null, // Field to store the handler
-    allocator: ?Allocator = null, // Allocator for pipeline if needed
+    handler_to_add: ?p2p_conn.AnyHandler = null,
+    allocator: ?Allocator = null,
 
     const Self = @This();
 
-    // Constructor to set the handler
     pub fn init(handler: ?p2p_conn.AnyHandler, alloc: ?Allocator) Self {
         return .{
             .handler_to_add = handler,
@@ -685,23 +624,12 @@ const MockConnInitializer1 = struct {
         };
     }
 
-    // Implementation
     pub fn initConnImpl(self: *Self, conn: p2p_conn.AnyRxConn) Error!void {
-        std.debug.print("MockConnInitializer.initConn called.\n", .{});
-
         if (self.handler_to_add) |handler| {
-            // If a handler is provided, add it to the pipeline
-            std.debug.print("MockConnInitializer.initConn called 111.\n", .{});
-
             const pipeline = conn.getPipeline();
-            std.debug.print("MockConnInitializer.initConn called 222.\n", .{});
-
             try pipeline.addLast("handler", handler);
         }
-
-        std.debug.print("MockConnInitializer.initConn called end.\n", .{});
-
-        return; // Explicitly return void
+        return;
     }
 
     // Static wrapper function for the VTable
@@ -715,7 +643,6 @@ const MockConnInitializer1 = struct {
         .initConnFn = vtableInitConnFn,
     };
 
-    // any() method to return the interface
     pub fn any(self: *Self) p2p_conn.AnyConnInitializer {
         return .{
             .instance = self,
@@ -730,12 +657,9 @@ const ConnHolder = struct {
     err: ?anyerror = null,
 
     pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
-        std.debug.print("ConnHolder.init: Callback called.\n", .{});
         const self: *@This() = @ptrCast(@alignCast(opaque_userdata.?));
 
         const accepted_channel = accept_result catch |err| {
-            std.debug.print("ConnHolder.init: Error from accept operation: {any}\n", .{err});
-
             self.err = err;
             self.ready.set();
             return;
@@ -743,7 +667,6 @@ const ConnHolder = struct {
 
         self.channel = accepted_channel;
         self.ready.set();
-        std.debug.print("ConnHolder.init: Channel accepted and set. Direction: {any}\n", .{self.channel.direction()});
     }
 };
 
@@ -890,11 +813,9 @@ const ServerEchoHandler = struct {
     }
 
     pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
-        std.debug.print("ConnHolder.init: Callback called.\n", .{});
         const self: *@This() = @ptrCast(@alignCast(opaque_userdata.?));
 
         const accepted_channel = accept_result catch |err| {
-            std.debug.print("ConnHolder.init: Error from accept operation: {any}\n", .{err});
             self.err = err;
             self.ready.set();
             return;
@@ -902,58 +823,43 @@ const ServerEchoHandler = struct {
 
         self.channel = accepted_channel;
         self.ready.set();
-        std.debug.print("ConnHolder.init: Channel accepted and set. Direction: {any}\n", .{self.channel.direction()});
     }
 
     // --- Actual Handler Implementations ---
     pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
         _ = self;
-        std.debug.print("ServerEchoHandler ({s}): Connection active.\n", .{ctx.name});
         ctx.fireActive();
     }
 
     pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
         _ = self;
-        std.debug.print("ServerEchoHandler ({s}): Connection inactive.\n", .{ctx.name});
         ctx.fireInactive();
     }
 
     pub fn onReadImpl(_: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
-        std.debug.print("ServerEchoHandler ({s}): Received message: {s}\n", .{ ctx.name, msg });
-
-        // Echo the message back
-        std.debug.print("ServerEchoHandler ({s}): Echoing message back.\n", .{ctx.name});
         var onWriteCallback = OnWriteCallback{};
-        ctx.write(msg, &onWriteCallback, OnWriteCallback.callback); // Propagate write operation
+        ctx.write(msg, &onWriteCallback, OnWriteCallback.callback);
 
-        std.debug.print("ServerEchoHandler ({s}): Propagating read operation.\n", .{ctx.name});
-        ctx.fireRead(msg); // Propagate read operation
+        ctx.fireRead(msg);
     }
 
     pub fn onReadCompleteImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
         _ = self;
-        std.debug.print("ServerEchoHandler ({s}): Read complete.\n", .{ctx.name});
-        ctx.fireReadComplete(); // Propagate read complete operation
+        ctx.fireReadComplete();
     }
 
     pub fn onErrorCaughtImpl(self: *Self, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
         _ = self;
-        std.log.err("ServerEchoHandler ({s}): Error caught: {any}\n", .{ ctx.name, err });
-        // Propagate the error
         ctx.fireErrorCaught(err);
     }
 
     pub fn writeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         _ = self;
-        std.debug.print("ServerEchoHandler ({s}): Write called (passing through).\n", .{ctx.name});
-        // Pass the write operation to the next handler in the pipeline (towards the head)
         ctx.write(buffer, user_data, callback);
     }
 
     pub fn closeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         _ = self;
-        std.debug.print("ServerEchoHandler ({s}): Close called (passing through).\n", .{ctx.name});
-        // Pass the close operation to the next handler in the pipeline (towards the head)
         ctx.close(user_data, callback);
     }
 
@@ -962,26 +868,32 @@ const ServerEchoHandler = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActiveImpl(ctx);
     }
+
     fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onInactiveImpl(ctx);
     }
+
     fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onReadImpl(ctx, msg);
     }
+
     fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onReadCompleteImpl(ctx);
     }
+
     fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onErrorCaughtImpl(ctx, err);
     }
+
     fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.writeImpl(ctx, buffer, user_data, callback);
     }
+
     fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.closeImpl(ctx, user_data, callback);
@@ -998,7 +910,6 @@ const ServerEchoHandler = struct {
         .closeFn = vtableCloseFn,
     };
 
-    // --- any() method ---
     pub fn any(self: *Self) p2p_conn.AnyHandler {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
@@ -1041,9 +952,7 @@ const ClientEchoHandler = struct {
 
         if (r) |bytes_written| {
             self.written = bytes_written;
-            std.debug.print("ClientEchoHandler.onWrite: Write completed. Bytes written: {d}\n", .{self.written});
-        } else |err| {
-            std.debug.print("ClientEchoHandler.onWrite: Error writing: {any}\n", .{err});
+        } else |_| {
             self.written = 0;
         }
 
@@ -1051,11 +960,9 @@ const ClientEchoHandler = struct {
     }
 
     pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
-        std.debug.print("ConnHolder.init: Callback called.\n", .{});
         const self: *@This() = @ptrCast(@alignCast(opaque_userdata.?));
 
         const accepted_channel = accept_result catch |err| {
-            std.debug.print("ConnHolder.init: Error from accept operation: {any}\n", .{err});
             self.err = err;
             self.ready.set();
             return;
@@ -1063,19 +970,16 @@ const ClientEchoHandler = struct {
 
         self.channel = accepted_channel;
         self.ready.set();
-        std.debug.print("ConnHolder.init: Channel accepted and set. Direction: {any}\n", .{self.channel.direction()});
     }
 
     // --- Actual Handler Implementations ---
     pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
         _ = self;
-        std.debug.print("ClientEchoHandler ({s}): Connection active.\n", .{ctx.name});
         ctx.fireActive();
     }
 
     pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
         _ = self;
-        std.debug.print("ClientEchoHandler ({s}): Connection inactive.\n", .{ctx.name});
         ctx.fireInactive();
     }
 
@@ -1083,64 +987,67 @@ const ClientEchoHandler = struct {
         const len = msg.len;
         @memcpy(self.received_message[0..len], msg[0..len]);
         self.read.set();
-        std.debug.print("ClientEchoHandler ({s}): Received message: {s}\n", .{ ctx.name, msg });
         ctx.fireRead(msg);
     }
 
     pub fn onReadCompleteImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
         _ = self;
-        std.debug.print("ClientEchoHandler ({s}): Read complete.\n", .{ctx.name});
         ctx.fireReadComplete();
     }
 
     pub fn onErrorCaughtImpl(self: *Self, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
         _ = self;
-        std.log.err("ClientEchoHandler ({s}): Error caught: {any}\n", .{ ctx.name, err });
-        // Propagate the error
+
         ctx.fireErrorCaught(err);
     }
 
     pub fn writeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         _ = self;
-        std.debug.print("ClientEchoHandler ({s}): Write called (passing through).\n", .{ctx.name});
-        // Pass the write operation to the next handler in the pipeline (towards the head)
         ctx.write(buffer, user_data, callback);
     }
+
     pub fn closeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         _ = self;
-        std.debug.print("ClientEchoHandler ({s}): Close called (passing through).\n", .{ctx.name});
-        // Pass the close operation to the next handler in the pipeline (towards the head)
+
         ctx.close(user_data, callback);
     }
+
     // --- Static Wrapper Functions for HandlerVTable ---
     fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActiveImpl(ctx);
     }
+
     fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onInactiveImpl(ctx);
     }
+
     fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onReadImpl(ctx, msg);
     }
+
     fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onReadCompleteImpl(ctx);
     }
+
     fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onErrorCaughtImpl(ctx, err);
     }
+
     fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.writeImpl(ctx, buffer, user_data, callback);
     }
+
     fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.closeImpl(ctx, user_data, callback);
     }
+
     // --- Static VTable Instance ---
     const vtable_instance = p2p_conn.HandlerVTable{
         .onActiveFn = vtableOnActiveFn,
@@ -1151,7 +1058,7 @@ const ClientEchoHandler = struct {
         .writeFn = vtableWriteFn,
         .closeFn = vtableCloseFn,
     };
-    // --- any() method ---
+
     pub fn any(self: *Self) p2p_conn.AnyHandler {
         return .{ .instance = self, .vtable = &vtable_instance };
     }

@@ -123,9 +123,9 @@ pub const AnyRxConn = struct {
 /// It is a linked list of handler contexts, where each context points to the next and previous contexts.
 pub const HandlerContext = struct {
     name: []const u8,
-    handler: AnyHandler, // Store AnyHandler value
+    handler: AnyHandler,
     pipeline: *HandlerPipeline,
-    conn: AnyRxConn, // Store AnyRxConn value
+    conn: AnyRxConn,
     next_context: ?*HandlerContext = null,
     prev_context: ?*HandlerContext = null,
 
@@ -142,56 +142,42 @@ pub const HandlerContext = struct {
     pub fn fireActive(self: *Self) void {
         if (self.findNextInbound()) |next_ctx| {
             next_ctx.handler.onActive(next_ctx);
-        } else {
-            std.log.debug("Pipeline: fireActive reached end.", .{});
         }
     }
 
     pub fn fireInactive(self: *Self) void {
         if (self.findNextInbound()) |next_ctx| {
             next_ctx.handler.onInactive(next_ctx);
-        } else {
-            std.log.debug("Pipeline: fireInactive reached head.", .{});
         }
     }
 
     pub fn fireErrorCaught(self: *Self, err: anyerror) void {
         if (self.findNextInbound()) |next_ctx| {
             next_ctx.handler.onErrorCaught(next_ctx, err);
-        } else {
-            std.log.debug("Pipeline: fireErrorCaught reached end.", .{});
         }
     }
 
     pub fn fireRead(self: *Self, msg: []const u8) void {
         if (self.findNextInbound()) |next_ctx| {
             next_ctx.handler.onRead(next_ctx, msg);
-        } else {
-            std.log.debug("Pipeline: fireRead reached end.", .{});
         }
     }
 
     pub fn fireReadComplete(self: *Self) void {
         if (self.findNextInbound()) |next_ctx| {
             next_ctx.handler.onReadComplete(next_ctx);
-        } else {
-            std.log.debug("Pipeline: fireReadComplete reached end.", .{});
         }
     }
 
     pub fn write(self: *Self, msg: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         if (self.findPrevOutbound()) |prev_ctx| {
             prev_ctx.handler.write(prev_ctx, msg, user_data, callback);
-        } else {
-            std.log.debug("Pipeline: write reached head, writing to connection.", .{});
         }
     }
 
     pub fn close(self: *Self, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         if (self.findPrevOutbound()) |prev_ctx| {
             prev_ctx.handler.close(prev_ctx, user_data, callback);
-        } else {
-            std.log.debug("Pipeline: close reached head, closing connection.", .{});
         }
     }
 };
@@ -211,56 +197,40 @@ const HeadHandlerImpl = struct {
     pub fn onActive(_: *Self, ctx: *HandlerContext) void {
         ctx.fireActive();
     }
+
     pub fn onInactive(_: *Self, ctx: *HandlerContext) void {
         ctx.fireInactive();
     }
+
     pub fn onRead(_: *Self, ctx: *HandlerContext, msg: []const u8) void {
         ctx.fireRead(msg);
     }
+
     pub fn onReadComplete(_: *Self, ctx: *HandlerContext) void {
         ctx.fireReadComplete();
     }
+
     pub fn onErrorCaught(_: *Self, ctx: *HandlerContext, err: anyerror) void {
         ctx.fireErrorCaught(err);
     }
-
-    // pub fn write(self: *Self, ctx: *HandlerContext, msg: []const u8, f: *WriteFuture) !void {
-    //     std.debug.print("Writing message: {*}\n", .{f});
-    //     const n = self.conn.write(msg) catch |err| {
-    //         std.log.err("Handler '{s}' error during write: {any}", .{ ctx.name, err });
-    //         f.setError(err);
-    //         return;
-    //     };
-    //     std.debug.print("Wrote message: {}\n", .{n});
-    //     f.setValue(n);
-    // }
 
     pub fn write(
         self: *Self,
         _: *HandlerContext,
         buffer: []const u8,
-        erased_userdata: ?*anyopaque,
-        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
+        user_data: ?*anyopaque,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void {
-        self.conn.write(buffer, erased_userdata, wrapped_cb);
+        self.conn.write(buffer, user_data, callback);
     }
-
-    // pub fn close(self: *Self, ctx: *HandlerContext, f: *CloseFuture) !void {
-    //     self.conn.close() catch |err| {
-    //         std.log.err("Handler '{s}' error during close: {any}", .{ ctx.name, err });
-    //         f.setError(err);
-    //         return;
-    //     };
-    //     f.setDone();
-    // }
 
     pub fn close(
         self: *Self,
         _: *HandlerContext,
-        erased_userdata: ?*anyopaque,
-        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
+        user_data: ?*anyopaque,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {
-        self.conn.close(erased_userdata, wrapped_cb);
+        self.conn.close(user_data, callback);
     }
 
     // --- Static Wrapper Functions ---
@@ -268,34 +238,32 @@ const HeadHandlerImpl = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActive(ctx);
     }
+
     fn vtableOnInactiveFn(instance: *anyopaque, ctx: *HandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onInactive(ctx);
     }
+
     fn vtableOnReadFn(instance: *anyopaque, ctx: *HandlerContext, msg: []const u8) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onRead(ctx, msg);
     }
+
     fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *HandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onReadComplete(ctx);
     }
+
     fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *HandlerContext, err: anyerror) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onErrorCaught(ctx, err);
     }
-    // fn vtableWriteFn(instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, future: *WriteFuture) anyerror!void {
-    //     const self: *Self = @ptrCast(@alignCast(instance));
-    //     return self.write(ctx, buffer, future);
-    // }
-    // fn vtableCloseFn(instance: *anyopaque, ctx: *HandlerContext, future: *CloseFuture) anyerror!void {
-    //     const self: *Self = @ptrCast(@alignCast(instance));
-    //     return self.close(ctx, future);
-    // }
+
     fn vtableWriteFn(instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.write(ctx, buffer, erased_userdata, wrapped_cb);
     }
+
     fn vtableCloseFn(instance: *anyopaque, ctx: *HandlerContext, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.close(ctx, erased_userdata, wrapped_cb);
@@ -328,14 +296,17 @@ const TailHandlerImpl = struct {
 
     // --- Actual Implementations ---
     pub fn onActive(_: *Self, _: *HandlerContext) void {}
+
     pub fn onInactive(_: *Self, _: *HandlerContext) void {}
+
     pub fn onRead(_: *Self, _: *HandlerContext, _: []const u8) void {}
+
     pub fn onReadComplete(_: *Self, _: *HandlerContext) void {}
+
     pub fn onErrorCaught(_: *Self, ctx: *HandlerContext, err: anyerror) void {
         std.log.err("Handler '{s}' error during onErrorCaught: {any}", .{ ctx.name, err });
     }
-    // pub fn write(_: *Self, _: *HandlerContext, _: []const u8, _: *WriteFuture) !void {}
-    // pub fn close(_: *Self, _: *HandlerContext, _: *CloseFuture) !void {}
+
     pub fn write(
         _: *Self,
         _: *HandlerContext,
@@ -343,6 +314,7 @@ const TailHandlerImpl = struct {
         _: ?*anyopaque,
         _: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void {}
+
     pub fn close(
         _: *Self,
         _: *HandlerContext,
@@ -355,34 +327,32 @@ const TailHandlerImpl = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActive(ctx);
     }
+
     fn vtableOnInactiveFn(instance: *anyopaque, ctx: *HandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onInactive(ctx);
     }
+
     fn vtableOnReadFn(instance: *anyopaque, ctx: *HandlerContext, msg: []const u8) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onRead(ctx, msg);
     }
+
     fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *HandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onReadComplete(ctx);
     }
+
     fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *HandlerContext, err: anyerror) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onErrorCaught(ctx, err);
     }
-    // fn vtableWriteFn(instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, future: *WriteFuture) anyerror!void {
-    //     const self: *Self = @ptrCast(@alignCast(instance));
-    //     return self.write(ctx, buffer, future);
-    // }
-    // fn vtableCloseFn(instance: *anyopaque, ctx: *HandlerContext, future: *CloseFuture) anyerror!void {
-    //     const self: *Self = @ptrCast(@alignCast(instance));
-    //     return self.close(ctx, future);
-    // }
+
     fn vtableWriteFn(instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.write(ctx, buffer, erased_userdata, wrapped_cb);
     }
+
     fn vtableCloseFn(instance: *anyopaque, ctx: *HandlerContext, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.close(ctx, erased_userdata, wrapped_cb);
@@ -470,41 +440,36 @@ pub const HandlerPipeline = struct {
     const Self = @This();
 
     pub fn init(self: *Self, allocator: std.mem.Allocator, associated_conn: AnyRxConn) !void {
-        // Initialize all fields in one go
         self.* = .{
             .allocator = allocator,
             .conn = associated_conn,
-            // Initialize embedded handlers directly here
             .head_handler_impl = .{ .conn = associated_conn },
             .tail_handler_impl = .{},
-            // Initialize contexts, but leave handler field undefined for now
             .head = HandlerContext{
                 .name = "HEAD",
-                .handler = undefined, // Will be set below
+                .handler = undefined,
                 .pipeline = self,
                 .conn = associated_conn,
-                .next_context = undefined, // Will be set below
+                .next_context = undefined,
                 .prev_context = null,
             },
+
             .tail = HandlerContext{
                 .name = "TAIL",
-                .handler = undefined, // Will be set below
+                .handler = undefined,
                 .pipeline = self,
                 .conn = associated_conn,
                 .next_context = null,
-                .prev_context = undefined, // Will be set below
+                .prev_context = undefined,
             },
         };
 
-        // Now that impls are initialized, get their AnyHandler values
         const head_any_handler = self.head_handler_impl.any();
         const tail_any_handler = self.tail_handler_impl.any();
 
-        // Assign the handlers to the contexts
         self.head.handler = head_any_handler;
         self.tail.handler = tail_any_handler;
 
-        // Link head and tail contexts
         self.head.next_context = &self.tail;
         self.tail.prev_context = &self.head;
     }
@@ -522,7 +487,6 @@ pub const HandlerPipeline = struct {
 
     /// Adds a handler context node *before* the specified 'next' node.
     fn addBefore(next_ctx: *HandlerContext, new_ctx: *HandlerContext) void {
-        std.debug.print("Adding handler '{s}' before '{s}'.\n", .{ new_ctx.name, next_ctx.name });
         const prev_ctx = next_ctx.prev_context orelse unreachable;
 
         new_ctx.prev_context = prev_ctx;
@@ -530,8 +494,6 @@ pub const HandlerPipeline = struct {
 
         prev_ctx.next_context = new_ctx;
         next_ctx.prev_context = new_ctx;
-
-        std.debug.print("Added handler '{s}' to pipeline.\n", .{new_ctx.name});
     }
 
     /// Adds a handler to the beginning of the pipeline (just after the head sentinel).
@@ -552,11 +514,8 @@ pub const HandlerPipeline = struct {
 
     /// Adds a handler to the end of the pipeline (just before the tail sentinel).
     pub fn addLast(self: *Self, name: []const u8, handler: AnyHandler) !void {
-        std.debug.print("Adding handler '{s}' to pipeline11.\n", .{name});
-
         const new_ctx = try self.allocator.create(HandlerContext);
         errdefer self.allocator.destroy(new_ctx);
-        std.debug.print("Adding handler '{s}' to pipeline.\n", .{name});
         new_ctx.* = .{
             .name = name,
             .handler = handler,
@@ -566,7 +525,6 @@ pub const HandlerPipeline = struct {
             .prev_context = undefined,
         };
         addBefore(&self.tail, new_ctx);
-        std.debug.print("Added handler '{s}' to pipeline.\n", .{name});
     }
 
     // --- Trigger Inbound Events ---
@@ -623,21 +581,24 @@ const MockHandlerImpl = struct {
 
     // --- Actual Implementations ---
     pub fn onActive(_: *Self, _: *HandlerContext) void {}
+
     pub fn onInactive(_: *Self, _: *HandlerContext) void {}
+
     pub fn onRead(self: *Self, ctx: *HandlerContext, msg: []const u8) void {
-        std.debug.print("MockHandlerImpl: onRead called with message: {s}\n", .{msg});
         @memcpy(self.read_msg[0..msg.len], msg);
         ctx.fireRead(msg);
     }
+
     pub fn onReadComplete(_: *Self, _: *HandlerContext) void {}
+
     pub fn onErrorCaught(_: *Self, _: *HandlerContext, _: anyerror) void {}
+
     pub fn write(self: *Self, ctx: *HandlerContext, msg: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         @memcpy(self.write_msg[0..msg.len], msg);
-        std.debug.print("MockHandlerImpl: write called with message: {s}\n", .{msg});
         ctx.write(msg, user_data, callback);
     }
+
     pub fn close(_: *Self, ctx: *HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
-        std.debug.print("MockHandlerImpl: close called\n", .{});
         ctx.close(user_data, callback);
     }
 
@@ -646,26 +607,32 @@ const MockHandlerImpl = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActive(ctx);
     }
+
     fn vtableOnInactiveFn(instance: *anyopaque, ctx: *HandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onInactive(ctx);
     }
+
     fn vtableOnReadFn(instance: *anyopaque, ctx: *HandlerContext, msg: []const u8) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onRead(ctx, msg);
     }
+
     fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *HandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onReadComplete(ctx);
     }
+
     fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *HandlerContext, err: anyerror) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onErrorCaught(ctx, err);
     }
+
     fn vtableWriteFn(instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.write(ctx, buffer, user_data, callback);
     }
+
     fn vtableCloseFn(instance: *anyopaque, ctx: *HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.close(ctx, user_data, callback);
@@ -730,6 +697,7 @@ const MockRxConnImpl = struct {
     pub fn direction(_: *Self) Direction {
         return Direction.INBOUND;
     }
+
     pub fn getPipeline(self: *Self) *HandlerPipeline {
         return self.pipeline orelse @panic("Pipeline not set in MockRxConnImpl");
     }
@@ -753,10 +721,12 @@ const MockRxConnImpl = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.close(erased_userdata, wrapped_cb);
     }
+
     fn vtableGetPipelineFn(instance: *anyopaque) *HandlerPipeline {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.getPipeline();
     }
+
     fn vtableDirectionFn(instance: *anyopaque) Direction {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.direction();
@@ -780,8 +750,7 @@ const OnWriteCallback = struct {
         _: ?*anyopaque,
         r: anyerror!usize,
     ) void {
-        if (r) |_| {} else |err| {
-            std.debug.print("Test Failure: Expected successful write, but got error: {any}\n", .{err});
+        if (r) |_| {} else |_| {
             @panic("write callback received an unexpected error");
         }
     }
@@ -790,17 +759,14 @@ const OnWriteCallback = struct {
 test "HandlerContext interaction with MockHandler and MockConn (VTable)" {
     const allocator = std.testing.allocator;
 
-    // Create Impl instances directly
     var mock_handler_impl = MockHandlerImpl.init(allocator);
     defer mock_handler_impl.deinit();
     var mock_conn_impl = MockRxConnImpl.init(allocator);
     defer mock_conn_impl.deinit();
 
-    // Get Any values using .any()
     const any_handler = mock_handler_impl.any();
     const any_conn = mock_conn_impl.any();
 
-    // Initialize HandlerContext with Any values
     var handler_ctx = HandlerContext{
         .name = "mock_ctx",
         .handler = any_handler, // Use value
@@ -826,32 +792,25 @@ test "HandlerContext interaction with MockHandler and MockConn (VTable)" {
 test "HandlerPipeline interaction with MockHandler and MockConn (VTable)" {
     const allocator = std.testing.allocator;
 
-    // Allocate the Mock Connection Impl directly
     const mock_conn_impl = try allocator.create(MockRxConnImpl);
     defer allocator.destroy(mock_conn_impl);
     mock_conn_impl.* = MockRxConnImpl.init(allocator);
     defer mock_conn_impl.deinit();
 
-    // Get the AnyRxConn value
     const any_conn = mock_conn_impl.any();
 
-    // Initialize Pipeline on the stack
-    var pipeline: HandlerPipeline = undefined; // Init will overwrite
-    // Pass AnyRxConn value to init
+    var pipeline: HandlerPipeline = undefined;
     try pipeline.init(allocator, any_conn);
     defer pipeline.deinit();
 
-    // Setup Mock Handlers Impl
-    // These need to live for the duration of the test
     var mock_handler_1_impl = MockHandlerImpl.init(allocator);
     defer mock_handler_1_impl.deinit();
-    const any_handler_1 = mock_handler_1_impl.any(); // Get value
+    const any_handler_1 = mock_handler_1_impl.any();
 
     var mock_handler_2_impl = MockHandlerImpl.init(allocator);
     defer mock_handler_2_impl.deinit();
-    const any_handler_2 = mock_handler_2_impl.any(); // Get value
+    const any_handler_2 = mock_handler_2_impl.any();
 
-    // Add Handlers to Pipeline (pass AnyHandler values)
     try pipeline.addLast("mock1", any_handler_1);
     try pipeline.addLast("mock2", any_handler_2);
 
@@ -874,14 +833,12 @@ test "HandlerPipeline interaction with MockHandler and MockConn (VTable)" {
 
     // Test Outbound Event (close)
     // TAIL -> mock2 -> mock1 -> HEAD -> conn
-
     pipeline.close(null, struct {
         fn callback(
             _: ?*anyopaque,
             r: anyerror!void,
         ) void {
-            if (r) |_| {} else |err| {
-                std.debug.print("Test Failure: Expected successful close, but got error: {any}\n", .{err});
+            if (r) |_| {} else |_| {
                 @panic("close callback received an unexpected error");
             }
         }
