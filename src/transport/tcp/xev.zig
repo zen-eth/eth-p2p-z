@@ -37,7 +37,7 @@ pub const XevSocketChannel = struct {
         self.direction = direction;
     }
 
-    pub fn asyncWrite(self: *XevSocketChannel, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    pub fn asyncWrite(self: *XevSocketChannel, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
             const w = self.transport.io_event_loop.write_pool.create() catch unreachable;
@@ -63,9 +63,7 @@ pub const XevSocketChannel = struct {
 
             self.transport.io_event_loop.queueMessage(message) catch |err| {
                 std.debug.print("Error queuing message: {}\n", .{err});
-                if (wrapped_cb) |cb| {
-                    cb(erased_userdata, err);
-                }
+                wrapped_cb(erased_userdata, err);
             };
         }
     }
@@ -151,7 +149,7 @@ pub const XevSocketChannel = struct {
         instance: *anyopaque,
         buffer: []const u8,
         erased_userdata: ?*anyopaque,
-        wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void,
+        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void {
         const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
         return self.asyncWrite(buffer, erased_userdata, wrapped_cb);
@@ -167,11 +165,10 @@ pub const XevSocketChannel = struct {
 
     // --- Static VTable Instance ---
     const vtable_instance = p2p_conn.RxConnVTable{
-        .closeFn = vtableCloseFn,
         .getPipelineFn = vtableGetPipelineFn,
         .directionFn = vtableDirectionFn,
         .writeFn = vtableAsyncWriteFn,
-        .asyncCloseFn = vtableAsyncCloseFn,
+        .closeFn = vtableAsyncCloseFn,
     };
 
     pub fn any(self: *XevSocketChannel) p2p_conn.AnyRxConn {
@@ -188,25 +185,11 @@ pub const XevSocketChannel = struct {
     ) xev.CallbackAction {
         std.debug.print("WriteCB called\n", .{});
         const w = ud.?;
-        const transport = w.transport.?;
+        const transport = w.transport;
         defer transport.io_event_loop.completion_pool.destroy(c);
         defer transport.io_event_loop.write_pool.destroy(w);
 
-        if (w.callback) |cb| {
-            cb(w.user_data, r);
-        } else if (w.future) |f| {
-            const written = r catch |err| {
-                std.debug.print("Error writing111111: {}\n", .{err});
-                f.setError(err);
-                return .disarm;
-            };
-            std.debug.print("WriteCB called1111\n {}", .{written});
-
-            std.debug.print("WriteCB called1111ff\n {}", .{w.future.?.*});
-
-            f.setValue(written);
-            std.debug.print("WriteCB called2222 {*}\n", .{w.future.?});
-        }
+        w.callback(w.user_data, r);
 
         return .disarm;
     }

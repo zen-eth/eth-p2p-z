@@ -78,8 +78,7 @@ pub const RxConnVTable = struct {
         erased_userdata: ?*anyopaque,
         wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void,
-    closeFn: *const fn (instance: *anyopaque) anyerror!void,
-    asyncCloseFn: *const fn (instance: *anyopaque, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void,
+    closeFn: *const fn (instance: *anyopaque, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void,
     getPipelineFn: *const fn (instance: *anyopaque) *HandlerPipeline,
     directionFn: *const fn (instance: *anyopaque) Direction,
 };
@@ -93,9 +92,6 @@ pub const AnyRxConn = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn close(self: Self) Error!void {
-        return self.vtable.closeFn(self.instance);
-    }
     pub fn direction(self: Self) Direction {
         return self.vtable.directionFn(self.instance);
     }
@@ -111,12 +107,12 @@ pub const AnyRxConn = struct {
         self.vtable.writeFn(self.instance, buffer, userdata, callback);
     }
 
-    pub fn asyncClose(
+    pub fn close(
         self: Self,
         userdata: ?*anyopaque,
         callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {
-        self.vtable.asyncCloseFn(self.instance, userdata, callback);
+        self.vtable.closeFn(self.instance, userdata, callback);
     }
 };
 
@@ -264,7 +260,7 @@ const HeadHandlerImpl = struct {
         erased_userdata: ?*anyopaque,
         wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {
-        self.conn.asyncClose(erased_userdata, wrapped_cb);
+        self.conn.close(erased_userdata, wrapped_cb);
     }
 
     // --- Static Wrapper Functions ---
@@ -781,11 +777,10 @@ const MockRxConnImpl = struct {
 
     // --- Static VTable Instance ---
     const vtable_instance = RxConnVTable{
-        .closeFn = vtableCloseFn,
         .getPipelineFn = vtableGetPipelineFn,
         .directionFn = vtableDirectionFn,
         .writeFn = vtableAsyncWriteFn,
-        .asyncCloseFn = vtableAsyncCloseFn,
+        .closeFn = vtableAsyncCloseFn,
     };
 
     pub fn any(self: *Self) AnyRxConn {

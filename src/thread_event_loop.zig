@@ -42,9 +42,8 @@ pub const IOAction = union(enum) {
     write: struct {
         buffer: []const u8,
         channel: *xev_tcp.XevSocketChannel,
-        future: ?*Future(usize, anyerror) = null,
         timeout_ms: u64,
-        callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void = null,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
         user_data: ?*anyopaque = null,
     },
     close: struct {
@@ -79,13 +78,11 @@ pub const Connect = struct {
 };
 
 pub const Write = struct {
-    future: ?*Future(usize, anyerror) = null,
-
-    transport: ?*xev_tcp.XevTransport = null,
+    transport: *xev_tcp.XevTransport,
 
     user_data: ?*anyopaque = null,
 
-    callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void = null,
+    callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
 };
 
 pub const Close = struct {
@@ -380,7 +377,6 @@ pub const ThreadEventLoop = struct {
                     const write_ud = self.write_pool.create() catch unreachable;
                     write_ud.* = .{
                         .transport = action_data.channel.transport,
-                        .future = action_data.future,
                         .user_data = action_data.user_data,
                         .callback = action_data.callback,
                     };
