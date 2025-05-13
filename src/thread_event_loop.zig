@@ -27,10 +27,10 @@ pub const IOAction = union(enum) {
     // },
     connect: struct {
         address: std.net.Address,
-        channel: *conn.AnyRxConn,
-        future: *Future(void, anyerror),
-        transport: ?*xev_tcp.XevTransport = null,
-        timeout_ms: u64,
+        transport: *xev_tcp.XevTransport,
+        timeout_ms: u64 = 30000,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void,
+        user_data: ?*anyopaque = null,
     },
     accept: struct {
         server: xev.TCP,
@@ -71,12 +71,11 @@ pub const ConnectTimeout = struct {
 };
 
 pub const Connect = struct {
-    /// The future for the connection result.
-    future: *Future(void, anyerror),
-    /// The transport used for the connection.
-    transport: ?*xev_tcp.XevTransport = null,
+    transport: *xev_tcp.XevTransport,
 
-    channel: *conn.AnyRxConn,
+    user_data: ?*anyopaque = null,
+
+    callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void,
 };
 
 pub const Write = struct {
@@ -355,9 +354,9 @@ pub const ThreadEventLoop = struct {
                     // const connect_timeout = action_data.timeout_ms;
                     const connect_ud = self.connect_pool.create() catch unreachable;
                     connect_ud.* = .{
-                        .future = action_data.future,
                         .transport = action_data.transport,
-                        .channel = action_data.channel,
+                        .callback = action_data.callback,
+                        .user_data = action_data.user_data,
                     };
                     // const connect_timeout_ud = self.connect_timeout_pool.create() catch unreachable;
                     // connect_timeout_ud.* = .{

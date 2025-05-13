@@ -2,6 +2,17 @@ const std = @import("std");
 const conn = @import("conn.zig");
 
 /// Listener interface for accepting incoming connections.
+/// This is a type-erased interface that allows
+/// different implementations of listeners to be used interchangeably.
+/// It uses the VTable pattern to provide a consistent interface for accepting
+/// incoming connections. The `acceptFn` function pointer is used to call the
+/// appropriate implementation of the accept function for the specific listener
+/// instance. The `user_data` parameter is an optional user-defined data pointer
+/// that can be passed to the callback function. The `callback` function is
+/// called when a new connection is accepted. It takes a user-defined data pointer
+/// and a result of type `anyerror!conn.AnyRxConn`, which represents the accepted
+/// connection. The `anyerror` type is used to represent any error that may occur
+/// during the acceptance of a connection.
 pub const ListenerVTable = struct {
     acceptFn: *const fn (instance: *anyopaque, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void) void,
 };
@@ -9,7 +20,15 @@ pub const ListenerVTable = struct {
 /// AnyListener is a struct that uses the VTable pattern to provide a type-erased
 /// interface for accepting incoming connections. It contains a pointer to the
 /// underlying listener implementation and a pointer to the VTable that defines
-/// the interface for that implementation.
+/// the interface for that implementation. The `instance` field is a pointer to
+/// the underlying listener instance, and the `vtable` field is a pointer to the
+/// VTable that defines the interface for that instance. The `accept` function
+/// is used to accept incoming connections. It takes an optional user-defined
+/// data pointer and a callback function that is called when a new connection
+/// is accepted. The callback function takes a user-defined data pointer and a
+/// result of type `anyerror!conn.AnyRxConn`, which represents the accepted
+/// connection. The `anyerror` type is used to represent any error that may occur
+/// during the acceptance of a connection.
 pub const AnyListener = struct {
     instance: *anyopaque,
     vtable: *const ListenerVTable,
@@ -24,7 +43,7 @@ pub const AnyListener = struct {
 
 /// Transport interface for dialing and listening on network addresses.
 pub const TransportVTable = struct {
-    dialFn: *const fn (instance: *anyopaque, addr: std.net.Address, connection: *conn.AnyRxConn) anyerror!void,
+    dialFn: *const fn (instance: *anyopaque, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void) void,
     listenFn: *const fn (instance: *anyopaque, addr: std.net.Address) anyerror!AnyListener,
 };
 
@@ -40,8 +59,8 @@ pub const AnyTransport = struct {
     pub const Error = anyerror;
 
     /// Dials a remote address via the underlying transport implementation.
-    pub fn dial(self: Self, addr: std.net.Address, connection: *conn.AnyRxConn) Error!void {
-        return self.vtable.dialFn(self.instance, addr, connection);
+    pub fn dial(self: Self, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void) void {
+        self.vtable.dialFn(self.instance, addr, user_data, callback);
     }
 
     /// Starts listening on a local address via the underlying transport implementation.

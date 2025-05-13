@@ -531,29 +531,21 @@ pub const XevTransport = struct {
     pub fn deinit(_: *XevTransport) void {}
 
     /// Dial connects to the given address and creates a channel for communication. It blocks until the connection is established. If an error occurs, it returns the error.
-    pub fn dial(self: *XevTransport, addr: std.net.Address, channel: *p2p_conn.AnyRxConn) !void {
-        const f = try self.allocator.create(Future(void, anyerror));
-        f.* = .{};
-        defer self.allocator.destroy(f);
+    pub fn dial(self: *XevTransport, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyRxConn) void) void {
         const message = io_loop.IOMessage{
             .action = .{ .connect = .{
                 .address = addr,
-                .channel = channel,
                 .transport = self,
-                .future = f,
                 .timeout_ms = 30000,
+                .user_data = user_data,
+                .callback = callback,
             } },
         };
 
         self.io_event_loop.queueMessage(message) catch |err| {
             std.debug.print("Error queuing message: {}\n", .{err});
-            return error.AsyncNotifyFailed;
+            callback(user_data, err);
         };
-
-        f.wait();
-        if (f.getErr()) |err| {
-            return err;
-        }
     }
 
     /// Listen listens for incoming connections on the given address. It blocks until the listener is initialized. If an error occurs, it returns the error.
@@ -564,9 +556,9 @@ pub const XevTransport = struct {
     }
 
     // --- Static Wrapper Functions for TransportVTable ---
-    fn vtableDialFn(instance: *anyopaque, addr: std.net.Address, connection: *p2p_conn.AnyRxConn) anyerror!void {
+    fn vtableDialFn(instance: *anyopaque, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyRxConn) void) void {
         const self: *XevTransport = @ptrCast(@alignCast(instance));
-        return self.dial(addr, connection);
+        return self.dial(addr, user_data, callback);
     }
 
     fn vtableListenFn(instance: *anyopaque, addr: std.net.Address) anyerror!p2p_transport.AnyListener {
@@ -602,13 +594,13 @@ pub const XevTransport = struct {
         r: xev.ConnectError!void,
     ) xev.CallbackAction {
         const connect = ud.?;
-        const transport = connect.transport.?;
+        const transport = connect.transport;
         defer transport.io_event_loop.completion_pool.destroy(c);
         defer transport.io_event_loop.connect_pool.destroy(connect);
 
         _ = r catch |err| {
             std.debug.print("Error connecting: {}\n", .{err});
-            connect.future.setError(err);
+            connect.callback(connect.user_data, err);
 
             return .disarm;
         };
@@ -618,20 +610,21 @@ pub const XevTransport = struct {
 
         const p = transport.io_event_loop.handler_pipeline_pool.create() catch unreachable;
         const associated_conn = channel.any();
-        connect.channel.* = associated_conn;
+
         p.init(transport.allocator, associated_conn) catch |err| {
             std.debug.print("Error creating handler pipeline: {}\n", .{err});
             transport.allocator.destroy(channel);
             transport.io_event_loop.handler_pipeline_pool.destroy(p);
-            connect.future.setError(err);
+            connect.callback(connect.user_data, err);
             return .disarm;
         };
         channel.handler_pipeline = p;
 
-        transport.io_event_loop.conn_initializer.initConn(connect.channel.*) catch |err| {
+        transport.io_event_loop.conn_initializer.initConn(associated_conn) catch |err| {
             std.debug.print("Error initializing connection: {}\n", .{err});
             transport.allocator.destroy(channel);
-            connect.future.setError(err);
+            transport.io_event_loop.handler_pipeline_pool.destroy(p);
+            connect.callback(connect.user_data, err);
             return .disarm;
         };
 
@@ -641,11 +634,7 @@ pub const XevTransport = struct {
         const read_c = transport.io_event_loop.completion_pool.create() catch unreachable;
         socket.read(l, read_c, .{ .slice = read_buf }, XevSocketChannel, channel, XevSocketChannel.readCB);
 
-        connect.future.rwlock.lock();
-        if (!connect.future.isDone()) {
-            connect.future.setDone();
-        }
-        connect.future.rwlock.unlock();
+        connect.callback(connect.user_data, associated_conn);
         return .disarm;
     }
 
@@ -813,6 +802,29 @@ const MockConnInitializer1 = struct {
     }
 };
 
+const ConnHolder = struct {
+    channel: p2p_conn.AnyRxConn,
+    ready: std.Thread.ResetEvent = .{},
+    err: ?anyerror = null,
+
+    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
+        std.debug.print("ConnHolder.init: Callback called.\n", .{});
+        const self: *@This() = @ptrCast(@alignCast(opaque_userdata.?));
+
+        const accepted_channel = accept_result catch |err| {
+            std.debug.print("ConnHolder.init: Error from accept operation: {any}\n", .{err});
+
+            self.err = err;
+            self.ready.set();
+            return;
+        };
+
+        self.channel = accepted_channel;
+        self.ready.set();
+        std.debug.print("ConnHolder.init: Channel accepted and set. Direction: {any}\n", .{self.channel.direction()});
+    }
+};
+
 test "dial connection refused" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -834,17 +846,23 @@ test "dial connection refused" {
     try transport.init(&event_loop, allocator, opts);
     defer transport.deinit();
 
-    var channel: p2p_conn.AnyRxConn = undefined;
+    var conn_holder: ConnHolder = .{ .channel = undefined };
     const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
-    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel));
+    transport.dial(addr, &conn_holder, ConnHolder.init);
+    conn_holder.ready.wait();
+    try std.testing.expectEqual(error.ConnectionRefused, conn_holder.err.?);
 
-    var channel1: p2p_conn.AnyRxConn = undefined;
-    try std.testing.expectError(error.ConnectionRefused, transport.dial(addr, &channel1));
+    var conn_holder1: ConnHolder = .{ .channel = undefined };
+    transport.dial(addr, &conn_holder1, ConnHolder.init);
+    conn_holder1.ready.wait();
+    try std.testing.expectEqual(error.ConnectionRefused, conn_holder1.err.?);
 
     const thread2 = try std.Thread.spawn(.{}, struct {
         fn run(t: *XevTransport, a: std.net.Address) !void {
-            var ch: p2p_conn.AnyRxConn = undefined;
-            try std.testing.expectError(error.ConnectionRefused, t.dial(a, &ch));
+            var conn_holder2: ConnHolder = .{ .channel = undefined };
+            t.dial(a, &conn_holder2, ConnHolder.init);
+            conn_holder2.ready.wait();
+            try std.testing.expectEqual(error.ConnectionRefused, conn_holder2.err.?);
         }
     }.run, .{ &transport, addr });
 
@@ -876,26 +894,6 @@ test "dial and accept" {
     const addr = try std.net.Address.parseIp("0.0.0.0", 8082);
     var listener = try transport.listen(addr);
 
-    const ConnHolder = struct {
-        channel: p2p_conn.AnyRxConn,
-        ready: std.Thread.ResetEvent = .{},
-
-        pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
-            std.debug.print("ConnHolder.init: Callback called.\n", .{});
-            const self: *@This() = @ptrCast(@alignCast(opaque_userdata.?));
-
-            const accepted_channel = accept_result catch |err| {
-                std.debug.print("ConnHolder.init: Error from accept operation: {any}\n", .{err});
-
-                return;
-            };
-
-            self.channel = accepted_channel;
-            self.ready.set();
-            std.debug.print("ConnHolder.init: Channel accepted and set. Direction: {any}\n", .{self.channel.direction()});
-        }
-    };
-
     const accept_thread = try std.Thread.spawn(.{}, struct {
         fn run(l: *p2p_transport.AnyListener) !void {
             var accepted_count: usize = 0;
@@ -918,13 +916,15 @@ test "dial and accept" {
     try client.init(&cl, allocator, opts);
     defer client.deinit();
 
-    var channel1: p2p_conn.AnyRxConn = undefined;
-    try client.dial(addr, &channel1);
-    try std.testing.expectEqual(channel1.direction(), p2p_conn.Direction.OUTBOUND);
+    var conn_holder1: ConnHolder = .{ .channel = undefined };
+    client.dial(addr, &conn_holder1, ConnHolder.init);
+    conn_holder1.ready.wait();
+    try std.testing.expectEqual(conn_holder1.channel.direction(), p2p_conn.Direction.OUTBOUND);
 
-    var channel2: p2p_conn.AnyRxConn = undefined;
-    try client.dial(addr, &channel2);
-    try std.testing.expectEqual(channel2.direction(), p2p_conn.Direction.OUTBOUND);
+    var conn_holder2: ConnHolder = .{ .channel = undefined };
+    client.dial(addr, &conn_holder2, ConnHolder.init);
+    conn_holder2.ready.wait();
+    try std.testing.expectEqual(conn_holder2.channel.direction(), p2p_conn.Direction.OUTBOUND);
 
     accept_thread.join();
 }
@@ -937,6 +937,8 @@ const ServerEchoHandler = struct {
     channel: p2p_conn.AnyRxConn,
 
     ready: std.Thread.ResetEvent = .{},
+
+    err: ?anyerror = null,
 
     const Self = @This();
 
@@ -959,7 +961,8 @@ const ServerEchoHandler = struct {
 
         const accepted_channel = accept_result catch |err| {
             std.debug.print("ConnHolder.init: Error from accept operation: {any}\n", .{err});
-
+            self.err = err;
+            self.ready.set();
             return;
         };
 
@@ -1077,6 +1080,8 @@ const ClientEchoHandler = struct {
 
     ready: std.Thread.ResetEvent = .{},
 
+    err: ?anyerror = null,
+
     const Self = @This();
 
     pub fn create(alloc: Allocator) !*Self {
@@ -1098,7 +1103,8 @@ const ClientEchoHandler = struct {
 
         const accepted_channel = accept_result catch |err| {
             std.debug.print("ConnHolder.init: Error from accept operation: {any}\n", .{err});
-
+            self.err = err;
+            self.ready.set();
             return;
         };
 
@@ -1255,230 +1261,14 @@ test "echo read and write" {
     try client.init(&cl, allocator, opts);
     defer client.deinit();
 
-    var channel1: p2p_conn.AnyRxConn = undefined;
-    try client.dial(addr, &channel1);
-    try std.testing.expectEqual(channel1.direction(), p2p_conn.Direction.OUTBOUND);
+    client.dial(addr, client_handler, ClientEchoHandler.init);
+    client_handler.ready.wait();
+    try std.testing.expectEqual(client_handler.channel.direction(), p2p_conn.Direction.OUTBOUND);
 
-    const n = try channel1.write("buf: []const u8");
+    const n = try client_handler.channel.write("buf: []const u8");
     try std.testing.expect(n == 15);
 
     client_handler.read.wait();
     try std.testing.expectEqualStrings("buf: []const u8", client_handler.received_message[0..n]);
     accept_thread.join();
 }
-
-// test "echo read and write" {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     const allocator = gpa.allocator();
-
-//     const opts = XevTransport.Options{
-//         .backlog = 128,
-//     };
-
-//     // const server_handler = try ServerEchoHandler.create(allocator);
-//     // defer server_handler.destroy();
-
-//     // const client_handler = try ClientEchoHandler.create(allocator);
-//     // defer client_handler.destroy();
-//     // const server_handler_any = server_handler.any();
-//     // const client_handler_any = client_handler.any();
-
-//     // var mock_client_initializer = MockConnInitializer1.init(client_handler_any, allocator);
-//     // var any_client_initializer = mock_client_initializer.any();
-
-//     // var mock_server_initializer = MockConnInitializer1.init(server_handler_any, allocator);
-//     // var any_server_initializer = mock_server_initializer.any();
-
-//         var mock_initializer = MockConnInitializer{};
-//     var any_initializer = mock_initializer.any();
-
-//     var sl: io_loop.ThreadEventLoop = undefined;
-//     try sl.init(allocator, &any_initializer);
-//     defer {
-//         sl.close();
-//         sl.deinit();
-//     }
-
-//     var transport: XevTransport = undefined;
-//     try transport.init(&sl, allocator, opts);
-//     defer transport.deinit();
-
-//     var listener: p2p_transport.AnyListener = undefined;
-//     const addr = try std.net.Address.parseIp("0.0.0.0", 8084);
-//     try transport.listen(addr, &listener);
-
-//     const accept_thread = try std.Thread.spawn(.{}, struct {
-//         fn run(l: *p2p_transport.AnyListener) !void {
-//             var accepted_count: usize = 0;
-//             while (accepted_count < 2) : (accepted_count += 1) {
-//                 var accepted_channel: p2p_conn.AnyRxConn = undefined;
-//                 try l.accept(&accepted_channel);
-//                 try std.testing.expectEqual(accepted_channel.direction(), p2p_conn.Direction.INBOUND);
-//             }
-//         }
-//     }.run, .{&listener});
-
-//     var cl: io_loop.ThreadEventLoop = undefined;
-//     try cl.init(allocator, &any_initializer);
-//     defer {
-//         cl.close();
-//         cl.deinit();
-//     }
-//     var client: XevTransport = undefined;
-//     try client.init(&cl, allocator, opts);
-//     defer client.deinit();
-
-//         var channel1: p2p_conn.AnyRxConn = undefined;
-//     try client.dial(addr, &channel1);
-//     try std.testing.expectEqual(channel1.direction(), p2p_conn.Direction.OUTBOUND);
-
-//     // _ = try channel1.write("buf: []const u8");
-//     // const buf = try allocator.alloc(u8, 1024);
-//     // defer allocator.free(buf);
-//     // const n = try channel1.read(buf);
-//     // try std.testing.expectStringStartsWith(buf, "buf: []const u8");
-//     // try std.testing.expect(n == 15);
-
-//     accept_thread.join();
-
-// }
-
-// test "generic transport dial and accept" {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     const allocator = gpa.allocator();
-
-//     // Server setup
-//     var server_loop: io_loop.ThreadEventLoop = undefined;
-//     try server_loop.init(allocator);
-//     defer {
-//         server_loop.close();
-//         server_loop.deinit();
-//     }
-
-//     const opts = XevTransport.Options{
-//         .backlog = 128,
-//     };
-
-//     var xev_server: XevTransport = undefined;
-//     try xev_server.init(&server_loop, allocator, opts);
-//     defer xev_server.deinit();
-
-//     // Get the generic transport interface
-//     const server = xev_server.toTransport();
-
-//     // Listener setup
-//     var xev_listener: XevListener = undefined;
-//     const addr = try std.net.Address.parseIp("0.0.0.0", 8083);
-//     try server.listen(addr, &xev_listener);
-//     const listener = xev_listener.toListener();
-
-//     // Accept thread using the generic interfaces
-//     const accept_thread = try std.Thread.spawn(.{}, struct {
-//         fn run(l: Listener) !void {
-//             var accepted_channel: XevSocketChannel = undefined;
-//             try l.accept(&accepted_channel);
-//             std.debug.print("Server accepted connection\n", .{});
-//             try std.testing.expectEqual(accepted_channel.direction, .INBOUND);
-//         }
-//     }.run, .{listener});
-
-//     // Client setup
-//     var client_loop: io_loop.ThreadEventLoop = undefined;
-//     try client_loop.init(allocator);
-//     defer {
-//         client_loop.close();
-//         client_loop.deinit();
-//     }
-
-//     var xev_client: XevTransport = undefined;
-//     try xev_client.init(&client_loop, allocator, opts);
-//     defer xev_client.deinit();
-
-//     // Get the generic transport interface
-//     const client = xev_client.toTransport();
-
-//     // Dialing using the generic interface
-//     var channel: XevSocketChannel = undefined;
-//     try client.dial(addr, &channel);
-//     std.debug.print("Client connected\n", .{});
-//     try std.testing.expectEqual(channel.direction, .OUTBOUND);
-
-//     accept_thread.join();
-// }
-
-// test "generic transport echo read and write" {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     const allocator = gpa.allocator();
-
-//     const opts = XevTransport.Options{
-//         .backlog = 128,
-//     };
-
-//     var sl: io_loop.ThreadEventLoop = undefined;
-//     try sl.init(allocator);
-//     defer {
-//         sl.close();
-//         sl.deinit();
-//     }
-
-//     var server: XevTransport = undefined;
-//     try server.init(&sl, allocator, opts);
-//     defer server.deinit();
-
-//     // Get the generic transport interface
-//     const server_transport = server.toTransport();
-
-//     var listener: XevListener = undefined;
-//     const addr = try std.net.Address.parseIp("0.0.0.0", 8084);
-//     try server_transport.listen(addr, &listener);
-
-//     const server_listener = listener.toListener();
-
-//     const accept_thread = try std.Thread.spawn(.{}, struct {
-//         fn run(l: Listener, alloc: Allocator) !void {
-//             var accepted_channel: XevSocketChannel = undefined;
-//             try l.accept(&accepted_channel);
-//             try std.testing.expectEqual(accepted_channel.direction, .INBOUND);
-
-//             const accepted_conn = accepted_channel.toConn();
-
-//             const buf = try alloc.alloc(u8, 1024);
-//             defer alloc.free(buf);
-//             const n = try accepted_conn.read(buf);
-//             try std.testing.expectStringStartsWith(buf, "buf: []const u8");
-
-//             try std.testing.expect(n == 15);
-//             _ = try accepted_conn.write(buf[0..n]);
-//         }
-//     }.run, .{ server_listener, allocator });
-
-//     var cl: io_loop.ThreadEventLoop = undefined;
-//     try cl.init(allocator);
-//     defer {
-//         cl.close();
-//         cl.deinit();
-//     }
-//     var client: XevTransport = undefined;
-//     try client.init(&cl, allocator, opts);
-//     defer client.deinit();
-
-//     // Get the generic transport interface
-//     const client_transport = client.toTransport();
-
-//     var channel1: XevSocketChannel = undefined;
-//     try client_transport.dial(addr, &channel1);
-//     try std.testing.expectEqual(channel1.direction, .OUTBOUND);
-
-//     // Write and read using the generic interface
-//     const conn = channel1.toConn();
-//     _ = try conn.write("buf: []const u8");
-//     const buf = try allocator.alloc(u8, 1024);
-//     defer allocator.free(buf);
-//     const n = try conn.read(buf);
-//     try std.testing.expectStringStartsWith(buf, "buf: []const u8");
-//     try std.testing.expect(n == 15);
-
-//     accept_thread.join();
-//     client.close();
-//     server.close();
-// }
