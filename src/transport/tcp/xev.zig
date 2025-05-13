@@ -490,12 +490,13 @@ pub const XevListener = struct {
             return .disarm;
         };
 
+        accept_ud.callback(accept_ud.user_data, any_rx_conn);
         p.fireActive();
 
         const read_buf = transport.io_event_loop.read_buffer_pool.create() catch unreachable;
         const read_c = transport.io_event_loop.completion_pool.create() catch unreachable;
         socket.read(l, read_c, .{ .slice = read_buf }, XevSocketChannel, channel, XevSocketChannel.readCB);
-        accept_ud.callback(accept_ud.user_data, any_rx_conn);
+
         return .disarm;
     }
 };
@@ -649,13 +650,13 @@ pub const XevTransport = struct {
             return .disarm;
         };
 
+        connect.callback(connect.user_data, associated_conn);
         p.fireActive();
 
         const read_buf = transport.io_event_loop.read_buffer_pool.create() catch unreachable;
         const read_c = transport.io_event_loop.completion_pool.create() catch unreachable;
         socket.read(l, read_c, .{ .slice = read_buf }, XevSocketChannel, channel, XevSocketChannel.readCB);
 
-        connect.callback(connect.user_data, associated_conn);
         return .disarm;
     }
 
