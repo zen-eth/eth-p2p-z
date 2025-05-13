@@ -11,7 +11,7 @@ pub const Direction = enum { INBOUND, OUTBOUND };
 /// ConnInitializer interface for initializing connections.
 /// This is used to set up the connection before it is used.
 pub const ConnInitializerVTable = struct {
-    initConnFn: *const fn (instance: *anyopaque, conn: *AnyRxConn) anyerror!void,
+    initConnFn: *const fn (instance: *anyopaque, conn: AnyRxConn) anyerror!void,
 };
 
 /// AnyConnInitializer is a struct that holds the instance and vtable for the ConnInitializer interface.
@@ -23,7 +23,7 @@ pub const AnyConnInitializer = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn initConn(self: Self, conn: *AnyRxConn) Error!void {
+    pub fn initConn(self: Self, conn: AnyRxConn) Error!void {
         return self.vtable.initConnFn(self.instance, conn);
     }
 };

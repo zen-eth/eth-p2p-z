@@ -470,7 +470,7 @@ pub const XevListener = struct {
 
         const channel = transport.allocator.create(XevSocketChannel) catch unreachable;
         channel.init(socket, transport, p2p_conn.Direction.INBOUND);
-        var any_rx_conn = channel.any();
+        const any_rx_conn = channel.any();
 
         const p = transport.io_event_loop.handler_pipeline_pool.create() catch unreachable;
         p.init(transport.allocator, any_rx_conn) catch |err| {
@@ -482,7 +482,7 @@ pub const XevListener = struct {
         };
         channel.handler_pipeline = p;
 
-        transport.io_event_loop.conn_initializer.initConn(&any_rx_conn) catch |err| {
+        transport.io_event_loop.conn_initializer.initConn(any_rx_conn) catch |err| {
             std.debug.print("Error initializing connection: {}\n", .{err});
             transport.allocator.destroy(channel);
             transport.io_event_loop.handler_pipeline_pool.destroy(p);
@@ -628,7 +628,7 @@ pub const XevTransport = struct {
         };
         channel.handler_pipeline = p;
 
-        transport.io_event_loop.conn_initializer.initConn(connect.channel) catch |err| {
+        transport.io_event_loop.conn_initializer.initConn(connect.channel.*) catch |err| {
             std.debug.print("Error initializing connection: {}\n", .{err});
             transport.allocator.destroy(channel);
             connect.future.setError(err);
@@ -732,7 +732,7 @@ const MockConnInitializer = struct {
     const Self = @This();
 
     // No-op implementation
-    pub fn initConnImpl(self: *Self, conn: *p2p_conn.AnyRxConn) Error!void {
+    pub fn initConnImpl(self: *Self, conn: p2p_conn.AnyRxConn) Error!void {
         _ = self; // Avoid unused self
         _ = conn; // Avoid unused conn
         // std.debug.print("MockConnInitializer.initConn called (no-op).\n", .{});
@@ -740,7 +740,7 @@ const MockConnInitializer = struct {
     }
 
     // Static wrapper function for the VTable
-    fn vtableInitConnFn(instance: *anyopaque, conn: *p2p_conn.AnyRxConn) Error!void {
+    fn vtableInitConnFn(instance: *anyopaque, conn: p2p_conn.AnyRxConn) Error!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.initConnImpl(conn);
     }
@@ -775,7 +775,7 @@ const MockConnInitializer1 = struct {
     }
 
     // Implementation
-    pub fn initConnImpl(self: *Self, conn: *p2p_conn.AnyRxConn) Error!void {
+    pub fn initConnImpl(self: *Self, conn: p2p_conn.AnyRxConn) Error!void {
         std.debug.print("MockConnInitializer.initConn called.\n", .{});
 
         if (self.handler_to_add) |handler| {
@@ -794,7 +794,7 @@ const MockConnInitializer1 = struct {
     }
 
     // Static wrapper function for the VTable
-    fn vtableInitConnFn(instance: *anyopaque, conn: *p2p_conn.AnyRxConn) Error!void {
+    fn vtableInitConnFn(instance: *anyopaque, conn: p2p_conn.AnyRxConn) Error!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.initConnImpl(conn);
     }
@@ -930,309 +930,344 @@ test "dial and accept" {
     accept_thread.join();
 }
 
-// const ServerEchoHandler = struct {
-//     allocator: Allocator,
+const ServerEchoHandler = struct {
+    allocator: Allocator,
 
-//     received_message: []u8,
+    received_message: []u8,
 
-//     const Self = @This();
+    channel: p2p_conn.AnyRxConn,
 
-//     pub fn create(alloc: Allocator) !*Self {
-//         const self = try alloc.create(Self);
-//         const received_message = try alloc.alloc(u8, 1024);
-//         @memset(received_message, 0);
-//         self.* = .{ .allocator = alloc, .received_message = received_message };
-//         return self;
-//     }
+    ready: std.Thread.ResetEvent = .{},
 
-//     pub fn destroy(self: *Self) void {
-//         self.allocator.free(self.received_message);
-//         self.allocator.destroy(self);
-//     }
+    const Self = @This();
 
-//     // --- Actual Handler Implementations ---
-//     pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
-//         _ = self;
-//         std.debug.print("ServerEchoHandler ({s}): Connection active.\n", .{ctx.name});
-//         ctx.fireActive();
-//     }
+    pub fn create(alloc: Allocator) !*Self {
+        const self = try alloc.create(Self);
+        const received_message = try alloc.alloc(u8, 1024);
+        @memset(received_message, 0);
+        self.* = .{ .allocator = alloc, .received_message = received_message, .channel = undefined };
+        return self;
+    }
 
-//     pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
-//         _ = self;
-//         std.debug.print("ServerEchoHandler ({s}): Connection inactive.\n", .{ctx.name});
-//         ctx.fireInactive();
-//     }
+    pub fn destroy(self: *Self) void {
+        self.allocator.free(self.received_message);
+        self.allocator.destroy(self);
+    }
 
-//     pub fn onReadImpl(_: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
-//         std.debug.print("ServerEchoHandler ({s}): Received message: {s}\n", .{ ctx.name, msg });
+    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
+        std.debug.print("ConnHolder.init: Callback called.\n", .{});
+        const self: *@This() = @ptrCast(@alignCast(opaque_userdata.?));
 
-//         // Echo the message back
-//         std.debug.print("ServerEchoHandler ({s}): Echoing message back.\n", .{ctx.name});
-//         ctx.write(msg, null, null); // Propagate write operation
+        const accepted_channel = accept_result catch |err| {
+            std.debug.print("ConnHolder.init: Error from accept operation: {any}\n", .{err});
 
-//         std.debug.print("ServerEchoHandler ({s}): Propagating read operation.\n", .{ctx.name});
-//         ctx.fireRead(msg); // Propagate read operation
-//     }
+            return;
+        };
 
-//     pub fn onReadCompleteImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
-//         _ = self;
-//         std.debug.print("ServerEchoHandler ({s}): Read complete.\n", .{ctx.name});
-//         ctx.fireReadComplete(); // Propagate read complete operation
-//     }
+        self.channel = accepted_channel;
+        self.ready.set();
+        std.debug.print("ConnHolder.init: Channel accepted and set. Direction: {any}\n", .{self.channel.direction()});
+    }
 
-//     pub fn onErrorCaughtImpl(self: *Self, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
-//         _ = self;
-//         std.log.err("ServerEchoHandler ({s}): Error caught: {any}\n", .{ ctx.name, err });
-//         // Propagate the error
-//         ctx.fireErrorCaught(err);
-//     }
+    // --- Actual Handler Implementations ---
+    pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+        _ = self;
+        std.debug.print("ServerEchoHandler ({s}): Connection active.\n", .{ctx.name});
+        ctx.fireActive();
+    }
 
-//     pub fn writeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
-//         _ = self;
-//         std.debug.print("ServerEchoHandler ({s}): Write called (passing through).\n", .{ctx.name});
-//         // Pass the write operation to the next handler in the pipeline (towards the head)
-//         ctx.write(buffer, user_data, callback);
-//     }
+    pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+        _ = self;
+        std.debug.print("ServerEchoHandler ({s}): Connection inactive.\n", .{ctx.name});
+        ctx.fireInactive();
+    }
 
-//     pub fn closeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
-//         _ = self;
-//         std.debug.print("ServerEchoHandler ({s}): Close called (passing through).\n", .{ctx.name});
-//         // Pass the close operation to the next handler in the pipeline (towards the head)
-//         ctx.close(user_data, callback);
-//     }
+    pub fn onReadImpl(_: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+        std.debug.print("ServerEchoHandler ({s}): Received message: {s}\n", .{ ctx.name, msg });
 
-//     // --- Static Wrapper Functions for HandlerVTable ---
-//     fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.onActiveImpl(ctx);
-//     }
-//     fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.onInactiveImpl(ctx);
-//     }
-//     fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.onReadImpl(ctx, msg);
-//     }
-//     fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.onReadCompleteImpl(ctx);
-//     }
-//     fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.onErrorCaughtImpl(ctx, err);
-//     }
-//     fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.writeImpl(ctx, buffer, user_data, callback);
-//     }
-//     fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.closeImpl(ctx, user_data, callback);
-//     }
+        // Echo the message back
+        std.debug.print("ServerEchoHandler ({s}): Echoing message back.\n", .{ctx.name});
+        ctx.write(msg, null, null); // Propagate write operation
 
-//     // --- Static VTable Instance ---
-//     const vtable_instance = p2p_conn.HandlerVTable{
-//         .onActiveFn = vtableOnActiveFn,
-//         .onInactiveFn = vtableOnInactiveFn,
-//         .onReadFn = vtableOnReadFn,
-//         .onReadCompleteFn = vtableOnReadCompleteFn,
-//         .onErrorCaughtFn = vtableOnErrorCaughtFn,
-//         .writeFn = vtableWriteFn,
-//         .closeFn = vtableCloseFn,
-//     };
+        std.debug.print("ServerEchoHandler ({s}): Propagating read operation.\n", .{ctx.name});
+        ctx.fireRead(msg); // Propagate read operation
+    }
 
-//     // --- any() method ---
-//     pub fn any(self: *Self) p2p_conn.AnyHandler {
-//         return .{ .instance = self, .vtable = &vtable_instance };
-//     }
-// };
+    pub fn onReadCompleteImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+        _ = self;
+        std.debug.print("ServerEchoHandler ({s}): Read complete.\n", .{ctx.name});
+        ctx.fireReadComplete(); // Propagate read complete operation
+    }
 
-// const ClientEchoHandler = struct {
-//     allocator: Allocator,
+    pub fn onErrorCaughtImpl(self: *Self, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
+        _ = self;
+        std.log.err("ServerEchoHandler ({s}): Error caught: {any}\n", .{ ctx.name, err });
+        // Propagate the error
+        ctx.fireErrorCaught(err);
+    }
 
-//     received_message: []u8,
+    pub fn writeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+        _ = self;
+        std.debug.print("ServerEchoHandler ({s}): Write called (passing through).\n", .{ctx.name});
+        // Pass the write operation to the next handler in the pipeline (towards the head)
+        ctx.write(buffer, user_data, callback);
+    }
 
-//     read: std.Thread.ResetEvent = .{},
+    pub fn closeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+        _ = self;
+        std.debug.print("ServerEchoHandler ({s}): Close called (passing through).\n", .{ctx.name});
+        // Pass the close operation to the next handler in the pipeline (towards the head)
+        ctx.close(user_data, callback);
+    }
 
-//     const Self = @This();
+    // --- Static Wrapper Functions for HandlerVTable ---
+    fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onActiveImpl(ctx);
+    }
+    fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onInactiveImpl(ctx);
+    }
+    fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onReadImpl(ctx, msg);
+    }
+    fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onReadCompleteImpl(ctx);
+    }
+    fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onErrorCaughtImpl(ctx, err);
+    }
+    fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.writeImpl(ctx, buffer, user_data, callback);
+    }
+    fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.closeImpl(ctx, user_data, callback);
+    }
 
-//     pub fn create(alloc: Allocator) !*Self {
-//         const self = try alloc.create(Self);
-//         const received_message = try alloc.alloc(u8, 1024);
-//         @memset(received_message, 0);
-//         self.* = .{ .allocator = alloc, .received_message = received_message };
-//         return self;
-//     }
+    // --- Static VTable Instance ---
+    const vtable_instance = p2p_conn.HandlerVTable{
+        .onActiveFn = vtableOnActiveFn,
+        .onInactiveFn = vtableOnInactiveFn,
+        .onReadFn = vtableOnReadFn,
+        .onReadCompleteFn = vtableOnReadCompleteFn,
+        .onErrorCaughtFn = vtableOnErrorCaughtFn,
+        .writeFn = vtableWriteFn,
+        .closeFn = vtableCloseFn,
+    };
 
-//     pub fn destroy(self: *Self) void {
-//         self.allocator.free(self.received_message);
-//         self.allocator.destroy(self);
-//     }
+    // --- any() method ---
+    pub fn any(self: *Self) p2p_conn.AnyHandler {
+        return .{ .instance = self, .vtable = &vtable_instance };
+    }
+};
 
-//     // --- Actual Handler Implementations ---
-//     pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
-//         _ = self;
-//         std.debug.print("ClientEchoHandler ({s}): Connection active.\n", .{ctx.name});
-//         ctx.fireActive();
-//     }
+const ClientEchoHandler = struct {
+    allocator: Allocator,
 
-//     pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
-//         _ = self;
-//         std.debug.print("ClientEchoHandler ({s}): Connection inactive.\n", .{ctx.name});
-//         ctx.fireInactive();
-//     }
+    received_message: []u8,
 
-//     pub fn onReadImpl(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
-//         const len = msg.len;
-//         @memcpy(self.received_message[0..len], msg[0..len]);
-//         self.read.set();
-//         std.debug.print("ClientEchoHandler ({s}): Received message: {s}\n", .{ ctx.name, msg });
-//         ctx.fireRead(msg);
-//     }
+    read: std.Thread.ResetEvent = .{},
 
-//     pub fn onReadCompleteImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
-//         _ = self;
-//         std.debug.print("ClientEchoHandler ({s}): Read complete.\n", .{ctx.name});
-//         ctx.fireReadComplete();
-//     }
+    channel: p2p_conn.AnyRxConn,
 
-//     pub fn onErrorCaughtImpl(self: *Self, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
-//         _ = self;
-//         std.log.err("ClientEchoHandler ({s}): Error caught: {any}\n", .{ ctx.name, err });
-//         // Propagate the error
-//         ctx.fireErrorCaught(err);
-//     }
+    ready: std.Thread.ResetEvent = .{},
 
-//     pub fn writeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
-//         _ = self;
-//         std.debug.print("ClientEchoHandler ({s}): Write called (passing through).\n", .{ctx.name});
-//         // Pass the write operation to the next handler in the pipeline (towards the head)
-//         ctx.write(buffer, user_data, callback);
-//     }
-//     pub fn closeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
-//         _ = self;
-//         std.debug.print("ClientEchoHandler ({s}): Close called (passing through).\n", .{ctx.name});
-//         // Pass the close operation to the next handler in the pipeline (towards the head)
-//         ctx.close(user_data, callback);
-//     }
-//     // --- Static Wrapper Functions for HandlerVTable ---
-//     fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.onActiveImpl(ctx);
-//     }
-//     fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.onInactiveImpl(ctx);
-//     }
-//     fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.onReadImpl(ctx, msg);
-//     }
-//     fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.onReadCompleteImpl(ctx);
-//     }
-//     fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.onErrorCaughtImpl(ctx, err);
-//     }
-//     fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.writeImpl(ctx, buffer, user_data, callback);
-//     }
-//     fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
-//         const self: *Self = @ptrCast(@alignCast(instance));
-//         return self.closeImpl(ctx, user_data, callback);
-//     }
-//     // --- Static VTable Instance ---
-//     const vtable_instance = p2p_conn.HandlerVTable{
-//         .onActiveFn = vtableOnActiveFn,
-//         .onInactiveFn = vtableOnInactiveFn,
-//         .onReadFn = vtableOnReadFn,
-//         .onReadCompleteFn = vtableOnReadCompleteFn,
-//         .onErrorCaughtFn = vtableOnErrorCaughtFn,
-//         .writeFn = vtableWriteFn,
-//         .closeFn = vtableCloseFn,
-//     };
-//     // --- any() method ---
-//     pub fn any(self: *Self) p2p_conn.AnyHandler {
-//         return .{ .instance = self, .vtable = &vtable_instance };
-//     }
-// };
+    const Self = @This();
 
-// test "echo read and write" {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     const allocator = gpa.allocator();
+    pub fn create(alloc: Allocator) !*Self {
+        const self = try alloc.create(Self);
+        const received_message = try alloc.alloc(u8, 1024);
+        @memset(received_message, 0);
+        self.* = .{ .allocator = alloc, .received_message = received_message, .channel = undefined };
+        return self;
+    }
 
-//     const server_handler = try ServerEchoHandler.create(allocator);
-//     defer server_handler.destroy();
+    pub fn destroy(self: *Self) void {
+        self.allocator.free(self.received_message);
+        self.allocator.destroy(self);
+    }
 
-//     const client_handler = try ClientEchoHandler.create(allocator);
-//     defer client_handler.destroy();
-//     const server_handler_any = server_handler.any();
-//     const client_handler_any = client_handler.any();
+    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
+        std.debug.print("ConnHolder.init: Callback called.\n", .{});
+        const self: *@This() = @ptrCast(@alignCast(opaque_userdata.?));
 
-//     var mock_client_initializer = MockConnInitializer1.init(client_handler_any, allocator);
-//     var any_client_initializer = mock_client_initializer.any();
+        const accepted_channel = accept_result catch |err| {
+            std.debug.print("ConnHolder.init: Error from accept operation: {any}\n", .{err});
 
-//     var mock_server_initializer = MockConnInitializer1.init(server_handler_any, allocator);
-//     var any_server_initializer = mock_server_initializer.any();
+            return;
+        };
 
-//     // var mock_initializer = MockConnInitializer{};
-//     // var any_initializer = mock_initializer.any();
+        self.channel = accepted_channel;
+        self.ready.set();
+        std.debug.print("ConnHolder.init: Channel accepted and set. Direction: {any}\n", .{self.channel.direction()});
+    }
 
-//     var sl: io_loop.ThreadEventLoop = undefined;
-//     try sl.init(allocator, &any_server_initializer);
-//     defer {
-//         sl.close();
-//         sl.deinit();
-//     }
+    // --- Actual Handler Implementations ---
+    pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+        _ = self;
+        std.debug.print("ClientEchoHandler ({s}): Connection active.\n", .{ctx.name});
+        ctx.fireActive();
+    }
 
-//     const opts = XevTransport.Options{
-//         .backlog = 128,
-//     };
+    pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+        _ = self;
+        std.debug.print("ClientEchoHandler ({s}): Connection inactive.\n", .{ctx.name});
+        ctx.fireInactive();
+    }
 
-//     var transport: XevTransport = undefined;
-//     try transport.init(&sl, allocator, opts);
-//     defer transport.deinit();
+    pub fn onReadImpl(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+        const len = msg.len;
+        @memcpy(self.received_message[0..len], msg[0..len]);
+        self.read.set();
+        std.debug.print("ClientEchoHandler ({s}): Received message: {s}\n", .{ ctx.name, msg });
+        ctx.fireRead(msg);
+    }
 
-//     var listener: p2p_transport.AnyListener = undefined;
-//     const addr = try std.net.Address.parseIp("0.0.0.0", 8083);
-//     try transport.listen(addr, &listener);
+    pub fn onReadCompleteImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+        _ = self;
+        std.debug.print("ClientEchoHandler ({s}): Read complete.\n", .{ctx.name});
+        ctx.fireReadComplete();
+    }
 
-//     const accept_thread = try std.Thread.spawn(.{}, struct {
-//         fn run(l: *p2p_transport.AnyListener) !void {
-//             var accepted_count: usize = 0;
-//             while (accepted_count < 1) : (accepted_count += 1) {
-//                 var accepted_channel: p2p_conn.AnyRxConn = undefined;
-//                 try l.accept(&accepted_channel);
-//                 try std.testing.expectEqual(accepted_channel.direction(), p2p_conn.Direction.INBOUND);
-//             }
-//         }
-//     }.run, .{&listener});
+    pub fn onErrorCaughtImpl(self: *Self, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
+        _ = self;
+        std.log.err("ClientEchoHandler ({s}): Error caught: {any}\n", .{ ctx.name, err });
+        // Propagate the error
+        ctx.fireErrorCaught(err);
+    }
 
-//     var cl: io_loop.ThreadEventLoop = undefined;
-//     try cl.init(allocator, &any_client_initializer);
-//     defer {
-//         cl.close();
-//         cl.deinit();
-//     }
-//     var client: XevTransport = undefined;
-//     try client.init(&cl, allocator, opts);
-//     defer client.deinit();
+    pub fn writeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+        _ = self;
+        std.debug.print("ClientEchoHandler ({s}): Write called (passing through).\n", .{ctx.name});
+        // Pass the write operation to the next handler in the pipeline (towards the head)
+        ctx.write(buffer, user_data, callback);
+    }
+    pub fn closeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+        _ = self;
+        std.debug.print("ClientEchoHandler ({s}): Close called (passing through).\n", .{ctx.name});
+        // Pass the close operation to the next handler in the pipeline (towards the head)
+        ctx.close(user_data, callback);
+    }
+    // --- Static Wrapper Functions for HandlerVTable ---
+    fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onActiveImpl(ctx);
+    }
+    fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onInactiveImpl(ctx);
+    }
+    fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onReadImpl(ctx, msg);
+    }
+    fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onReadCompleteImpl(ctx);
+    }
+    fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onErrorCaughtImpl(ctx, err);
+    }
+    fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.writeImpl(ctx, buffer, user_data, callback);
+    }
+    fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.closeImpl(ctx, user_data, callback);
+    }
+    // --- Static VTable Instance ---
+    const vtable_instance = p2p_conn.HandlerVTable{
+        .onActiveFn = vtableOnActiveFn,
+        .onInactiveFn = vtableOnInactiveFn,
+        .onReadFn = vtableOnReadFn,
+        .onReadCompleteFn = vtableOnReadCompleteFn,
+        .onErrorCaughtFn = vtableOnErrorCaughtFn,
+        .writeFn = vtableWriteFn,
+        .closeFn = vtableCloseFn,
+    };
+    // --- any() method ---
+    pub fn any(self: *Self) p2p_conn.AnyHandler {
+        return .{ .instance = self, .vtable = &vtable_instance };
+    }
+};
 
-//     var channel1: p2p_conn.AnyRxConn = undefined;
-//     try client.dial(addr, &channel1);
-//     try std.testing.expectEqual(channel1.direction(), p2p_conn.Direction.OUTBOUND);
+test "echo read and write" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
 
-//     const n = try channel1.write("buf: []const u8");
-//     try std.testing.expect(n == 15);
+    const server_handler = try ServerEchoHandler.create(allocator);
+    defer server_handler.destroy();
 
-//     client_handler.read.wait();
-//     try std.testing.expectEqualStrings("buf: []const u8", client_handler.received_message[0..n]);
-//     accept_thread.join();
-// }
+    const client_handler = try ClientEchoHandler.create(allocator);
+    defer client_handler.destroy();
+    const server_handler_any = server_handler.any();
+    const client_handler_any = client_handler.any();
+
+    var mock_client_initializer = MockConnInitializer1.init(client_handler_any, allocator);
+    var any_client_initializer = mock_client_initializer.any();
+
+    var mock_server_initializer = MockConnInitializer1.init(server_handler_any, allocator);
+    var any_server_initializer = mock_server_initializer.any();
+
+    var sl: io_loop.ThreadEventLoop = undefined;
+    try sl.init(allocator, &any_server_initializer);
+    defer {
+        sl.close();
+        sl.deinit();
+    }
+
+    const opts = XevTransport.Options{
+        .backlog = 128,
+    };
+
+    var transport: XevTransport = undefined;
+    try transport.init(&sl, allocator, opts);
+    defer transport.deinit();
+
+    var listener: p2p_transport.AnyListener = undefined;
+    const addr = try std.net.Address.parseIp("0.0.0.0", 8083);
+    try transport.listen(addr, &listener);
+
+    const accept_thread = try std.Thread.spawn(.{}, struct {
+        fn run(l: *p2p_transport.AnyListener, sh: *ServerEchoHandler) !void {
+            var accepted_count: usize = 0;
+            while (accepted_count < 1) : (accepted_count += 1) {
+                l.accept(sh, ServerEchoHandler.init);
+                sh.ready.wait();
+                try std.testing.expectEqual(sh.channel.direction(), p2p_conn.Direction.INBOUND);
+            }
+        }
+    }.run, .{ &listener, server_handler });
+
+    var cl: io_loop.ThreadEventLoop = undefined;
+    try cl.init(allocator, &any_client_initializer);
+    defer {
+        cl.close();
+        cl.deinit();
+    }
+    var client: XevTransport = undefined;
+    try client.init(&cl, allocator, opts);
+    defer client.deinit();
+
+    var channel1: p2p_conn.AnyRxConn = undefined;
+    try client.dial(addr, &channel1);
+    try std.testing.expectEqual(channel1.direction(), p2p_conn.Direction.OUTBOUND);
+
+    const n = try channel1.write("buf: []const u8");
+    try std.testing.expect(n == 15);
+
+    client_handler.read.wait();
+    try std.testing.expectEqualStrings("buf: []const u8", client_handler.received_message[0..n]);
+    accept_thread.join();
+}
 
 // test "echo read and write" {
 //     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
