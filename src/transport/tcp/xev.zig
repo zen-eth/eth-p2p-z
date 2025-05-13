@@ -990,7 +990,7 @@ const ServerEchoHandler = struct {
         ctx.write(buffer, user_data, callback);
     }
 
-    pub fn closeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    pub fn closeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         _ = self;
         std.debug.print("ServerEchoHandler ({s}): Close called (passing through).\n", .{ctx.name});
         // Pass the close operation to the next handler in the pipeline (towards the head)
@@ -1022,7 +1022,7 @@ const ServerEchoHandler = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.writeImpl(ctx, buffer, user_data, callback);
     }
-    fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.closeImpl(ctx, user_data, callback);
     }
@@ -1146,7 +1146,7 @@ const ClientEchoHandler = struct {
         // Pass the write operation to the next handler in the pipeline (towards the head)
         ctx.write(buffer, user_data, callback);
     }
-    pub fn closeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    pub fn closeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         _ = self;
         std.debug.print("ClientEchoHandler ({s}): Close called (passing through).\n", .{ctx.name});
         // Pass the close operation to the next handler in the pipeline (towards the head)
@@ -1177,7 +1177,7 @@ const ClientEchoHandler = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.writeImpl(ctx, buffer, user_data, callback);
     }
-    fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.closeImpl(ctx, user_data, callback);
     }

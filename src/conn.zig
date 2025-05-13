@@ -36,7 +36,7 @@ pub const HandlerVTable = struct {
     onReadCompleteFn: *const fn (instance: *anyopaque, ctx: *HandlerContext) void,
     onErrorCaughtFn: *const fn (instance: *anyopaque, ctx: *HandlerContext, err: anyerror) void,
     writeFn: *const fn (instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void,
-    closeFn: *const fn (instance: *anyopaque, ctx: *HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void,
+    closeFn: *const fn (instance: *anyopaque, ctx: *HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void,
 };
 
 /// AnyHandler is a struct that holds the instance and vtable for the Handler interface.
@@ -64,7 +64,7 @@ pub const AnyHandler = struct {
     pub fn write(self: Self, ctx: *HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         return self.vtable.writeFn(self.instance, ctx, buffer, user_data, callback);
     }
-    pub fn close(self: Self, ctx: *HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    pub fn close(self: Self, ctx: *HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         return self.vtable.closeFn(self.instance, ctx, user_data, callback);
     }
 };
@@ -78,7 +78,7 @@ pub const RxConnVTable = struct {
         erased_userdata: ?*anyopaque,
         wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void,
-    closeFn: *const fn (instance: *anyopaque, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void,
+    closeFn: *const fn (instance: *anyopaque, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void,
     getPipelineFn: *const fn (instance: *anyopaque) *HandlerPipeline,
     directionFn: *const fn (instance: *anyopaque) Direction,
 };
@@ -110,7 +110,7 @@ pub const AnyRxConn = struct {
     pub fn close(
         self: Self,
         userdata: ?*anyopaque,
-        callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {
         self.vtable.closeFn(self.instance, userdata, callback);
     }
@@ -187,7 +187,7 @@ pub const HandlerContext = struct {
         }
     }
 
-    pub fn close(self: *Self, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    pub fn close(self: *Self, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         if (self.findPrevOutbound()) |prev_ctx| {
             prev_ctx.handler.close(prev_ctx, user_data, callback);
         } else {
@@ -254,11 +254,11 @@ const HeadHandlerImpl = struct {
     //     f.setDone();
     // }
 
-    pub fn asyncClose(
+    pub fn close(
         self: *Self,
         _: *HandlerContext,
         erased_userdata: ?*anyopaque,
-        wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void,
+        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {
         self.conn.close(erased_userdata, wrapped_cb);
     }
@@ -296,9 +296,9 @@ const HeadHandlerImpl = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.write(ctx, buffer, erased_userdata, wrapped_cb);
     }
-    fn vtableAsyncCloseFn(instance: *anyopaque, ctx: *HandlerContext, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    fn vtableCloseFn(instance: *anyopaque, ctx: *HandlerContext, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.asyncClose(ctx, erased_userdata, wrapped_cb);
+        return self.close(ctx, erased_userdata, wrapped_cb);
     }
 
     // --- Static VTable Instance ---
@@ -309,7 +309,7 @@ const HeadHandlerImpl = struct {
         .onReadCompleteFn = vtableOnReadCompleteFn,
         .onErrorCaughtFn = vtableOnErrorCaughtFn,
         .writeFn = vtableWriteFn,
-        .closeFn = vtableAsyncCloseFn,
+        .closeFn = vtableCloseFn,
     };
 
     pub fn any(self: *Self) AnyHandler {
@@ -336,18 +336,18 @@ const TailHandlerImpl = struct {
     }
     // pub fn write(_: *Self, _: *HandlerContext, _: []const u8, _: *WriteFuture) !void {}
     // pub fn close(_: *Self, _: *HandlerContext, _: *CloseFuture) !void {}
-    pub fn asyncWrite(
+    pub fn write(
         _: *Self,
         _: *HandlerContext,
         _: []const u8,
         _: ?*anyopaque,
         _: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void {}
-    pub fn asyncClose(
+    pub fn close(
         _: *Self,
         _: *HandlerContext,
         _: ?*anyopaque,
-        _: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void,
+        _: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {}
 
     // --- Static Wrapper Functions ---
@@ -379,13 +379,13 @@ const TailHandlerImpl = struct {
     //     const self: *Self = @ptrCast(@alignCast(instance));
     //     return self.close(ctx, future);
     // }
-    fn vtableAsyncWriteFn(instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    fn vtableWriteFn(instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.asyncWrite(ctx, buffer, erased_userdata, wrapped_cb);
+        return self.write(ctx, buffer, erased_userdata, wrapped_cb);
     }
-    fn vtableAsyncCloseFn(instance: *anyopaque, ctx: *HandlerContext, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    fn vtableCloseFn(instance: *anyopaque, ctx: *HandlerContext, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.asyncClose(ctx, erased_userdata, wrapped_cb);
+        return self.close(ctx, erased_userdata, wrapped_cb);
     }
 
     // --- Static VTable Instance ---
@@ -395,8 +395,8 @@ const TailHandlerImpl = struct {
         .onReadFn = vtableOnReadFn,
         .onReadCompleteFn = vtableOnReadCompleteFn,
         .onErrorCaughtFn = vtableOnErrorCaughtFn,
-        .writeFn = vtableAsyncWriteFn,
-        .closeFn = vtableAsyncCloseFn,
+        .writeFn = vtableWriteFn,
+        .closeFn = vtableCloseFn,
     };
 
     pub fn any(self: *Self) AnyHandler {
@@ -593,7 +593,7 @@ pub const HandlerPipeline = struct {
         self.tail.write(msg, user_data, callback);
     }
 
-    pub fn close(self: *Self, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    pub fn close(self: *Self, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         self.tail.close(user_data, callback);
     }
 };
@@ -636,7 +636,7 @@ const MockHandlerImpl = struct {
         std.debug.print("MockHandlerImpl: write called with message: {s}\n", .{msg});
         ctx.write(msg, user_data, callback);
     }
-    pub fn close(_: *Self, ctx: *HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    pub fn close(_: *Self, ctx: *HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         std.debug.print("MockHandlerImpl: close called\n", .{});
         ctx.close(user_data, callback);
     }
@@ -666,7 +666,7 @@ const MockHandlerImpl = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.write(ctx, buffer, user_data, callback);
     }
-    fn vtableCloseFn(instance: *anyopaque, ctx: *HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    fn vtableCloseFn(instance: *anyopaque, ctx: *HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.close(ctx, user_data, callback);
     }
@@ -708,31 +708,23 @@ const MockRxConnImpl = struct {
     }
 
     // --- Actual Implementations ---
-    pub fn asyncWrite(
+    pub fn write(
         self: *Self,
         buffer: []const u8,
         erased_userdata: ?*anyopaque,
-        wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void,
+        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void {
         @memcpy(self.write_msg[0..buffer.len], buffer);
-        if (wrapped_cb) |cb| {
-            cb(erased_userdata, buffer.len);
-        }
+        wrapped_cb(erased_userdata, buffer.len);
     }
 
-    pub fn close(self: *Self) !void {
-        self.closed = true;
-    }
-
-    pub fn asyncClose(
+    pub fn close(
         self: *Self,
         erased_userdata: ?*anyopaque,
-        wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void,
+        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {
         self.closed = true;
-        if (wrapped_cb) |cb| {
-            cb(erased_userdata, {});
-        }
+        wrapped_cb(erased_userdata, {});
     }
 
     pub fn direction(_: *Self) Direction {
@@ -743,28 +735,23 @@ const MockRxConnImpl = struct {
     }
 
     // --- Static Wrapper Functions ---
-    fn vtableAsyncWriteFn(
+    fn vtableWriteFn(
         instance: *anyopaque,
         buffer: []const u8,
         erased_userdata: ?*anyopaque,
-        wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void,
+        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.asyncWrite(buffer, erased_userdata, wrapped_cb);
+        return self.write(buffer, erased_userdata, wrapped_cb);
     }
 
-    fn vtableCloseFn(instance: *anyopaque) anyerror!void {
-        const self: *Self = @ptrCast(@alignCast(instance));
-        return self.close();
-    }
-
-    fn vtableAsyncCloseFn(
+    fn vtableCloseFn(
         instance: *anyopaque,
         erased_userdata: ?*anyopaque,
-        wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void,
+        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.asyncClose(erased_userdata, wrapped_cb);
+        return self.close(erased_userdata, wrapped_cb);
     }
     fn vtableGetPipelineFn(instance: *anyopaque) *HandlerPipeline {
         const self: *Self = @ptrCast(@alignCast(instance));
@@ -779,8 +766,8 @@ const MockRxConnImpl = struct {
     const vtable_instance = RxConnVTable{
         .getPipelineFn = vtableGetPipelineFn,
         .directionFn = vtableDirectionFn,
-        .writeFn = vtableAsyncWriteFn,
-        .closeFn = vtableAsyncCloseFn,
+        .writeFn = vtableWriteFn,
+        .closeFn = vtableCloseFn,
     };
 
     pub fn any(self: *Self) AnyRxConn {
