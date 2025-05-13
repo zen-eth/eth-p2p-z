@@ -35,7 +35,7 @@ pub const HandlerVTable = struct {
     onReadFn: *const fn (instance: *anyopaque, ctx: *HandlerContext, msg: []const u8) void,
     onReadCompleteFn: *const fn (instance: *anyopaque, ctx: *HandlerContext) void,
     onErrorCaughtFn: *const fn (instance: *anyopaque, ctx: *HandlerContext, err: anyerror) void,
-    writeFn: *const fn (instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void,
+    writeFn: *const fn (instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void,
     closeFn: *const fn (instance: *anyopaque, ctx: *HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void,
 };
 
@@ -61,7 +61,7 @@ pub const AnyHandler = struct {
     pub fn onErrorCaught(self: Self, ctx: *HandlerContext, err: anyerror) void {
         return self.vtable.onErrorCaughtFn(self.instance, ctx, err);
     }
-    pub fn write(self: Self, ctx: *HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    pub fn write(self: Self, ctx: *HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         return self.vtable.writeFn(self.instance, ctx, buffer, user_data, callback);
     }
     pub fn close(self: Self, ctx: *HandlerContext, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
@@ -72,12 +72,11 @@ pub const AnyHandler = struct {
 /// Reactive connection interface for handling read/write operations.
 /// This interface is used to abstract the underlying connection implementation.
 pub const RxConnVTable = struct {
-    writeFn: *const fn (instance: *anyopaque, buffer: []const u8) anyerror!usize,
-    asyncWriteFn: *const fn (
+    writeFn: *const fn (
         instance: *anyopaque,
         buffer: []const u8,
         erased_userdata: ?*anyopaque,
-        wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void,
+        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void,
     closeFn: *const fn (instance: *anyopaque) anyerror!void,
     asyncCloseFn: *const fn (instance: *anyopaque, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void,
@@ -94,9 +93,6 @@ pub const AnyRxConn = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn write(self: Self, buffer: []const u8) Error!usize {
-        return self.vtable.writeFn(self.instance, buffer);
-    }
     pub fn close(self: Self) Error!void {
         return self.vtable.closeFn(self.instance);
     }
@@ -106,13 +102,13 @@ pub const AnyRxConn = struct {
     pub fn getPipeline(self: Self) *HandlerPipeline {
         return self.vtable.getPipelineFn(self.instance);
     }
-    pub fn asyncWrite(
+    pub fn write(
         self: Self,
         buffer: []const u8,
         userdata: ?*anyopaque,
-        callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void {
-        self.vtable.asyncWriteFn(self.instance, buffer, userdata, callback);
+        self.vtable.writeFn(self.instance, buffer, userdata, callback);
     }
 
     pub fn asyncClose(
@@ -187,7 +183,7 @@ pub const HandlerContext = struct {
         }
     }
 
-    pub fn write(self: *Self, msg: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    pub fn write(self: *Self, msg: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         if (self.findPrevOutbound()) |prev_ctx| {
             prev_ctx.handler.write(prev_ctx, msg, user_data, callback);
         } else {
@@ -243,14 +239,14 @@ const HeadHandlerImpl = struct {
     //     f.setValue(n);
     // }
 
-    pub fn asyncWrite(
+    pub fn write(
         self: *Self,
         _: *HandlerContext,
         buffer: []const u8,
         erased_userdata: ?*anyopaque,
-        wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void,
+        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void {
-        self.conn.asyncWrite(buffer, erased_userdata, wrapped_cb);
+        self.conn.write(buffer, erased_userdata, wrapped_cb);
     }
 
     // pub fn close(self: *Self, ctx: *HandlerContext, f: *CloseFuture) !void {
@@ -300,9 +296,9 @@ const HeadHandlerImpl = struct {
     //     const self: *Self = @ptrCast(@alignCast(instance));
     //     return self.close(ctx, future);
     // }
-    fn vtableAsyncWriteFn(instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    fn vtableWriteFn(instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.asyncWrite(ctx, buffer, erased_userdata, wrapped_cb);
+        return self.write(ctx, buffer, erased_userdata, wrapped_cb);
     }
     fn vtableAsyncCloseFn(instance: *anyopaque, ctx: *HandlerContext, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
@@ -316,7 +312,7 @@ const HeadHandlerImpl = struct {
         .onReadFn = vtableOnReadFn,
         .onReadCompleteFn = vtableOnReadCompleteFn,
         .onErrorCaughtFn = vtableOnErrorCaughtFn,
-        .writeFn = vtableAsyncWriteFn,
+        .writeFn = vtableWriteFn,
         .closeFn = vtableAsyncCloseFn,
     };
 
@@ -597,7 +593,7 @@ pub const HandlerPipeline = struct {
     }
 
     // --- Trigger Outbound Events ---
-    pub fn write(self: *Self, msg: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    pub fn write(self: *Self, msg: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         self.tail.write(msg, user_data, callback);
     }
 
@@ -639,7 +635,7 @@ const MockHandlerImpl = struct {
     }
     pub fn onReadComplete(_: *Self, _: *HandlerContext) void {}
     pub fn onErrorCaught(_: *Self, _: *HandlerContext, _: anyerror) void {}
-    pub fn write(self: *Self, ctx: *HandlerContext, msg: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    pub fn write(self: *Self, ctx: *HandlerContext, msg: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         @memcpy(self.write_msg[0..msg.len], msg);
         std.debug.print("MockHandlerImpl: write called with message: {s}\n", .{msg});
         ctx.write(msg, user_data, callback);
@@ -670,7 +666,7 @@ const MockHandlerImpl = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onErrorCaught(ctx, err);
     }
-    fn vtableWriteFn(instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    fn vtableWriteFn(instance: *anyopaque, ctx: *HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.write(ctx, buffer, user_data, callback);
     }
@@ -716,11 +712,6 @@ const MockRxConnImpl = struct {
     }
 
     // --- Actual Implementations ---
-    pub fn write(self: *Self, buffer: []const u8) !usize {
-        @memcpy(self.write_msg[0..buffer.len], buffer);
-        return buffer.len;
-    }
-
     pub fn asyncWrite(
         self: *Self,
         buffer: []const u8,
@@ -756,11 +747,6 @@ const MockRxConnImpl = struct {
     }
 
     // --- Static Wrapper Functions ---
-    fn vtableWriteFn(instance: *anyopaque, buffer: []const u8) anyerror!usize {
-        const self: *Self = @ptrCast(@alignCast(instance));
-        return self.write(buffer);
-    }
-
     fn vtableAsyncWriteFn(
         instance: *anyopaque,
         buffer: []const u8,
@@ -795,16 +781,27 @@ const MockRxConnImpl = struct {
 
     // --- Static VTable Instance ---
     const vtable_instance = RxConnVTable{
-        .writeFn = vtableWriteFn,
         .closeFn = vtableCloseFn,
         .getPipelineFn = vtableGetPipelineFn,
         .directionFn = vtableDirectionFn,
-        .asyncWriteFn = vtableAsyncWriteFn,
+        .writeFn = vtableAsyncWriteFn,
         .asyncCloseFn = vtableAsyncCloseFn,
     };
 
     pub fn any(self: *Self) AnyRxConn {
         return .{ .instance = self, .vtable = &vtable_instance };
+    }
+};
+
+const OnWriteCallback = struct {
+    fn callback(
+        _: ?*anyopaque,
+        r: anyerror!usize,
+    ) void {
+        if (r) |_| {} else |err| {
+            std.debug.print("Test Failure: Expected successful write, but got error: {any}\n", .{err});
+            @panic("write callback received an unexpected error");
+        }
     }
 };
 
@@ -838,8 +835,9 @@ test "HandlerContext interaction with MockHandler and MockConn (VTable)" {
 
     // Test Outbound Event Dispatch (write -> handler.write)
     const write_msg = "test write";
+    var onWriteCallback = OnWriteCallback{};
 
-    handler_ctx.handler.write(&handler_ctx, write_msg, null, null);
+    handler_ctx.handler.write(&handler_ctx, write_msg, &onWriteCallback, OnWriteCallback.callback);
     try testing.expectEqualSlices(u8, &write_msg.*, mock_handler_impl.write_msg[0..write_msg.len]);
 }
 
@@ -886,7 +884,8 @@ test "HandlerPipeline interaction with MockHandler and MockConn (VTable)" {
     // TAIL -> mock2 -> mock1 -> HEAD -> conn
     const write_msg = "outbound data";
 
-    pipeline.write(write_msg, null, null);
+    var onWriteCallback = OnWriteCallback{};
+    pipeline.write(write_msg, &onWriteCallback, OnWriteCallback.callback);
 
     try testing.expectEqualSlices(u8, &write_msg.*, mock_handler_1_impl.write_msg[0..write_msg.len]);
     try testing.expectEqualSlices(u8, &write_msg.*, mock_conn_impl.write_msg[0..write_msg.len]);

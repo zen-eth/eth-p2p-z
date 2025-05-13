@@ -37,48 +37,6 @@ pub const XevSocketChannel = struct {
         self.direction = direction;
     }
 
-    /// Write sends the buffer to the other end of the channel. It blocks until the write is complete. If an error occurs, it returns the error.
-    pub fn write(self: *XevSocketChannel, msg: []const u8) !usize {
-        const f = try self.transport.allocator.create(Future(usize, anyerror));
-        std.debug.print("WriteCB called44444 {*}\n", .{f});
-
-        defer self.transport.allocator.destroy(f);
-        f.* = .{};
-        if (self.transport.io_event_loop.inEventLoopThread()) {
-            const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
-            const w = self.transport.io_event_loop.write_pool.create() catch unreachable;
-
-            w.* = .{
-                .transport = self.transport,
-                .future = f,
-            };
-            std.debug.print("WriteCB called55555 {*}\n", .{w});
-            self.socket.write(&self.transport.io_event_loop.loop, c, .{ .slice = msg }, io_loop.Write, w, writeCB);
-            std.debug.print("WriteCB called66666 \n", .{});
-        } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .write = .{
-                    .channel = self,
-                    .buffer = msg,
-                    .future = f,
-                    .timeout_ms = self.write_timeout_ms,
-                } },
-            };
-
-            self.transport.io_event_loop.queueMessage(message) catch |err| {
-                std.debug.print("Error queuing message: {}\n", .{err});
-                return error.AsyncNotifyFailed;
-            };
-        }
-
-        f.wait();
-        if (f.getErr()) |err| {
-            std.debug.print("Error writing: {}\n", .{err});
-            return err;
-        }
-        return f.getValue().?;
-    }
-
     pub fn asyncWrite(self: *XevSocketChannel, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
@@ -209,11 +167,10 @@ pub const XevSocketChannel = struct {
 
     // --- Static VTable Instance ---
     const vtable_instance = p2p_conn.RxConnVTable{
-        .writeFn = vtableWriteFn,
         .closeFn = vtableCloseFn,
         .getPipelineFn = vtableGetPipelineFn,
         .directionFn = vtableDirectionFn,
-        .asyncWriteFn = vtableAsyncWriteFn,
+        .writeFn = vtableAsyncWriteFn,
         .asyncCloseFn = vtableAsyncCloseFn,
     };
 
@@ -951,6 +908,18 @@ test "dial and accept" {
     accept_thread.join();
 }
 
+const OnWriteCallback = struct {
+    fn callback(
+        _: ?*anyopaque,
+        r: anyerror!usize,
+    ) void {
+        if (r) |_| {} else |err| {
+            std.debug.print("Test Failure: Expected successful write, but got error: {any}\n", .{err});
+            @panic("write callback received an unexpected error");
+        }
+    }
+};
+
 const ServerEchoHandler = struct {
     allocator: Allocator,
 
@@ -1011,7 +980,8 @@ const ServerEchoHandler = struct {
 
         // Echo the message back
         std.debug.print("ServerEchoHandler ({s}): Echoing message back.\n", .{ctx.name});
-        ctx.write(msg, null, null); // Propagate write operation
+        var onWriteCallback = OnWriteCallback{};
+        ctx.write(msg, &onWriteCallback, OnWriteCallback.callback); // Propagate write operation
 
         std.debug.print("ServerEchoHandler ({s}): Propagating read operation.\n", .{ctx.name});
         ctx.fireRead(msg); // Propagate read operation
@@ -1030,7 +1000,7 @@ const ServerEchoHandler = struct {
         ctx.fireErrorCaught(err);
     }
 
-    pub fn writeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    pub fn writeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         _ = self;
         std.debug.print("ServerEchoHandler ({s}): Write called (passing through).\n", .{ctx.name});
         // Pass the write operation to the next handler in the pipeline (towards the head)
@@ -1065,7 +1035,7 @@ const ServerEchoHandler = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onErrorCaughtImpl(ctx, err);
     }
-    fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.writeImpl(ctx, buffer, user_data, callback);
     }
@@ -1104,19 +1074,37 @@ const ClientEchoHandler = struct {
 
     err: ?anyerror = null,
 
+    written: usize,
+
+    written_ready: std.Thread.ResetEvent = .{},
+
     const Self = @This();
 
     pub fn create(alloc: Allocator) !*Self {
         const self = try alloc.create(Self);
         const received_message = try alloc.alloc(u8, 1024);
         @memset(received_message, 0);
-        self.* = .{ .allocator = alloc, .received_message = received_message, .channel = undefined };
+        self.* = .{ .allocator = alloc, .received_message = received_message, .written = 0, .channel = undefined };
         return self;
     }
 
     pub fn destroy(self: *Self) void {
         self.allocator.free(self.received_message);
         self.allocator.destroy(self);
+    }
+
+    pub fn onWrite(ud: ?*anyopaque, r: anyerror!usize) void {
+        const self: *Self = @ptrCast(@alignCast(ud.?));
+
+        if (r) |bytes_written| {
+            self.written = bytes_written;
+            std.debug.print("ClientEchoHandler.onWrite: Write completed. Bytes written: {d}\n", .{self.written});
+        } else |err| {
+            std.debug.print("ClientEchoHandler.onWrite: Error writing: {any}\n", .{err});
+            self.written = 0;
+        }
+
+        self.written_ready.set();
     }
 
     pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
@@ -1169,7 +1157,7 @@ const ClientEchoHandler = struct {
         ctx.fireErrorCaught(err);
     }
 
-    pub fn writeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    pub fn writeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         _ = self;
         std.debug.print("ClientEchoHandler ({s}): Write called (passing through).\n", .{ctx.name});
         // Pass the write operation to the next handler in the pipeline (towards the head)
@@ -1202,7 +1190,7 @@ const ClientEchoHandler = struct {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onErrorCaughtImpl(ctx, err);
     }
-    fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: ?*const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.writeImpl(ctx, buffer, user_data, callback);
     }
@@ -1287,10 +1275,11 @@ test "echo read and write" {
     client_handler.ready.wait();
     try std.testing.expectEqual(client_handler.channel.direction(), p2p_conn.Direction.OUTBOUND);
 
-    const n = try client_handler.channel.write("buf: []const u8");
-    try std.testing.expect(n == 15);
+    client_handler.channel.write("buf: []const u8", client_handler, ClientEchoHandler.onWrite);
+    client_handler.written_ready.wait();
+    try std.testing.expect(client_handler.written == 15);
 
     client_handler.read.wait();
-    try std.testing.expectEqualStrings("buf: []const u8", client_handler.received_message[0..n]);
+    try std.testing.expectEqualStrings("buf: []const u8", client_handler.received_message[0..client_handler.written]);
     accept_thread.join();
 }
