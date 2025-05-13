@@ -557,10 +557,10 @@ pub const XevTransport = struct {
     }
 
     /// Listen listens for incoming connections on the given address. It blocks until the listener is initialized. If an error occurs, it returns the error.
-    pub fn listen(self: *XevTransport, addr: std.net.Address, listener: *p2p_transport.AnyListener) XevListener.ListenError!void {
+    pub fn listen(self: *XevTransport, addr: std.net.Address) XevListener.ListenError!p2p_transport.AnyListener {
         const l = try self.allocator.create(XevListener);
         try l.init(addr, self.options.backlog, self);
-        listener.* = l.any();
+        return l.any();
     }
 
     // --- Static Wrapper Functions for TransportVTable ---
@@ -569,9 +569,9 @@ pub const XevTransport = struct {
         return self.dial(addr, connection);
     }
 
-    fn vtableListenFn(instance: *anyopaque, addr: std.net.Address, listener: *p2p_transport.AnyListener) anyerror!void {
+    fn vtableListenFn(instance: *anyopaque, addr: std.net.Address) anyerror!p2p_transport.AnyListener {
         const self: *XevTransport = @ptrCast(@alignCast(instance));
-        return self.listen(addr, listener);
+        return self.listen(addr);
     }
 
     // --- Static VTable Instance ---
@@ -873,9 +873,8 @@ test "dial and accept" {
     try transport.init(&sl, allocator, opts);
     defer transport.deinit();
 
-    var listener: p2p_transport.AnyListener = undefined;
     const addr = try std.net.Address.parseIp("0.0.0.0", 8082);
-    try transport.listen(addr, &listener);
+    var listener = try transport.listen(addr);
 
     const ConnHolder = struct {
         channel: p2p_conn.AnyRxConn,
@@ -1232,9 +1231,8 @@ test "echo read and write" {
     try transport.init(&sl, allocator, opts);
     defer transport.deinit();
 
-    var listener: p2p_transport.AnyListener = undefined;
     const addr = try std.net.Address.parseIp("0.0.0.0", 8083);
-    try transport.listen(addr, &listener);
+    var listener = try transport.listen(addr);
 
     const accept_thread = try std.Thread.spawn(.{}, struct {
         fn run(l: *p2p_transport.AnyListener, sh: *ServerEchoHandler) !void {

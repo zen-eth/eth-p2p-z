@@ -25,7 +25,7 @@ pub const AnyListener = struct {
 /// Transport interface for dialing and listening on network addresses.
 pub const TransportVTable = struct {
     dialFn: *const fn (instance: *anyopaque, addr: std.net.Address, connection: *conn.AnyRxConn) anyerror!void,
-    listenFn: *const fn (instance: *anyopaque, addr: std.net.Address, listener: *AnyListener) anyerror!void,
+    listenFn: *const fn (instance: *anyopaque, addr: std.net.Address) anyerror!AnyListener,
 };
 
 /// AnyTransport is a struct that uses the VTable pattern to provide a type-erased
@@ -46,7 +46,7 @@ pub const AnyTransport = struct {
 
     /// Starts listening on a local address via the underlying transport implementation.
     /// The actual listener logic is provided via the `listener` argument.
-    pub fn listen(self: Self, addr: std.net.Address, listener: *AnyListener) Error!void {
-        return self.vtable.listenFn(self.instance, addr, listener);
+    pub fn listen(self: Self, addr: std.net.Address) Error!AnyListener {
+        return self.vtable.listenFn(self.instance, addr);
     }
 };
