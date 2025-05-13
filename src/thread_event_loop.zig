@@ -48,17 +48,10 @@ pub const IOAction = union(enum) {
     },
     close: struct {
         channel: *xev_tcp.XevSocketChannel,
-        future: ?*Future(void, anyerror) = null,
-        callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void = null,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
         user_data: ?*anyopaque = null,
         timeout_ms: u64,
     },
-    // read: struct {
-    //     channel: *xev_tcp.XevSocketChannel,
-    //     buffer: []u8,
-    //     future: *Future(usize, xev_tcp.XevSocketChannel.ReadError),
-    //     io_loop: ?*ThreadEventLoop = null,
-    // },
 };
 
 pub const ConnectTimeout = struct {
@@ -86,13 +79,11 @@ pub const Write = struct {
 };
 
 pub const Close = struct {
-    future: ?*Future(void, anyerror) = null,
-
     channel: *xev_tcp.XevSocketChannel,
 
     user_data: ?*anyopaque = null,
 
-    callback: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void = null,
+    callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
 };
 
 pub const Accept = struct {
@@ -388,7 +379,6 @@ pub const ThreadEventLoop = struct {
                     const close_ud = self.close_pool.create() catch unreachable;
                     close_ud.* = .{
                         .channel = channel,
-                        .future = action_data.future,
                         .user_data = action_data.user_data,
                         .callback = action_data.callback,
                     };

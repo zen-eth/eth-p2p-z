@@ -37,7 +37,7 @@ pub const XevSocketChannel = struct {
         self.direction = direction;
     }
 
-    pub fn asyncWrite(self: *XevSocketChannel, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    pub fn write(self: *XevSocketChannel, buffer: []const u8, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
             const w = self.transport.io_event_loop.write_pool.create() catch unreachable;
@@ -68,34 +68,7 @@ pub const XevSocketChannel = struct {
         }
     }
 
-    /// Close closes the channel. It blocks until the close is complete.
-    pub fn close(self: *XevSocketChannel) !void {
-        const f = try self.transport.allocator.create(Future(void, anyerror));
-
-        defer self.transport.allocator.destroy(f);
-        f.* = .{};
-        if (self.transport.io_event_loop.inEventLoopThread()) {
-            const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
-            const close_ud = self.transport.io_event_loop.close_pool.create() catch unreachable;
-
-            close_ud.* = .{
-                .channel = self,
-                .future = f,
-            };
-            self.socket.shutdown(&self.transport.io_event_loop.loop, c, io_loop.Close, close_ud, shutdownCB);
-        } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .close = .{ .channel = self, .future = f, .timeout_ms = 30000 } },
-            };
-
-            self.transport.io_event_loop.queueMessage(message) catch |err| {
-                std.debug.print("Error queuing message: {}\n", .{err});
-                return error.AsyncNotifyFailed;
-            };
-        }
-    }
-
-    pub fn asyncClose(self: *XevSocketChannel, erased_userdata: ?*anyopaque, wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    pub fn close(self: *XevSocketChannel, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
             const close_ud = self.transport.io_event_loop.close_pool.create() catch unreachable;
@@ -113,9 +86,7 @@ pub const XevSocketChannel = struct {
 
             self.transport.io_event_loop.queueMessage(message) catch |err| {
                 std.debug.print("Error queuing message: {}\n", .{err});
-                if (wrapped_cb) |cb| {
-                    cb(erased_userdata, err);
-                }
+                wrapped_cb(erased_userdata, err);
             };
         }
     }
@@ -129,14 +100,6 @@ pub const XevSocketChannel = struct {
     }
 
     // --- Static Wrapper Functions ---
-    fn vtableWriteFn(instance: *anyopaque, buffer: []const u8) anyerror!usize {
-        const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
-        return self.write(buffer);
-    }
-    fn vtableCloseFn(instance: *anyopaque) anyerror!void {
-        const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
-        return self.close();
-    }
     fn vtableGetPipelineFn(instance: *anyopaque) *p2p_conn.HandlerPipeline {
         const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
         return self.handlerPipeline();
@@ -145,30 +108,30 @@ pub const XevSocketChannel = struct {
         const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
         return self.connDirection();
     }
-    fn vtableAsyncWriteFn(
+    fn vtableWriteFn(
         instance: *anyopaque,
         buffer: []const u8,
         erased_userdata: ?*anyopaque,
         wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
     ) void {
         const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
-        return self.asyncWrite(buffer, erased_userdata, wrapped_cb);
+        return self.write(buffer, erased_userdata, wrapped_cb);
     }
-    fn vtableAsyncCloseFn(
+    fn vtableCloseFn(
         instance: *anyopaque,
         erased_userdata: ?*anyopaque,
-        wrapped_cb: ?*const fn (ud: ?*anyopaque, r: anyerror!void) void,
+        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {
         const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
-        return self.asyncClose(erased_userdata, wrapped_cb);
+        return self.close(erased_userdata, wrapped_cb);
     }
 
     // --- Static VTable Instance ---
     const vtable_instance = p2p_conn.RxConnVTable{
         .getPipelineFn = vtableGetPipelineFn,
         .directionFn = vtableDirectionFn,
-        .writeFn = vtableAsyncWriteFn,
-        .closeFn = vtableAsyncCloseFn,
+        .writeFn = vtableWriteFn,
+        .closeFn = vtableCloseFn,
     };
 
     pub fn any(self: *XevSocketChannel) p2p_conn.AnyRxConn {
@@ -216,6 +179,8 @@ pub const XevSocketChannel = struct {
                 const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
                 close_ud.* = .{
                     .channel = channel,
+                    .callback = noopCloseCB,
+                    .user_data = channel,
                 };
                 socket.shutdown(loop, c, io_loop.Close, close_ud, shutdownCB);
 
@@ -232,6 +197,8 @@ pub const XevSocketChannel = struct {
                 const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
                 close_ud.* = .{
                     .channel = channel,
+                    .callback = noopCloseCB,
+                    .user_data = channel,
                 };
                 socket.shutdown(loop, c, io_loop.Close, close_ud, shutdownCB);
 
@@ -259,11 +226,7 @@ pub const XevSocketChannel = struct {
 
         _ = r catch |err| {
             std.log.err("Error shutting down: {}\n", .{err});
-            if (close_ud.callback) |cb| {
-                cb(close_ud.user_data, err);
-            } else {
-                close_ud.future.?.setError(err);
-            }
+            close_ud.callback(close_ud.user_data, err);
 
             return .disarm;
         };
@@ -294,28 +257,25 @@ pub const XevSocketChannel = struct {
             transport.io_event_loop.close_pool.destroy(close_ud);
         }
 
-        if (close_ud.callback) |cb| {
-            cb(close_ud.user_data, r);
+        close_ud.callback(close_ud.user_data, r);
 
-            _ = r catch |err| {
-                std.debug.print("Error closing: {}\n", .{err});
-                return .disarm;
-            };
-
-            channel.handlerPipeline().fireInactive();
-
+        _ = r catch |err| {
+            std.debug.print("Error closing: {}\n", .{err});
             return .disarm;
-        } else {
-            _ = r catch |err| {
-                std.debug.print("Error closing: {}\n", .{err});
-                close_ud.future.?.setError(err);
-                return .disarm;
-            };
+        };
 
-            channel.handlerPipeline().fireInactive();
+        channel.handlerPipeline().fireInactive();
 
-            return .disarm;
-        }
+        return .disarm;
+    }
+
+    fn noopCloseCB(ud: ?*anyopaque, r: anyerror!void) void {
+        // No-op callback for close operation
+        _ = ud;
+        _ = r catch |err| {
+            std.debug.print("Error in no-op close callback: {}\n", .{err});
+        };
+        std.debug.print("No-op close callback called.\n", .{});
     }
 };
 
