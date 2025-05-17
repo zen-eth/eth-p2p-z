@@ -527,6 +527,27 @@ pub const HandlerPipeline = struct {
         addBefore(&self.tail, new_ctx);
     }
 
+    /// Removes a handler by its name from the pipeline.
+    /// Deallocates the HandlerContext. The handler instance itself is not deinitialized by this function.
+    /// The caller is responsible for deinitializing the actual handler instance if needed.
+    pub fn remove(self: *Self, name: []const u8) !void {
+        var current = self.head.next_context;
+        while (current != null and current != &self.tail) : (current = current.?.next_context) {
+            const ctx_to_check = current.?;
+            if (std.mem.eql(u8, ctx_to_check.name, name)) {
+                const prev_ctx = ctx_to_check.prev_context orelse unreachable;
+                const next_ctx = ctx_to_check.next_context orelse unreachable;
+
+                prev_ctx.next_context = next_ctx;
+                next_ctx.prev_context = prev_ctx;
+
+                self.allocator.destroy(ctx_to_check);
+                return;
+            }
+        }
+        return error.NotFound;
+    }
+
     // --- Trigger Inbound Events ---
     pub fn fireActive(self: *Self) void {
         self.head.fireActive();
@@ -845,4 +866,112 @@ test "HandlerPipeline interaction with MockHandler and MockConn (VTable)" {
     }.callback);
 
     try testing.expect(mock_conn_impl.closed);
+}
+
+test "HandlerPipeline.remove functionality" {
+    const allocator = std.testing.allocator;
+
+    var mock_conn_impl_val = MockRxConnImpl.init(allocator);
+    defer mock_conn_impl_val.deinit();
+    const any_conn = mock_conn_impl_val.any();
+
+    var pipeline: HandlerPipeline = undefined;
+    try pipeline.init(allocator, any_conn);
+    defer pipeline.deinit();
+
+    var mh1_impl = MockHandlerImpl.init(allocator);
+    defer mh1_impl.deinit();
+    var mh2_impl = MockHandlerImpl.init(allocator);
+    defer mh2_impl.deinit();
+    var mh3_impl = MockHandlerImpl.init(allocator);
+    defer mh3_impl.deinit();
+
+    const h1 = mh1_impl.any();
+    const h2 = mh2_impl.any();
+    const h3 = mh3_impl.any();
+
+    // Add handlers: HEAD <> h1 <> h2 <> h3 <> TAIL
+    try pipeline.addLast("h1", h1);
+    try pipeline.addLast("h2", h2);
+    try pipeline.addLast("h3", h3);
+
+    // Remove handler h2: HEAD <> h1 <> h3 <> TAIL
+    try pipeline.remove("h2");
+
+    // 1. Test Inbound Event (fireRead)
+    // Expected: HEAD -> h1.onRead -> h3.onRead -> TAIL
+    const read_msg = "inbound after remove";
+    // Clear previous read messages if any (or use fresh mocks)
+    @memset(mh1_impl.read_msg, 0);
+    @memset(mh2_impl.read_msg, 0);
+    @memset(mh3_impl.read_msg, 0);
+
+    pipeline.fireRead(read_msg);
+
+    try testing.expectEqualSlices(u8, read_msg, mh1_impl.read_msg[0..read_msg.len]);
+    try testing.expectEqualSlices(u8, read_msg, mh3_impl.read_msg[0..read_msg.len]);
+
+    if (mh2_impl.read_msg.len > 0) {
+        const expected_zeros = try allocator.alloc(u8, mh2_impl.read_msg.len);
+        defer allocator.free(expected_zeros);
+        @memset(expected_zeros, 0);
+        try testing.expectEqualSlices(u8, expected_zeros, mh2_impl.read_msg);
+    }
+
+    // 2. Test Outbound Event (write)
+    // Expected: TAIL -> h3.write -> h1.write -> HEAD -> conn.write
+    const write_msg = "outbound after remove";
+    // Clear previous write messages
+    @memset(mh1_impl.write_msg, 0);
+    @memset(mh2_impl.write_msg, 0);
+    @memset(mh3_impl.write_msg, 0);
+    @memset(mock_conn_impl_val.write_msg, 0);
+
+    var on_write_cb_data = OnWriteCallback{};
+    pipeline.write(write_msg, &on_write_cb_data, OnWriteCallback.callback);
+
+    try testing.expectEqualSlices(u8, write_msg, mh3_impl.write_msg[0..write_msg.len]);
+    try testing.expectEqualSlices(u8, write_msg, mh1_impl.write_msg[0..write_msg.len]);
+    try testing.expectEqualSlices(u8, write_msg, mock_conn_impl_val.write_msg[0..write_msg.len]);
+
+    if (mh2_impl.write_msg.len > 0) {
+        const expected_zeros_for_write = try allocator.alloc(u8, mh2_impl.write_msg.len);
+        defer allocator.free(expected_zeros_for_write);
+        @memset(expected_zeros_for_write, 0);
+        try testing.expectEqualSlices(u8, expected_zeros_for_write, mh2_impl.write_msg);
+    }
+
+    // 3. Test removing a non-existent handler
+    const remove_non_existent_result = pipeline.remove("non_existent_handler");
+    try testing.expectError(error.NotFound, remove_non_existent_result);
+
+    // 4. Test removing handler h1: HEAD <> h3 <> TAIL
+    try pipeline.remove("h1");
+    @memset(mh1_impl.read_msg, 0);
+    @memset(mh3_impl.read_msg, 0);
+    pipeline.fireRead("inbound after h1 remove");
+    try testing.expectEqualSlices(u8, "inbound after h1 remove", mh3_impl.read_msg[0.."inbound after h1 remove".len]);
+    if (mh1_impl.read_msg.len > 0) {
+        const expected_zeros_h1_read = try allocator.alloc(u8, mh1_impl.read_msg.len);
+        defer allocator.free(expected_zeros_h1_read);
+        @memset(expected_zeros_h1_read, 0);
+        try testing.expectEqualSlices(u8, expected_zeros_h1_read, mh1_impl.read_msg);
+    }
+
+    // 5. Test removing handler h3: HEAD <> TAIL (empty user pipeline)
+    try pipeline.remove("h3");
+    @memset(mh3_impl.read_msg, 0);
+    @memset(mock_conn_impl_val.write_msg, 0);
+
+    pipeline.fireRead("inbound after h3 remove");
+    if (mh3_impl.read_msg.len > 0) {
+        const expected_zeros_h3_read = try allocator.alloc(u8, mh3_impl.read_msg.len);
+        defer allocator.free(expected_zeros_h3_read);
+        @memset(expected_zeros_h3_read, 0);
+        try testing.expectEqualSlices(u8, expected_zeros_h3_read, mh3_impl.read_msg);
+    }
+
+    // For an empty pipeline, write goes from TailHandler -> HeadHandler -> Connection
+    pipeline.write("outbound after h3 remove", &on_write_cb_data, OnWriteCallback.callback);
+    try testing.expectEqualSlices(u8, "outbound after h3 remove", mock_conn_impl_val.write_msg[0.."outbound after h3 remove".len]);
 }
