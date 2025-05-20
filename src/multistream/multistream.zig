@@ -3,11 +3,9 @@ const proto_binding = @import("protocol_binding.zig");
 const ArrayList = std.ArrayList;
 const p2p_conn = @import("../conn.zig");
 
-
 pub const Multistream = struct {
     bindings: ArrayList(proto_binding.AnyProtocolBinding),
     negotiation_time_limit: u64,
-
 
     const Self = @This();
 
@@ -21,8 +19,6 @@ pub const Multistream = struct {
         // conn.getPipeline().addLast(name: []const u8, handler: AnyHandler)
     }
 };
- 
-
 
 // package io.libp2p.multistream
 
