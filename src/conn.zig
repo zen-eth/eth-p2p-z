@@ -8,6 +8,22 @@ pub const WriteFuture = Future(usize, anyerror);
 pub const CloseFuture = Future(void, anyerror);
 pub const Direction = enum { INBOUND, OUTBOUND };
 
+pub const ConnInitializer1VTable = struct {
+    initConnFn: *const fn (instance: *anyopaque, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!*anyopaque) void) void,
+};
+
+pub const AnyConnInitializer1 = struct {
+    instance: *anyopaque,
+    vtable: *const ConnInitializer1VTable,
+
+    const Self = @This();
+    pub const Error = anyerror;
+
+    pub fn initConn(self: Self, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!*anyopaque) void) void {
+        return self.vtable.initConnFn(self.instance, conn, user_data, callback);
+    }
+};
+
 /// ConnInitializer interface for initializing connections.
 /// This is used to set up the connection before it is used.
 pub const ConnInitializerVTable = struct {
