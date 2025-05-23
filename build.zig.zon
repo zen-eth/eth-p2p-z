@@ -37,6 +37,10 @@
             .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.zip",
             .hash = "libxev-0.0.0-86vtc87kEgBxgbJ1RI1R6Elynb7zydCgNR8dt3uw01My",
         },
+        .zmultiformats = .{
+            .url = "https://github.com/zen-eth/multiformats-zig/archive/main.tar.gz",
+            .hash = "zmultiformats-0.1.0-6A8pcfMWBQDp8HneiCSGNfumvIlDoHdW9OA_MPnH_8tW",
+        },
     },
     .paths = .{
         "build.zig",
