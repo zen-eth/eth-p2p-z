@@ -39,8 +39,8 @@ pub const PlainSecureChannel = struct {
     }
 
     // --- Actual Implementations ---
-    pub fn getProtocolDescriptor(self: *Self) ProtocolDescriptor {
-        return self.protocol_descriptor;
+    pub fn getProtocolDescriptor(self: *Self) *ProtocolDescriptor {
+        return &self.protocol_descriptor;
     }
 
     pub fn initConn(
@@ -52,7 +52,7 @@ pub const PlainSecureChannel = struct {
     ) void {}
 
     // --- Static Wrapper Functions ---
-    pub fn vtableGetProtocolDescriptionFn(instance: *anyopaque) ProtocolDescriptor {
+    pub fn vtableGetProtocolDescriptionFn(instance: *anyopaque) *ProtocolDescriptor {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.getProtocolDescriptor();
     }

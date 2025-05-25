@@ -3,6 +3,7 @@ const proto_binding = @import("protocol_binding.zig");
 const ArrayList = std.ArrayList;
 const p2p_conn = @import("../conn.zig");
 const ProtocolId = @import("../protocol_id.zig").ProtocolId;
+const ProtoMatcher = @import("protocol_matcher.zig").ProtocolMatcher;
 const multiformats = @import("multiformats");
 const uvarint = multiformats.uvarint;
 
@@ -37,12 +38,16 @@ pub const Negotiator = struct {
 
     pub const NegotiatorError = error{
         ProtocolIdTooLong,
-        InvalidProtocolIdPacket,
-        InvalidMultistreamPacket,
+        InvalidMultistreamSuffix,
+        FirstLineShouldBeMultistream,
         AllProposedProtocolsRejected,
     };
 
-    bindings: ArrayList(ProtocolId),
+    protocols: ?ArrayList(*const ProtocolId),
+
+    matchers: ?ArrayList(*const ProtoMatcher),
+
+    bindings: ArrayList(proto_binding.AnyProtocolBinding),
 
     negotiation_time_limit: u64,
 
@@ -110,26 +115,67 @@ pub const Negotiator = struct {
         self: *Self,
         allocator: std.mem.Allocator,
         negotiation_time_limit: u64,
+        bindings: []proto_binding.AnyProtocolBinding,
+        direction: p2p_conn.Direction,
     ) !void {
-        var message_pool = std.heap.MemoryPool([MAX_LENGTH_BYTES + MAX_MULTISTREAM_MESSAGE_LENGTH]u8).init(allocator);
+        var message_pool = std.heap.MemoryPool([POOL_ITEM_SIZE]u8).init(allocator);
         errdefer message_pool.deinit();
 
         const buffer_slice = try message_pool.create();
+        errdefer message_pool.destroy(@alignCast(
+            @as(*[POOL_ITEM_SIZE]u8, @ptrFromInt(@intFromPtr(buffer_slice.ptr))),
+        ));
+
+        const binding_list = ArrayList(proto_binding.AnyProtocolBinding).fromOwnedSlice(allocator, bindings);
+        errdefer binding_list.deinit();
 
         self.* = Negotiator{
-            .bindings = ArrayList(ProtocolId).init(allocator),
+            .bindings = binding_list,
             .negotiation_time_limit = negotiation_time_limit,
             .message_pool = message_pool,
             .allocator = allocator,
             .buffer = std.fifo.LinearFifo(u8, .Slice).init(buffer_slice),
+            .protocols = null,
+            .matchers = null,
         };
+
+        switch (direction) {
+            .OUTBOUND => {
+                var protos = ArrayList(*const ProtocolId).init(allocator);
+                errdefer protos.deinit();
+
+                for (bindings) |binding| {
+                    const proto_desc = binding.protoDesc();
+                    for (proto_desc.announce_protocols.items) |*proto_id| {
+                        try protos.append(proto_id);
+                    }
+                }
+                self.protocols = protos;
+            },
+            .INBOUND => {
+                var matchers = ArrayList(*const ProtoMatcher).init(allocator);
+                errdefer matchers.deinit();
+                for (bindings) |binding| {
+                    const proto_desc = binding.protoDesc();
+                    const matcher = &proto_desc.protocol_matcher;
+                    try matchers.append(matcher);
+                }
+                self.matchers = matchers;
+            },
+        }
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.protocols) |*protos| {
+            protos.deinit();
+        }
+        if (self.matchers) |*matchers| {
+            matchers.deinit();
+        }
         self.bindings.deinit();
         self.message_pool.destroy(
             @alignCast(
-                @as(*[MAX_LENGTH_BYTES + MAX_MULTISTREAM_MESSAGE_LENGTH]u8, @ptrFromInt(@intFromPtr(self.buffer.buf.ptr))),
+                @as(*[POOL_ITEM_SIZE]u8, @ptrFromInt(@intFromPtr(self.buffer.buf.ptr))),
             ),
         );
         self.message_pool.deinit();
@@ -167,11 +213,11 @@ pub const Negotiator = struct {
                 return;
             };
 
-            _ = uvarint.encodeStream(proto_writer, u16, @intCast(self.bindings.items[0].len)) catch |err| {
+            _ = uvarint.encodeStream(proto_writer, u16, @intCast(self.protocols.?.items[0].len)) catch |err| {
                 self.handleInitiatorError(ctx, buffer, err);
                 return;
             };
-            proto_writer.writeAll(self.bindings.items[0]) catch |err| {
+            proto_writer.writeAll(self.protocols.?.items[0].*) catch |err| {
                 self.handleInitiatorError(ctx, buffer, err);
                 return;
             };
@@ -204,7 +250,7 @@ pub const Negotiator = struct {
             var proto_buffer = std.io.fixedBufferStream(buffer);
             var proto_writer = proto_buffer.writer();
 
-            _ = uvarint.encodeStream(proto_writer, u8, MULTISTREAM_PROTO.len) catch |err| {
+            _ = uvarint.encodeStream(proto_writer, u16, MULTISTREAM_PROTO.len) catch |err| {
                 self.handleErrorWithBufferCleanup(ctx, buffer, err);
                 return;
             };
@@ -232,7 +278,9 @@ pub const Negotiator = struct {
         }
     }
 
-    pub inline fn onInactiveImpl(_: *Self, _: *p2p_conn.HandlerContext) void {}
+    pub inline fn onInactiveImpl(_: *Self, ctx: *p2p_conn.HandlerContext) void {
+        ctx.fireInactive();
+    }
 
     pub fn onReadImpl(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
         self.buffer.write(msg) catch |err| {
@@ -251,6 +299,12 @@ pub const Negotiator = struct {
                 self.handleErrorWithBufferCleanup(ctx, null, err);
                 return;
             };
+            if (decoded_length_bytes.remaining.len > 0) {
+                self.buffer.unget(decoded_length_bytes.remaining) catch |err| {
+                    self.handleErrorWithBufferCleanup(ctx, null, err);
+                    return;
+                };
+            }
             const proto_id_length = decoded_length_bytes.value;
             if (proto_id_length > MAX_MULTISTREAM_MESSAGE_LENGTH) {
                 self.handleErrorWithBufferCleanup(ctx, null, NegotiatorError.ProtocolIdTooLong);
@@ -262,15 +316,17 @@ pub const Negotiator = struct {
             var proto_id_bytes: [MAX_MULTISTREAM_MESSAGE_LENGTH]u8 = undefined;
             _ = self.buffer.read(proto_id_bytes[0..proto_id_length]);
 
-            if (!std.mem.eql(u8, proto_id_bytes[proto_id_length - 1 - MESSAGE_SUFFIX_LENGTH ..], MESSAGE_SUFFIX)) {
-                self.handleErrorWithBufferCleanup(ctx, null, NegotiatorError.InvalidProtocolIdPacket);
+            if (proto_id_length < MESSAGE_SUFFIX_LENGTH or
+                !std.mem.eql(u8, proto_id_bytes[proto_id_length - MESSAGE_SUFFIX_LENGTH .. proto_id_length], MESSAGE_SUFFIX))
+            {
+                self.handleErrorWithBufferCleanup(ctx, null, NegotiatorError.InvalidMultistreamSuffix);
                 return;
             }
             const proto_id = proto_id_bytes[0 .. proto_id_length - MESSAGE_SUFFIX_LENGTH];
             if (!self.header_received) {
                 // If we haven't received the header yet, we expect the multistream protocol ID
                 if (!std.mem.eql(u8, proto_id, MULTISTREAM_PROTO)) {
-                    self.handleErrorWithBufferCleanup(ctx, null, NegotiatorError.InvalidMultistreamPacket);
+                    self.handleErrorWithBufferCleanup(ctx, null, NegotiatorError.FirstLineShouldBeMultistream);
                     return;
                 } else {
                     self.header_received = true;
@@ -279,9 +335,9 @@ pub const Negotiator = struct {
             }
             if (ctx.conn.direction() == p2p_conn.Direction.OUTBOUND) {
                 // Initiator
-                if (!std.mem.eql(u8, proto_id, self.bindings.items[self.proposed_proto_index])) {
+                if (!std.mem.eql(u8, proto_id, self.protocols.?.items[self.proposed_proto_index].*)) {
                     // If the protocol ID does not match the proposed one, we need to handle it
-                    if (self.proposed_proto_index < self.bindings.items.len - 1) {
+                    if (self.proposed_proto_index < self.protocols.?.items.len - 1) {
                         // If we have more proposed protocols, increment the index
                         self.proposed_proto_index += 1;
 
@@ -296,12 +352,12 @@ pub const Negotiator = struct {
                         var proto_buffer = std.io.fixedBufferStream(buffer);
                         var proto_writer = proto_buffer.writer();
 
-                        _ = uvarint.encodeStream(proto_writer, u16, @intCast(self.bindings.items[self.proposed_proto_index].len)) catch |err| {
+                        _ = uvarint.encodeStream(proto_writer, u16, @intCast(self.protocols.?.items[self.proposed_proto_index].len)) catch |err| {
                             self.handleErrorWithBufferCleanup(ctx, buffer, err);
                             return;
                         };
 
-                        proto_writer.writeAll(self.bindings.items[self.proposed_proto_index]) catch |err| {
+                        proto_writer.writeAll(self.protocols.?.items[self.proposed_proto_index].*) catch |err| {
                             self.handleErrorWithBufferCleanup(ctx, buffer, err);
                             return;
                         };
@@ -329,12 +385,91 @@ pub const Negotiator = struct {
                         return;
                     }
                 } else {
-                    // We found a match, reset the index for future reads
-                    self.proposed_proto_index = 0;
+                    // We found a match
+                    // TODO: Negotiate the protocol binding here
                 }
             } else {
                 // Responder
+                for (self.matchers.?.items) |matcher| {
+                    if (matcher.matches(proto_id)) {
+                        const buffer = self.message_pool.create() catch |err| {
+                            ctx.fireErrorCaught(err);
+                            self.deinit();
+                            ctx.close(null, struct {
+                                pub fn callback(_: ?*anyopaque, _: anyerror!void) void {}
+                            }.callback);
+                            return;
+                        };
+                        var proto_buffer = std.io.fixedBufferStream(buffer);
+                        var proto_writer = proto_buffer.writer();
 
+                        _ = uvarint.encodeStream(proto_writer, u16, @intCast(proto_id.len)) catch |err| {
+                            self.handleErrorWithBufferCleanup(ctx, buffer, err);
+                            return;
+                        };
+
+                        proto_writer.writeAll(proto_id) catch |err| {
+                            self.handleErrorWithBufferCleanup(ctx, buffer, err);
+                            return;
+                        };
+
+                        proto_writer.writeAll(MESSAGE_SUFFIX) catch |err| {
+                            self.handleErrorWithBufferCleanup(ctx, buffer, err);
+                            return;
+                        };
+
+                        const callback_ctx = self.allocator.create(WriteCallbackContext) catch |err| {
+                            self.handleErrorWithBufferCleanup(ctx, buffer, err);
+                            return;
+                        };
+                        callback_ctx.* = .{
+                            .negotiator = self,
+                            .buffer = buffer,
+                            .ctx = ctx,
+                        };
+                        ctx.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
+
+                        // TODO: Negotiate the protocol binding here
+                        return;
+                    }
+                }
+
+                const buffer = self.message_pool.create() catch |err| {
+                    ctx.fireErrorCaught(err);
+                    self.deinit();
+                    ctx.close(null, struct {
+                        pub fn callback(_: ?*anyopaque, _: anyerror!void) void {}
+                    }.callback);
+                    return;
+                };
+                var proto_buffer = std.io.fixedBufferStream(buffer);
+                var proto_writer = proto_buffer.writer();
+
+                _ = uvarint.encodeStream(proto_writer, u16, @intCast(NA.len)) catch |err| {
+                    self.handleErrorWithBufferCleanup(ctx, buffer, err);
+                    return;
+                };
+
+                proto_writer.writeAll(NA) catch |err| {
+                    self.handleErrorWithBufferCleanup(ctx, buffer, err);
+                    return;
+                };
+
+                proto_writer.writeAll(MESSAGE_SUFFIX) catch |err| {
+                    self.handleErrorWithBufferCleanup(ctx, buffer, err);
+                    return;
+                };
+
+                const callback_ctx = self.allocator.create(WriteCallbackContext) catch |err| {
+                    self.handleErrorWithBufferCleanup(ctx, buffer, err);
+                    return;
+                };
+                callback_ctx.* = .{
+                    .negotiator = self,
+                    .buffer = buffer,
+                    .ctx = ctx,
+                };
+                ctx.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
             }
         }
     }
@@ -413,7 +548,7 @@ pub const Negotiator = struct {
     // Helper function to destroy a buffer from the message pool
     fn destroyPooledBuffer(self: *Self, buffer_slice: []u8) void {
         self.message_pool.destroy(@alignCast(
-            @as(*[1026]u8, @ptrFromInt(@intFromPtr(buffer_slice.ptr))),
+            @as(*[POOL_ITEM_SIZE]u8, @ptrFromInt(@intFromPtr(buffer_slice.ptr))),
         ));
     }
 
