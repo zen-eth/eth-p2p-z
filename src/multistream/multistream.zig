@@ -12,31 +12,28 @@ pub const Multistream = struct {
 
     negotiation_time_limit: u64,
 
-    allocator: std.mem.Allocator,
-
     const Self = @This();
 
     pub fn init(
         self: *Self,
-        allocator: std.mem.Allocator,
         negotiation_time_limit: u64,
         bindings: []const proto_binding.AnyProtocolBinding,
     ) !void {
         self.* = Multistream{
             .bindings = bindings,
             .negotiation_time_limit = negotiation_time_limit,
-            .allocator = allocator,
         };
     }
 
     pub fn initConn(self: *Self, conn: p2p_conn.AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void {
-        const negotiator = self.allocator.create(Negotiator) catch |err| {
+        // free negotiator when it be removed from the pipeline
+        const negotiator = conn.getPipeline().allocator.create(Negotiator) catch |err| {
             callback(user_data, err);
             return;
         };
 
-        negotiator.init(self.allocator, self.negotiation_time_limit, self.bindings, conn.direction(), user_data, callback) catch |err| {
-            self.allocator.destroy(negotiator);
+        negotiator.init(conn.getPipeline().allocator, self.negotiation_time_limit, self.bindings, conn.direction(), user_data, callback) catch |err| {
+            conn.getPipeline().allocator.destroy(negotiator);
             callback(user_data, err);
             return;
         };
@@ -44,7 +41,7 @@ pub const Multistream = struct {
         const handler = negotiator.any();
         conn.getPipeline().addLast("mss", handler) catch |err| {
             negotiator.deinit();
-            self.allocator.destroy(negotiator);
+            conn.getPipeline().allocator.destroy(negotiator);
             callback(user_data, err);
             return;
         };

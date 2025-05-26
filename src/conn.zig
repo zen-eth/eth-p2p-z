@@ -9,7 +9,7 @@ pub const CloseFuture = Future(void, anyerror);
 pub const Direction = enum { INBOUND, OUTBOUND };
 
 pub const ConnUpgraderVTable = struct {
-    initConnFn: *const fn (instance: *anyopaque, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!*anyopaque) void) void,
+    initConnFn: *const fn (instance: *anyopaque, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void,
 };
 
 pub const AnyConnUpgrader = struct {
@@ -19,7 +19,7 @@ pub const AnyConnUpgrader = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn initConn(self: Self, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!*anyopaque) void) void {
+    pub fn initConn(self: Self, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void {
         return self.vtable.initConnFn(self.instance, conn, user_data, callback);
     }
 };
