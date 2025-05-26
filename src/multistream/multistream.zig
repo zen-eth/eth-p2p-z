@@ -8,19 +8,46 @@ const multiformats = @import("multiformats");
 const uvarint = multiformats.uvarint;
 
 pub const Multistream = struct {
-    bindings: ArrayList(proto_binding.AnyProtocolBinding),
+    bindings: []const proto_binding.AnyProtocolBinding,
+
     negotiation_time_limit: u64,
+
+    allocator: std.mem.Allocator,
 
     const Self = @This();
 
-    pub fn initConn(_: *Self, _: p2p_conn.AnyRxConn, _: ?*anyopaque, _: *const fn (ud: ?*anyopaque, r: anyerror!*anyopaque) void) void {
-        // const handler: p2p_conn.AnyHandler = if (conn.direction() == p2p_conn.Direction.OUTBOUND) {
+    pub fn init(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        negotiation_time_limit: u64,
+        bindings: []const proto_binding.AnyProtocolBinding,
+    ) !void {
+        self.* = Multistream{
+            .bindings = bindings,
+            .negotiation_time_limit = negotiation_time_limit,
+            .allocator = allocator,
+        };
+    }
 
-        // } else {
+    pub fn initConn(self: *Self, conn: p2p_conn.AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void {
+        const negotiator = self.allocator.create(Negotiator) catch |err| {
+            callback(user_data, err);
+            return;
+        };
 
-        // };
+        negotiator.init(self.allocator, self.negotiation_time_limit, self.bindings, conn.direction(), user_data, callback) catch |err| {
+            self.allocator.destroy(negotiator);
+            callback(user_data, err);
+            return;
+        };
 
-        // conn.getPipeline().addLast(name: []const u8, handler: AnyHandler)
+        const handler = negotiator.any();
+        conn.getPipeline().addLast("mss", handler) catch |err| {
+            negotiator.deinit();
+            self.allocator.destroy(negotiator);
+            callback(user_data, err);
+            return;
+        };
     }
 };
 
@@ -47,7 +74,7 @@ pub const Negotiator = struct {
 
     matchers: ?ArrayList(*const ProtoMatcher),
 
-    bindings: ArrayList(proto_binding.AnyProtocolBinding),
+    bindings: []const proto_binding.AnyProtocolBinding,
 
     negotiation_time_limit: u64,
 
@@ -60,6 +87,10 @@ pub const Negotiator = struct {
     header_received: bool = false,
 
     proposed_proto_index: usize = 0,
+
+    user_data: ?*anyopaque = null,
+
+    callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void,
 
     const Self = @This();
 
@@ -91,7 +122,7 @@ pub const Negotiator = struct {
     };
 
     // Initiator-specific write callback
-    const InitiatorWriteCallback = struct {
+    const AllocatorWriteCallback = struct {
         pub fn callback(w: ?*anyopaque, n: anyerror!usize) void {
             const w_ctx: *WriteCallbackContext = @ptrCast(@alignCast(w.?));
             const allocator = w_ctx.negotiator.allocator;
@@ -111,13 +142,7 @@ pub const Negotiator = struct {
         }
     };
 
-    pub fn init(
-        self: *Self,
-        allocator: std.mem.Allocator,
-        negotiation_time_limit: u64,
-        bindings: []proto_binding.AnyProtocolBinding,
-        direction: p2p_conn.Direction,
-    ) !void {
+    pub fn init(self: *Self, allocator: std.mem.Allocator, negotiation_time_limit: u64, bindings: []const proto_binding.AnyProtocolBinding, direction: p2p_conn.Direction, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) !void {
         var message_pool = std.heap.MemoryPool([POOL_ITEM_SIZE]u8).init(allocator);
         errdefer message_pool.deinit();
 
@@ -126,17 +151,16 @@ pub const Negotiator = struct {
             @as(*[POOL_ITEM_SIZE]u8, @ptrFromInt(@intFromPtr(buffer_slice.ptr))),
         ));
 
-        const binding_list = ArrayList(proto_binding.AnyProtocolBinding).fromOwnedSlice(allocator, bindings);
-        errdefer binding_list.deinit();
-
         self.* = Negotiator{
-            .bindings = binding_list,
+            .bindings = bindings,
             .negotiation_time_limit = negotiation_time_limit,
             .message_pool = message_pool,
             .allocator = allocator,
             .buffer = std.fifo.LinearFifo(u8, .Slice).init(buffer_slice),
             .protocols = null,
             .matchers = null,
+            .user_data = user_data,
+            .callback = callback,
         };
 
         switch (direction) {
@@ -172,7 +196,6 @@ pub const Negotiator = struct {
         if (self.matchers) |*matchers| {
             matchers.deinit();
         }
-        self.bindings.deinit();
         self.message_pool.destroy(
             @alignCast(
                 @as(*[POOL_ITEM_SIZE]u8, @ptrFromInt(@intFromPtr(self.buffer.buf.ptr))),
@@ -236,7 +259,7 @@ pub const Negotiator = struct {
                 .ctx = ctx,
             };
 
-            ctx.write(proto_buffer.getWritten(), callback_ctx, InitiatorWriteCallback.callback);
+            ctx.write(proto_buffer.getWritten(), callback_ctx, AllocatorWriteCallback.callback);
         } else {
             // Responder
             const buffer = self.message_pool.create() catch |err| {
@@ -278,7 +301,8 @@ pub const Negotiator = struct {
         }
     }
 
-    pub inline fn onInactiveImpl(_: *Self, ctx: *p2p_conn.HandlerContext) void {
+    pub inline fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+        _ = self;
         ctx.fireInactive();
     }
 

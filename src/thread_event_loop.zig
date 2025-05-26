@@ -150,14 +150,12 @@ pub const ThreadEventLoop = struct {
 
     close_pool: ClosePool,
 
-    conn_initializer: conn.AnyConnInitializer,
-
     loop_thread_id: std.Thread.Id,
 
     const Self = @This();
 
     /// Initializes the event loop.
-    pub fn init(self: *Self, allocator: Allocator, conn_initializer: conn.AnyConnInitializer) !void {
+    pub fn init(self: *Self, allocator: Allocator) !void {
         var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
 
@@ -213,7 +211,6 @@ pub const ThreadEventLoop = struct {
             .accept_pool = accept_pool,
             .read_buffer_pool = read_buffer_pool,
             .close_pool = close_pool,
-            .conn_initializer = conn_initializer,
         };
 
         const thread = try std.Thread.spawn(.{}, start, .{self});

@@ -8,13 +8,13 @@ pub const WriteFuture = Future(usize, anyerror);
 pub const CloseFuture = Future(void, anyerror);
 pub const Direction = enum { INBOUND, OUTBOUND };
 
-pub const ConnInitializer1VTable = struct {
+pub const ConnUpgraderVTable = struct {
     initConnFn: *const fn (instance: *anyopaque, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!*anyopaque) void) void,
 };
 
-pub const AnyConnInitializer1 = struct {
+pub const AnyConnUpgrader = struct {
     instance: *anyopaque,
-    vtable: *const ConnInitializer1VTable,
+    vtable: *const ConnUpgraderVTable,
 
     const Self = @This();
     pub const Error = anyerror;
@@ -24,17 +24,17 @@ pub const AnyConnInitializer1 = struct {
     }
 };
 
-/// ConnInitializer interface for initializing connections.
+/// ConnInitiator interface for initializing connections.
 /// This is used to set up the connection before it is used.
-pub const ConnInitializerVTable = struct {
+pub const ConnInitiatorVTable = struct {
     initConnFn: *const fn (instance: *anyopaque, conn: AnyRxConn) anyerror!void,
 };
 
-/// AnyConnInitializer is a struct that holds the instance and vtable for the ConnInitializer interface.
+/// AnyConnInitiator is a struct that holds the instance and vtable for the ConnInitiator interface.
 /// It is used to initialize connections before they are used.
-pub const AnyConnInitializer = struct {
+pub const AnyConnInitiator = struct {
     instance: *anyopaque,
-    vtable: *const ConnInitializerVTable,
+    vtable: *const ConnInitiatorVTable,
 
     const Self = @This();
     pub const Error = anyerror;

@@ -371,7 +371,7 @@ pub const XevListener = struct {
         };
         channel.handler_pipeline = p;
 
-        transport.io_event_loop.conn_initializer.initConn(any_rx_conn) catch |err| {
+        transport.conn_initiator.initConn(any_rx_conn) catch |err| {
             transport.allocator.destroy(channel);
             transport.io_event_loop.handler_pipeline_pool.destroy(p);
             accept_ud.callback(accept_ud.user_data, err);
@@ -393,6 +393,8 @@ pub const XevListener = struct {
 pub const XevTransport = struct {
     pub const DialError = Allocator.Error || xev.ConnectError || error{AsyncNotifyFailed};
 
+    conn_initiator: p2p_conn.AnyConnInitiator,
+
     io_event_loop: *io_loop.ThreadEventLoop,
 
     /// The options for the transport.
@@ -408,8 +410,9 @@ pub const XevTransport = struct {
     };
 
     /// Initialize the transport with the given allocator and options.
-    pub fn init(self: *XevTransport, loop: *io_loop.ThreadEventLoop, allocator: Allocator, opts: Options) !void {
+    pub fn init(self: *XevTransport, conn_initiator: p2p_conn.AnyConnInitiator, loop: *io_loop.ThreadEventLoop, allocator: Allocator, opts: Options) !void {
         self.* = .{
+            .conn_initiator = conn_initiator,
             .io_event_loop = loop,
             .options = opts,
             .allocator = allocator,
@@ -527,7 +530,7 @@ pub const XevTransport = struct {
         };
         channel.handler_pipeline = p;
 
-        transport.io_event_loop.conn_initializer.initConn(associated_conn) catch |err| {
+        transport.conn_initiator.initConn(associated_conn) catch |err| {
             transport.allocator.destroy(channel);
             transport.io_event_loop.handler_pipeline_pool.destroy(p);
             connect.callback(connect.user_data, err);
@@ -580,7 +583,7 @@ pub const XevTransport = struct {
 
 };
 
-const MockConnInitializer = struct {
+const MockConnInitiator = struct {
     pub const Error = anyerror;
 
     const Self = @This();
@@ -598,11 +601,11 @@ const MockConnInitializer = struct {
     }
 
     // Static VTable instance
-    const vtable_instance = p2p_conn.ConnInitializerVTable{
+    const vtable_instance = p2p_conn.ConnInitiatorVTable{
         .initConnFn = vtableInitConnFn,
     };
 
-    pub fn any(self: *Self) p2p_conn.AnyConnInitializer {
+    pub fn any(self: *Self) p2p_conn.AnyConnInitiator {
         return .{
             .instance = self,
             .vtable = &vtable_instance,
@@ -610,7 +613,7 @@ const MockConnInitializer = struct {
     }
 };
 
-const MockConnInitializer1 = struct {
+const MockConnInitiator1 = struct {
     pub const Error = anyerror;
     handler_to_add: ?p2p_conn.AnyHandler = null,
     allocator: ?Allocator = null,
@@ -639,11 +642,11 @@ const MockConnInitializer1 = struct {
     }
 
     // Static VTable instance
-    const vtable_instance = p2p_conn.ConnInitializerVTable{
+    const vtable_instance = p2p_conn.ConnInitiatorVTable{
         .initConnFn = vtableInitConnFn,
     };
 
-    pub fn any(self: *Self) p2p_conn.AnyConnInitializer {
+    pub fn any(self: *Self) p2p_conn.AnyConnInitiator {
         return .{
             .instance = self,
             .vtable = &vtable_instance,
@@ -677,18 +680,18 @@ test "dial connection refused" {
         .backlog = 128,
     };
 
-    var mock_initializer = MockConnInitializer{};
-    const any_initializer = mock_initializer.any();
+    var mock_initiator = MockConnInitiator{};
+    const any_initiator = mock_initiator.any();
 
     var event_loop: io_loop.ThreadEventLoop = undefined;
-    try event_loop.init(allocator, any_initializer);
+    try event_loop.init(allocator);
     defer {
         event_loop.close();
         event_loop.deinit();
     }
 
     var transport: XevTransport = undefined;
-    try transport.init(&event_loop, allocator, opts);
+    try transport.init(any_initiator, &event_loop, allocator, opts);
     defer transport.deinit();
 
     var conn_holder: ConnHolder = .{ .channel = undefined };
@@ -718,11 +721,11 @@ test "dial and accept" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    var mock_initializer = MockConnInitializer{};
-    const any_initializer = mock_initializer.any();
+    var mock_initiator = MockConnInitiator{};
+    const any_initiator = mock_initiator.any();
 
     var sl: io_loop.ThreadEventLoop = undefined;
-    try sl.init(allocator, any_initializer);
+    try sl.init(allocator);
     defer {
         sl.close();
         sl.deinit();
@@ -733,7 +736,7 @@ test "dial and accept" {
     };
 
     var transport: XevTransport = undefined;
-    try transport.init(&sl, allocator, opts);
+    try transport.init(any_initiator, &sl, allocator, opts);
     defer transport.deinit();
 
     const addr = try std.net.Address.parseIp("0.0.0.0", 8082);
@@ -752,13 +755,13 @@ test "dial and accept" {
     }.run, .{&listener});
 
     var cl: io_loop.ThreadEventLoop = undefined;
-    try cl.init(allocator, any_initializer);
+    try cl.init(allocator);
     defer {
         cl.close();
         cl.deinit();
     }
     var client: XevTransport = undefined;
-    try client.init(&cl, allocator, opts);
+    try client.init(any_initiator, &cl, allocator, opts);
     defer client.deinit();
 
     var conn_holder1: ConnHolder = .{ .channel = undefined };
@@ -1076,14 +1079,14 @@ test "echo read and write" {
     const server_handler_any = server_handler.any();
     const client_handler_any = client_handler.any();
 
-    var mock_client_initializer = MockConnInitializer1.init(client_handler_any, allocator);
-    const any_client_initializer = mock_client_initializer.any();
+    var mock_client_initiator = MockConnInitiator1.init(client_handler_any, allocator);
+    const any_client_initiator = mock_client_initiator.any();
 
-    var mock_server_initializer = MockConnInitializer1.init(server_handler_any, allocator);
-    const any_server_initializer = mock_server_initializer.any();
+    var mock_server_initiator = MockConnInitiator1.init(server_handler_any, allocator);
+    const any_server_initiator = mock_server_initiator.any();
 
     var sl: io_loop.ThreadEventLoop = undefined;
-    try sl.init(allocator, any_server_initializer);
+    try sl.init(allocator);
     defer {
         sl.close();
         sl.deinit();
@@ -1094,7 +1097,7 @@ test "echo read and write" {
     };
 
     var transport: XevTransport = undefined;
-    try transport.init(&sl, allocator, opts);
+    try transport.init(any_server_initiator, &sl, allocator, opts);
     defer transport.deinit();
 
     const addr = try std.net.Address.parseIp("0.0.0.0", 8083);
@@ -1112,13 +1115,13 @@ test "echo read and write" {
     }.run, .{ &listener, server_handler });
 
     var cl: io_loop.ThreadEventLoop = undefined;
-    try cl.init(allocator, any_client_initializer);
+    try cl.init(allocator);
     defer {
         cl.close();
         cl.deinit();
     }
     var client: XevTransport = undefined;
-    try client.init(&cl, allocator, opts);
+    try client.init(any_client_initiator, &cl, allocator, opts);
     defer client.deinit();
 
     client.dial(addr, client_handler, ClientEchoHandler.init);
