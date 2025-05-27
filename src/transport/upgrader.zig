@@ -29,11 +29,11 @@ pub const Upgrader = struct {
                 std.debug.print("Security session upgraded successfully: {}\n", .{security_session.*});
             } else |err| {
                 s_ctx.conn.getPipeline().fireErrorCaught(err);
-                s_ctx.conn.getPipeline().close(null, struct {
-                    pub fn callback(_: ?*anyopaque, _: anyerror!void) void {
-                        // Callback after close
-                    }
-                }.callback);
+                const closeContext = s_ctx.conn.getPipeline().allocator.create(p2p_conn.NoOPContext) catch unreachable;
+                closeContext.* = .{
+                    .conn = s_ctx.conn,
+                };
+                s_ctx.conn.getPipeline().close(closeContext, p2p_conn.NoOPCallback.closeCallback);
             }
         }
     };

@@ -8,6 +8,25 @@ pub const WriteFuture = Future(usize, anyerror);
 pub const CloseFuture = Future(void, anyerror);
 pub const Direction = enum { INBOUND, OUTBOUND };
 
+pub const NoOPContext = struct {
+    conn: ?AnyRxConn = null,
+    ctx: ?*HandlerContext = null,
+};
+
+pub const NoOPCallback = struct {
+    pub fn closeCallback(ud: ?*anyopaque, r: anyerror!void) void {
+        const self: *NoOPContext = @ptrCast(@alignCast(ud.?));
+        defer if (self.conn) |conn| conn.getPipeline().allocator.destroy(self) else if (self.ctx) |ctx| ctx.pipeline.allocator.destroy(self);
+        if (r) |_| {} else |err| {
+            if (self.conn) |conn| {
+                conn.getPipeline().fireErrorCaught(err);
+            } else if (self.ctx) |ctx| {
+                ctx.fireErrorCaught(err);
+            }
+        }
+    }
+};
+
 pub const ConnUpgraderVTable = struct {
     initConnFn: *const fn (instance: *anyopaque, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void,
 };
