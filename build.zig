@@ -80,12 +80,15 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    const filters = b.option([]const []const u8, "filter", "filter based on name");
+
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const libp2p_lib_unit_tests = b.addTest(.{
         .root_module = root_module,
         .target = target,
         .optimize = optimize,
+        .filters = filters orelse &.{},
     });
 
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
