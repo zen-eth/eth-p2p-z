@@ -4,6 +4,7 @@ const ArrayList = std.ArrayList;
 
 pub const ProtocolId = []const u8;
 
+// TODO: Avoid copying protocol IDs in matchers.
 const StrictMatcherData = struct {
     protocol_id: []u8,
     allocator: Allocator,
