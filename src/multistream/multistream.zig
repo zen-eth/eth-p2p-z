@@ -203,7 +203,7 @@ pub const Negotiator = struct {
     }
 
     // --- Actual Handler Implementations ---
-    pub inline fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+    pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
         if (ctx.conn.direction() == p2p_conn.Direction.OUTBOUND) {
             // Initiator
             const buffer = self.allocator.alloc(u8, (MAX_LENGTH_BYTES + MAX_MULTISTREAM_MESSAGE_LENGTH) * 2) catch |err| {
@@ -298,7 +298,7 @@ pub const Negotiator = struct {
         }
     }
 
-    pub inline fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+    pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
         _ = self;
         ctx.fireInactive();
     }

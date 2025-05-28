@@ -4,6 +4,8 @@ const ProtocolMatcher = @import("../multistream/protocol_matcher.zig").ProtocolM
 const ProtocolId = @import("../protocol_id.zig").ProtocolId;
 const Allocator = @import("std").mem.Allocator;
 const p2p_conn = @import("../conn.zig");
+const std = @import("std");
+const security = @import("../security/lib.zig");
 
 pub const InsecureChannel = struct {
     protocol_descriptor: ProtocolDescriptor,
@@ -40,12 +42,16 @@ pub const InsecureChannel = struct {
 
     pub fn initConn(
         _: *Self,
-        _: p2p_conn.AnyRxConn,
+        conn: p2p_conn.AnyRxConn,
         _: ProtocolId,
-        _: ?*anyopaque,
-        _: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void,
+        user_data: ?*anyopaque,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void,
     ) void {
-        // Mock implementation does nothing
+        const handler: *InsecureHandler = conn.getPipeline().allocator.create(InsecureHandler) catch unreachable;
+        handler.init(user_data, callback);
+        // Free the handler when it is removed from the pipeline
+        // It should be removed when the handshake is successful
+        conn.getPipeline().addLast("insecure_handler", handler.any()) catch unreachable;
     }
 
     // --- Static Wrapper Functions ---
@@ -78,4 +84,146 @@ pub const InsecureChannel = struct {
     }
 };
 
-pub const InsecureHandler = struct {};
+pub const InsecureHandler = struct {
+    on_handshake_context: ?*anyopaque = null,
+
+    on_handshake_callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void,
+
+    handshake_state: HandshakeState = .NotStarted,
+
+    buffer: [1024]u8 = std.mem.zeroes([1024]u8),
+
+    buffer_pos: usize = 0,
+
+    const mock_handshake_msg: []const u8 = "mock_handshake";
+
+    const HandshakeState = enum {
+        NotStarted,
+        InProgress,
+        Successful,
+        Failed,
+    };
+
+    const Self = @This();
+
+    pub fn init(
+        self: *Self,
+        on_handshake_context: ?*anyopaque,
+        on_handshake_callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void,
+    ) void {
+        self.on_handshake_context = on_handshake_context;
+        self.on_handshake_callback = on_handshake_callback;
+    }
+
+    // --- Actual Implementations ---
+    pub fn onActive(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+        const write_context = ctx.pipeline.allocator.create(p2p_conn.NoOPContext) catch unreachable;
+        write_context.* = p2p_conn.NoOPContext{
+            .ctx = ctx,
+        };
+        ctx.write(Self.mock_handshake_msg, write_context, p2p_conn.NoOPCallback.writeCallback);
+        self.handshake_state = .InProgress;
+    }
+
+    pub fn onInactive(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+        _ = self;
+        ctx.fireInactive();
+    }
+
+    pub fn onRead(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+        @memcpy(self.buffer[self.buffer_pos .. self.buffer_pos + msg.len], msg);
+        self.buffer_pos += msg.len;
+        if (self.buffer_pos >= Self.mock_handshake_msg.len) {
+            if (std.mem.eql(u8, self.buffer[0..Self.mock_handshake_msg.len], Self.mock_handshake_msg)) {
+                self.handshake_state = .Successful;
+                const session = ctx.pipeline.allocator.create(security.session.Session) catch unreachable;
+                session.* = .{
+                    .local_id = "mock_local_id",
+                    .remote_id = "mock_remote_id",
+                    .remote_public_key = "mock_remote_key",
+                };
+                // TODO: Set the session on the connection
+                const handler = ctx.pipeline.remove("insecure_handler") catch unreachable;
+                const insecure_handler: *InsecureHandler = @ptrCast(@alignCast(handler.instance));
+                ctx.pipeline.allocator.destroy(insecure_handler);
+            } else {
+                self.handshake_state = .Failed;
+                ctx.fireErrorCaught(
+                    error.InvalidHandshake,
+                );
+                const close_context = ctx.pipeline.allocator.create(p2p_conn.NoOPContext) catch unreachable;
+                close_context.* = p2p_conn.NoOPContext{
+                    .ctx = ctx,
+                };
+                ctx.close(close_context, p2p_conn.NoOPCallback.closeCallback);
+            }
+        }
+    }
+
+    pub fn onReadComplete(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+        _ = self;
+        ctx.fireReadComplete();
+    }
+
+    pub fn onErrorCaught(_: *Self, _: *p2p_conn.HandlerContext, _: anyerror) void {}
+
+    pub fn write(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+        _ = self;
+        ctx.write(msg, user_data, callback);
+    }
+
+    pub fn close(_: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+        ctx.close(user_data, callback);
+    }
+
+    // --- Static Wrapper Functions ---
+    fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onActive(ctx);
+    }
+
+    fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onInactive(ctx);
+    }
+
+    fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onRead(ctx, msg);
+    }
+
+    fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onReadComplete(ctx);
+    }
+
+    fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.onErrorCaught(ctx, err);
+    }
+
+    fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.write(ctx, buffer, user_data, callback);
+    }
+
+    fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.close(ctx, user_data, callback);
+    }
+
+    // --- Static VTable Instance ---
+    const vtable_instance = p2p_conn.HandlerVTable{
+        .onActiveFn = vtableOnActiveFn,
+        .onInactiveFn = vtableOnInactiveFn,
+        .onReadFn = vtableOnReadFn,
+        .onReadCompleteFn = vtableOnReadCompleteFn,
+        .onErrorCaughtFn = vtableOnErrorCaughtFn,
+        .writeFn = vtableWriteFn,
+        .closeFn = vtableCloseFn,
+    };
+
+    pub fn any(self: *Self) p2p_conn.AnyHandler {
+        return .{ .instance = self, .vtable = &vtable_instance };
+    }
+};

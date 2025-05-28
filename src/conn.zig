@@ -25,6 +25,20 @@ pub const NoOPCallback = struct {
             }
         }
     }
+
+    pub fn writeCallback(ud: ?*anyopaque, r: anyerror!usize) void {
+        const self: *NoOPContext = @ptrCast(@alignCast(ud.?));
+        if (r) |_| {
+            if (self.conn) |conn| conn.getPipeline().allocator.destroy(self) else if (self.ctx) |ctx| ctx.pipeline.allocator.destroy(self);
+        } else |err| {
+            if (self.conn) |conn| {
+                conn.getPipeline().close(ud, NoOPCallback.closeCallback);
+            } else if (self.ctx) |ctx| {
+                ctx.fireErrorCaught(err);
+                ctx.close(ud, NoOPCallback.closeCallback);
+            }
+        }
+    }
 };
 
 pub const ConnUpgraderVTable = struct {
@@ -565,7 +579,7 @@ pub const HandlerPipeline = struct {
     /// Removes a handler by its name from the pipeline.
     /// Deallocates the HandlerContext. The handler instance itself is not deinitialized by this function.
     /// The caller is responsible for deinitializing the actual handler instance if needed.
-    pub fn remove(self: *Self, name: []const u8) !void {
+    pub fn remove(self: *Self, name: []const u8) !AnyHandler {
         var current = self.head.next_context;
         while (current != null and current != &self.tail) : (current = current.?.next_context) {
             const ctx_to_check = current.?;
@@ -576,8 +590,9 @@ pub const HandlerPipeline = struct {
                 prev_ctx.next_context = next_ctx;
                 next_ctx.prev_context = prev_ctx;
 
+                const ctx_to_check_handler = ctx_to_check.handler;
                 self.allocator.destroy(ctx_to_check);
-                return;
+                return ctx_to_check_handler;
             }
         }
         return error.NotFound;
@@ -931,7 +946,7 @@ test "HandlerPipeline.remove functionality" {
     try pipeline.addLast("h3", h3);
 
     // Remove handler h2: HEAD <> h1 <> h3 <> TAIL
-    try pipeline.remove("h2");
+    _ = try pipeline.remove("h2");
 
     // 1. Test Inbound Event (fireRead)
     // Expected: HEAD -> h1.onRead -> h3.onRead -> TAIL
@@ -981,7 +996,7 @@ test "HandlerPipeline.remove functionality" {
     try testing.expectError(error.NotFound, remove_non_existent_result);
 
     // 4. Test removing handler h1: HEAD <> h3 <> TAIL
-    try pipeline.remove("h1");
+    _ = try pipeline.remove("h1");
     @memset(mh1_impl.read_msg, 0);
     @memset(mh3_impl.read_msg, 0);
     pipeline.fireRead("inbound after h1 remove");
@@ -994,7 +1009,7 @@ test "HandlerPipeline.remove functionality" {
     }
 
     // 5. Test removing handler h3: HEAD <> TAIL (empty user pipeline)
-    try pipeline.remove("h3");
+    _ = try pipeline.remove("h3");
     @memset(mh3_impl.read_msg, 0);
     @memset(mock_conn_impl_val.write_msg, 0);
 
