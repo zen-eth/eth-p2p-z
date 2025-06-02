@@ -3,43 +3,11 @@ const mem = std.mem;
 const testing = std.testing;
 const Thread = std.Thread;
 const Future = @import("concurrent/future.zig").Future;
+const io_loop = @import("thread_event_loop.zig");
 
 pub const WriteFuture = Future(usize, anyerror);
 pub const CloseFuture = Future(void, anyerror);
 pub const Direction = enum { INBOUND, OUTBOUND };
-
-pub const NoOPContext = struct {
-    conn: ?AnyRxConn = null,
-    ctx: ?*HandlerContext = null,
-};
-
-pub const NoOPCallback = struct {
-    pub fn closeCallback(ud: ?*anyopaque, r: anyerror!void) void {
-        const self: *NoOPContext = @ptrCast(@alignCast(ud.?));
-        defer if (self.conn) |conn| conn.getPipeline().allocator.destroy(self) else if (self.ctx) |ctx| ctx.pipeline.allocator.destroy(self);
-        if (r) |_| {} else |err| {
-            if (self.conn) |conn| {
-                conn.getPipeline().fireErrorCaught(err);
-            } else if (self.ctx) |ctx| {
-                ctx.fireErrorCaught(err);
-            }
-        }
-    }
-
-    pub fn writeCallback(ud: ?*anyopaque, r: anyerror!usize) void {
-        const self: *NoOPContext = @ptrCast(@alignCast(ud.?));
-        if (r) |_| {
-            if (self.conn) |conn| conn.getPipeline().allocator.destroy(self) else if (self.ctx) |ctx| ctx.pipeline.allocator.destroy(self);
-        } else |err| {
-            if (self.conn) |conn| {
-                conn.getPipeline().close(ud, NoOPCallback.closeCallback);
-            } else if (self.ctx) |ctx| {
-                ctx.fireErrorCaught(err);
-                ctx.close(ud, NoOPCallback.closeCallback);
-            }
-        }
-    }
-};
 
 pub const ConnUpgraderVTable = struct {
     initConnFn: *const fn (instance: *anyopaque, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void,
@@ -423,6 +391,26 @@ const TailHandlerImpl = struct {
     }
 };
 
+const MemoryPool = struct {
+    allocator: std.mem.Allocator,
+    close_ctx_pool: io_loop.CloseCtxPool,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator) !Self {
+        var close_ctx_pool = io_loop.CloseCtxPool.init(allocator);
+        errdefer close_ctx_pool.deinit();
+
+        return .{
+            .allocator = allocator,
+            .close_ctx_pool = close_ctx_pool,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.close_ctx_pool.deinit();
+    }
+};
 /// HandlerPipeline manages a doubly-linked list of Handlers that process I/O
 /// events and operations for an associated connection (AnyRxConn). It allows
 /// for dynamic modification of the pipeline, enabling flexible processing logic.
@@ -479,6 +467,7 @@ const TailHandlerImpl = struct {
 ///
 pub const HandlerPipeline = struct {
     allocator: std.mem.Allocator,
+    mempool: *MemoryPool,
     head: HandlerContext,
     tail: HandlerContext,
     conn: AnyRxConn,
@@ -489,8 +478,15 @@ pub const HandlerPipeline = struct {
     const Self = @This();
 
     pub fn init(self: *Self, allocator: std.mem.Allocator, associated_conn: AnyRxConn) !void {
+        var mempool = try allocator.create(MemoryPool);
+        errdefer allocator.destroy(mempool);
+
+        mempool.* = try MemoryPool.init(allocator);
+        errdefer mempool.deinit();
+
         self.* = .{
             .allocator = allocator,
+            .mempool = mempool,
             .conn = associated_conn,
             .head_handler_impl = .{ .conn = associated_conn },
             .tail_handler_impl = .{},
@@ -532,6 +528,8 @@ pub const HandlerPipeline = struct {
         }
         self.head.next_context = &self.tail;
         self.tail.prev_context = &self.head;
+        self.mempool.deinit();
+        self.allocator.destroy(self.mempool);
     }
 
     /// Adds a handler context node *before* the specified 'next' node.

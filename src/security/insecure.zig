@@ -6,6 +6,7 @@ const Allocator = @import("std").mem.Allocator;
 const p2p_conn = @import("../conn.zig");
 const std = @import("std");
 const security = @import("../security/lib.zig");
+const io_loop = @import("../thread_event_loop.zig");
 
 pub const InsecureChannel = struct {
     protocol_descriptor: ProtocolDescriptor,
@@ -117,11 +118,11 @@ pub const InsecureHandler = struct {
 
     // --- Actual Implementations ---
     pub fn onActive(self: *Self, ctx: *p2p_conn.HandlerContext) void {
-        const write_context = ctx.pipeline.allocator.create(p2p_conn.NoOPContext) catch unreachable;
-        write_context.* = p2p_conn.NoOPContext{
+        const write_context = ctx.pipeline.mempool.close_ctx_pool.create() catch unreachable;
+        write_context.* = .{
             .ctx = ctx,
         };
-        ctx.write(Self.mock_handshake_msg, write_context, p2p_conn.NoOPCallback.writeCallback);
+        ctx.write(Self.mock_handshake_msg, write_context, io_loop.NoOPCallback.writeCallback);
         self.handshake_state = .InProgress;
     }
 
@@ -151,11 +152,11 @@ pub const InsecureHandler = struct {
                 ctx.fireErrorCaught(
                     error.InvalidHandshake,
                 );
-                const close_context = ctx.pipeline.allocator.create(p2p_conn.NoOPContext) catch unreachable;
-                close_context.* = p2p_conn.NoOPContext{
+                const close_context = ctx.pipeline.mempool.close_ctx_pool.create() catch unreachable;
+                close_context.* = io_loop.NoOPContext{
                     .ctx = ctx,
                 };
-                ctx.close(close_context, p2p_conn.NoOPCallback.closeCallback);
+                ctx.close(close_context, io_loop.NoOPCallback.closeCallback);
             }
         }
     }

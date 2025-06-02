@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const AnyProtocolBinding = proto_binding.AnyProtocolBinding;
 const security = @import("../security/lib.zig");
 const SecuritySession = security.session.Session;
+const io_loop = @import("../thread_event_loop.zig");
 
 pub const Upgrader = struct {
     security_bindings: []const AnyProtocolBinding,
@@ -29,11 +30,11 @@ pub const Upgrader = struct {
                 std.debug.print("Security session upgraded successfully: {}\n", .{security_session.*});
             } else |err| {
                 s_ctx.conn.getPipeline().fireErrorCaught(err);
-                const closeContext = s_ctx.conn.getPipeline().allocator.create(p2p_conn.NoOPContext) catch unreachable;
-                closeContext.* = .{
+                const close_ctx = s_ctx.conn.getPipeline().mempool.close_ctx_pool.create() catch unreachable;
+                close_ctx.* = .{
                     .conn = s_ctx.conn,
                 };
-                s_ctx.conn.getPipeline().close(closeContext, p2p_conn.NoOPCallback.closeCallback);
+                s_ctx.conn.getPipeline().close(close_ctx, io_loop.NoOPCallback.closeCallback);
             }
         }
     };

@@ -105,6 +105,39 @@ pub const IOMessage = struct {
     action: IOAction,
 };
 
+pub const NoOPContext = struct {
+    conn: ?conn.AnyRxConn = null,
+    ctx: ?*conn.HandlerContext = null,
+};
+
+pub const NoOPCallback = struct {
+    pub fn closeCallback(ud: ?*anyopaque, r: anyerror!void) void {
+        const self: *NoOPContext = @ptrCast(@alignCast(ud.?));
+        defer if (self.conn) |any_conn| any_conn.getPipeline().allocator.destroy(self) else if (self.ctx) |ctx| ctx.pipeline.allocator.destroy(self);
+        if (r) |_| {} else |err| {
+            if (self.conn) |any_conn| {
+                any_conn.getPipeline().fireErrorCaught(err);
+            } else if (self.ctx) |ctx| {
+                ctx.fireErrorCaught(err);
+            }
+        }
+    }
+
+    pub fn writeCallback(ud: ?*anyopaque, r: anyerror!usize) void {
+        const self: *NoOPContext = @ptrCast(@alignCast(ud.?));
+        if (r) |_| {
+            if (self.conn) |any_conn| any_conn.getPipeline().allocator.destroy(self) else if (self.ctx) |ctx| ctx.pipeline.allocator.destroy(self);
+        } else |err| {
+            if (self.conn) |any_conn| {
+                any_conn.getPipeline().close(ud, NoOPCallback.closeCallback);
+            } else if (self.ctx) |ctx| {
+                ctx.fireErrorCaught(err);
+                ctx.close(ud, NoOPCallback.closeCallback);
+            }
+        }
+    }
+};
+
 pub const BUFFER_SIZE = 64 * 1024;
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
 const ConnectPool = std.heap.MemoryPool(Connect);
@@ -114,6 +147,8 @@ const WritePool = std.heap.MemoryPool(Write);
 const AcceptPool = std.heap.MemoryPool(Accept);
 const ReadBufferPool = std.heap.MemoryPool([BUFFER_SIZE]u8);
 const ClosePool = std.heap.MemoryPool(Close);
+
+pub const CloseCtxPool = std.heap.MemoryPool(NoOPContext);
 
 /// Represents a thread-based event loop for managing asynchronous I/O operations.
 pub const ThreadEventLoop = struct {
