@@ -145,7 +145,7 @@ pub const InsecureHandler = struct {
                     .remote_public_key = "mock_remote_key",
                 };
                 // TODO: Set the session on the connection
-                if(ctx.conn.direction() == .INBOUND) {
+                if (ctx.conn.direction() == .INBOUND) {
                     const server_handler = xev_tcp.xev_transport.ServerEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
                     const server_handler_any = server_handler.any();
                     ctx.pipeline.addLast("server_echo_handler", server_handler_any) catch unreachable;
@@ -154,10 +154,10 @@ pub const InsecureHandler = struct {
                     const client_handler_any = client_handler.any();
                     ctx.pipeline.addLast("client_echo_handler", client_handler_any) catch unreachable;
                 }
-                
-                if(self.buffer_pos > Self.mock_handshake_msg.len) {
+
+                if (self.buffer_pos > Self.mock_handshake_msg.len) {
                     // If there is extra data in the buffer, we need to handle it
-                    const extra_data = self.buffer[Self.mock_handshake_msg.len .. self.buffer_pos];
+                    const extra_data = self.buffer[Self.mock_handshake_msg.len..self.buffer_pos];
                     ctx.fireRead(extra_data);
                 }
                 const handler = ctx.pipeline.remove("insecure_handler") catch unreachable;

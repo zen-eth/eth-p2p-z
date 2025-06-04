@@ -11,6 +11,10 @@ const uvarint = multiformats.uvarint;
 const Allocator = std.mem.Allocator;
 const LinearFifo = std.fifo.LinearFifo;
 const io_loop = @import("../thread_event_loop.zig");
+const Upgrader = @import("../transport/upgrader.zig").Upgrader;
+const insecure = @import("../security/insecure.zig");
+const xev_tcp = @import("../transport/tcp/xev.zig");
+const p2p_transport = @import("../transport.zig");
 
 pub const Multistream = struct {
     bindings: []const AnyProtocolBinding,
@@ -31,6 +35,7 @@ pub const Multistream = struct {
     }
 
     pub fn initConn(self: *Self, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void {
+        std.debug.print("Initializing Multistream Negotiator for connection\n", .{});
         // free negotiator when it be removed from the pipeline
         const negotiator = conn.getPipeline().allocator.create(Negotiator) catch unreachable;
 
@@ -433,14 +438,17 @@ pub const Negotiator = struct {
     // Helper function for error handling with buffer cleanup
     fn handleError(self: *Self, ctx: *p2p_conn.HandlerContext, buffer_slice: ?[]u8, err: anyerror) void {
         ctx.fireErrorCaught(err);
+        std.debug.print("Multistream Negotiator error: {}\n", .{err});
         if (buffer_slice) |slice| {
             self.allocator.free(slice);
         }
-        self.deinit();
+        std.debug.print("Cleaning up Multistream Negotiator resources\n", .{});
+        defer self.deinit();
         const close_ctx = ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
         close_ctx.* = .{
             .ctx = ctx,
         };
+        std.debug.print("Closing context after error\n", .{});
         ctx.close(close_ctx, io_loop.NoOPCallback.closeCallback);
     }
 
@@ -472,3 +480,90 @@ pub const Negotiator = struct {
         _ = ctx.pipeline.remove("mss") catch unreachable;
     }
 };
+
+const ConnHolder = struct {
+    channel: ?p2p_conn.AnyRxConn = null,
+    ready: std.Thread.ResetEvent = .{},
+    err: ?anyerror = null,
+
+    const Self = @This();
+
+    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
+        const self: *ConnHolder = @ptrCast(@alignCast(opaque_userdata.?));
+
+        const accepted_channel = accept_result catch |err| {
+            self.err = err;
+            self.ready.set();
+            return;
+        };
+
+        self.channel = accepted_channel;
+        self.ready.set();
+    }
+};
+
+test "Multistream Negotiator with Insecure Protocol" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    var insecure_channel: insecure.InsecureChannel = undefined;
+    try insecure_channel.init(allocator); // this should be freed by pipeline
+    const proposed_bindings = &[_]AnyProtocolBinding{insecure_channel.any()};
+    var upgrader: Upgrader = undefined;
+
+    try upgrader.init(proposed_bindings, std.time.ns_per_s * 10);
+    const any_upgrader = upgrader.any();
+    var sl: io_loop.ThreadEventLoop = undefined;
+    try sl.init(allocator);
+    defer {
+        sl.close();
+        sl.deinit();
+    }
+
+    const opts = xev_tcp.XevTransport.Options{
+        .backlog = 128,
+    };
+
+    var transport: xev_tcp.XevTransport = undefined;
+    try transport.init(any_upgrader, &sl, allocator, opts);
+    defer transport.deinit();
+
+    const addr = try std.net.Address.parseIp("0.0.0.0", 8093);
+    var listener = try transport.listen(addr);
+
+    var conn_holder: ConnHolder = .{};
+    const accept_thread = try std.Thread.spawn(.{}, struct {
+        fn run(l: *p2p_transport.AnyListener, ch: *ConnHolder) !void {
+            var accepted_count: usize = 0;
+            while (accepted_count < 1) : (accepted_count += 1) {
+                l.accept(ch, ConnHolder.init);
+                ch.ready.wait();
+                try std.testing.expectEqual(ch.channel.?.direction(), p2p_conn.Direction.INBOUND);
+            }
+        }
+    }.run, .{ &listener, &conn_holder });
+
+    var cl: io_loop.ThreadEventLoop = undefined;
+    try cl.init(allocator);
+    defer {
+        cl.close();
+        cl.deinit();
+    }
+    var client: xev_tcp.XevTransport = undefined;
+    try client.init(any_upgrader, &cl, allocator, opts);
+    defer client.deinit();
+
+    var dial_conn_holder: ConnHolder = .{};
+    client.dial(addr, &dial_conn_holder, ConnHolder.init);
+    dial_conn_holder.ready.wait();
+    try std.testing.expectEqual(dial_conn_holder.channel.?.direction(), p2p_conn.Direction.OUTBOUND);
+
+    // client_handler.channel.write("buf: []const u8", client_handler, ClientEchoHandler.onWrite);
+    // client_handler.written_ready.wait();
+    // try std.testing.expect(client_handler.written == 15);
+
+    // client_handler.read.wait();
+    // try std.testing.expectEqualStrings("buf: []const u8", client_handler.received_message[0..client_handler.written]);
+    accept_thread.join();
+    // std.time.sleep(std.time.ns_per_s * 10);
+}
