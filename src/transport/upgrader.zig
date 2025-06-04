@@ -30,7 +30,7 @@ pub const Upgrader = struct {
                 std.debug.print("Security session upgraded successfully: {}\n", .{security_session.*});
             } else |err| {
                 s_ctx.conn.getPipeline().fireErrorCaught(err);
-                const close_ctx = s_ctx.conn.getPipeline().mempool.close_ctx_pool.create() catch unreachable;
+                const close_ctx = s_ctx.conn.getPipeline().mempool.io_no_op_context_pool.create() catch unreachable;
                 close_ctx.* = .{
                     .conn = s_ctx.conn,
                 };

@@ -120,7 +120,7 @@ pub const Negotiator = struct {
                 w_ctx.negotiator.deinit();
                 w_ctx.negotiator.allocator.free(w_ctx.buffer);
                 w_ctx.negotiator.allocator.destroy(w_ctx);
-                const close_ctx = w_ctx.ctx.pipeline.mempool.close_ctx_pool.create() catch unreachable;
+                const close_ctx = w_ctx.ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
                 close_ctx.* = .{
                     .ctx = w_ctx.ctx,
                 };
@@ -437,7 +437,7 @@ pub const Negotiator = struct {
             self.allocator.free(slice);
         }
         self.deinit();
-        const close_ctx = ctx.pipeline.mempool.close_ctx_pool.create() catch unreachable;
+        const close_ctx = ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
         close_ctx.* = .{
             .ctx = ctx,
         };

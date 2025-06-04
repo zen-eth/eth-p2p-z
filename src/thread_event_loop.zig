@@ -148,7 +148,7 @@ const AcceptPool = std.heap.MemoryPool(Accept);
 const ReadBufferPool = std.heap.MemoryPool([BUFFER_SIZE]u8);
 const ClosePool = std.heap.MemoryPool(Close);
 
-pub const CloseCtxPool = std.heap.MemoryPool(NoOPContext);
+pub const NoOpContextMemoryPool = std.heap.MemoryPool(NoOPContext);
 
 /// Represents a thread-based event loop for managing asynchronous I/O operations.
 pub const ThreadEventLoop = struct {

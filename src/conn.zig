@@ -393,22 +393,22 @@ const TailHandlerImpl = struct {
 
 const MemoryPool = struct {
     allocator: std.mem.Allocator,
-    close_ctx_pool: io_loop.CloseCtxPool,
+    io_no_op_context_pool: io_loop.NoOpContextMemoryPool,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) !Self {
-        var close_ctx_pool = io_loop.CloseCtxPool.init(allocator);
-        errdefer close_ctx_pool.deinit();
+        var no_op_ctx_pool = io_loop.NoOpContextMemoryPool.init(allocator);
+        errdefer no_op_ctx_pool.deinit();
 
         return .{
             .allocator = allocator,
-            .close_ctx_pool = close_ctx_pool,
+            .io_no_op_context_pool = no_op_ctx_pool,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.close_ctx_pool.deinit();
+        self.io_no_op_context_pool.deinit();
     }
 };
 /// HandlerPipeline manages a doubly-linked list of Handlers that process I/O

@@ -789,7 +789,7 @@ const OnWriteCallback = struct {
     }
 };
 
-const ServerEchoHandler = struct {
+pub const ServerEchoHandler = struct {
     allocator: Allocator,
 
     received_message: []u8,
@@ -918,7 +918,7 @@ const ServerEchoHandler = struct {
     }
 };
 
-const ClientEchoHandler = struct {
+pub const ClientEchoHandler = struct {
     allocator: Allocator,
 
     received_message: []u8,

@@ -7,6 +7,7 @@ const p2p_conn = @import("../conn.zig");
 const std = @import("std");
 const security = @import("../security/lib.zig");
 const io_loop = @import("../thread_event_loop.zig");
+const xev_tcp = @import("../transport/tcp/lib.zig");
 
 pub const InsecureChannel = struct {
     protocol_descriptor: ProtocolDescriptor,
@@ -118,7 +119,7 @@ pub const InsecureHandler = struct {
 
     // --- Actual Implementations ---
     pub fn onActive(self: *Self, ctx: *p2p_conn.HandlerContext) void {
-        const write_context = ctx.pipeline.mempool.close_ctx_pool.create() catch unreachable;
+        const write_context = ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
         write_context.* = .{
             .ctx = ctx,
         };
@@ -144,6 +145,21 @@ pub const InsecureHandler = struct {
                     .remote_public_key = "mock_remote_key",
                 };
                 // TODO: Set the session on the connection
+                if(ctx.conn.direction() == .INBOUND) {
+                    const server_handler = xev_tcp.xev_transport.ServerEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
+                    const server_handler_any = server_handler.any();
+                    ctx.pipeline.addLast("server_echo_handler", server_handler_any) catch unreachable;
+                } else {
+                    const client_handler = xev_tcp.xev_transport.ClientEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
+                    const client_handler_any = client_handler.any();
+                    ctx.pipeline.addLast("client_echo_handler", client_handler_any) catch unreachable;
+                }
+                
+                if(self.buffer_pos > Self.mock_handshake_msg.len) {
+                    // If there is extra data in the buffer, we need to handle it
+                    const extra_data = self.buffer[Self.mock_handshake_msg.len .. self.buffer_pos];
+                    ctx.fireRead(extra_data);
+                }
                 const handler = ctx.pipeline.remove("insecure_handler") catch unreachable;
                 const insecure_handler: *InsecureHandler = @ptrCast(@alignCast(handler.instance));
                 ctx.pipeline.allocator.destroy(insecure_handler);
@@ -152,7 +168,7 @@ pub const InsecureHandler = struct {
                 ctx.fireErrorCaught(
                     error.InvalidHandshake,
                 );
-                const close_context = ctx.pipeline.mempool.close_ctx_pool.create() catch unreachable;
+                const close_context = ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
                 close_context.* = io_loop.NoOPContext{
                     .ctx = ctx,
                 };
