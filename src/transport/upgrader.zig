@@ -52,7 +52,6 @@ pub const Upgrader = struct {
         self: *const Upgrader,
         conn: p2p_conn.AnyRxConn,
     ) void {
-        std.debug.print("start upgrading security session for connection\n", .{});
         const security_ctx = conn.getPipeline().allocator.create(SecurityUpgradeCallbackContext) catch |err| {
             conn.getPipeline().fireErrorCaught(err);
             conn.getPipeline().close(null, struct {

@@ -406,7 +406,7 @@ pub const Session = struct {
         self.shutdown_completion.set();
 
         self.conn.close() catch |err| {
-            std.log.err("close: conn close error: {}\n", .{err});
+            std.log.warn("close: conn close error: {}\n", .{err});
         };
         self.recv_done.cond.broadcast();
 
@@ -464,7 +464,7 @@ pub const Session = struct {
             }
             self.ping() catch |err| {
                 if (err != Error.SessionShutdown) {
-                    std.log.err("keepalive: ping error: {}\n", .{err});
+                    std.log.warn("keepalive: ping error: {}\n", .{err});
                     self.setExitErr(Error.KeepAliveTimeout);
                 }
                 return;
@@ -481,7 +481,7 @@ pub const Session = struct {
     pub fn onRead(self: *Session, buffer: []u8, bytes_read: anyerror!usize) !void {
         const n = bytes_read catch |err| {
             if (err != xev.ReadError.EOF) {
-                std.log.err("onRead: read error: {}\n", .{err});
+                std.log.warn("onRead: read error: {}\n", .{err});
             }
             self.setExitErr(err);
             return err;
@@ -492,7 +492,7 @@ pub const Session = struct {
         }
 
         self.inbound_buffer.write(buffer[0..n]) catch |err| {
-            std.log.err("onRead: write inbound buffer error: {}\n", .{err});
+            std.log.warn("onRead: write inbound buffer error: {}\n", .{err});
             self.setExitErr(err);
             return err;
         };
@@ -590,11 +590,11 @@ pub const Session = struct {
             if (hdr.frame_type == frame.FrameType.DATA and hdr.length > 0) {
                 std.log.warn("discarding data for stream {} with length {}\n", .{ stream_id, hdr.length });
                 self.buf_read.skipBytes(hdr.length, .{}) catch |err| {
-                    std.log.err("error skipping bytes: {}\n", .{err});
+                    std.log.warn("error skipping bytes: {}\n", .{err});
                     return;
                 };
             } else {
-                std.log.err("frame for missing stream {}\n", .{hdr});
+                std.log.warn("frame for missing stream {}\n", .{hdr});
             }
 
             return;
@@ -602,28 +602,28 @@ pub const Session = struct {
 
         if (hdr.frame_type == .WINDOW_UPDATE) {
             stream.?.incrSendWindow(hdr, flags) catch |err| {
-                std.log.err("handleStreamMessage: incrSendWindow error: {}\n", .{err});
+                std.log.warn("handleStreamMessage: incrSendWindow error: {}\n", .{err});
                 const goaway_hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
                 defer self.allocator.free(goaway_hdr);
                 self.goAway(@intFromEnum(frame.GoAwayCode.PROTOCOL_ERROR), goaway_hdr) catch |goaway_err| {
-                    std.log.err("createInboundStream: goAway error: {}\n", .{goaway_err});
+                    std.log.warn("createInboundStream: goAway error: {}\n", .{goaway_err});
                 };
                 self.send(goaway_hdr, null) catch |send_err| {
-                    std.log.err("createInboundStream: send error: {}\n", .{send_err});
+                    std.log.warn("createInboundStream: send error: {}\n", .{send_err});
                 };
                 return err;
             };
         }
 
         stream.?.readData(hdr, flags, self.buf_read) catch |err| {
-            std.log.err("handleStreamMessage: readData error: {}\n", .{err});
+            std.log.warn("handleStreamMessage: readData error: {}\n", .{err});
             const goaway_hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
             defer self.allocator.free(goaway_hdr);
             self.goAway(@intFromEnum(frame.GoAwayCode.PROTOCOL_ERROR), goaway_hdr) catch |goaway_err| {
-                std.log.err("createInboundStream: goAway error: {}\n", .{goaway_err});
+                std.log.warn("createInboundStream: goAway error: {}\n", .{goaway_err});
             };
             self.send(goaway_hdr, null) catch |send_err| {
-                std.log.err("createInboundStream: send error: {}\n", .{send_err});
+                std.log.warn("createInboundStream: send error: {}\n", .{send_err});
             };
             return err;
         };
@@ -637,10 +637,10 @@ pub const Session = struct {
             const syn_hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
             defer self.allocator.free(syn_hdr);
             frame.Header.init(frame.FrameType.PING, frame.FrameFlags.ACK, 0, ping_id).encode(syn_hdr) catch |err| {
-                std.log.err("handlePing: encode error: {}\n", .{err});
+                std.log.warn("handlePing: encode error: {}\n", .{err});
             };
             self.send(syn_hdr, null) catch |err| {
-                std.log.err("handlePing: send error: {}\n", .{err});
+                std.log.warn("handlePing: send error: {}\n", .{err});
             };
             return;
         }
@@ -683,14 +683,14 @@ pub const Session = struct {
 
         // Check if the stream is already established
         if (self.streams.contains(id)) {
-            std.log.err("createInboundStream: stream already exists\n", .{});
+            std.log.warn("createInboundStream: stream already exists\n", .{});
             const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
             defer self.allocator.free(hdr);
             self.goAway(@intFromEnum(frame.GoAwayCode.PROTOCOL_ERROR), hdr) catch |err| {
-                std.log.err("createInboundStream: goAway error: {}\n", .{err});
+                std.log.warn("createInboundStream: goAway error: {}\n", .{err});
             };
             self.send(hdr, null) catch |err| {
-                std.log.err("createInboundStream: send error: {}\n", .{err});
+                std.log.warn("createInboundStream: send error: {}\n", .{err});
             };
             return Error.DuplicateStream;
         }
@@ -698,15 +698,15 @@ pub const Session = struct {
         try self.streams.put(id, stream);
 
         if (self.accept_queue.push(self.streams.getPtr(id).?, .{ .instant = {} }) == 0) {
-            std.log.err("ccreateInboundStream: accept_queue push failed since queue is full\n", .{});
+            std.log.warn("ccreateInboundStream: accept_queue push failed since queue is full\n", .{});
             _ = self.streams.remove(id);
             const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
             defer self.allocator.free(hdr);
             frame.Header.init(frame.FrameType.WINDOW_UPDATE, frame.FrameFlags.RST, id, 0).encode(hdr) catch |err| {
-                std.log.err("createInboundStream: encode error: {}\n", .{err});
+                std.log.warn("createInboundStream: encode error: {}\n", .{err});
             };
             self.send(hdr, null) catch |err| {
-                std.log.err("createInboundStream: send error: {}\n", .{err});
+                std.log.warn("createInboundStream: send error: {}\n", .{err});
             };
         }
     }
@@ -726,7 +726,7 @@ pub const Session = struct {
         if (self.inflight.contains(id)) {
             _ = self.inflight.remove(id);
         } else {
-            std.log.err("establishStream: stream not found in inflight\n", .{});
+            std.log.warn("establishStream: stream not found in inflight\n", .{});
         }
         self.syn_semaphore.post();
         self.stream_mutex.unlock();

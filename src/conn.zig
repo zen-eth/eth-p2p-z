@@ -247,6 +247,7 @@ const HeadHandlerImpl = struct {
         user_data: ?*anyopaque,
         callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {
+        std.debug.print("HeadHandlerImpl: Closing connection with user_data\n", .{});
         self.conn.close(user_data, callback);
     }
 
@@ -321,7 +322,7 @@ const TailHandlerImpl = struct {
     pub fn onReadComplete(_: *Self, _: *HandlerContext) void {}
 
     pub fn onErrorCaught(_: *Self, ctx: *HandlerContext, err: anyerror) void {
-        std.log.err("Handler '{s}' error during onErrorCaught: {any}", .{ ctx.name, err });
+        std.log.warn("Handler '{s}' error during onErrorCaught: {any}", .{ ctx.name, err });
     }
 
     pub fn write(

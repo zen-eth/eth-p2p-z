@@ -449,7 +449,9 @@ pub const Negotiator = struct {
             .ctx = ctx,
         };
         std.debug.print("Closing context after error\n", .{});
-        ctx.close(close_ctx, io_loop.NoOPCallback.closeCallback);
+        ctx.close(null, struct {
+            fn callback(_: ?*anyopaque, _: anyerror!void) void {}
+        }.callback);
     }
 
     fn writePacket(writer: anytype, proto: []const u8) !void {
@@ -565,5 +567,5 @@ test "Multistream Negotiator with Insecure Protocol" {
     // client_handler.read.wait();
     // try std.testing.expectEqualStrings("buf: []const u8", client_handler.received_message[0..client_handler.written]);
     accept_thread.join();
-    // std.time.sleep(std.time.ns_per_s * 10);
+    std.time.sleep(std.time.ns_per_s * 4);
 }

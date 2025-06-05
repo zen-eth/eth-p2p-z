@@ -111,16 +111,16 @@ pub const NoOPContext = struct {
 };
 
 pub const NoOPCallback = struct {
-    pub fn closeCallback(ud: ?*anyopaque, _: anyerror!void) void {
+    pub fn closeCallback(ud: ?*anyopaque, r: anyerror!void) void {
         const self: *NoOPContext = @ptrCast(@alignCast(ud.?));
         defer if (self.conn) |any_conn| any_conn.getPipeline().mempool.io_no_op_context_pool.destroy(self) else if (self.ctx) |ctx| ctx.pipeline.mempool.io_no_op_context_pool.destroy(self);
-        // if (r) |_| {} else |err| {
-        //     if (self.conn) |any_conn| {
-        //         any_conn.getPipeline().fireErrorCaught(err);
-        //     } else if (self.ctx) |ctx| {
-        //         ctx.fireErrorCaught(err);
-        //     }
-        // }
+        if (r) |_| {} else |err| {
+            if (self.conn) |any_conn| {
+                any_conn.getPipeline().fireErrorCaught(err);
+            } else if (self.ctx) |ctx| {
+                ctx.fireErrorCaught(err);
+            }
+        }
     }
 
     pub fn writeCallback(ud: ?*anyopaque, r: anyerror!usize) void {
@@ -197,8 +197,8 @@ pub const ThreadEventLoop = struct {
         thread_pool.* = xev.ThreadPool.init(.{});
         errdefer allocator.destroy(thread_pool);
 
-        // var loop = try xev.Loop.init(.{.thread_pool = thread_pool});
-        var loop = try xev.Loop.init(.{});
+        var loop = try xev.Loop.init(.{ .thread_pool = thread_pool });
+        // var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
 
         var stop_notifier = try xev.Async.init();
@@ -296,7 +296,7 @@ pub const ThreadEventLoop = struct {
     /// Stops the event loop and joins the thread.
     pub fn close(self: *Self) void {
         self.stop_notifier.notify() catch |err| {
-            std.log.err("Error notifying stop: {}\n", .{err});
+            std.log.warn("Error notifying stop: {}\n", .{err});
         };
 
         self.loop_thread.join();
@@ -327,7 +327,7 @@ pub const ThreadEventLoop = struct {
         r: xev.Async.WaitError!void,
     ) xev.CallbackAction {
         r catch |err| {
-            std.log.err("Error in stop callback: {}\n", .{err});
+            std.log.warn("Error in stop callback: {}\n", .{err});
             return .disarm;
         };
 
@@ -344,7 +344,7 @@ pub const ThreadEventLoop = struct {
         r: xev.Async.WaitError!void,
     ) xev.CallbackAction {
         r catch |err| {
-            std.log.err("Error in async callback: {}\n", .{err});
+            std.log.warn("Error in async callback: {}\n", .{err});
             return .disarm;
         };
         const self = self_.?;
@@ -452,7 +452,7 @@ pub const ThreadEventLoop = struct {
 
     //     tr catch |err| {
     //         if (err != xev.Timer.RunError.Canceled) {
-    //             std.log.err("Error in timer callback: {}\n", .{err});
+    //             std.log.warn("Error in timer callback: {}\n", .{err});
     //         }
     //         return .disarm;
     //     };
