@@ -213,6 +213,7 @@ pub const Negotiator = struct {
             .ctx = ctx,
         };
 
+        std.debug.print("Multistream Negotiator onActive: {}\n", .{proto_buffer.getWritten().len});
         ctx.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
     }
 
@@ -223,6 +224,7 @@ pub const Negotiator = struct {
     }
 
     pub fn onReadImpl(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) !void {
+        std.debug.print("Multistream Negotiator onRead: {}\n", .{msg.len});
         self.buffer.write(msg) catch |err| {
             self.handleError(ctx, null, err);
             return err;
@@ -244,10 +246,15 @@ pub const Negotiator = struct {
             // If there are remaining bytes in the buffer, put them back
             // so that we can read them again as it is not length bytes but actual protocol ID bytes.
             if (decoded_length_bytes.remaining.len > 0) {
+                std.debug.print("Multistream Negotiator remain buffer length: {}\n", .{self.buffer.readableLength()});
+                std.debug.print("Decoded remaining length: {}\n", .{decoded_length_bytes.remaining.len});
+                std.debug.print("Decoded remaining bytes: {s}\n", .{decoded_length_bytes.remaining});
                 self.buffer.unget(decoded_length_bytes.remaining) catch |err| {
                     self.handleError(ctx, null, err);
                     return err;
                 };
+                std.debug.print("Multistream Negotiator ungeted remain buffer length: {}\n", .{self.buffer.readableLength()});
+                std.debug.print("Multistream Negotiator ungeted remain buffer: {s}\n", .{self.buffer.readableSlice(0)});
             }
 
             const proto_id_length = decoded_length_bytes.value;
@@ -264,6 +271,7 @@ pub const Negotiator = struct {
             var proto_id_bytes: [MAX_MULTISTREAM_MESSAGE_LENGTH]u8 = undefined;
             _ = self.buffer.read(proto_id_bytes[0..proto_id_length]);
 
+            std.debug.print("Multistream Negotiator read protocol ID: {s}\n", .{proto_id_bytes[0..proto_id_length]});
             if (proto_id_length < MESSAGE_SUFFIX_LENGTH or
                 !std.mem.eql(u8, proto_id_bytes[proto_id_length - MESSAGE_SUFFIX_LENGTH .. proto_id_length], MESSAGE_SUFFIX))
             {
@@ -442,7 +450,8 @@ pub const Negotiator = struct {
     }
 
     fn writePacket(writer: anytype, proto: []const u8) !void {
-        _ = try uvarint.encodeStream(writer, u16, @intCast(proto.len));
+        const n = try uvarint.encodeStream(writer, u16, @intCast(proto.len + MESSAGE_SUFFIX_LENGTH));
+        std.debug.print("Multistream Negotiator writePacket length: {}", .{n});
         try writer.writeAll(proto);
         try writer.writeAll(MESSAGE_SUFFIX);
     }
@@ -453,6 +462,7 @@ pub const Negotiator = struct {
 
         for (self.bindings) |binding| {
             if (binding.protoDesc().protocol_matcher.matches(proto_id)) {
+                std.debug.print("Multistream Negotiator found matching protocol binding for: {s}\n", .{proto_id});
                 selected_proto_binding = binding;
                 break;
             }
@@ -467,6 +477,7 @@ pub const Negotiator = struct {
             try ctx.fireRead(self.buffer.readableSlice(0));
         }
         _ = try ctx.pipeline.remove("mss");
+        std.debug.print("Multistream Negotiator onProtoSelected: removed 'mss' handler\n", .{});
         self.deinit();
         ctx.pipeline.allocator.destroy(self);
     }

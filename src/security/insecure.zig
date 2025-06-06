@@ -49,6 +49,7 @@ pub const InsecureChannel = struct {
         user_data: ?*anyopaque,
         callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void,
     ) void {
+        std.debug.print("InsecureChannel.initConn called with conn: {}\n", .{conn});
         const handler: *InsecureHandler = conn.getPipeline().allocator.create(InsecureHandler) catch unreachable;
         handler.init(user_data, callback);
         // Free the handler when it is removed from the pipeline
