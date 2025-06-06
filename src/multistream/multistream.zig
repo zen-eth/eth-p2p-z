@@ -560,12 +560,8 @@ test "Multistream Negotiator with Insecure Protocol" {
     dial_conn_holder.ready.wait();
     try std.testing.expectEqual(dial_conn_holder.channel.?.direction(), p2p_conn.Direction.OUTBOUND);
 
-    // client_handler.channel.write("buf: []const u8", client_handler, ClientEchoHandler.onWrite);
-    // client_handler.written_ready.wait();
-    // try std.testing.expect(client_handler.written == 15);
-
-    // client_handler.read.wait();
-    // try std.testing.expectEqualStrings("buf: []const u8", client_handler.received_message[0..client_handler.written]);
     accept_thread.join();
+    // temporary sleep to ensure the multistream negotiation completes
+    // will make it more robust later
     std.time.sleep(std.time.ns_per_s * 4);
 }
