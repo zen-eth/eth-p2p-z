@@ -71,7 +71,7 @@ pub const Connect = struct {
 };
 
 pub const Write = struct {
-    transport: *xev_tcp.XevTransport,
+    channel: *xev_tcp.XevSocketChannel,
 
     user_data: ?*anyopaque = null,
 
@@ -407,7 +407,7 @@ pub const ThreadEventLoop = struct {
                     const buffer = action_data.buffer;
                     const write_ud = self.write_pool.create() catch unreachable;
                     write_ud.* = .{
-                        .transport = action_data.channel.transport,
+                        .channel = action_data.channel,
                         .user_data = action_data.user_data,
                         .callback = action_data.callback,
                     };

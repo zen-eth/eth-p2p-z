@@ -43,7 +43,7 @@ pub const XevSocketChannel = struct {
             const w = self.transport.io_event_loop.write_pool.create() catch unreachable;
 
             w.* = .{
-                .transport = self.transport,
+                .channel = self,
                 .user_data = user_data,
                 .callback = callback,
             };
@@ -146,10 +146,11 @@ pub const XevSocketChannel = struct {
         r: xev.WriteError!usize,
     ) xev.CallbackAction {
         const w = ud.?;
-        const transport = w.transport;
+        const transport = w.channel.transport;
         defer transport.io_event_loop.completion_pool.destroy(c);
         defer transport.io_event_loop.write_pool.destroy(w);
 
+        // In general, user defined callbacks should close the channel on error.
         w.callback(w.user_data, r);
 
         return .disarm;
@@ -157,9 +158,9 @@ pub const XevSocketChannel = struct {
 
     pub fn readCB(
         ud: ?*XevSocketChannel,
-        loop: *xev.Loop,
+        _: *xev.Loop,
         c: *xev.Completion,
-        socket: xev.TCP,
+        _: xev.TCP,
         rb: xev.ReadBuffer,
         r: xev.ReadError!usize,
     ) xev.CallbackAction {
@@ -168,47 +169,40 @@ pub const XevSocketChannel = struct {
 
         const read_bytes = r catch |err| switch (err) {
             error.EOF => {
-                std.debug.print("EOF received on channel\n", .{});
+                // Default behavior on EOF is to close the channel in the `TailHandler` of the pipeline.
                 channel.handlerPipeline().fireReadComplete();
                 transport.io_event_loop.read_buffer_pool.destroy(
                     @alignCast(
                         @as(*[io_loop.BUFFER_SIZE]u8, @ptrFromInt(@intFromPtr(rb.slice.ptr))),
                     ),
                 );
-                const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
-                close_ud.* = .{
-                    .channel = channel,
-                    .callback = noopCloseCB,
-                    .user_data = channel,
-                };
-                std.debug.print("Shutting down socket after EOF {}\n", .{close_ud.*});
-                socket.shutdown(loop, c, io_loop.Close, close_ud, shutdownCB);
-
+                transport.io_event_loop.completion_pool.destroy(c);
                 return .disarm;
             },
 
             else => {
-                std.debug.print("Read error on channel\n", .{});
+                // On any other error, we log the error and close the channel, also in the `TailHandler`.
                 channel.handlerPipeline().fireErrorCaught(err);
                 transport.io_event_loop.read_buffer_pool.destroy(
                     @alignCast(
                         @as(*[io_loop.BUFFER_SIZE]u8, @ptrFromInt(@intFromPtr(rb.slice.ptr))),
                     ),
                 );
-                const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
-                close_ud.* = .{
-                    .channel = channel,
-                    .callback = noopCloseCB,
-                    .user_data = channel,
-                };
-                socket.shutdown(loop, c, io_loop.Close, close_ud, shutdownCB);
-
+                transport.io_event_loop.completion_pool.destroy(c);
                 return .disarm;
             },
         };
 
         if (read_bytes > 0) {
-            channel.handlerPipeline().fireRead(rb.slice[0..read_bytes]);
+            channel.handlerPipeline().fireRead(rb.slice[0..read_bytes]) catch {
+                transport.io_event_loop.read_buffer_pool.destroy(
+                    @alignCast(
+                        @as(*[io_loop.BUFFER_SIZE]u8, @ptrFromInt(@intFromPtr(rb.slice.ptr))),
+                    ),
+                );
+                transport.io_event_loop.completion_pool.destroy(c);
+                return .disarm;
+            };
         }
 
         return .rearm;
@@ -226,13 +220,11 @@ pub const XevSocketChannel = struct {
         const close_ud = ud.?;
 
         _ = r catch |err| {
-            std.debug.print("Error shutting down socket: {}\n", .{err});
             close_ud.callback(close_ud.user_data, err);
 
             return .disarm;
         };
 
-        std.debug.print("Socket shutdown completed, proceeding to close.\n", .{});
         s.close(l, c, io_loop.Close, ud, closeCB);
         return .disarm;
     }
@@ -369,22 +361,37 @@ pub const XevListener = struct {
 
         const p = transport.io_event_loop.handler_pipeline_pool.create() catch unreachable;
         p.init(transport.allocator, any_rx_conn) catch |err| {
-            transport.allocator.destroy(channel);
-            transport.io_event_loop.handler_pipeline_pool.destroy(p);
+            const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
+            close_ud.* = .{
+                .channel = channel,
+                .callback = XevSocketChannel.noopCloseCB,
+                .user_data = channel,
+            };
+            socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
+
             accept_ud.callback(accept_ud.user_data, err);
             return .disarm;
         };
         channel.handler_pipeline = p;
 
         transport.conn_initiator.initConn(any_rx_conn) catch |err| {
-            transport.allocator.destroy(channel);
-            transport.io_event_loop.handler_pipeline_pool.destroy(p);
+            const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
+            close_ud.* = .{
+                .channel = channel,
+                .callback = XevSocketChannel.noopCloseCB,
+                .user_data = channel,
+            };
+            socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
+
             accept_ud.callback(accept_ud.user_data, err);
             return .disarm;
         };
 
         accept_ud.callback(accept_ud.user_data, any_rx_conn);
-        p.fireActive();
+        p.fireActive() catch |err| {
+            accept_ud.callback(accept_ud.user_data, err);
+            return .disarm;
+        };
 
         const read_buf = transport.io_event_loop.read_buffer_pool.create() catch unreachable;
         const read_c = transport.io_event_loop.completion_pool.create() catch unreachable;
@@ -524,26 +531,41 @@ pub const XevTransport = struct {
         const channel = transport.allocator.create(XevSocketChannel) catch unreachable;
         channel.init(socket, transport, p2p_conn.Direction.OUTBOUND);
 
-        const p = transport.io_event_loop.handler_pipeline_pool.create() catch unreachable;
+        const handler_pipeline = transport.io_event_loop.handler_pipeline_pool.create() catch unreachable;
         const associated_conn = channel.any();
 
-        p.init(transport.allocator, associated_conn) catch |err| {
-            transport.allocator.destroy(channel);
-            transport.io_event_loop.handler_pipeline_pool.destroy(p);
+        handler_pipeline.init(transport.allocator, associated_conn) catch |err| {
+            const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
+            close_ud.* = .{
+                .channel = channel,
+                .callback = XevSocketChannel.noopCloseCB,
+                .user_data = channel,
+            };
+            socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
+
             connect.callback(connect.user_data, err);
             return .disarm;
         };
-        channel.handler_pipeline = p;
+        channel.handler_pipeline = handler_pipeline;
 
         transport.conn_initiator.initConn(associated_conn) catch |err| {
-            transport.allocator.destroy(channel);
-            transport.io_event_loop.handler_pipeline_pool.destroy(p);
+            const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
+            close_ud.* = .{
+                .channel = channel,
+                .callback = XevSocketChannel.noopCloseCB,
+                .user_data = channel,
+            };
+            socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
+
             connect.callback(connect.user_data, err);
             return .disarm;
         };
 
         connect.callback(connect.user_data, associated_conn);
-        p.fireActive();
+        handler_pipeline.fireActive() catch |err| {
+            connect.callback(connect.user_data, err);
+            return .disarm;
+        };
 
         const read_buf = transport.io_event_loop.read_buffer_pool.create() catch unreachable;
         const read_c = transport.io_event_loop.completion_pool.create() catch unreachable;
@@ -834,9 +856,9 @@ pub const ServerEchoHandler = struct {
     }
 
     // --- Actual Handler Implementations ---
-    pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+    pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) !void {
         _ = self;
-        ctx.fireActive();
+        try ctx.fireActive();
     }
 
     pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
@@ -844,11 +866,11 @@ pub const ServerEchoHandler = struct {
         ctx.fireInactive();
     }
 
-    pub fn onReadImpl(_: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+    pub fn onReadImpl(_: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) !void {
         var onWriteCallback = OnWriteCallback{};
         ctx.write(msg, &onWriteCallback, OnWriteCallback.callback);
 
-        ctx.fireRead(msg);
+        try ctx.fireRead(msg);
     }
 
     pub fn onReadCompleteImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
@@ -872,9 +894,9 @@ pub const ServerEchoHandler = struct {
     }
 
     // --- Static Wrapper Functions for HandlerVTable ---
-    fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+    fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.onActiveImpl(ctx);
+        return try self.onActiveImpl(ctx);
     }
 
     fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
@@ -882,9 +904,9 @@ pub const ServerEchoHandler = struct {
         return self.onInactiveImpl(ctx);
     }
 
-    fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+    fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.onReadImpl(ctx, msg);
+        return try self.onReadImpl(ctx, msg);
     }
 
     fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
@@ -981,9 +1003,9 @@ pub const ClientEchoHandler = struct {
     }
 
     // --- Actual Handler Implementations ---
-    pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+    pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) !void {
         _ = self;
-        ctx.fireActive();
+        try ctx.fireActive();
     }
 
     pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
@@ -991,11 +1013,11 @@ pub const ClientEchoHandler = struct {
         ctx.fireInactive();
     }
 
-    pub fn onReadImpl(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+    pub fn onReadImpl(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) !void {
         const len = msg.len;
         @memcpy(self.received_message[0..len], msg[0..len]);
         self.read.set();
-        ctx.fireRead(msg);
+        try ctx.fireRead(msg);
     }
 
     pub fn onReadCompleteImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
@@ -1021,9 +1043,9 @@ pub const ClientEchoHandler = struct {
     }
 
     // --- Static Wrapper Functions for HandlerVTable ---
-    fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+    fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.onActiveImpl(ctx);
+        return try self.onActiveImpl(ctx);
     }
 
     fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
@@ -1031,9 +1053,9 @@ pub const ClientEchoHandler = struct {
         return self.onInactiveImpl(ctx);
     }
 
-    fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+    fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.onReadImpl(ctx, msg);
+        return try self.onReadImpl(ctx, msg);
     }
 
     fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {

@@ -35,7 +35,6 @@ pub const Multistream = struct {
     }
 
     pub fn initConn(self: *Self, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void {
-        std.debug.print("Initializing Multistream Negotiator for connection\n", .{});
         // free negotiator when it be removed from the pipeline
         const negotiator = conn.getPipeline().allocator.create(Negotiator) catch unreachable;
 
@@ -188,7 +187,7 @@ pub const Negotiator = struct {
     }
 
     // --- Actual Handler Implementations ---
-    pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+    pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) !void {
         const is_initiator = ctx.conn.direction() == p2p_conn.Direction.OUTBOUND;
         const buffer = if (is_initiator) self.allocator.alloc(u8, TOTAL_MESSAGE_LENGTH * 2) catch unreachable else self.allocator.alloc(u8, TOTAL_MESSAGE_LENGTH) catch unreachable;
 
@@ -197,13 +196,13 @@ pub const Negotiator = struct {
 
         Self.writePacket(proto_writer, MULTISTREAM_PROTO) catch |err| {
             self.handleError(ctx, buffer, err);
-            return;
+            return err;
         };
 
         if (is_initiator) {
             Self.writePacket(proto_writer, self.protocols.?.items[0].*) catch |err| {
                 self.handleError(ctx, buffer, err);
-                return;
+                return err;
             };
         }
 
@@ -218,14 +217,15 @@ pub const Negotiator = struct {
     }
 
     pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
-        _ = self;
         ctx.fireInactive();
+        self.deinit();
+        ctx.pipeline.allocator.destroy(self);
     }
 
-    pub fn onReadImpl(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+    pub fn onReadImpl(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) !void {
         self.buffer.write(msg) catch |err| {
             self.handleError(ctx, null, err);
-            return;
+            return err;
         };
         while (true) {
             if (self.buffer.readableLength() < MAX_LENGTH_BYTES) {
@@ -238,7 +238,7 @@ pub const Negotiator = struct {
 
             const decoded_length_bytes = uvarint.decode(u16, &length_bytes) catch |err| {
                 self.handleError(ctx, null, err);
-                return;
+                return err;
             };
 
             // If there are remaining bytes in the buffer, put them back
@@ -246,7 +246,7 @@ pub const Negotiator = struct {
             if (decoded_length_bytes.remaining.len > 0) {
                 self.buffer.unget(decoded_length_bytes.remaining) catch |err| {
                     self.handleError(ctx, null, err);
-                    return;
+                    return err;
                 };
             }
 
@@ -254,7 +254,7 @@ pub const Negotiator = struct {
 
             if (proto_id_length > MAX_MULTISTREAM_MESSAGE_LENGTH) {
                 self.handleError(ctx, null, NegotiatorError.ProtocolIdTooLong);
-                return;
+                return NegotiatorError.ProtocolIdTooLong;
             }
 
             if (self.buffer.readableLength() < proto_id_length) {
@@ -268,7 +268,7 @@ pub const Negotiator = struct {
                 !std.mem.eql(u8, proto_id_bytes[proto_id_length - MESSAGE_SUFFIX_LENGTH .. proto_id_length], MESSAGE_SUFFIX))
             {
                 self.handleError(ctx, null, NegotiatorError.InvalidMultistreamSuffix);
-                return;
+                return NegotiatorError.InvalidMultistreamSuffix;
             }
 
             const proto_id = proto_id_bytes[0 .. proto_id_length - MESSAGE_SUFFIX_LENGTH];
@@ -276,7 +276,7 @@ pub const Negotiator = struct {
                 // If we haven't received the header yet, we expect the multistream protocol ID
                 if (!std.mem.eql(u8, proto_id, MULTISTREAM_PROTO)) {
                     self.handleError(ctx, null, NegotiatorError.FirstLineShouldBeMultistream);
-                    return;
+                    return NegotiatorError.FirstLineShouldBeMultistream;
                 } else {
                     self.state = .HEADER_RECEIVED;
                     continue;
@@ -297,7 +297,7 @@ pub const Negotiator = struct {
 
                         Self.writePacket(proto_writer, self.protocols.?.items[self.proposed_proto_index].*) catch |err| {
                             self.handleError(ctx, buffer, err);
-                            return;
+                            return err;
                         };
 
                         const callback_ctx = self.allocator.create(WriteCallbackContext) catch unreachable;
@@ -312,11 +312,10 @@ pub const Negotiator = struct {
                     } else {
                         // No more proposed protocols, handle error
                         self.handleError(ctx, null, NegotiatorError.AllProposedProtocolsRejected);
-                        return;
+                        return NegotiatorError.AllProposedProtocolsRejected;
                     }
                 } else {
-                    self.onProtoSelected(proto_id, ctx);
-                    return;
+                    return self.onProtoSelected(proto_id, ctx);
                 }
             } else {
                 // Responder
@@ -328,7 +327,7 @@ pub const Negotiator = struct {
 
                         Self.writePacket(proto_writer, proto_id) catch |err| {
                             self.handleError(ctx, buffer, err);
-                            return;
+                            return err;
                         };
 
                         const callback_ctx = self.allocator.create(WriteCallbackContext) catch unreachable;
@@ -339,8 +338,7 @@ pub const Negotiator = struct {
                         };
                         ctx.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
 
-                        self.onProtoSelected(proto_id, ctx);
-                        return;
+                        return self.onProtoSelected(proto_id, ctx);
                     }
                 }
 
@@ -350,7 +348,7 @@ pub const Negotiator = struct {
 
                 Self.writePacket(proto_writer, NA) catch |err| {
                     self.handleError(ctx, buffer, err);
-                    return;
+                    return err;
                 };
 
                 const callback_ctx = self.allocator.create(WriteCallbackContext) catch unreachable;
@@ -385,9 +383,9 @@ pub const Negotiator = struct {
     }
 
     // --- Static Wrapper Functions for HandlerVTable ---
-    fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+    fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.onActiveImpl(ctx);
+        return try self.onActiveImpl(ctx);
     }
 
     fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
@@ -395,9 +393,9 @@ pub const Negotiator = struct {
         return self.onInactiveImpl(ctx);
     }
 
-    fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) void {
+    fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.onReadImpl(ctx, msg);
+        return try self.onReadImpl(ctx, msg);
     }
 
     fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
@@ -437,21 +435,10 @@ pub const Negotiator = struct {
 
     // Helper function for error handling with buffer cleanup
     fn handleError(self: *Self, ctx: *p2p_conn.HandlerContext, buffer_slice: ?[]u8, err: anyerror) void {
-        ctx.fireErrorCaught(err);
-        std.debug.print("Multistream Negotiator error: {}\n", .{err});
         if (buffer_slice) |slice| {
             self.allocator.free(slice);
         }
-        std.debug.print("Cleaning up Multistream Negotiator resources\n", .{});
-        defer self.deinit();
-        const close_ctx = ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
-        close_ctx.* = .{
-            .ctx = ctx,
-        };
-        std.debug.print("Closing context after error\n", .{});
-        ctx.close(null, struct {
-            fn callback(_: ?*anyopaque, _: anyerror!void) void {}
-        }.callback);
+        ctx.fireErrorCaught(err);
     }
 
     fn writePacket(writer: anytype, proto: []const u8) !void {
@@ -460,7 +447,7 @@ pub const Negotiator = struct {
         try writer.writeAll(MESSAGE_SUFFIX);
     }
 
-    fn onProtoSelected(self: *Self, proto_id: []const u8, ctx: *p2p_conn.HandlerContext) void {
+    fn onProtoSelected(self: *Self, proto_id: []const u8, ctx: *p2p_conn.HandlerContext) !void {
         self.state = .PROTOCOL_SELECTED;
         var selected_proto_binding: AnyProtocolBinding = undefined;
 
@@ -477,9 +464,11 @@ pub const Negotiator = struct {
             // to the selected protocol handler.
             // This is necessary to ensure that any remaining data in the buffer
             // is not lost and can be processed by the selected protocol handler.
-            ctx.fireRead(self.buffer.readableSlice(0));
+            try ctx.fireRead(self.buffer.readableSlice(0));
         }
-        _ = ctx.pipeline.remove("mss") catch unreachable;
+        _ = try ctx.pipeline.remove("mss");
+        self.deinit();
+        ctx.pipeline.allocator.destroy(self);
     }
 };
 
