@@ -9,22 +9,6 @@ pub const WriteFuture = Future(usize, anyerror);
 pub const CloseFuture = Future(void, anyerror);
 pub const Direction = enum { INBOUND, OUTBOUND };
 
-pub const ConnUpgraderVTable = struct {
-    initConnFn: *const fn (instance: *anyopaque, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void,
-};
-
-pub const AnyConnUpgrader = struct {
-    instance: *anyopaque,
-    vtable: *const ConnUpgraderVTable,
-
-    const Self = @This();
-    pub const Error = anyerror;
-
-    pub fn initConn(self: Self, conn: AnyRxConn, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void {
-        return self.vtable.initConnFn(self.instance, conn, user_data, callback);
-    }
-};
-
 /// ConnInitiator interface for initializing connections.
 /// This is used to set up the connection before it is used.
 pub const ConnInitiatorVTable = struct {
