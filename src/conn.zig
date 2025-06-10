@@ -9,23 +9,23 @@ pub const WriteFuture = Future(usize, anyerror);
 pub const CloseFuture = Future(void, anyerror);
 pub const Direction = enum { INBOUND, OUTBOUND };
 
-/// ConnInitiator interface for initializing connections.
+/// ConnEnhancer interface for initializing connections.
 /// This is used to set up the connection before it is used.
-pub const ConnInitiatorVTable = struct {
-    initConnFn: *const fn (instance: *anyopaque, conn: AnyConn) anyerror!void,
+pub const ConnEnhancerVTable = struct {
+    enhanceConnFn: *const fn (instance: *anyopaque, conn: AnyConn) anyerror!void,
 };
 
-/// AnyConnInitiator is a struct that holds the instance and vtable for the ConnInitiator interface.
+/// AnyConnEnhancer is a struct that holds the instance and vtable for the ConnEnhancer interface.
 /// It is used to initialize connections before they are used.
-pub const AnyConnInitiator = struct {
+pub const AnyConnEnhancer = struct {
     instance: *anyopaque,
-    vtable: *const ConnInitiatorVTable,
+    vtable: *const ConnEnhancerVTable,
 
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn initConn(self: Self, conn: AnyConn) Error!void {
-        return self.vtable.initConnFn(self.instance, conn);
+    pub fn enhanceConn(self: Self, conn: AnyConn) Error!void {
+        return self.vtable.enhanceConnFn(self.instance, conn);
     }
 };
 

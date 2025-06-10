@@ -374,7 +374,7 @@ pub const XevListener = struct {
         };
         channel.handler_pipeline = p;
 
-        transport.conn_initiator.initConn(any_rx_conn) catch |err| {
+        transport.conn_enhancer.enhanceConn(any_rx_conn) catch |err| {
             const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
             close_ud.* = .{
                 .channel = channel,
@@ -405,7 +405,7 @@ pub const XevListener = struct {
 pub const XevTransport = struct {
     pub const DialError = Allocator.Error || xev.ConnectError || error{AsyncNotifyFailed};
 
-    conn_initiator: p2p_conn.AnyConnInitiator,
+    conn_enhancer: p2p_conn.AnyConnEnhancer,
 
     io_event_loop: *io_loop.ThreadEventLoop,
 
@@ -422,9 +422,9 @@ pub const XevTransport = struct {
     };
 
     /// Initialize the transport with the given allocator and options.
-    pub fn init(self: *XevTransport, conn_initiator: p2p_conn.AnyConnInitiator, loop: *io_loop.ThreadEventLoop, allocator: Allocator, opts: Options) !void {
+    pub fn init(self: *XevTransport, conn_enhancer: p2p_conn.AnyConnEnhancer, loop: *io_loop.ThreadEventLoop, allocator: Allocator, opts: Options) !void {
         self.* = .{
-            .conn_initiator = conn_initiator,
+            .conn_enhancer = conn_enhancer,
             .io_event_loop = loop,
             .options = opts,
             .allocator = allocator,
@@ -548,7 +548,7 @@ pub const XevTransport = struct {
         };
         channel.handler_pipeline = handler_pipeline;
 
-        transport.conn_initiator.initConn(associated_conn) catch |err| {
+        transport.conn_enhancer.enhanceConn(associated_conn) catch |err| {
             const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
             close_ud.* = .{
                 .channel = channel,
@@ -628,11 +628,11 @@ const MockConnInitiator = struct {
     }
 
     // Static VTable instance
-    const vtable_instance = p2p_conn.ConnInitiatorVTable{
-        .initConnFn = vtableInitConnFn,
+    const vtable_instance = p2p_conn.ConnEnhancerVTable{
+        .enhanceConnFn = vtableInitConnFn,
     };
 
-    pub fn any(self: *Self) p2p_conn.AnyConnInitiator {
+    pub fn any(self: *Self) p2p_conn.AnyConnEnhancer {
         return .{
             .instance = self,
             .vtable = &vtable_instance,
@@ -669,11 +669,11 @@ const MockConnInitiator1 = struct {
     }
 
     // Static VTable instance
-    const vtable_instance = p2p_conn.ConnInitiatorVTable{
-        .initConnFn = vtableInitConnFn,
+    const vtable_instance = p2p_conn.ConnEnhancerVTable{
+        .enhanceConnFn = vtableInitConnFn,
     };
 
-    pub fn any(self: *Self) p2p_conn.AnyConnInitiator {
+    pub fn any(self: *Self) p2p_conn.AnyConnEnhancer {
         return .{
             .instance = self,
             .vtable = &vtable_instance,

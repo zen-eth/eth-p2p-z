@@ -86,11 +86,11 @@ pub const Upgrader = struct {
     }
 
     // Static VTable instance
-    const vtable_instance = p2p_conn.ConnInitiatorVTable{
-        .initConnFn = vtableInitConnFn,
+    const vtable_instance = p2p_conn.ConnEnhancerVTable{
+        .enhanceConnFn = vtableInitConnFn,
     };
 
-    pub fn any(self: *Self) p2p_conn.AnyConnInitiator {
+    pub fn any(self: *Self) p2p_conn.AnyConnEnhancer {
         return .{
             .instance = self,
             .vtable = &vtable_instance,
