@@ -44,7 +44,7 @@ pub const InsecureChannel = struct {
 
     pub fn initConn(
         _: *Self,
-        conn: p2p_conn.AnyRxConn,
+        conn: p2p_conn.AnyConn,
         _: ProtocolId,
         user_data: ?*anyopaque,
         callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void,
@@ -65,7 +65,7 @@ pub const InsecureChannel = struct {
 
     pub fn vtableInitConnFn(
         instance: *anyopaque,
-        conn: p2p_conn.AnyRxConn,
+        conn: p2p_conn.AnyConn,
         protocol_id: ProtocolId,
         user_data: ?*anyopaque,
         callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void,

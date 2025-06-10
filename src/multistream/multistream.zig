@@ -3,7 +3,7 @@ const proto_binding = @import("protocol_binding.zig");
 const AnyProtocolBinding = proto_binding.AnyProtocolBinding;
 const ArrayList = std.ArrayList;
 const p2p_conn = @import("../conn.zig");
-const AnyRxConn = p2p_conn.AnyRxConn;
+const AnyRxConn = p2p_conn.AnyConn;
 const ProtocolId = @import("../protocol_id.zig").ProtocolId;
 const ProtoMatcher = @import("protocol_matcher.zig").ProtocolMatcher;
 const multiformats = @import("multiformats");
@@ -484,13 +484,13 @@ pub const Negotiator = struct {
 };
 
 const ConnHolder = struct {
-    channel: ?p2p_conn.AnyRxConn = null,
+    channel: ?p2p_conn.AnyConn = null,
     ready: std.Thread.ResetEvent = .{},
     err: ?anyerror = null,
 
     const Self = @This();
 
-    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
+    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyConn) void {
         const self: *ConnHolder = @ptrCast(@alignCast(opaque_userdata.?));
 
         const accepted_channel = accept_result catch |err| {

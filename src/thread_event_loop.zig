@@ -29,14 +29,14 @@ pub const IOAction = union(enum) {
         address: std.net.Address,
         transport: *xev_tcp.XevTransport,
         timeout_ms: u64 = 30000,
-        callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void,
         user_data: ?*anyopaque = null,
     },
     accept: struct {
         server: xev.TCP,
         transport: *xev_tcp.XevTransport,
         timeout_ms: u64,
-        callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void,
+        callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void,
         user_data: ?*anyopaque = null,
     },
     write: struct {
@@ -67,7 +67,7 @@ pub const Connect = struct {
 
     user_data: ?*anyopaque = null,
 
-    callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void,
+    callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void,
 };
 
 pub const Write = struct {
@@ -91,7 +91,7 @@ pub const Accept = struct {
 
     user_data: ?*anyopaque = null,
 
-    callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void,
+    callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void,
 };
 
 /// Represents a message for I/O operations in the event loop.
@@ -106,7 +106,7 @@ pub const IOMessage = struct {
 };
 
 pub const NoOPContext = struct {
-    conn: ?conn.AnyRxConn = null,
+    conn: ?conn.AnyConn = null,
     ctx: ?*conn.HandlerContext = null,
 };
 

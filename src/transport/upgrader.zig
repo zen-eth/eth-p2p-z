@@ -17,7 +17,7 @@ pub const Upgrader = struct {
     const Self = @This();
 
     const SecurityUpgradeCallbackContext = struct {
-        conn: p2p_conn.AnyRxConn,
+        conn: p2p_conn.AnyConn,
     };
 
     const SecurityUpgradeCallback = struct {
@@ -50,7 +50,7 @@ pub const Upgrader = struct {
 
     pub fn upgradeSecuritySession(
         self: *const Upgrader,
-        conn: p2p_conn.AnyRxConn,
+        conn: p2p_conn.AnyConn,
     ) void {
         const security_ctx = conn.getPipeline().allocator.create(SecurityUpgradeCallbackContext) catch |err| {
             conn.getPipeline().fireErrorCaught(err);
@@ -74,13 +74,13 @@ pub const Upgrader = struct {
         ms.initConn(conn, security_ctx, SecurityUpgradeCallback.callback);
     }
 
-    pub fn initConnImpl(self: *Self, conn: p2p_conn.AnyRxConn) !void {
+    pub fn initConnImpl(self: *Self, conn: p2p_conn.AnyConn) !void {
         // Start the security upgrade process
         self.upgradeSecuritySession(conn);
     }
 
     // Static wrapper function for the VTable
-    fn vtableInitConnFn(instance: *anyopaque, conn: p2p_conn.AnyRxConn) !void {
+    fn vtableInitConnFn(instance: *anyopaque, conn: p2p_conn.AnyConn) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.initConnImpl(conn);
     }

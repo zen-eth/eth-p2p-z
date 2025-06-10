@@ -14,7 +14,7 @@ const conn = @import("conn.zig");
 /// connection. The `anyerror` type is used to represent any error that may occur
 /// during the acceptance of a connection.
 pub const ListenerVTable = struct {
-    acceptFn: *const fn (instance: *anyopaque, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void) void,
+    acceptFn: *const fn (instance: *anyopaque, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void) void,
 };
 
 /// AnyListener is a struct that uses the VTable pattern to provide a type-erased
@@ -36,7 +36,7 @@ pub const AnyListener = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn accept(self: Self, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void) void {
+    pub fn accept(self: Self, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void) void {
         self.vtable.acceptFn(self.instance, user_data, callback);
     }
 };
@@ -50,7 +50,7 @@ pub const AnyListener = struct {
 /// The `listenFn` function pointer is used to call the appropriate implementation
 /// of the listen function for the specific transport instance.
 pub const TransportVTable = struct {
-    dialFn: *const fn (instance: *anyopaque, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void) void,
+    dialFn: *const fn (instance: *anyopaque, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void) void,
     listenFn: *const fn (instance: *anyopaque, addr: std.net.Address) anyerror!AnyListener,
 };
 
@@ -76,7 +76,7 @@ pub const AnyTransport = struct {
     pub const Error = anyerror;
 
     /// Dials a remote address via the underlying transport implementation.
-    pub fn dial(self: Self, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyRxConn) void) void {
+    pub fn dial(self: Self, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void) void {
         self.vtable.dialFn(self.instance, addr, user_data, callback);
     }
 

@@ -3,7 +3,7 @@ const ProtocolId = @import("../protocol_id.zig").ProtocolId;
 const ProtocolDescriptor = @import("./protocol_descriptor.zig").ProtocolDescriptor;
 const std = @import("std");
 
-pub const ProtocolBindingVTable = struct { initConnFn: *const fn (instance: *anyopaque, conn: p2p_conn.AnyRxConn, protocol_id: ProtocolId, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void, protoDescFn: *const fn (instance: *anyopaque) *ProtocolDescriptor };
+pub const ProtocolBindingVTable = struct { initConnFn: *const fn (instance: *anyopaque, conn: p2p_conn.AnyConn, protocol_id: ProtocolId, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void) void, protoDescFn: *const fn (instance: *anyopaque) *ProtocolDescriptor };
 
 pub const AnyProtocolBinding = struct {
     vtable: *const ProtocolBindingVTable,
@@ -14,7 +14,7 @@ pub const AnyProtocolBinding = struct {
 
     pub fn initConn(
         self: *const Self,
-        conn: p2p_conn.AnyRxConn,
+        conn: p2p_conn.AnyConn,
         protocol_id: ProtocolId,
         user_data: ?*anyopaque,
         callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void,

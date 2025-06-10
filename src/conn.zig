@@ -12,7 +12,7 @@ pub const Direction = enum { INBOUND, OUTBOUND };
 /// ConnInitiator interface for initializing connections.
 /// This is used to set up the connection before it is used.
 pub const ConnInitiatorVTable = struct {
-    initConnFn: *const fn (instance: *anyopaque, conn: AnyRxConn) anyerror!void,
+    initConnFn: *const fn (instance: *anyopaque, conn: AnyConn) anyerror!void,
 };
 
 /// AnyConnInitiator is a struct that holds the instance and vtable for the ConnInitiator interface.
@@ -24,7 +24,7 @@ pub const AnyConnInitiator = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn initConn(self: Self, conn: AnyRxConn) Error!void {
+    pub fn initConn(self: Self, conn: AnyConn) Error!void {
         return self.vtable.initConnFn(self.instance, conn);
     }
 };
@@ -88,25 +88,25 @@ pub const AnyHandler = struct {
     }
 };
 
-/// Reactive connection interface for handling read/write operations.
+/// Connection interface for handling read/write operations.
 /// This interface is used to abstract the underlying connection implementation.
-pub const RxConnVTable = struct {
+pub const ConnVTable = struct {
     writeFn: *const fn (
         instance: *anyopaque,
         buffer: []const u8,
-        erased_userdata: ?*anyopaque,
-        wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
+        cb_instance: ?*anyopaque,
+        cb: *const fn (instance: ?*anyopaque, r: anyerror!usize) void,
     ) void,
-    closeFn: *const fn (instance: *anyopaque, erased_userdata: ?*anyopaque, wrapped_cb: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void,
-    getPipelineFn: *const fn (instance: *anyopaque) *HandlerPipeline,
+    closeFn: *const fn (instance: *anyopaque, cb_instance: ?*anyopaque, cb: *const fn (instance: ?*anyopaque, r: anyerror!void) void) void,
+    handlerPipelineFn: *const fn (instance: *anyopaque) *HandlerPipeline,
     directionFn: *const fn (instance: *anyopaque) Direction,
 };
 
-/// AnyRxConn is a struct that holds the instance and vtable for the Reactive connection interface.
+/// AnyConn is a struct that holds the instance and vtable for the Reactive connection interface.
 /// It is used to perform read/write operations on the connection.
-pub const AnyRxConn = struct {
+pub const AnyConn = struct {
     instance: *anyopaque,
-    vtable: *const RxConnVTable,
+    vtable: *const ConnVTable,
 
     const Self = @This();
     pub const Error = anyerror;
@@ -115,7 +115,7 @@ pub const AnyRxConn = struct {
         return self.vtable.directionFn(self.instance);
     }
     pub fn getPipeline(self: Self) *HandlerPipeline {
-        return self.vtable.getPipelineFn(self.instance);
+        return self.vtable.handlerPipelineFn(self.instance);
     }
     pub fn write(
         self: Self,
@@ -144,7 +144,7 @@ pub const HandlerContext = struct {
     name: []const u8,
     handler: AnyHandler,
     pipeline: *HandlerPipeline,
-    conn: AnyRxConn,
+    conn: AnyConn,
     next_context: ?*HandlerContext = null,
     prev_context: ?*HandlerContext = null,
 
@@ -208,7 +208,7 @@ pub const HandlerContext = struct {
 /// The head handler is a special case in the pipeline, as it does not have a previous context.
 /// It is the entry point for inbound events and the exit point for outbound events.
 const HeadHandlerImpl = struct {
-    conn: AnyRxConn,
+    conn: AnyConn,
 
     pub const Self = @This();
 
@@ -483,14 +483,14 @@ pub const HandlerPipeline = struct {
     mempool: *MemoryPool,
     head: HandlerContext,
     tail: HandlerContext,
-    conn: AnyRxConn,
+    conn: AnyConn,
 
     head_handler_impl: HeadHandlerImpl,
     tail_handler_impl: TailHandlerImpl,
 
     const Self = @This();
 
-    pub fn init(self: *Self, allocator: std.mem.Allocator, associated_conn: AnyRxConn) !void {
+    pub fn init(self: *Self, allocator: std.mem.Allocator, associated_conn: AnyConn) !void {
         var mempool = try allocator.create(MemoryPool);
         errdefer allocator.destroy(mempool);
 
@@ -815,14 +815,14 @@ const MockRxConnImpl = struct {
     }
 
     // --- Static VTable Instance ---
-    const vtable_instance = RxConnVTable{
-        .getPipelineFn = vtableGetPipelineFn,
+    const vtable_instance = ConnVTable{
+        .handlerPipelineFn = vtableGetPipelineFn,
         .directionFn = vtableDirectionFn,
         .writeFn = vtableWriteFn,
         .closeFn = vtableCloseFn,
     };
 
-    pub fn any(self: *Self) AnyRxConn {
+    pub fn any(self: *Self) AnyConn {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 };

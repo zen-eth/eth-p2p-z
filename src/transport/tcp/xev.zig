@@ -126,14 +126,14 @@ pub const XevSocketChannel = struct {
     }
 
     // --- Static VTable Instance ---
-    const vtable_instance = p2p_conn.RxConnVTable{
-        .getPipelineFn = vtableGetPipelineFn,
+    const vtable_instance = p2p_conn.ConnVTable{
+        .handlerPipelineFn = vtableGetPipelineFn,
         .directionFn = vtableDirectionFn,
         .writeFn = vtableWriteFn,
         .closeFn = vtableCloseFn,
     };
 
-    pub fn any(self: *XevSocketChannel) p2p_conn.AnyRxConn {
+    pub fn any(self: *XevSocketChannel) p2p_conn.AnyConn {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 
@@ -300,7 +300,7 @@ pub const XevListener = struct {
     }
 
     /// Accept asynchronously accept a connection from the listener. It does not block. If an error occurs, it returns the error.
-    pub fn accept(self: *XevListener, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyRxConn) void) void {
+    pub fn accept(self: *XevListener, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyConn) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
             const accept_ud = self.transport.io_event_loop.accept_pool.create() catch unreachable;
@@ -323,7 +323,7 @@ pub const XevListener = struct {
     }
 
     // --- Static Wrapper Function for ListenerVTable ---
-    fn vtableAcceptFn(instance: *anyopaque, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyRxConn) void) void {
+    fn vtableAcceptFn(instance: *anyopaque, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyConn) void) void {
         const self: *XevListener = @ptrCast(@alignCast(instance));
         return self.accept(user_data, callback);
     }
@@ -435,7 +435,7 @@ pub const XevTransport = struct {
     pub fn deinit(_: *XevTransport) void {}
 
     /// Dial connects to the given address and creates a channel for communication. It blocks until the connection is established. If an error occurs, it returns the error.
-    pub fn dial(self: *XevTransport, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyRxConn) void) void {
+    pub fn dial(self: *XevTransport, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyConn) void) void {
         if (self.io_event_loop.inEventLoopThread()) {
             var socket = xev.TCP.init(addr) catch unreachable;
             const c = self.io_event_loop.completion_pool.create() catch unreachable;
@@ -480,7 +480,7 @@ pub const XevTransport = struct {
     }
 
     // --- Static Wrapper Functions for TransportVTable ---
-    fn vtableDialFn(instance: *anyopaque, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyRxConn) void) void {
+    fn vtableDialFn(instance: *anyopaque, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyConn) void) void {
         const self: *XevTransport = @ptrCast(@alignCast(instance));
         return self.dial(addr, user_data, callback);
     }
@@ -615,14 +615,14 @@ const MockConnInitiator = struct {
 
     const Self = @This();
 
-    pub fn initConnImpl(self: *Self, conn: p2p_conn.AnyRxConn) Error!void {
+    pub fn initConnImpl(self: *Self, conn: p2p_conn.AnyConn) Error!void {
         _ = self;
         _ = conn;
         return;
     }
 
     // Static wrapper function for the VTable
-    fn vtableInitConnFn(instance: *anyopaque, conn: p2p_conn.AnyRxConn) Error!void {
+    fn vtableInitConnFn(instance: *anyopaque, conn: p2p_conn.AnyConn) Error!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.initConnImpl(conn);
     }
@@ -654,7 +654,7 @@ const MockConnInitiator1 = struct {
         };
     }
 
-    pub fn initConnImpl(self: *Self, conn: p2p_conn.AnyRxConn) Error!void {
+    pub fn initConnImpl(self: *Self, conn: p2p_conn.AnyConn) Error!void {
         if (self.handler_to_add) |handler| {
             const pipeline = conn.getPipeline();
             try pipeline.addLast("handler", handler);
@@ -663,7 +663,7 @@ const MockConnInitiator1 = struct {
     }
 
     // Static wrapper function for the VTable
-    fn vtableInitConnFn(instance: *anyopaque, conn: p2p_conn.AnyRxConn) Error!void {
+    fn vtableInitConnFn(instance: *anyopaque, conn: p2p_conn.AnyConn) Error!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.initConnImpl(conn);
     }
@@ -682,11 +682,11 @@ const MockConnInitiator1 = struct {
 };
 
 const ConnHolder = struct {
-    channel: p2p_conn.AnyRxConn,
+    channel: p2p_conn.AnyConn,
     ready: std.Thread.ResetEvent = .{},
     err: ?anyerror = null,
 
-    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
+    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyConn) void {
         const self: *@This() = @ptrCast(@alignCast(opaque_userdata.?));
 
         const accepted_channel = accept_result catch |err| {
@@ -821,7 +821,7 @@ pub const ServerEchoHandler = struct {
 
     received_message: []u8,
 
-    channel: p2p_conn.AnyRxConn,
+    channel: p2p_conn.AnyConn,
 
     ready: std.Thread.ResetEvent = .{},
 
@@ -842,7 +842,7 @@ pub const ServerEchoHandler = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
+    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyConn) void {
         const self: *@This() = @ptrCast(@alignCast(opaque_userdata.?));
 
         const accepted_channel = accept_result catch |err| {
@@ -952,7 +952,7 @@ pub const ClientEchoHandler = struct {
 
     read: std.Thread.ResetEvent = .{},
 
-    channel: p2p_conn.AnyRxConn,
+    channel: p2p_conn.AnyConn,
 
     ready: std.Thread.ResetEvent = .{},
 
@@ -989,7 +989,7 @@ pub const ClientEchoHandler = struct {
         self.written_ready.set();
     }
 
-    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyRxConn) void {
+    pub fn init(opaque_userdata: ?*anyopaque, accept_result: anyerror!p2p_conn.AnyConn) void {
         const self: *@This() = @ptrCast(@alignCast(opaque_userdata.?));
 
         const accepted_channel = accept_result catch |err| {
