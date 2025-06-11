@@ -25,6 +25,8 @@ pub const XevSocketChannel = struct {
 
     handler_pipeline: *p2p_conn.HandlerPipeline,
 
+    session: ?p2p_conn.SecuritySession = null,
+
     // TODO: MAKE TIMEOUTS CONFIGURABLE
     write_timeout_ms: u64 = 30000,
 
@@ -95,6 +97,14 @@ pub const XevSocketChannel = struct {
         return self.handler_pipeline;
     }
 
+    pub fn setSession(self: *XevSocketChannel, session: p2p_conn.SecuritySession) void {
+        self.session = session;
+    }
+
+    pub fn getSession(self: *XevSocketChannel) ?p2p_conn.SecuritySession {
+        return self.session;
+    }
+
     // --- Static Wrapper Functions ---
     fn vtableGetPipelineFn(instance: *anyopaque) *p2p_conn.HandlerPipeline {
         const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
@@ -125,12 +135,23 @@ pub const XevSocketChannel = struct {
         return self.close(user_data, callback);
     }
 
+    fn vtableGetSessionFn(instance: *anyopaque) ?p2p_conn.SecuritySession {
+        const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
+        return self.getSession();
+    }
+
+    fn vtableSetSessionFn(instance: *anyopaque, session: p2p_conn.SecuritySession) void {
+        const self: *XevSocketChannel = @ptrCast(@alignCast(instance));
+        self.setSession(session);
+    }
     // --- Static VTable Instance ---
     const vtable_instance = p2p_conn.ConnVTable{
         .handlerPipelineFn = vtableGetPipelineFn,
         .directionFn = vtableDirectionFn,
         .writeFn = vtableWriteFn,
         .closeFn = vtableCloseFn,
+        .securitySessionFn = vtableGetSessionFn,
+        .setSecuritySessionFn = vtableSetSessionFn,
     };
 
     pub fn any(self: *XevSocketChannel) p2p_conn.AnyConn {

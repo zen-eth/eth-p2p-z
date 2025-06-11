@@ -4,6 +4,7 @@ const testing = std.testing;
 const Thread = std.Thread;
 const Future = @import("concurrent/future.zig").Future;
 const io_loop = @import("thread_event_loop.zig");
+pub const SecuritySession = @import("./security/session.zig").Session;
 
 pub const WriteFuture = Future(usize, anyerror);
 pub const CloseFuture = Future(void, anyerror);
@@ -100,6 +101,8 @@ pub const ConnVTable = struct {
     closeFn: *const fn (instance: *anyopaque, cb_instance: ?*anyopaque, cb: *const fn (instance: ?*anyopaque, r: anyerror!void) void) void,
     handlerPipelineFn: *const fn (instance: *anyopaque) *HandlerPipeline,
     directionFn: *const fn (instance: *anyopaque) Direction,
+    setSecuritySessionFn: *const fn (instance: *anyopaque, session: SecuritySession) void,
+    securitySessionFn: *const fn (instance: *anyopaque) ?SecuritySession,
 };
 
 /// AnyConn is a struct that holds the instance and vtable for the Reactive connection interface.
@@ -132,6 +135,14 @@ pub const AnyConn = struct {
         callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
     ) void {
         self.vtable.closeFn(self.instance, userdata, callback);
+    }
+
+    pub fn setSecuritySession(self: Self, session: SecuritySession) void {
+        self.vtable.setSecuritySessionFn(self.instance, session);
+    }
+
+    pub fn securitySession(self: Self) ?SecuritySession {
+        return self.vtable.securitySessionFn(self.instance);
     }
 };
 
@@ -784,6 +795,18 @@ const MockRxConnImpl = struct {
         return self.pipeline orelse @panic("Pipeline not set in MockRxConnImpl");
     }
 
+    pub fn setSecuritySession(self: *Self, session: SecuritySession) void {
+        // Mock implementation does not handle security sessions
+        _ = session;
+        _ = self;
+    }
+
+    pub fn securitySession(self: *Self) ?SecuritySession {
+        _ = self;
+        // Mock implementation does not handle security sessions
+        return null;
+    }
+
     // --- Static Wrapper Functions ---
     fn vtableWriteFn(
         instance: *anyopaque,
@@ -814,12 +837,24 @@ const MockRxConnImpl = struct {
         return self.direction();
     }
 
+    fn vtableSetSecuritySessionFn(instance: *anyopaque, session: SecuritySession) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.setSecuritySession(session);
+    }
+
+    fn vtableSecuritySessionFn(instance: *anyopaque) ?SecuritySession {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.securitySession();
+    }
+
     // --- Static VTable Instance ---
     const vtable_instance = ConnVTable{
         .handlerPipelineFn = vtableGetPipelineFn,
         .directionFn = vtableDirectionFn,
         .writeFn = vtableWriteFn,
         .closeFn = vtableCloseFn,
+        .setSecuritySessionFn = vtableSetSecuritySessionFn,
+        .securitySessionFn = vtableSecuritySessionFn,
     };
 
     pub fn any(self: *Self) AnyConn {
