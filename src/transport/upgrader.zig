@@ -26,8 +26,10 @@ pub const Upgrader = struct {
 
             if (r) |result| {
                 const security_session: *SecuritySession = @ptrCast(@alignCast(result.?));
-                // TODO: Set the security session on the connection
                 std.debug.print("Security session upgraded successfully: {}\n", .{security_session.*});
+
+                s_ctx.conn.setSecuritySession(security_session.*);
+                s_ctx.conn.getPipeline().allocator.destroy(security_session);
             } else |err| {
                 s_ctx.conn.getPipeline().fireErrorCaught(err);
                 const close_ctx = s_ctx.conn.getPipeline().mempool.io_no_op_context_pool.create() catch unreachable;

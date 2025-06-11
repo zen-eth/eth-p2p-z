@@ -145,7 +145,8 @@ pub const InsecureHandler = struct {
                     .remote_id = "mock_remote_id",
                     .remote_public_key = "mock_remote_key",
                 };
-                // TODO: Set the session on the connection
+                std.debug.print("Handshake successful, session created: {}\n", .{session.*});
+                self.on_handshake_callback(self.on_handshake_context, session);
                 if (ctx.conn.direction() == .INBOUND) {
                     const server_handler = xev_tcp.xev_transport.ServerEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
                     const server_handler_any = server_handler.any();
