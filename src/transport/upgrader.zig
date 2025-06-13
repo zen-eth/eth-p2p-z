@@ -26,7 +26,6 @@ pub const Upgrader = struct {
 
             if (r) |result| {
                 const security_session: *SecuritySession = @ptrCast(@alignCast(result.?));
-                std.debug.print("Security session upgraded successfully: {}\n", .{security_session.*});
 
                 s_ctx.conn.setSecuritySession(security_session.*);
                 s_ctx.conn.getPipeline().allocator.destroy(security_session);

@@ -600,8 +600,8 @@ pub const HandlerPipeline = struct {
 
     /// Removes a handler by its name from the pipeline.
     /// Deallocates the HandlerContext. The handler instance itself is not deinitialized by this function.
-    /// The caller is responsible for deinitializing the actual handler instance if needed.
-    pub fn remove(self: *Self, name: []const u8) !AnyHandler {
+    /// The caller is responsible for deinitializing the HandlerContext instance if needed.
+    pub fn remove(self: *Self, name: []const u8) !*HandlerContext {
         var current = self.head.next_context;
         while (current != null and current != &self.tail) : (current = current.?.next_context) {
             const ctx_to_check = current.?;
@@ -612,9 +612,7 @@ pub const HandlerPipeline = struct {
                 prev_ctx.next_context = next_ctx;
                 next_ctx.prev_context = prev_ctx;
 
-                const ctx_to_check_handler = ctx_to_check.handler;
-                self.allocator.destroy(ctx_to_check);
-                return ctx_to_check_handler;
+                return ctx_to_check;
             }
         }
         return error.NotFound;
@@ -992,7 +990,8 @@ test "HandlerPipeline.remove functionality" {
     try pipeline.addLast("h3", h3);
 
     // Remove handler h2: HEAD <> h1 <> h3 <> TAIL
-    _ = try pipeline.remove("h2");
+    const context2 = try pipeline.remove("h2");
+    defer allocator.destroy(context2);
 
     // 1. Test Inbound Event (fireRead)
     // Expected: HEAD -> h1.onRead -> h3.onRead -> TAIL
@@ -1042,7 +1041,8 @@ test "HandlerPipeline.remove functionality" {
     try testing.expectError(error.NotFound, remove_non_existent_result);
 
     // 4. Test removing handler h1: HEAD <> h3 <> TAIL
-    _ = try pipeline.remove("h1");
+    const context1 = try pipeline.remove("h1");
+    defer allocator.destroy(context1);
     @memset(mh1_impl.read_msg, 0);
     @memset(mh3_impl.read_msg, 0);
     try pipeline.fireRead("inbound after h1 remove");
@@ -1055,7 +1055,8 @@ test "HandlerPipeline.remove functionality" {
     }
 
     // 5. Test removing handler h3: HEAD <> TAIL (empty user pipeline)
-    _ = try pipeline.remove("h3");
+    const context3 = try pipeline.remove("h3");
+    defer allocator.destroy(context3);
     @memset(mh3_impl.read_msg, 0);
     @memset(mock_conn_impl_val.write_msg, 0);
 

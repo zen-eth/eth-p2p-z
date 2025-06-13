@@ -49,7 +49,6 @@ pub const InsecureChannel = struct {
         user_data: ?*anyopaque,
         callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void,
     ) void {
-        std.debug.print("InsecureChannel.initConn called with conn: {}\n", .{conn});
         const handler: *InsecureHandler = conn.getPipeline().allocator.create(InsecureHandler) catch unreachable;
         handler.init(user_data, callback);
         // Free the handler when it is removed from the pipeline
@@ -114,8 +113,10 @@ pub const InsecureHandler = struct {
         on_handshake_context: ?*anyopaque,
         on_handshake_callback: *const fn (ud: ?*anyopaque, r: anyerror!?*anyopaque) void,
     ) void {
-        self.on_handshake_context = on_handshake_context;
-        self.on_handshake_callback = on_handshake_callback;
+        self.* = .{
+            .on_handshake_context = on_handshake_context,
+            .on_handshake_callback = on_handshake_callback,
+        };
     }
 
     // --- Actual Implementations ---
@@ -145,7 +146,6 @@ pub const InsecureHandler = struct {
                     .remote_id = "mock_remote_id",
                     .remote_public_key = "mock_remote_key",
                 };
-                std.debug.print("Handshake successful, session created: {}\n", .{session.*});
                 self.on_handshake_callback(self.on_handshake_context, session);
                 if (ctx.conn.direction() == .INBOUND) {
                     const server_handler = xev_tcp.xev_transport.ServerEchoHandler.create(ctx.pipeline.allocator) catch unreachable;

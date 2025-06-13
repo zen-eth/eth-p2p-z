@@ -109,6 +109,7 @@ pub const Negotiator = struct {
     const WriteCallbackContext = struct {
         negotiator: *Self,
         buffer: []const u8,
+        proto_id: ?[]const u8,
         ctx: *p2p_conn.HandlerContext,
     };
 
@@ -117,6 +118,24 @@ pub const Negotiator = struct {
             const w_ctx: *WriteCallbackContext = @ptrCast(@alignCast(w.?));
 
             if (n) |_| {
+                // Responder case: we have selected a protocol ID, we need to inform the negotiator
+                if (w_ctx.proto_id) |proto_id| {
+                    w_ctx.negotiator.onProtoSelected(proto_id, w_ctx.ctx) catch |err| {
+                        w_ctx.ctx.fireErrorCaught(err);
+                        w_ctx.negotiator.deinit();
+                        w_ctx.negotiator.allocator.free(proto_id);
+                        w_ctx.negotiator.allocator.free(w_ctx.buffer);
+                        w_ctx.negotiator.allocator.destroy(w_ctx);
+                        const close_ctx = w_ctx.ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
+                        close_ctx.* = .{
+                            .ctx = w_ctx.ctx,
+                        };
+                        w_ctx.ctx.close(close_ctx, io_loop.NoOPCallback.closeCallback);
+                        return;
+                    };
+                    w_ctx.negotiator.allocator.free(proto_id);
+                }
+
                 w_ctx.negotiator.allocator.free(w_ctx.buffer);
                 w_ctx.negotiator.allocator.destroy(w_ctx);
             } else |err| {
@@ -211,9 +230,9 @@ pub const Negotiator = struct {
             .negotiator = self,
             .buffer = buffer,
             .ctx = ctx,
+            .proto_id = null,
         };
 
-        std.debug.print("Multistream Negotiator onActive: {}\n", .{proto_buffer.getWritten().len});
         ctx.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
     }
 
@@ -221,10 +240,11 @@ pub const Negotiator = struct {
         ctx.fireInactive();
         self.deinit();
         ctx.pipeline.allocator.destroy(self);
+        // ctx should be freed by the pipeline deinit
     }
 
     pub fn onReadImpl(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) !void {
-        std.debug.print("Multistream Negotiator onRead: {}\n", .{msg.len});
+        std.log.debug("Multistream Negotiator onRead: {any}", .{msg});
         self.buffer.write(msg) catch |err| {
             self.handleError(ctx, null, err);
             return err;
@@ -246,15 +266,10 @@ pub const Negotiator = struct {
             // If there are remaining bytes in the buffer, put them back
             // so that we can read them again as it is not length bytes but actual protocol ID bytes.
             if (decoded_length_bytes.remaining.len > 0) {
-                std.debug.print("Multistream Negotiator remain buffer length: {}\n", .{self.buffer.readableLength()});
-                std.debug.print("Decoded remaining length: {}\n", .{decoded_length_bytes.remaining.len});
-                std.debug.print("Decoded remaining bytes: {s}\n", .{decoded_length_bytes.remaining});
                 self.buffer.unget(decoded_length_bytes.remaining) catch |err| {
                     self.handleError(ctx, null, err);
                     return err;
                 };
-                std.debug.print("Multistream Negotiator ungeted remain buffer length: {}\n", .{self.buffer.readableLength()});
-                std.debug.print("Multistream Negotiator ungeted remain buffer: {s}\n", .{self.buffer.readableSlice(0)});
             }
 
             const proto_id_length = decoded_length_bytes.value;
@@ -271,7 +286,6 @@ pub const Negotiator = struct {
             var proto_id_bytes: [MAX_MULTISTREAM_MESSAGE_LENGTH]u8 = undefined;
             _ = self.buffer.read(proto_id_bytes[0..proto_id_length]);
 
-            std.debug.print("Multistream Negotiator read protocol ID: {s}\n", .{proto_id_bytes[0..proto_id_length]});
             if (proto_id_length < MESSAGE_SUFFIX_LENGTH or
                 !std.mem.eql(u8, proto_id_bytes[proto_id_length - MESSAGE_SUFFIX_LENGTH .. proto_id_length], MESSAGE_SUFFIX))
             {
@@ -313,6 +327,7 @@ pub const Negotiator = struct {
                             .negotiator = self,
                             .buffer = buffer,
                             .ctx = ctx,
+                            .proto_id = null,
                         };
                         ctx.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
 
@@ -339,14 +354,17 @@ pub const Negotiator = struct {
                         };
 
                         const callback_ctx = self.allocator.create(WriteCallbackContext) catch unreachable;
+                        const copy_proto_id = self.allocator.alloc(u8, proto_id.len) catch unreachable;
+                        @memcpy(copy_proto_id, proto_id);
                         callback_ctx.* = .{
                             .negotiator = self,
                             .buffer = buffer,
                             .ctx = ctx,
+                            .proto_id = copy_proto_id,
                         };
                         ctx.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
 
-                        return self.onProtoSelected(proto_id, ctx);
+                        return;
                     }
                 }
 
@@ -364,6 +382,7 @@ pub const Negotiator = struct {
                     .negotiator = self,
                     .buffer = buffer,
                     .ctx = ctx,
+                    .proto_id = null,
                 };
                 ctx.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
             }
@@ -451,7 +470,7 @@ pub const Negotiator = struct {
 
     fn writePacket(writer: anytype, proto: []const u8) !void {
         const n = try uvarint.encodeStream(writer, u16, @intCast(proto.len + MESSAGE_SUFFIX_LENGTH));
-        std.debug.print("Multistream Negotiator writePacket length: {}", .{n});
+        std.log.debug("Multistream Negotiator writePacket length: {}\n", .{n});
         try writer.writeAll(proto);
         try writer.writeAll(MESSAGE_SUFFIX);
     }
@@ -459,16 +478,18 @@ pub const Negotiator = struct {
     fn onProtoSelected(self: *Self, proto_id: []const u8, ctx: *p2p_conn.HandlerContext) !void {
         self.state = .PROTOCOL_SELECTED;
         var selected_proto_binding: AnyProtocolBinding = undefined;
-
         for (self.bindings) |binding| {
             if (binding.protoDesc().protocol_matcher.matches(proto_id)) {
-                std.debug.print("Multistream Negotiator found matching protocol binding for: {s}\n", .{proto_id});
                 selected_proto_binding = binding;
                 break;
             }
         }
 
         selected_proto_binding.initConn(ctx.conn, proto_id, self.callback_ctx, self.callback);
+
+        const context = try ctx.pipeline.remove("mss");
+        std.debug.assert(context == ctx);
+
         if (self.buffer.readableLength() > 0) {
             // If there are still bytes in the buffer, we need to propagate them
             // to the selected protocol handler.
@@ -476,10 +497,13 @@ pub const Negotiator = struct {
             // is not lost and can be processed by the selected protocol handler.
             try ctx.fireRead(self.buffer.readableSlice(0));
         }
-        _ = try ctx.pipeline.remove("mss");
-        std.debug.print("Multistream Negotiator onProtoSelected: removed 'mss' handler\n", .{});
+
+        // Active the next handler in the pipeline
+        try ctx.fireActive();
         self.deinit();
-        ctx.pipeline.allocator.destroy(self);
+        const allocator = ctx.pipeline.allocator;
+        allocator.destroy(self);
+        allocator.destroy(ctx);
     }
 };
 
@@ -564,4 +588,11 @@ test "Multistream Negotiator with Insecure Protocol" {
     // temporary sleep to ensure the multistream negotiation completes
     // will make it more robust later
     std.time.sleep(std.time.ns_per_s * 4);
+
+    try std.testing.expectEqualStrings(conn_holder.channel.?.securitySession().?.local_id, "mock_local_id");
+    try std.testing.expectEqualStrings(conn_holder.channel.?.securitySession().?.remote_id, "mock_remote_id");
+    try std.testing.expectEqualStrings(conn_holder.channel.?.securitySession().?.remote_public_key, "mock_remote_key");
+    try std.testing.expectEqualStrings(dial_conn_holder.channel.?.securitySession().?.local_id, "mock_local_id");
+    try std.testing.expectEqualStrings(dial_conn_holder.channel.?.securitySession().?.remote_id, "mock_remote_id");
+    try std.testing.expectEqualStrings(dial_conn_holder.channel.?.securitySession().?.remote_public_key, "mock_remote_key");
 }

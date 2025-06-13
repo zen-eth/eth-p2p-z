@@ -126,7 +126,7 @@ pub const NoOPCallback = struct {
     pub fn writeCallback(ud: ?*anyopaque, r: anyerror!usize) void {
         const self: *NoOPContext = @ptrCast(@alignCast(ud.?));
         if (r) |_| {
-            if (self.conn) |any_conn| any_conn.getPipeline().allocator.destroy(self) else if (self.ctx) |ctx| ctx.pipeline.allocator.destroy(self);
+            if (self.conn) |any_conn| any_conn.getPipeline().mempool.io_no_op_context_pool.destroy(self) else if (self.ctx) |ctx| ctx.pipeline.mempool.io_no_op_context_pool.destroy(self);
         } else |err| {
             if (self.conn) |any_conn| {
                 any_conn.getPipeline().close(ud, NoOPCallback.closeCallback);
@@ -187,18 +187,11 @@ pub const ThreadEventLoop = struct {
 
     loop_thread_id: std.Thread.Id,
 
-    thread_pool: *xev.ThreadPool,
-
     const Self = @This();
 
     /// Initializes the event loop.
     pub fn init(self: *Self, allocator: Allocator) !void {
-        const thread_pool = try allocator.create(xev.ThreadPool);
-        thread_pool.* = xev.ThreadPool.init(.{});
-        errdefer allocator.destroy(thread_pool);
-
-        var loop = try xev.Loop.init(.{ .thread_pool = thread_pool });
-        // var loop = try xev.Loop.init(.{});
+        var loop = try xev.Loop.init(.{});
         errdefer loop.deinit();
 
         var stop_notifier = try xev.Async.init();
@@ -253,7 +246,6 @@ pub const ThreadEventLoop = struct {
             .accept_pool = accept_pool,
             .read_buffer_pool = read_buffer_pool,
             .close_pool = close_pool,
-            .thread_pool = thread_pool,
         };
 
         const thread = try std.Thread.spawn(.{}, start, .{self});
@@ -277,9 +269,6 @@ pub const ThreadEventLoop = struct {
         self.accept_pool.deinit();
         self.read_buffer_pool.deinit();
         self.close_pool.deinit();
-        self.thread_pool.shutdown();
-        self.thread_pool.deinit();
-        self.allocator.destroy(self.thread_pool);
     }
 
     /// Starts the event loop.
