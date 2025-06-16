@@ -9,29 +9,33 @@ const security = @import("../security/lib.zig");
 const SecuritySession = security.session.Session;
 const io_loop = @import("../thread_event_loop.zig");
 
-pub const Upgrader = struct {
+/// ConnUpgrader is a struct that manages the security upgrade process for P2P connections.
+/// It uses a set of protocol bindings to negotiate a security session with the peer.
+pub const ConnUpgrader = struct {
+    /// security_bindings is a list of protocol bindings that can be used to negotiate a security session.
     security_bindings: []const AnyProtocolBinding,
 
-    negotiate_time_limit: u64 = std.time.ms_per_s * 10,
+    /// negotiate_timeout_ms is the timeout for the security negotiation process in milliseconds.
+    negotiate_timeout_ms: u64 = std.time.ms_per_s * 10,
 
     const Self = @This();
 
-    const SecurityUpgradeCallbackContext = struct {
+    const SecurityUpgradeCallbackCtx = struct {
         conn: p2p_conn.AnyConn,
     };
 
     const SecurityUpgradeCallback = struct {
-        pub fn callback(ud: ?*anyopaque, r: anyerror!?*anyopaque) void {
-            const s_ctx: *SecurityUpgradeCallbackContext = @ptrCast(@alignCast(ud.?));
+        pub fn callback(instance: ?*anyopaque, res: anyerror!?*anyopaque) void {
+            const s_ctx: *SecurityUpgradeCallbackCtx = @ptrCast(@alignCast(instance.?));
 
-            if (r) |result| {
+            if (res) |result| {
                 const security_session: *SecuritySession = @ptrCast(@alignCast(result.?));
 
                 s_ctx.conn.setSecuritySession(security_session.*);
                 s_ctx.conn.getPipeline().allocator.destroy(security_session);
             } else |err| {
                 s_ctx.conn.getPipeline().fireErrorCaught(err);
-                const close_ctx = s_ctx.conn.getPipeline().mempool.no_op_ctx_pool.create() catch unreachable;
+                const close_ctx = s_ctx.conn.getPipeline().pool_manager.no_op_ctx_pool.create() catch unreachable;
                 close_ctx.* = .{
                     .conn = s_ctx.conn,
                 };
@@ -43,32 +47,24 @@ pub const Upgrader = struct {
     pub fn init(
         self: *Self,
         security_bindings: []const AnyProtocolBinding,
-        negotiate_time_limit: u64,
+        negotiate_timeout_ms: u64,
     ) !void {
         self.security_bindings = security_bindings;
-        self.negotiate_time_limit = negotiate_time_limit;
+        self.negotiate_timeout_ms = negotiate_timeout_ms;
     }
 
     pub fn upgradeSecuritySession(
-        self: *const Upgrader,
+        self: *const ConnUpgrader,
         conn: p2p_conn.AnyConn,
     ) void {
-        const security_ctx = conn.getPipeline().allocator.create(SecurityUpgradeCallbackContext) catch |err| {
-            conn.getPipeline().fireErrorCaught(err);
-            conn.getPipeline().close(null, struct {
-                pub fn callback(_: ?*anyopaque, _: anyerror!void) void {
-                    // Callback after close
-                }
-            }.callback);
-            return;
-        };
+        const security_ctx = conn.getPipeline().allocator.create(SecurityUpgradeCallbackCtx) catch unreachable;
         defer conn.getPipeline().allocator.destroy(security_ctx);
-        security_ctx.* = SecurityUpgradeCallbackContext{
+        security_ctx.* = SecurityUpgradeCallbackCtx{
             .conn = conn,
         };
 
         var ms: Multistream = undefined;
-        ms.init(self.negotiate_time_limit, self.security_bindings) catch |err| {
+        ms.init(self.negotiate_timeout_ms, self.security_bindings) catch |err| {
             SecurityUpgradeCallback.callback(security_ctx, err);
             return;
         };

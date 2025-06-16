@@ -153,7 +153,7 @@ pub const NoOpCallback = struct {
     /// The close callback function that is called when a close operation is complete.
     pub fn closeCallback(instance: ?*anyopaque, res: anyerror!void) void {
         const cb_ctx: *NoOpCallbackCtx = @ptrCast(@alignCast(instance.?));
-        defer if (cb_ctx.conn) |any_conn| any_conn.getPipeline().mempool.no_op_ctx_pool.destroy(cb_ctx) else if (cb_ctx.ctx) |ctx| ctx.pipeline.mempool.no_op_ctx_pool.destroy(cb_ctx);
+        defer if (cb_ctx.conn) |any_conn| any_conn.getPipeline().pool_manager.no_op_ctx_pool.destroy(cb_ctx) else if (cb_ctx.ctx) |ctx| ctx.pipeline.pool_manager.no_op_ctx_pool.destroy(cb_ctx);
         if (res) |_| {} else |err| {
             if (cb_ctx.conn) |any_conn| {
                 any_conn.getPipeline().fireErrorCaught(err);
@@ -167,7 +167,7 @@ pub const NoOpCallback = struct {
     pub fn writeCallback(instance: ?*anyopaque, res: anyerror!usize) void {
         const cb_ctx: *NoOpCallbackCtx = @ptrCast(@alignCast(instance.?));
         if (res) |_| {
-            if (cb_ctx.conn) |any_conn| any_conn.getPipeline().mempool.no_op_ctx_pool.destroy(cb_ctx) else if (cb_ctx.ctx) |ctx| ctx.pipeline.mempool.no_op_ctx_pool.destroy(cb_ctx);
+            if (cb_ctx.conn) |any_conn| any_conn.getPipeline().pool_manager.no_op_ctx_pool.destroy(cb_ctx) else if (cb_ctx.ctx) |ctx| ctx.pipeline.pool_manager.no_op_ctx_pool.destroy(cb_ctx);
         } else |err| {
             if (cb_ctx.conn) |any_conn| {
                 any_conn.getPipeline().close(instance, NoOpCallback.closeCallback);

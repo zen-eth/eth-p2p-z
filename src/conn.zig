@@ -8,6 +8,7 @@ const io_loop = @import("thread_event_loop.zig");
 pub const SecuritySession = @import("./security/session.zig").Session;
 pub const Direction = enum { INBOUND, OUTBOUND };
 
+// TODO: Check if this interface is needed.
 /// ConnEnhancer interface for initializing connections.
 /// This is used to set up the connection before it is used.
 pub const ConnEnhancerVTable = struct {
@@ -330,7 +331,7 @@ const TailConnHandlerImpl = struct {
     pub fn onRead(_: *Self, _: *ConnHandlerContext, _: []const u8) !void {}
 
     pub fn onReadComplete(_: *Self, ctx: *ConnHandlerContext) void {
-        const no_op_ctx = ctx.pipeline.mempool.no_op_ctx_pool.create() catch unreachable;
+        const no_op_ctx = ctx.pipeline.pool_manager.no_op_ctx_pool.create() catch unreachable;
         no_op_ctx.* = .{
             .ctx = ctx,
         };
@@ -339,7 +340,7 @@ const TailConnHandlerImpl = struct {
 
     pub fn onErrorCaught(_: *Self, ctx: *ConnHandlerContext, err: anyerror) void {
         std.log.warn("Handler '{s}' error during onErrorCaught: {any}", .{ ctx.name, err });
-        const no_op_ctx = ctx.pipeline.mempool.no_op_ctx_pool.create() catch unreachable;
+        const no_op_ctx = ctx.pipeline.pool_manager.no_op_ctx_pool.create() catch unreachable;
         no_op_ctx.* = .{
             .ctx = ctx,
         };
@@ -492,7 +493,7 @@ const PoolManager = struct {
 ///
 pub const HandlerPipeline = struct {
     allocator: Allocator,
-    mempool: *PoolManager,
+    pool_manager: *PoolManager,
     head: ConnHandlerContext,
     tail: ConnHandlerContext,
     conn: AnyConn,
@@ -503,15 +504,15 @@ pub const HandlerPipeline = struct {
     const Self = @This();
 
     pub fn init(self: *Self, allocator: Allocator, conn: AnyConn) !void {
-        var mempool = try allocator.create(PoolManager);
-        errdefer allocator.destroy(mempool);
+        var pool_manager = try allocator.create(PoolManager);
+        errdefer allocator.destroy(pool_manager);
 
-        mempool.* = try PoolManager.init(allocator);
-        errdefer mempool.deinit();
+        pool_manager.* = try PoolManager.init(allocator);
+        errdefer pool_manager.deinit();
 
         self.* = .{
             .allocator = allocator,
-            .mempool = mempool,
+            .pool_manager = pool_manager,
             .conn = conn,
             .head_handler_impl = .{ .conn = conn },
             .tail_handler_impl = .{},
@@ -553,8 +554,8 @@ pub const HandlerPipeline = struct {
         }
         self.head.next_context = &self.tail;
         self.tail.prev_context = &self.head;
-        self.mempool.deinit();
-        self.allocator.destroy(self.mempool);
+        self.pool_manager.deinit();
+        self.allocator.destroy(self.pool_manager);
     }
 
     /// Adds a handler context node *before* the specified 'next' node.

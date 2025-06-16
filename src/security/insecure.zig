@@ -121,7 +121,7 @@ pub const InsecureHandler = struct {
 
     // --- Actual Implementations ---
     pub fn onActive(self: *Self, ctx: *p2p_conn.ConnHandlerContext) !void {
-        const write_context = ctx.pipeline.mempool.no_op_ctx_pool.create() catch unreachable;
+        const write_context = ctx.pipeline.pool_manager.no_op_ctx_pool.create() catch unreachable;
         write_context.* = .{
             .ctx = ctx,
         };

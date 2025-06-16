@@ -11,7 +11,7 @@ const uvarint = multiformats.uvarint;
 const Allocator = std.mem.Allocator;
 const LinearFifo = std.fifo.LinearFifo;
 const io_loop = @import("../thread_event_loop.zig");
-const Upgrader = @import("../transport/upgrader.zig").Upgrader;
+const Upgrader = @import("../transport/upgrader.zig").ConnUpgrader;
 const insecure = @import("../security/insecure.zig");
 const xev_tcp = @import("../transport/tcp/xev.zig");
 const p2p_transport = @import("../transport.zig");
@@ -126,7 +126,7 @@ pub const Negotiator = struct {
                         w_ctx.negotiator.allocator.free(proto_id);
                         w_ctx.negotiator.allocator.free(w_ctx.buffer);
                         w_ctx.negotiator.allocator.destroy(w_ctx);
-                        const close_ctx = w_ctx.ctx.pipeline.mempool.no_op_ctx_pool.create() catch unreachable;
+                        const close_ctx = w_ctx.ctx.pipeline.pool_manager.no_op_ctx_pool.create() catch unreachable;
                         close_ctx.* = .{
                             .ctx = w_ctx.ctx,
                         };
@@ -143,7 +143,7 @@ pub const Negotiator = struct {
                 w_ctx.negotiator.deinit();
                 w_ctx.negotiator.allocator.free(w_ctx.buffer);
                 w_ctx.negotiator.allocator.destroy(w_ctx);
-                const close_ctx = w_ctx.ctx.pipeline.mempool.no_op_ctx_pool.create() catch unreachable;
+                const close_ctx = w_ctx.ctx.pipeline.pool_manager.no_op_ctx_pool.create() catch unreachable;
                 close_ctx.* = .{
                     .ctx = w_ctx.ctx,
                 };
