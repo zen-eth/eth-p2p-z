@@ -145,7 +145,7 @@ pub const NoOpCallbackCtx = struct {
     /// The connection associated with the callback, if any.
     conn: ?conn.AnyConn = null,
     /// The handler context associated with the callback, if any.
-    ctx: ?*conn.HandlerContext = null,
+    ctx: ?*conn.ConnHandlerContext = null,
 };
 
 /// A no-op callback implementation for handling write and close operations in the event loop.
@@ -412,7 +412,7 @@ pub const ThreadEventLoop = struct {
                         .callback_instance = action_data.callback_instance,
                         .callback = action_data.callback,
                     };
-                    channel.socket.write(loop, c, .{ .slice = buffer }, WriteCtx, write_ctx, xev_tcp.XevSocketChannel.writeCB);
+                    channel.socket.write(loop, c, .{ .slice = buffer }, WriteCtx, write_ctx, xev_tcp.XevSocketChannel.writeCallback);
                 },
                 .close => |action_data| {
                     const channel = action_data.channel;

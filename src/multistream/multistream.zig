@@ -110,7 +110,7 @@ pub const Negotiator = struct {
         negotiator: *Self,
         buffer: []const u8,
         proto_id: ?[]const u8,
-        ctx: *p2p_conn.HandlerContext,
+        ctx: *p2p_conn.ConnHandlerContext,
     };
 
     const WriteCallback = struct {
@@ -206,7 +206,7 @@ pub const Negotiator = struct {
     }
 
     // --- Actual Handler Implementations ---
-    pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) !void {
+    pub fn onActiveImpl(self: *Self, ctx: *p2p_conn.ConnHandlerContext) !void {
         const is_initiator = ctx.conn.direction() == p2p_conn.Direction.OUTBOUND;
         const buffer = if (is_initiator) self.allocator.alloc(u8, TOTAL_MESSAGE_LENGTH * 2) catch unreachable else self.allocator.alloc(u8, TOTAL_MESSAGE_LENGTH) catch unreachable;
 
@@ -236,14 +236,14 @@ pub const Negotiator = struct {
         ctx.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
     }
 
-    pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+    pub fn onInactiveImpl(self: *Self, ctx: *p2p_conn.ConnHandlerContext) void {
         ctx.fireInactive();
         self.deinit();
         ctx.pipeline.allocator.destroy(self);
         // ctx should be freed by the pipeline deinit
     }
 
-    pub fn onReadImpl(self: *Self, ctx: *p2p_conn.HandlerContext, msg: []const u8) !void {
+    pub fn onReadImpl(self: *Self, ctx: *p2p_conn.ConnHandlerContext, msg: []const u8) !void {
         std.log.debug("Multistream Negotiator onRead: {any}", .{msg});
         self.buffer.write(msg) catch |err| {
             self.handleError(ctx, null, err);
@@ -389,64 +389,64 @@ pub const Negotiator = struct {
         }
     }
 
-    pub fn onReadCompleteImpl(self: *Self, ctx: *p2p_conn.HandlerContext) void {
+    pub fn onReadCompleteImpl(self: *Self, ctx: *p2p_conn.ConnHandlerContext) void {
         _ = self;
         ctx.fireReadComplete();
     }
 
-    pub fn onErrorCaughtImpl(self: *Self, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
+    pub fn onErrorCaughtImpl(self: *Self, ctx: *p2p_conn.ConnHandlerContext, err: anyerror) void {
         _ = self;
         ctx.fireErrorCaught(err);
     }
 
-    pub fn writeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    pub fn writeImpl(self: *Self, ctx: *p2p_conn.ConnHandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         _ = self;
         ctx.write(buffer, user_data, callback);
     }
 
-    pub fn closeImpl(self: *Self, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    pub fn closeImpl(self: *Self, ctx: *p2p_conn.ConnHandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         _ = self;
         ctx.close(user_data, callback);
     }
 
     // --- Static Wrapper Functions for HandlerVTable ---
-    fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) !void {
+    fn vtableOnActiveFn(instance: *anyopaque, ctx: *p2p_conn.ConnHandlerContext) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return try self.onActiveImpl(ctx);
     }
 
-    fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+    fn vtableOnInactiveFn(instance: *anyopaque, ctx: *p2p_conn.ConnHandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onInactiveImpl(ctx);
     }
 
-    fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, msg: []const u8) !void {
+    fn vtableOnReadFn(instance: *anyopaque, ctx: *p2p_conn.ConnHandlerContext, msg: []const u8) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return try self.onReadImpl(ctx, msg);
     }
 
-    fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext) void {
+    fn vtableOnReadCompleteFn(instance: *anyopaque, ctx: *p2p_conn.ConnHandlerContext) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onReadCompleteImpl(ctx);
     }
 
-    fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, err: anyerror) void {
+    fn vtableOnErrorCaughtFn(instance: *anyopaque, ctx: *p2p_conn.ConnHandlerContext, err: anyerror) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onErrorCaughtImpl(ctx, err);
     }
 
-    fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    fn vtableWriteFn(instance: *anyopaque, ctx: *p2p_conn.ConnHandlerContext, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.writeImpl(ctx, buffer, user_data, callback);
     }
 
-    fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.HandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    fn vtableCloseFn(instance: *anyopaque, ctx: *p2p_conn.ConnHandlerContext, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.closeImpl(ctx, user_data, callback);
     }
 
     // --- Static VTable Instance ---
-    const vtable_instance = p2p_conn.HandlerVTable{
+    const vtable_instance = p2p_conn.ConnHandlerVTable{
         .onActiveFn = vtableOnActiveFn,
         .onInactiveFn = vtableOnInactiveFn,
         .onReadFn = vtableOnReadFn,
@@ -456,12 +456,12 @@ pub const Negotiator = struct {
         .closeFn = vtableCloseFn,
     };
 
-    pub fn any(self: *Self) p2p_conn.AnyHandler {
+    pub fn any(self: *Self) p2p_conn.AnyConnHandler {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 
     // Helper function for error handling with buffer cleanup
-    fn handleError(self: *Self, ctx: *p2p_conn.HandlerContext, buffer_slice: ?[]u8, err: anyerror) void {
+    fn handleError(self: *Self, ctx: *p2p_conn.ConnHandlerContext, buffer_slice: ?[]u8, err: anyerror) void {
         if (buffer_slice) |slice| {
             self.allocator.free(slice);
         }
@@ -475,7 +475,7 @@ pub const Negotiator = struct {
         try writer.writeAll(MESSAGE_SUFFIX);
     }
 
-    fn onProtoSelected(self: *Self, proto_id: []const u8, ctx: *p2p_conn.HandlerContext) !void {
+    fn onProtoSelected(self: *Self, proto_id: []const u8, ctx: *p2p_conn.ConnHandlerContext) !void {
         self.state = .PROTOCOL_SELECTED;
         var selected_proto_binding: AnyProtocolBinding = undefined;
         for (self.bindings) |binding| {
