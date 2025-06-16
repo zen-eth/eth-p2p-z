@@ -7,14 +7,14 @@ const conn = @import("conn.zig");
 /// It uses the VTable pattern to provide a consistent interface for accepting
 /// incoming connections. The `acceptFn` function pointer is used to call the
 /// appropriate implementation of the accept function for the specific listener
-/// instance. The `user_data` parameter is an optional user-defined data pointer
+/// instance. The `callback_instance` parameter is an optional user-defined data pointer
 /// that can be passed to the callback function. The `callback` function is
 /// called when a new connection is accepted. It takes a user-defined data pointer
 /// and a result of type `anyerror!conn.AnyRxConn`, which represents the accepted
 /// connection. The `anyerror` type is used to represent any error that may occur
 /// during the acceptance of a connection.
 pub const ListenerVTable = struct {
-    acceptFn: *const fn (instance: *anyopaque, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void) void,
+    acceptFn: *const fn (instance: *anyopaque, callback_instance: ?*anyopaque, callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void) void,
 };
 
 /// AnyListener is a struct that uses the VTable pattern to provide a type-erased
@@ -36,8 +36,8 @@ pub const AnyListener = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn accept(self: Self, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void) void {
-        self.vtable.acceptFn(self.instance, user_data, callback);
+    pub fn accept(self: Self, callback_instance: ?*anyopaque, callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void) void {
+        self.vtable.acceptFn(self.instance, callback_instance, callback);
     }
 };
 
@@ -50,7 +50,7 @@ pub const AnyListener = struct {
 /// The `listenFn` function pointer is used to call the appropriate implementation
 /// of the listen function for the specific transport instance.
 pub const TransportVTable = struct {
-    dialFn: *const fn (instance: *anyopaque, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void) void,
+    dialFn: *const fn (instance: *anyopaque, addr: std.net.Address, callback_instance: ?*anyopaque, callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void) void,
     listenFn: *const fn (instance: *anyopaque, addr: std.net.Address) anyerror!AnyListener,
 };
 
@@ -76,8 +76,8 @@ pub const AnyTransport = struct {
     pub const Error = anyerror;
 
     /// Dials a remote address via the underlying transport implementation.
-    pub fn dial(self: Self, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void) void {
-        self.vtable.dialFn(self.instance, addr, user_data, callback);
+    pub fn dial(self: Self, addr: std.net.Address, callback_instance: ?*anyopaque, callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void) void {
+        self.vtable.dialFn(self.instance, addr, callback_instance, callback);
     }
 
     /// Starts listening on a local address via the underlying transport implementation.

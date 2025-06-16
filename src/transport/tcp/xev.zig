@@ -39,14 +39,14 @@ pub const XevSocketChannel = struct {
         self.direction = direction;
     }
 
-    pub fn write(self: *XevSocketChannel, buffer: []const u8, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void) void {
+    pub fn write(self: *XevSocketChannel, buffer: []const u8, callback_instance: ?*anyopaque, callback: *const fn (instance: ?*anyopaque, res: anyerror!usize) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
             const w = self.transport.io_event_loop.write_pool.create() catch unreachable;
 
             w.* = .{
                 .channel = self,
-                .user_data = user_data,
+                .callback_instance = callback_instance,
                 .callback = callback,
             };
             self.socket.write(&self.transport.io_event_loop.loop, c, .{ .slice = buffer }, io_loop.Write, w, writeCB);
@@ -55,36 +55,36 @@ pub const XevSocketChannel = struct {
                 .action = .{ .write = .{
                     .channel = self,
                     .buffer = buffer,
-                    .user_data = user_data,
+                    .callback_instance = callback_instance,
                     .callback = callback,
                     .timeout_ms = self.write_timeout_ms,
                 } },
             };
 
             self.transport.io_event_loop.queueMessage(message) catch |err| {
-                callback(user_data, err);
+                callback(callback_instance, err);
             };
         }
     }
 
-    pub fn close(self: *XevSocketChannel, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
+    pub fn close(self: *XevSocketChannel, callback_instance: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
             const close_ud = self.transport.io_event_loop.close_pool.create() catch unreachable;
 
             close_ud.* = .{
                 .channel = self,
-                .user_data = user_data,
+                .callback_instance = callback_instance,
                 .callback = callback,
             };
             self.socket.shutdown(&self.transport.io_event_loop.loop, c, io_loop.Close, close_ud, shutdownCB);
         } else {
             const message = io_loop.IOMessage{
-                .action = .{ .close = .{ .channel = self, .user_data = user_data, .callback = callback, .timeout_ms = 30000 } },
+                .action = .{ .close = .{ .channel = self, .callback_instance = callback_instance, .callback = callback, .timeout_ms = 30000 } },
             };
 
             self.transport.io_event_loop.queueMessage(message) catch |err| {
-                callback(user_data, err);
+                callback(callback_instance, err);
             };
         }
     }
@@ -172,7 +172,7 @@ pub const XevSocketChannel = struct {
         defer transport.io_event_loop.write_pool.destroy(w);
 
         // In general, user defined callbacks should close the channel on error.
-        w.callback(w.user_data, r);
+        w.callback(w.callback_instance, r);
 
         return .disarm;
     }
@@ -241,7 +241,7 @@ pub const XevSocketChannel = struct {
         const close_ud = ud.?;
 
         _ = r catch |err| {
-            close_ud.callback(close_ud.user_data, err);
+            close_ud.callback(close_ud.callback_instance, err);
 
             return .disarm;
         };
@@ -272,7 +272,7 @@ pub const XevSocketChannel = struct {
             transport.io_event_loop.close_pool.destroy(close_ud);
         }
 
-        close_ud.callback(close_ud.user_data, r);
+        close_ud.callback(close_ud.callback_instance, r);
 
         _ = r catch |err| {
             std.log.warn("Error closing socket: {}\n", .{err});
@@ -321,24 +321,24 @@ pub const XevListener = struct {
     }
 
     /// Accept asynchronously accept a connection from the listener. It does not block. If an error occurs, it returns the error.
-    pub fn accept(self: *XevListener, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyConn) void) void {
+    pub fn accept(self: *XevListener, callback_instance: ?*anyopaque, callback: *const fn (instance: ?*anyopaque, res: anyerror!p2p_conn.AnyConn) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
             const accept_ud = self.transport.io_event_loop.accept_pool.create() catch unreachable;
 
             accept_ud.* = .{
                 .transport = self.transport,
-                .user_data = user_data,
+                .callback_instance = callback_instance,
                 .callback = callback,
             };
             self.server.accept(&self.transport.io_event_loop.loop, c, io_loop.Accept, accept_ud, acceptCB);
         } else {
             const message = io_loop.IOMessage{
-                .action = .{ .accept = .{ .server = self.server, .transport = self.transport, .user_data = user_data, .callback = callback, .timeout_ms = 30000 } },
+                .action = .{ .accept = .{ .server = self.server, .transport = self.transport, .callback_instance = callback_instance, .callback = callback, .timeout_ms = 30000 } },
             };
 
             self.transport.io_event_loop.queueMessage(message) catch |err| {
-                callback(user_data, err);
+                callback(callback_instance, err);
             };
         }
     }
@@ -371,7 +371,7 @@ pub const XevListener = struct {
         defer transport.io_event_loop.accept_pool.destroy(accept_ud);
 
         const socket = r catch |err| {
-            accept_ud.callback(accept_ud.user_data, err);
+            accept_ud.callback(accept_ud.callback_instance, err);
 
             return .disarm;
         };
@@ -386,11 +386,11 @@ pub const XevListener = struct {
             close_ud.* = .{
                 .channel = channel,
                 .callback = XevSocketChannel.noopCloseCB,
-                .user_data = channel,
+                .callback_instance = channel,
             };
             socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
 
-            accept_ud.callback(accept_ud.user_data, err);
+            accept_ud.callback(accept_ud.callback_instance, err);
             return .disarm;
         };
         channel.handler_pipeline = p;
@@ -400,17 +400,17 @@ pub const XevListener = struct {
             close_ud.* = .{
                 .channel = channel,
                 .callback = XevSocketChannel.noopCloseCB,
-                .user_data = channel,
+                .callback_instance = channel,
             };
             socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
 
-            accept_ud.callback(accept_ud.user_data, err);
+            accept_ud.callback(accept_ud.callback_instance, err);
             return .disarm;
         };
 
-        accept_ud.callback(accept_ud.user_data, any_rx_conn);
+        accept_ud.callback(accept_ud.callback_instance, any_rx_conn);
         p.fireActive() catch |err| {
-            accept_ud.callback(accept_ud.user_data, err);
+            accept_ud.callback(accept_ud.callback_instance, err);
             return .disarm;
         };
 
@@ -456,7 +456,7 @@ pub const XevTransport = struct {
     pub fn deinit(_: *XevTransport) void {}
 
     /// Dial connects to the given address and creates a channel for communication. It blocks until the connection is established. If an error occurs, it returns the error.
-    pub fn dial(self: *XevTransport, addr: std.net.Address, user_data: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!p2p_conn.AnyConn) void) void {
+    pub fn dial(self: *XevTransport, addr: std.net.Address, callback_instance: ?*anyopaque, callback: *const fn (instance: ?*anyopaque, res: anyerror!p2p_conn.AnyConn) void) void {
         if (self.io_event_loop.inEventLoopThread()) {
             var socket = xev.TCP.init(addr) catch unreachable;
             const c = self.io_event_loop.completion_pool.create() catch unreachable;
@@ -467,7 +467,7 @@ pub const XevTransport = struct {
             connect_ud.* = .{
                 .transport = self,
                 .callback = callback,
-                .user_data = user_data,
+                .callback_instance = callback_instance,
             };
             // const connect_timeout_ud = self.connect_timeout_pool.create() catch unreachable;
             // connect_timeout_ud.* = .{
@@ -482,13 +482,13 @@ pub const XevTransport = struct {
                     .address = addr,
                     .transport = self,
                     .timeout_ms = 30000,
-                    .user_data = user_data,
+                    .callback_instance = callback_instance,
                     .callback = callback,
                 } },
             };
 
             self.io_event_loop.queueMessage(message) catch |err| {
-                callback(user_data, err);
+                callback(callback_instance, err);
             };
         }
     }
@@ -544,7 +544,7 @@ pub const XevTransport = struct {
         defer transport.io_event_loop.connect_pool.destroy(connect);
 
         _ = r catch |err| {
-            connect.callback(connect.user_data, err);
+            connect.callback(connect.callback_instance, err);
 
             return .disarm;
         };
@@ -560,11 +560,11 @@ pub const XevTransport = struct {
             close_ud.* = .{
                 .channel = channel,
                 .callback = XevSocketChannel.noopCloseCB,
-                .user_data = channel,
+                .callback_instance = channel,
             };
             socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
 
-            connect.callback(connect.user_data, err);
+            connect.callback(connect.callback_instance, err);
             return .disarm;
         };
         channel.handler_pipeline = handler_pipeline;
@@ -574,17 +574,17 @@ pub const XevTransport = struct {
             close_ud.* = .{
                 .channel = channel,
                 .callback = XevSocketChannel.noopCloseCB,
-                .user_data = channel,
+                .callback_instance = channel,
             };
             socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
 
-            connect.callback(connect.user_data, err);
+            connect.callback(connect.callback_instance, err);
             return .disarm;
         };
 
-        connect.callback(connect.user_data, associated_conn);
+        connect.callback(connect.callback_instance, associated_conn);
         handler_pipeline.fireActive() catch |err| {
-            connect.callback(connect.user_data, err);
+            connect.callback(connect.callback_instance, err);
             return .disarm;
         };
 

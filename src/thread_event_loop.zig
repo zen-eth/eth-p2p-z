@@ -29,27 +29,27 @@ pub const IOAction = union(enum) {
         address: std.net.Address,
         transport: *xev_tcp.XevTransport,
         timeout_ms: u64 = 30000,
-        callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void,
-        user_data: ?*anyopaque = null,
+        callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void,
+        callback_instance: ?*anyopaque = null,
     },
     accept: struct {
         server: xev.TCP,
         transport: *xev_tcp.XevTransport,
         timeout_ms: u64,
-        callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void,
-        user_data: ?*anyopaque = null,
+        callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void,
+        callback_instance: ?*anyopaque = null,
     },
     write: struct {
         buffer: []const u8,
         channel: *xev_tcp.XevSocketChannel,
         timeout_ms: u64,
-        callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
-        user_data: ?*anyopaque = null,
+        callback: *const fn (instance: ?*anyopaque, res: anyerror!usize) void,
+        callback_instance: ?*anyopaque = null,
     },
     close: struct {
         channel: *xev_tcp.XevSocketChannel,
         callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
-        user_data: ?*anyopaque = null,
+        callback_instance: ?*anyopaque = null,
         timeout_ms: u64,
     },
 };
@@ -65,33 +65,33 @@ pub const ConnectTimeout = struct {
 pub const Connect = struct {
     transport: *xev_tcp.XevTransport,
 
-    user_data: ?*anyopaque = null,
+    callback_instance: ?*anyopaque = null,
 
-    callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void,
+    callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void,
 };
 
 pub const Write = struct {
     channel: *xev_tcp.XevSocketChannel,
 
-    user_data: ?*anyopaque = null,
+    callback_instance: ?*anyopaque = null,
 
-    callback: *const fn (ud: ?*anyopaque, r: anyerror!usize) void,
+    callback: *const fn (instance: ?*anyopaque, res: anyerror!usize) void,
 };
 
 pub const Close = struct {
     channel: *xev_tcp.XevSocketChannel,
 
-    user_data: ?*anyopaque = null,
+    callback_instance: ?*anyopaque = null,
 
-    callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
+    callback: *const fn (instance: ?*anyopaque, res: anyerror!void) void,
 };
 
 pub const Accept = struct {
     transport: *xev_tcp.XevTransport,
 
-    user_data: ?*anyopaque = null,
+    callback_instance: ?*anyopaque = null,
 
-    callback: *const fn (ud: ?*anyopaque, r: anyerror!conn.AnyConn) void,
+    callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void,
 };
 
 /// Represents a message for I/O operations in the event loop.
@@ -368,7 +368,7 @@ pub const ThreadEventLoop = struct {
                     connect_ud.* = .{
                         .transport = action_data.transport,
                         .callback = action_data.callback,
-                        .user_data = action_data.user_data,
+                        .callback_instance = action_data.callback_instance,
                     };
                     // const connect_timeout_ud = self.connect_timeout_pool.create() catch unreachable;
                     // connect_timeout_ud.* = .{
@@ -385,7 +385,7 @@ pub const ThreadEventLoop = struct {
                     const accept_ud = self.accept_pool.create() catch unreachable;
                     accept_ud.* = .{
                         .callback = action_data.callback,
-                        .user_data = action_data.user_data,
+                        .callback_instance = action_data.callback_instance,
                         .transport = action_data.transport,
                     };
                     server.accept(loop, c, Accept, accept_ud, xev_tcp.XevListener.acceptCB);
@@ -397,7 +397,7 @@ pub const ThreadEventLoop = struct {
                     const write_ud = self.write_pool.create() catch unreachable;
                     write_ud.* = .{
                         .channel = action_data.channel,
-                        .user_data = action_data.user_data,
+                        .callback_instance = action_data.callback_instance,
                         .callback = action_data.callback,
                     };
                     channel.socket.write(loop, c, .{ .slice = buffer }, Write, write_ud, xev_tcp.XevSocketChannel.writeCB);
@@ -408,7 +408,7 @@ pub const ThreadEventLoop = struct {
                     const close_ud = self.close_pool.create() catch unreachable;
                     close_ud.* = .{
                         .channel = channel,
-                        .user_data = action_data.user_data,
+                        .callback_instance = action_data.callback_instance,
                         .callback = action_data.callback,
                     };
                     channel.socket.shutdown(loop, c, Close, close_ud, xev_tcp.XevSocketChannel.shutdownCB);
