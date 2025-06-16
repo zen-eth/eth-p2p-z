@@ -1,7 +1,7 @@
 const proto_binding = @import("../multistream/protocol_binding.zig");
 const ProtocolDescriptor = @import("../multistream/protocol_descriptor.zig").ProtocolDescriptor;
 const ProtocolMatcher = @import("../multistream/protocol_matcher.zig").ProtocolMatcher;
-const ProtocolId = @import("../protocol_id.zig").ProtocolId;
+const ProtocolId = @import("../misc.zig").ProtocolId;
 const Allocactor = @import("std").mem.Allocator;
 const p2p_conn = @import("../conn.zig");
 

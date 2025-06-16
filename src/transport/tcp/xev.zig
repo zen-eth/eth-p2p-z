@@ -42,14 +42,14 @@ pub const XevSocketChannel = struct {
     pub fn write(self: *XevSocketChannel, buffer: []const u8, callback_instance: ?*anyopaque, callback: *const fn (instance: ?*anyopaque, res: anyerror!usize) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
-            const w = self.transport.io_event_loop.write_pool.create() catch unreachable;
+            const w = self.transport.io_event_loop.write_ctx_pool.create() catch unreachable;
 
             w.* = .{
                 .channel = self,
                 .callback_instance = callback_instance,
                 .callback = callback,
             };
-            self.socket.write(&self.transport.io_event_loop.loop, c, .{ .slice = buffer }, io_loop.Write, w, writeCB);
+            self.socket.write(&self.transport.io_event_loop.loop, c, .{ .slice = buffer }, io_loop.WriteCtx, w, writeCB);
         } else {
             const message = io_loop.IOMessage{
                 .action = .{ .write = .{
@@ -70,14 +70,14 @@ pub const XevSocketChannel = struct {
     pub fn close(self: *XevSocketChannel, callback_instance: ?*anyopaque, callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
-            const close_ud = self.transport.io_event_loop.close_pool.create() catch unreachable;
+            const close_ctx = self.transport.io_event_loop.close_ctx_pool.create() catch unreachable;
 
-            close_ud.* = .{
+            close_ctx.* = .{
                 .channel = self,
                 .callback_instance = callback_instance,
                 .callback = callback,
             };
-            self.socket.shutdown(&self.transport.io_event_loop.loop, c, io_loop.Close, close_ud, shutdownCB);
+            self.socket.shutdown(&self.transport.io_event_loop.loop, c, io_loop.CloseCtx, close_ctx, shutdownCB);
         } else {
             const message = io_loop.IOMessage{
                 .action = .{ .close = .{ .channel = self, .callback_instance = callback_instance, .callback = callback, .timeout_ms = 30000 } },
@@ -159,7 +159,7 @@ pub const XevSocketChannel = struct {
     }
 
     pub fn writeCB(
-        ud: ?*io_loop.Write,
+        ud: ?*io_loop.WriteCtx,
         _: *xev.Loop,
         c: *xev.Completion,
         _: xev.TCP,
@@ -169,7 +169,7 @@ pub const XevSocketChannel = struct {
         const w = ud.?;
         const transport = w.channel.transport;
         defer transport.io_event_loop.completion_pool.destroy(c);
-        defer transport.io_event_loop.write_pool.destroy(w);
+        defer transport.io_event_loop.write_ctx_pool.destroy(w);
 
         // In general, user defined callbacks should close the channel on error.
         w.callback(w.callback_instance, r);
@@ -232,7 +232,7 @@ pub const XevSocketChannel = struct {
     /// Callback executed when a socket shutdown operation completes.
     /// This initiates a full socket close after the shutdown completes.
     pub fn shutdownCB(
-        ud: ?*io_loop.Close,
+        ud: ?*io_loop.CloseCtx,
         l: *xev.Loop,
         c: *xev.Completion,
         s: xev.TCP,
@@ -246,21 +246,21 @@ pub const XevSocketChannel = struct {
             return .disarm;
         };
 
-        s.close(l, c, io_loop.Close, ud, closeCB);
+        s.close(l, c, io_loop.CloseCtx, ud, closeCB);
         return .disarm;
     }
 
     /// Callback executed when a socket close operation completes.
     /// This is the final step in the socket cleanup process.
     pub fn closeCB(
-        ud: ?*io_loop.Close,
+        instance: ?*io_loop.CloseCtx,
         _: *xev.Loop,
         c: *xev.Completion,
         _: xev.TCP,
         r: xev.CloseError!void,
     ) xev.CallbackAction {
-        const close_ud = ud.?;
-        const channel = close_ud.channel;
+        const close_ctx = instance.?;
+        const channel = close_ctx.channel;
         const transport = channel.transport;
         defer {
             const p = channel.handlerPipeline();
@@ -269,10 +269,10 @@ pub const XevSocketChannel = struct {
 
             transport.allocator.destroy(channel);
             transport.io_event_loop.completion_pool.destroy(c);
-            transport.io_event_loop.close_pool.destroy(close_ud);
+            transport.io_event_loop.close_ctx_pool.destroy(close_ctx);
         }
 
-        close_ud.callback(close_ud.callback_instance, r);
+        close_ctx.callback(close_ctx.callback_instance, r);
 
         _ = r catch |err| {
             std.log.warn("Error closing socket: {}\n", .{err});
@@ -324,14 +324,14 @@ pub const XevListener = struct {
     pub fn accept(self: *XevListener, callback_instance: ?*anyopaque, callback: *const fn (instance: ?*anyopaque, res: anyerror!p2p_conn.AnyConn) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
-            const accept_ud = self.transport.io_event_loop.accept_pool.create() catch unreachable;
+            const accept_ud = self.transport.io_event_loop.accept_ctx_pool.create() catch unreachable;
 
             accept_ud.* = .{
                 .transport = self.transport,
                 .callback_instance = callback_instance,
                 .callback = callback,
             };
-            self.server.accept(&self.transport.io_event_loop.loop, c, io_loop.Accept, accept_ud, acceptCB);
+            self.server.accept(&self.transport.io_event_loop.loop, c, io_loop.AcceptCtx, accept_ud, acceptCB);
         } else {
             const message = io_loop.IOMessage{
                 .action = .{ .accept = .{ .server = self.server, .transport = self.transport, .callback_instance = callback_instance, .callback = callback, .timeout_ms = 30000 } },
@@ -360,18 +360,18 @@ pub const XevListener = struct {
     }
 
     pub fn acceptCB(
-        ud: ?*io_loop.Accept,
+        instance: ?*io_loop.AcceptCtx,
         l: *xev.Loop,
         c: *xev.Completion,
         r: xev.AcceptError!xev.TCP,
     ) xev.CallbackAction {
-        const accept_ud = ud.?;
-        const transport = accept_ud.transport;
+        const accept_ctx = instance.?;
+        const transport = accept_ctx.transport;
         defer transport.io_event_loop.completion_pool.destroy(c);
-        defer transport.io_event_loop.accept_pool.destroy(accept_ud);
+        defer transport.io_event_loop.accept_ctx_pool.destroy(accept_ctx);
 
         const socket = r catch |err| {
-            accept_ud.callback(accept_ud.callback_instance, err);
+            accept_ctx.callback(accept_ctx.callback_instance, err);
 
             return .disarm;
         };
@@ -382,35 +382,35 @@ pub const XevListener = struct {
 
         const p = transport.io_event_loop.handler_pipeline_pool.create() catch unreachable;
         p.init(transport.allocator, any_rx_conn) catch |err| {
-            const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
-            close_ud.* = .{
+            const close_ctx = transport.io_event_loop.close_ctx_pool.create() catch unreachable;
+            close_ctx.* = .{
                 .channel = channel,
                 .callback = XevSocketChannel.noopCloseCB,
                 .callback_instance = channel,
             };
-            socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
+            socket.shutdown(l, c, io_loop.CloseCtx, close_ctx, XevSocketChannel.shutdownCB);
 
-            accept_ud.callback(accept_ud.callback_instance, err);
+            accept_ctx.callback(accept_ctx.callback_instance, err);
             return .disarm;
         };
         channel.handler_pipeline = p;
 
         transport.conn_enhancer.enhanceConn(any_rx_conn) catch |err| {
-            const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
-            close_ud.* = .{
+            const close_ctx = transport.io_event_loop.close_ctx_pool.create() catch unreachable;
+            close_ctx.* = .{
                 .channel = channel,
                 .callback = XevSocketChannel.noopCloseCB,
                 .callback_instance = channel,
             };
-            socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
+            socket.shutdown(l, c, io_loop.CloseCtx, close_ctx, XevSocketChannel.shutdownCB);
 
-            accept_ud.callback(accept_ud.callback_instance, err);
+            accept_ctx.callback(accept_ctx.callback_instance, err);
             return .disarm;
         };
 
-        accept_ud.callback(accept_ud.callback_instance, any_rx_conn);
+        accept_ctx.callback(accept_ctx.callback_instance, any_rx_conn);
         p.fireActive() catch |err| {
-            accept_ud.callback(accept_ud.callback_instance, err);
+            accept_ctx.callback(accept_ctx.callback_instance, err);
             return .disarm;
         };
 
@@ -463,7 +463,7 @@ pub const XevTransport = struct {
             // const timer = xev.Timer.init() catch unreachable;
             // const c_timer = self.completion_pool.create() catch unreachable;
             // const connect_timeout = action_data.timeout_ms;
-            const connect_ud = self.io_event_loop.connect_pool.create() catch unreachable;
+            const connect_ud = self.io_event_loop.connect_ctx_pool.create() catch unreachable;
             connect_ud.* = .{
                 .transport = self,
                 .callback = callback,
@@ -475,7 +475,7 @@ pub const XevTransport = struct {
             //     .transport = self,
             //     .socket = socket,
             // };
-            socket.connect(&self.io_event_loop.loop, c, addr, io_loop.Connect, connect_ud, connectCB);
+            socket.connect(&self.io_event_loop.loop, c, addr, io_loop.ConnectCtx, connect_ud, connectCB);
         } else {
             const message = io_loop.IOMessage{
                 .action = .{ .connect = .{
@@ -532,7 +532,7 @@ pub const XevTransport = struct {
     /// Callback executed when a connection attempt completes.
     /// This handles the result of trying to connect to a remote address.
     pub fn connectCB(
-        ud: ?*io_loop.Connect,
+        ud: ?*io_loop.ConnectCtx,
         l: *xev.Loop,
         c: *xev.Completion,
         socket: xev.TCP,
@@ -541,7 +541,7 @@ pub const XevTransport = struct {
         const connect = ud.?;
         const transport = connect.transport;
         defer transport.io_event_loop.completion_pool.destroy(c);
-        defer transport.io_event_loop.connect_pool.destroy(connect);
+        defer transport.io_event_loop.connect_ctx_pool.destroy(connect);
 
         _ = r catch |err| {
             connect.callback(connect.callback_instance, err);
@@ -556,13 +556,13 @@ pub const XevTransport = struct {
         const associated_conn = channel.any();
 
         handler_pipeline.init(transport.allocator, associated_conn) catch |err| {
-            const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
-            close_ud.* = .{
+            const close_ctx = transport.io_event_loop.close_ctx_pool.create() catch unreachable;
+            close_ctx.* = .{
                 .channel = channel,
                 .callback = XevSocketChannel.noopCloseCB,
                 .callback_instance = channel,
             };
-            socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
+            socket.shutdown(l, c, io_loop.CloseCtx, close_ctx, XevSocketChannel.shutdownCB);
 
             connect.callback(connect.callback_instance, err);
             return .disarm;
@@ -570,13 +570,13 @@ pub const XevTransport = struct {
         channel.handler_pipeline = handler_pipeline;
 
         transport.conn_enhancer.enhanceConn(associated_conn) catch |err| {
-            const close_ud = transport.io_event_loop.close_pool.create() catch unreachable;
-            close_ud.* = .{
+            const close_ctx = transport.io_event_loop.close_ctx_pool.create() catch unreachable;
+            close_ctx.* = .{
                 .channel = channel,
                 .callback = XevSocketChannel.noopCloseCB,
                 .callback_instance = channel,
             };
-            socket.shutdown(l, c, io_loop.Close, close_ud, XevSocketChannel.shutdownCB);
+            socket.shutdown(l, c, io_loop.CloseCtx, close_ctx, XevSocketChannel.shutdownCB);
 
             connect.callback(connect.callback_instance, err);
             return .disarm;

@@ -1,7 +1,7 @@
 const proto_binding = @import("../multistream/protocol_binding.zig");
 const ProtocolDescriptor = @import("../multistream/protocol_descriptor.zig").ProtocolDescriptor;
 const ProtocolMatcher = @import("../multistream/protocol_matcher.zig").ProtocolMatcher;
-const ProtocolId = @import("../protocol_id.zig").ProtocolId;
+const ProtocolId = @import("../misc.zig").ProtocolId;
 const Allocator = @import("std").mem.Allocator;
 const p2p_conn = @import("../conn.zig");
 const std = @import("std");
@@ -121,11 +121,11 @@ pub const InsecureHandler = struct {
 
     // --- Actual Implementations ---
     pub fn onActive(self: *Self, ctx: *p2p_conn.HandlerContext) !void {
-        const write_context = ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
+        const write_context = ctx.pipeline.mempool.no_op_ctx_pool.create() catch unreachable;
         write_context.* = .{
             .ctx = ctx,
         };
-        ctx.write(Self.mock_handshake_msg, write_context, io_loop.NoOPCallback.writeCallback);
+        ctx.write(Self.mock_handshake_msg, write_context, io_loop.NoOpCallback.writeCallback);
         self.handshake_state = .InProgress;
     }
 

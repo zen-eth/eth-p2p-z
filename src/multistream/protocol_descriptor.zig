@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ProtocolId = @import("../protocol_id.zig").ProtocolId;
+const ProtocolId = @import("../misc.zig").ProtocolId;
 const ProtocolMatcher = @import("./protocol_matcher.zig").ProtocolMatcher;
 
 pub const ProtocolDescriptor = struct {

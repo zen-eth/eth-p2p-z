@@ -3,58 +3,96 @@ const Allocator = std.mem.Allocator;
 const xev = @import("xev");
 const Intrusive = @import("concurrent/mpsc_queue.zig").Intrusive;
 const Future = @import("concurrent/future.zig").Future;
-// const Stream = @import("muxer/yamux/stream.zig").Stream;
 const conn = @import("conn.zig");
-// const Config = @import("muxer/yamux/Config.zig");
-// const session = @import("muxer/yamux/session.zig");
 const xev_tcp = @import("transport/tcp/xev.zig");
-// const yamux_timer = @import("muxer/yamux/timeout_loop.zig");
 
+/// Memory pool for managing completion objects in the event loop.
+const CompletionPool = std.heap.MemoryPool(xev.Completion);
+/// Memory pool for managing connection objects in the event loop.
+const ConnectCtxPool = std.heap.MemoryPool(ConnectCtx);
+/// Memory pool for managing connection timeouts in the event loop.
+const ConnectTimeoutPool = std.heap.MemoryPool(ConnectTimeout);
+/// Memory pool for managing handler pipelines in the event loop.
+const HandlerPipelinePool = std.heap.MemoryPool(conn.HandlerPipeline);
+/// Memory pools for managing write operations in the event loop.
+const WriteCtxPool = std.heap.MemoryPool(WriteCtx);
+/// Memory pools for managing accept operations in the event loop.
+const AcceptCtxPool = std.heap.MemoryPool(AcceptCtx);
+/// Memory pools for managing close operations in the event loop.
+const CloseCtxPool = std.heap.MemoryPool(CloseCtx);
+/// Memory pool for managing read buffers in the event loop.
+const ReadBufferPool = std.heap.MemoryPool([BUFFER_SIZE]u8);
+
+/// The size of the read buffer used for I/O operations in the event loop.
+pub const BUFFER_SIZE = 64 * 1024;
+/// A no-op context pool for managing callback contexts in the event loop.
+pub const NoOpCtxPool = std.heap.MemoryPool(NoOpCallbackCtx);
+
+/// Represents an I/O action that can be performed in the event loop.
 pub const IOAction = union(enum) {
-    // run_open_stream_timer: struct {
-    //     stream: *Stream,
-    //     timeout_ms: u64,
-    //     io_loop: ?*ThreadEventLoop = null,
-    // },
-    // run_close_stream_timer: struct {
-    //     stream: *Stream,
-    //     timeout_ms: u64,
-    //     io_loop: ?*ThreadEventLoop = null,
-    // },
-    // cancel_close_stream_timer: struct {
-    //     stream: *Stream,
-    //     io_loop: ?*ThreadEventLoop = null,
-    // },
+    /// Connect to a remote address.
     connect: struct {
+        /// The address to connect to.
         address: std.net.Address,
+        /// The transport used for the connection.
         transport: *xev_tcp.XevTransport,
+        /// The timeout for the connection operation in milliseconds.
         timeout_ms: u64 = 30000,
+        /// The callback function to be called when the connection is established.
         callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void,
+        /// The instance to be passed to the callback function.
         callback_instance: ?*anyopaque = null,
     },
+    /// Accept a new connection on a server socket.
     accept: struct {
+        /// The server socket to accept connections on.
         server: xev.TCP,
+        /// The transport used for the accepted connection.
         transport: *xev_tcp.XevTransport,
-        timeout_ms: u64,
+        /// The timeout for the accept operation in milliseconds.
+        timeout_ms: u64 = 30000,
+        /// The callback function to be called when a new connection is accepted.
         callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void,
+        /// The instance to be passed to the callback function.
         callback_instance: ?*anyopaque = null,
     },
+    /// Write data to a socket channel.
     write: struct {
+        /// The buffer containing the data to be written.
         buffer: []const u8,
+        /// The socket channel to write data to.
         channel: *xev_tcp.XevSocketChannel,
+        /// The timeout for the write operation in milliseconds.
         timeout_ms: u64,
+        /// The callback function to be called when the write operation is complete.
         callback: *const fn (instance: ?*anyopaque, res: anyerror!usize) void,
+        /// The instance to be passed to the callback function.
         callback_instance: ?*anyopaque = null,
     },
+    /// Close a socket channel.
     close: struct {
+        /// The socket channel to be closed.
         channel: *xev_tcp.XevSocketChannel,
+        /// The callback function to be called when the close operation is complete.
         callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
+        /// The instance to be passed to the callback function.
         callback_instance: ?*anyopaque = null,
+        /// The timeout for the close operation in milliseconds.
         timeout_ms: u64,
     },
 };
 
+/// Represents a queued message for I/O operations in the event loop.
+pub const IOMessage = struct {
+    const Self = @This();
+    /// Pointer to the next message in the queue.
+    next: ?*Self = null,
+    /// The action to be performed, represented as a union of possible operations.
+    action: IOAction,
+};
+
 pub const ConnectTimeout = struct {
+    /// The address to connect to.
     socket: xev.TCP,
     /// The future for the connection result.
     future: *Future(void, anyerror),
@@ -62,93 +100,84 @@ pub const ConnectTimeout = struct {
     transport: ?*xev_tcp.XevTransport = null,
 };
 
-pub const Connect = struct {
+/// Represents the context for a connection operation in the event loop.
+pub const ConnectCtx = struct {
+    /// The transport used for the connection.
     transport: *xev_tcp.XevTransport,
-
+    /// The callback function to be called when the connection is established.
     callback_instance: ?*anyopaque = null,
-
+    /// The instance to be passed to the callback function.
     callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void,
 };
 
-pub const Write = struct {
+/// Represents the context for writing data to a socket channel in the event loop.
+pub const WriteCtx = struct {
+    /// The socket channel to write data to.
     channel: *xev_tcp.XevSocketChannel,
-
+    /// The instance to be passed to the callback function.
     callback_instance: ?*anyopaque = null,
-
+    /// The callback function to be called when the write operation is complete.
     callback: *const fn (instance: ?*anyopaque, res: anyerror!usize) void,
 };
 
-pub const Close = struct {
+/// Represents the context for closing a socket channel in the event loop.
+pub const CloseCtx = struct {
+    /// The socket channel to be closed.
     channel: *xev_tcp.XevSocketChannel,
-
+    /// The instance to be passed to the callback function.
     callback_instance: ?*anyopaque = null,
-
+    /// The callback function to be called when the close operation is complete.
     callback: *const fn (instance: ?*anyopaque, res: anyerror!void) void,
 };
 
-pub const Accept = struct {
+/// Represents the context for accepting a new connection in the event loop.
+pub const AcceptCtx = struct {
+    /// The transport used for the accepted connection.
     transport: *xev_tcp.XevTransport,
-
+    /// The instance to be passed to the callback function.
     callback_instance: ?*anyopaque = null,
-
+    /// The callback function to be called when the accepted connection is established.
     callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void,
 };
 
-/// Represents a message for I/O operations in the event loop.
-pub const IOMessage = struct {
-    const Self = @This();
-
-    /// Pointer to the next message in the queue.
-    next: ?*Self = null,
-
-    /// The action to be performed, represented as a union of possible operations.
-    action: IOAction,
-};
-
-pub const NoOPContext = struct {
+/// Represents a no-op callback context used for handling callbacks in the event loop.
+pub const NoOpCallbackCtx = struct {
+    /// The connection associated with the callback, if any.
     conn: ?conn.AnyConn = null,
+    /// The handler context associated with the callback, if any.
     ctx: ?*conn.HandlerContext = null,
 };
 
-pub const NoOPCallback = struct {
-    pub fn closeCallback(ud: ?*anyopaque, r: anyerror!void) void {
-        const self: *NoOPContext = @ptrCast(@alignCast(ud.?));
-        defer if (self.conn) |any_conn| any_conn.getPipeline().mempool.io_no_op_context_pool.destroy(self) else if (self.ctx) |ctx| ctx.pipeline.mempool.io_no_op_context_pool.destroy(self);
-        if (r) |_| {} else |err| {
-            if (self.conn) |any_conn| {
+/// A no-op callback implementation for handling write and close operations in the event loop.
+pub const NoOpCallback = struct {
+    /// The close callback function that is called when a close operation is complete.
+    pub fn closeCallback(instance: ?*anyopaque, res: anyerror!void) void {
+        const cb_ctx: *NoOpCallbackCtx = @ptrCast(@alignCast(instance.?));
+        defer if (cb_ctx.conn) |any_conn| any_conn.getPipeline().mempool.no_op_ctx_pool.destroy(cb_ctx) else if (cb_ctx.ctx) |ctx| ctx.pipeline.mempool.no_op_ctx_pool.destroy(cb_ctx);
+        if (res) |_| {} else |err| {
+            if (cb_ctx.conn) |any_conn| {
                 any_conn.getPipeline().fireErrorCaught(err);
-            } else if (self.ctx) |ctx| {
+            } else if (cb_ctx.ctx) |ctx| {
                 ctx.fireErrorCaught(err);
             }
         }
     }
 
-    pub fn writeCallback(ud: ?*anyopaque, r: anyerror!usize) void {
-        const self: *NoOPContext = @ptrCast(@alignCast(ud.?));
-        if (r) |_| {
-            if (self.conn) |any_conn| any_conn.getPipeline().mempool.io_no_op_context_pool.destroy(self) else if (self.ctx) |ctx| ctx.pipeline.mempool.io_no_op_context_pool.destroy(self);
+    /// The write callback function that is called when a write operation is complete.
+    pub fn writeCallback(instance: ?*anyopaque, res: anyerror!usize) void {
+        const cb_ctx: *NoOpCallbackCtx = @ptrCast(@alignCast(instance.?));
+        if (res) |_| {
+            if (cb_ctx.conn) |any_conn| any_conn.getPipeline().mempool.no_op_ctx_pool.destroy(cb_ctx) else if (cb_ctx.ctx) |ctx| ctx.pipeline.mempool.no_op_ctx_pool.destroy(cb_ctx);
         } else |err| {
-            if (self.conn) |any_conn| {
-                any_conn.getPipeline().close(ud, NoOPCallback.closeCallback);
-            } else if (self.ctx) |ctx| {
+            if (cb_ctx.conn) |any_conn| {
+                any_conn.getPipeline().close(instance, NoOpCallback.closeCallback);
+            } else if (cb_ctx.ctx) |ctx| {
                 ctx.fireErrorCaught(err);
-                ctx.close(ud, NoOPCallback.closeCallback);
+                ctx.close(instance, NoOpCallback.closeCallback);
             }
         }
     }
 };
-
-pub const BUFFER_SIZE = 64 * 1024;
-const CompletionPool = std.heap.MemoryPool(xev.Completion);
-const ConnectPool = std.heap.MemoryPool(Connect);
-const ConnectTimeoutPool = std.heap.MemoryPool(ConnectTimeout);
-const HandlerPipelinePool = std.heap.MemoryPool(conn.HandlerPipeline);
-const WritePool = std.heap.MemoryPool(Write);
-const AcceptPool = std.heap.MemoryPool(Accept);
-const ReadBufferPool = std.heap.MemoryPool([BUFFER_SIZE]u8);
-const ClosePool = std.heap.MemoryPool(Close);
-
-pub const NoOpContextMemoryPool = std.heap.MemoryPool(NoOPContext);
 
 /// Represents a thread-based event loop for managing asynchronous I/O operations.
 pub const ThreadEventLoop = struct {
@@ -170,21 +199,21 @@ pub const ThreadEventLoop = struct {
     allocator: Allocator,
     /// The memory pool for managing completion objects.
     completion_pool: CompletionPool,
-
-    connect_pool: ConnectPool,
-
+    /// The memory pool for managing connection objects.
+    connect_ctx_pool: ConnectCtxPool,
+    /// The memory pool for managing connection timeouts.
     connect_timeout_pool: ConnectTimeoutPool,
-
+    /// The memory pool for managing handler pipelines.
     handler_pipeline_pool: HandlerPipelinePool,
-
-    write_pool: WritePool,
-
-    accept_pool: AcceptPool,
-
+    /// The memory pool for managing write operations.
+    write_ctx_pool: WriteCtxPool,
+    /// The memory pool for managing accept operations.
+    accept_ctx_pool: AcceptCtxPool,
+    /// The memory pool for managing read buffers.
     read_buffer_pool: ReadBufferPool,
-
-    close_pool: ClosePool,
-
+    /// The memory pool for managing close operations.
+    close_ctx_pool: CloseCtxPool,
+    /// The thread ID of the event loop thread.
     loop_thread_id: std.Thread.Id,
 
     const Self = @This();
@@ -210,23 +239,23 @@ pub const ThreadEventLoop = struct {
         var connect_timeout_pool = ConnectTimeoutPool.init(allocator);
         errdefer connect_timeout_pool.deinit();
 
-        var connect_pool = ConnectPool.init(allocator);
-        errdefer connect_pool.deinit();
+        var connect_ctx_pool = ConnectCtxPool.init(allocator);
+        errdefer connect_ctx_pool.deinit();
 
         var handler_pipeline_pool = HandlerPipelinePool.init(allocator);
         errdefer handler_pipeline_pool.deinit();
 
-        var write_pool = WritePool.init(allocator);
-        errdefer write_pool.deinit();
+        var write_ctx_pool = WriteCtxPool.init(allocator);
+        errdefer write_ctx_pool.deinit();
 
-        var accept_pool = AcceptPool.init(allocator);
-        errdefer accept_pool.deinit();
+        var accept_ctx_pool = AcceptCtxPool.init(allocator);
+        errdefer accept_ctx_pool.deinit();
 
         var read_buffer_pool = ReadBufferPool.init(allocator);
         errdefer read_buffer_pool.deinit();
 
-        var close_pool = ClosePool.init(allocator);
-        errdefer close_pool.deinit();
+        var close_ctx_pool = CloseCtxPool.init(allocator);
+        errdefer close_ctx_pool.deinit();
 
         self.* = .{
             .loop = loop,
@@ -239,13 +268,13 @@ pub const ThreadEventLoop = struct {
             .loop_thread_id = undefined,
             .allocator = allocator,
             .completion_pool = completion_pool,
-            .connect_pool = connect_pool,
+            .connect_ctx_pool = connect_ctx_pool,
             .connect_timeout_pool = connect_timeout_pool,
             .handler_pipeline_pool = handler_pipeline_pool,
-            .write_pool = write_pool,
-            .accept_pool = accept_pool,
+            .write_ctx_pool = write_ctx_pool,
+            .accept_ctx_pool = accept_ctx_pool,
             .read_buffer_pool = read_buffer_pool,
-            .close_pool = close_pool,
+            .close_ctx_pool = close_ctx_pool,
         };
 
         const thread = try std.Thread.spawn(.{}, start, .{self});
@@ -262,13 +291,13 @@ pub const ThreadEventLoop = struct {
         }
         self.allocator.destroy(self.task_queue);
         self.completion_pool.deinit();
-        self.connect_pool.deinit();
+        self.connect_ctx_pool.deinit();
         self.connect_timeout_pool.deinit();
         self.handler_pipeline_pool.deinit();
-        self.write_pool.deinit();
-        self.accept_pool.deinit();
+        self.write_ctx_pool.deinit();
+        self.accept_ctx_pool.deinit();
         self.read_buffer_pool.deinit();
-        self.close_pool.deinit();
+        self.close_ctx_pool.deinit();
     }
 
     /// Starts the event loop.
@@ -327,7 +356,7 @@ pub const ThreadEventLoop = struct {
 
     /// Callback for handling the async notifier.
     fn asyncCallback(
-        self_: ?*Self,
+        instance: ?*Self,
         loop: *xev.Loop,
         _: *xev.Completion,
         r: xev.Async.WaitError!void,
@@ -336,27 +365,10 @@ pub const ThreadEventLoop = struct {
             std.log.warn("Error in async callback: {}\n", .{err});
             return .disarm;
         };
-        const self = self_.?;
+        const self = instance.?;
 
         while (self.task_queue.pop()) |m| {
             switch (m.action) {
-                // .run_open_stream_timer => |*action_data| {
-                //     const timer = xev.Timer.init() catch unreachable;
-                //     const c_timer = self.completion_pool.create() catch unreachable;
-                //     timer.run(loop, c_timer, action_data.timeout_ms, IOAction, m.action, yamux_timer.TimeoutLoop.runOpenStreamTimerCB);
-                // },
-                // .run_close_stream_timer => |*action_data| {
-                //     const timer = action_data.stream.close_timer.?;
-                //     const c_timer = action_data.stream.c_close_timer.?;
-                //     timer.run(loop, c_timer, action_data.timeout_ms, IOAction, m.action, yamux_timer.TimeoutLoop.runCloseStreamTimerCB);
-                // },
-                // .cancel_close_stream_timer => |*action_data| {
-                //     const timer = action_data.stream.close_timer.?;
-                //     const c_timer = action_data.stream.c_close_timer.?;
-                //     const c_cancel_timer = self.completion_pool.create() catch unreachable;
-                //     c_cancel_timer.* = .{};
-                //     timer.cancel(loop, c_timer, c_cancel_timer, IOAction, m.action, yamux_timer.TimeoutLoop.cancelCloseStreamTimerCB);
-                // },
                 .connect => |action_data| {
                     const address = action_data.address;
                     var socket = xev.TCP.init(address) catch unreachable;
@@ -364,8 +376,8 @@ pub const ThreadEventLoop = struct {
                     // const timer = xev.Timer.init() catch unreachable;
                     // const c_timer = self.completion_pool.create() catch unreachable;
                     // const connect_timeout = action_data.timeout_ms;
-                    const connect_ud = self.connect_pool.create() catch unreachable;
-                    connect_ud.* = .{
+                    const connect_ctx = self.connect_ctx_pool.create() catch unreachable;
+                    connect_ctx.* = .{
                         .transport = action_data.transport,
                         .callback = action_data.callback,
                         .callback_instance = action_data.callback_instance,
@@ -376,132 +388,47 @@ pub const ThreadEventLoop = struct {
                     //     .transport = action_data.transport,
                     //     .socket = socket,
                     // };
-                    socket.connect(loop, c, address, Connect, connect_ud, xev_tcp.XevTransport.connectCB);
+                    socket.connect(loop, c, address, ConnectCtx, connect_ctx, xev_tcp.XevTransport.connectCB);
                     // timer.run(loop, c_timer, connect_timeout, ConnectTimeout, connect_timeout_ud, xev_tcp.XevTransport.connectTimeoutCB);
                 },
                 .accept => |action_data| {
                     const server = action_data.server;
                     const c = self.completion_pool.create() catch unreachable;
-                    const accept_ud = self.accept_pool.create() catch unreachable;
-                    accept_ud.* = .{
+                    const accept_ctx = self.accept_ctx_pool.create() catch unreachable;
+                    accept_ctx.* = .{
                         .callback = action_data.callback,
                         .callback_instance = action_data.callback_instance,
                         .transport = action_data.transport,
                     };
-                    server.accept(loop, c, Accept, accept_ud, xev_tcp.XevListener.acceptCB);
+                    server.accept(loop, c, AcceptCtx, accept_ctx, xev_tcp.XevListener.acceptCB);
                 },
                 .write => |action_data| {
                     const c = self.completion_pool.create() catch unreachable;
                     const channel = action_data.channel;
                     const buffer = action_data.buffer;
-                    const write_ud = self.write_pool.create() catch unreachable;
-                    write_ud.* = .{
+                    const write_ctx = self.write_ctx_pool.create() catch unreachable;
+                    write_ctx.* = .{
                         .channel = action_data.channel,
                         .callback_instance = action_data.callback_instance,
                         .callback = action_data.callback,
                     };
-                    channel.socket.write(loop, c, .{ .slice = buffer }, Write, write_ud, xev_tcp.XevSocketChannel.writeCB);
+                    channel.socket.write(loop, c, .{ .slice = buffer }, WriteCtx, write_ctx, xev_tcp.XevSocketChannel.writeCB);
                 },
                 .close => |action_data| {
                     const channel = action_data.channel;
                     const c = self.completion_pool.create() catch unreachable;
-                    const close_ud = self.close_pool.create() catch unreachable;
-                    close_ud.* = .{
+                    const close_ctx = self.close_ctx_pool.create() catch unreachable;
+                    close_ctx.* = .{
                         .channel = channel,
                         .callback_instance = action_data.callback_instance,
                         .callback = action_data.callback,
                     };
-                    channel.socket.shutdown(loop, c, Close, close_ud, xev_tcp.XevSocketChannel.shutdownCB);
+                    channel.socket.shutdown(loop, c, CloseCtx, close_ctx, xev_tcp.XevSocketChannel.shutdownCB);
                 },
-                // .read => {
-                //     const channel = m.action.read.channel;
-                //     const buffer = m.action.read.buffer;
-                //     const c = self.completion_pool.create() catch unreachable;
-                //     m.action.read.io_loop = self;
-                //     channel.socket.read(loop, c, .{ .slice = buffer }, IOMessage, m, readCB);
-                // },
             }
             self.allocator.destroy(m);
         }
 
         return .rearm;
     }
-
-    // /// Callback executed when the open stream timer expires.
-    // /// This is used to handle timeouts when establishing a new stream connection.
-    // fn runOpenStreamTimerCB(
-    //     ud: ?*IOAction,
-    //     _: *xev.Loop,
-    //     c: *xev.Completion,
-    //     tr: xev.Timer.RunError!void,
-    // ) xev.CallbackAction {
-    //     const action = ud.?.run_open_stream_timer;
-    //     defer action.io_loop.?.completion_pool.destroy(c);
-    //     defer action.io_loop.?.allocator.destroy(action);
-
-    //     tr catch |err| {
-    //         if (err != xev.Timer.RunError.Canceled) {
-    //             std.log.warn("Error in timer callback: {}\n", .{err});
-    //         }
-    //         return .disarm;
-    //     };
-
-    //     if (action.stream.session.isClosed()) {
-    //         return .disarm;
-    //     }
-
-    //     if (action.stream.establish_completion.isSet()) {
-    //         return .disarm;
-    //     }
-
-    //     // timer expired
-    //     action.stream.session.close();
-    //     return .disarm;
-    // }
-
-    // /// Callback executed when the close stream timer expires.
-    // /// This is used to handle timeouts when closing a stream connection.
-    // fn runCloseStreamTimerCB(
-    //     ud: ?*IOMessage,
-    //     _: *xev.Loop,
-    //     _: *xev.Completion,
-    //     tr: xev.Timer.RunError!void,
-    // ) xev.CallbackAction {
-    //     const n = ud.?;
-    //     const action = n.action.run_close_stream_timer;
-    //     defer action.io_loop.?.allocator.destroy(n);
-
-    //     tr catch |err| {
-    //         if (err != xev.Timer.RunError.Canceled) {
-    //             std.debug.print("Error in timer callback: {}\n", .{err});
-    //         }
-    //         return .disarm;
-    //     };
-
-    //     // timer expired
-    //     action.stream.closeTimeout();
-    //     return .disarm;
-    // }
-
-    // /// Callback executed when a close stream timer is canceled.
-    // /// This is used to clean up resources when a timer is canceled before expiry.
-    // fn cancelCloseStreamTimerCB(
-    //     ud: ?*IOMessage,
-    //     _: *xev.Loop,
-    //     c: *xev.Completion,
-    //     tr: xev.Timer.CancelError!void,
-    // ) xev.CallbackAction {
-    //     const n = ud.?;
-    //     const action = n.action.cancel_close_stream_timer;
-    //     defer action.io_loop.?.completion_pool.destroy(c);
-    //     defer action.io_loop.?.allocator.destroy(n);
-
-    //     tr catch |err| {
-    //         std.debug.print("Error in timer callback: {}\n", .{err});
-    //         return .disarm;
-    //     };
-
-    //     return .disarm;
-    // }
-
 };

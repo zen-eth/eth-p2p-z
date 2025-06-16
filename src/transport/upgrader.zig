@@ -31,11 +31,11 @@ pub const Upgrader = struct {
                 s_ctx.conn.getPipeline().allocator.destroy(security_session);
             } else |err| {
                 s_ctx.conn.getPipeline().fireErrorCaught(err);
-                const close_ctx = s_ctx.conn.getPipeline().mempool.io_no_op_context_pool.create() catch unreachable;
+                const close_ctx = s_ctx.conn.getPipeline().mempool.no_op_ctx_pool.create() catch unreachable;
                 close_ctx.* = .{
                     .conn = s_ctx.conn,
                 };
-                s_ctx.conn.getPipeline().close(close_ctx, io_loop.NoOPCallback.closeCallback);
+                s_ctx.conn.getPipeline().close(close_ctx, io_loop.NoOpCallback.closeCallback);
             }
         }
     };

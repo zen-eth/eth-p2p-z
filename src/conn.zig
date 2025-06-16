@@ -332,20 +332,20 @@ const TailHandlerImpl = struct {
     pub fn onRead(_: *Self, _: *HandlerContext, _: []const u8) !void {}
 
     pub fn onReadComplete(_: *Self, ctx: *HandlerContext) void {
-        const no_op_ctx = ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
+        const no_op_ctx = ctx.pipeline.mempool.no_op_ctx_pool.create() catch unreachable;
         no_op_ctx.* = .{
             .ctx = ctx,
         };
-        ctx.conn.close(no_op_ctx, io_loop.NoOPCallback.closeCallback);
+        ctx.conn.close(no_op_ctx, io_loop.NoOpCallback.closeCallback);
     }
 
     pub fn onErrorCaught(_: *Self, ctx: *HandlerContext, err: anyerror) void {
         std.log.warn("Handler '{s}' error during onErrorCaught: {any}", .{ ctx.name, err });
-        const no_op_ctx = ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
+        const no_op_ctx = ctx.pipeline.mempool.no_op_ctx_pool.create() catch unreachable;
         no_op_ctx.* = .{
             .ctx = ctx,
         };
-        ctx.conn.close(no_op_ctx, io_loop.NoOPCallback.closeCallback);
+        ctx.conn.close(no_op_ctx, io_loop.NoOpCallback.closeCallback);
     }
 
     pub fn write(
@@ -417,22 +417,22 @@ const TailHandlerImpl = struct {
 
 const MemoryPool = struct {
     allocator: std.mem.Allocator,
-    io_no_op_context_pool: io_loop.NoOpContextMemoryPool,
+    no_op_ctx_pool: io_loop.NoOpCtxPool,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) !Self {
-        var no_op_ctx_pool = io_loop.NoOpContextMemoryPool.init(allocator);
+        var no_op_ctx_pool = io_loop.NoOpCtxPool.init(allocator);
         errdefer no_op_ctx_pool.deinit();
 
         return .{
             .allocator = allocator,
-            .io_no_op_context_pool = no_op_ctx_pool,
+            .no_op_ctx_pool = no_op_ctx_pool,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.io_no_op_context_pool.deinit();
+        self.no_op_ctx_pool.deinit();
     }
 };
 /// HandlerPipeline manages a doubly-linked list of Handlers that process I/O

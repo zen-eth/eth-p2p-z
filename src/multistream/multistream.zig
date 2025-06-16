@@ -4,7 +4,7 @@ const AnyProtocolBinding = proto_binding.AnyProtocolBinding;
 const ArrayList = std.ArrayList;
 const p2p_conn = @import("../conn.zig");
 const AnyRxConn = p2p_conn.AnyConn;
-const ProtocolId = @import("../protocol_id.zig").ProtocolId;
+const ProtocolId = @import("../misc.zig").ProtocolId;
 const ProtoMatcher = @import("protocol_matcher.zig").ProtocolMatcher;
 const multiformats = @import("multiformats");
 const uvarint = multiformats.uvarint;
@@ -126,11 +126,11 @@ pub const Negotiator = struct {
                         w_ctx.negotiator.allocator.free(proto_id);
                         w_ctx.negotiator.allocator.free(w_ctx.buffer);
                         w_ctx.negotiator.allocator.destroy(w_ctx);
-                        const close_ctx = w_ctx.ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
+                        const close_ctx = w_ctx.ctx.pipeline.mempool.no_op_ctx_pool.create() catch unreachable;
                         close_ctx.* = .{
                             .ctx = w_ctx.ctx,
                         };
-                        w_ctx.ctx.close(close_ctx, io_loop.NoOPCallback.closeCallback);
+                        w_ctx.ctx.close(close_ctx, io_loop.NoOpCallback.closeCallback);
                         return;
                     };
                     w_ctx.negotiator.allocator.free(proto_id);
@@ -143,11 +143,11 @@ pub const Negotiator = struct {
                 w_ctx.negotiator.deinit();
                 w_ctx.negotiator.allocator.free(w_ctx.buffer);
                 w_ctx.negotiator.allocator.destroy(w_ctx);
-                const close_ctx = w_ctx.ctx.pipeline.mempool.io_no_op_context_pool.create() catch unreachable;
+                const close_ctx = w_ctx.ctx.pipeline.mempool.no_op_ctx_pool.create() catch unreachable;
                 close_ctx.* = .{
                     .ctx = w_ctx.ctx,
                 };
-                w_ctx.ctx.close(close_ctx, io_loop.NoOPCallback.closeCallback);
+                w_ctx.ctx.close(close_ctx, io_loop.NoOpCallback.closeCallback);
             }
         }
     };
