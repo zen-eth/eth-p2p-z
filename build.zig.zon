@@ -41,6 +41,10 @@
             .url = "https://github.com/zen-eth/multiformats-zig/archive/main.tar.gz",
             .hash = "zmultiformats-0.1.0-6A8pca4MBQAOeUuxppEgwy_j0U_FVNK6h7swLzzDrCZ0",
         },
+        .lsquic = .{
+            .url = "git+https://github.com/zen-eth/lsquic.git#2440030f9f636c00304fa09c064b829eae3376e0",
+            .hash = "lsquic-0.0.0-jO7gdhAXAAAcMreeC2FoU9XUSvzKsnoZeJIryvnTfk62",
+        },
     },
     .paths = .{
         "build.zig",
