@@ -8,7 +8,7 @@ const io_loop = @import("thread_event_loop.zig");
 pub const SecuritySession = @import("./security/session.zig").Session;
 pub const Direction = enum { INBOUND, OUTBOUND };
 
-// TODO: Check if this interface is needed.
+// TODO: Check if this interface is needed. Because only `ConnUpgrader` uses it.
 /// ConnEnhancer interface for initializing connections.
 /// This is used to set up the connection before it is used.
 pub const ConnEnhancerVTable = struct {

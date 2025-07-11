@@ -104,9 +104,9 @@ pub const ConnectTimeout = struct {
 pub const ConnectCtx = struct {
     /// The transport used for the connection.
     transport: *xev_tcp.XevTransport,
-    /// The callback function to be called when the connection is established.
-    callback_instance: ?*anyopaque = null,
     /// The instance to be passed to the callback function.
+    callback_instance: ?*anyopaque = null,
+    /// The callback function to be called when the connection is established.
     callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void,
 };
 
