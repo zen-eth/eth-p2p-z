@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addImport("xev", libxev_module);
     root_module.addImport("multiformats", zmultiformats_module);
+    root_module.addIncludePath(lsquic_dep.path("include"));
 
     const libp2p_lib = b.addLibrary(.{
         .name = "zig-libp2p",
@@ -49,6 +50,7 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
     });
     libp2p_lib.linkLibrary(lsquic_artifact);
+    libp2p_lib.linkSystemLibrary("zlib");
 
     b.installArtifact(libp2p_lib);
 
@@ -58,11 +60,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    libp2p_exe.linkLibrary(lsquic_artifact);
-
+    libp2p_exe.root_module.addIncludePath(lsquic_dep.path("include"));
     libp2p_exe.root_module.addImport("xev", libxev_module);
     libp2p_exe.root_module.addImport("multiformats", zmultiformats_module);
 
+    libp2p_exe.linkLibrary(lsquic_artifact);
+    libp2p_exe.linkSystemLibrary("zlib");
     b.installArtifact(libp2p_exe);
 
     // This *creates* a Run step in the build graph, to be executed when another
@@ -99,9 +102,12 @@ pub fn build(b: *std.Build) void {
         .filters = filters orelse &.{},
     });
 
-    libp2p_lib_unit_tests.linkLibrary(lsquic_artifact);
+    libp2p_lib_unit_tests.root_module.addIncludePath(lsquic_dep.path("include"));
     libp2p_lib_unit_tests.root_module.addImport("xev", libxev_module);
     libp2p_lib_unit_tests.root_module.addImport("multiformats", zmultiformats_module);
+
+    libp2p_lib_unit_tests.linkLibrary(lsquic_artifact);
+    libp2p_lib_unit_tests.linkSystemLibrary("zlib");
 
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
 
@@ -111,11 +117,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    libp2p_exe_unit_tests.linkLibrary(lsquic_artifact);
+    libp2p_exe_unit_tests.root_module.addIncludePath(lsquic_dep.path("include"));
     // exe_unit_tests.root_module.addImport("libuv", libuv_module);
     // exe_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
     libp2p_exe_unit_tests.root_module.addImport("xev", libxev_module);
     libp2p_exe_unit_tests.root_module.addImport("multiformats", zmultiformats_module);
+    libp2p_exe_unit_tests.linkLibrary(lsquic_artifact);
+    libp2p_exe_unit_tests.linkSystemLibrary("zlib");
     // // for exe, lib, tests, etc.
     // exe_unit_tests.root_module.addImport("aio", zig_aio_module);
     // // for coroutines api
