@@ -32,6 +32,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const lsquic_artifact = lsquic_dep.artifact("lsquic");
+    const ssl_dep = lsquic_dep.builder.dependency("boringssl", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ssl_module = ssl_dep.module("ssl");
 
     const root_module = b.addModule("zig-libp2p", .{
         .root_source_file = b.path("src/root.zig"),
@@ -40,6 +45,7 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addImport("xev", libxev_module);
     root_module.addImport("multiformats", zmultiformats_module);
+    root_module.addImport("ssl", ssl_module);
     root_module.addIncludePath(lsquic_dep.path("include"));
 
     const libp2p_lib = b.addLibrary(.{
@@ -63,6 +69,7 @@ pub fn build(b: *std.Build) void {
     libp2p_exe.root_module.addIncludePath(lsquic_dep.path("include"));
     libp2p_exe.root_module.addImport("xev", libxev_module);
     libp2p_exe.root_module.addImport("multiformats", zmultiformats_module);
+    libp2p_exe.root_module.addImport("ssl", ssl_module);
 
     libp2p_exe.linkLibrary(lsquic_artifact);
     libp2p_exe.linkSystemLibrary("zlib");
@@ -105,6 +112,7 @@ pub fn build(b: *std.Build) void {
     libp2p_lib_unit_tests.root_module.addIncludePath(lsquic_dep.path("include"));
     libp2p_lib_unit_tests.root_module.addImport("xev", libxev_module);
     libp2p_lib_unit_tests.root_module.addImport("multiformats", zmultiformats_module);
+    libp2p_lib_unit_tests.root_module.addImport("ssl", ssl_module);
 
     libp2p_lib_unit_tests.linkLibrary(lsquic_artifact);
     libp2p_lib_unit_tests.linkSystemLibrary("zlib");
@@ -122,6 +130,7 @@ pub fn build(b: *std.Build) void {
     // exe_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
     libp2p_exe_unit_tests.root_module.addImport("xev", libxev_module);
     libp2p_exe_unit_tests.root_module.addImport("multiformats", zmultiformats_module);
+    libp2p_exe_unit_tests.root_module.addImport("ssl", ssl_module);
     libp2p_exe_unit_tests.linkLibrary(lsquic_artifact);
     libp2p_exe_unit_tests.linkSystemLibrary("zlib");
     // // for exe, lib, tests, etc.
