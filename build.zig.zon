@@ -35,11 +35,11 @@
         // },
         .libxev = .{
             .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.zip",
-            .hash = "libxev-0.0.0-86vtc87kEgBxgbJ1RI1R6Elynb7zydCgNR8dt3uw01My",
+            .hash = "libxev-0.0.0-86vtc2UaEwDfiTKX3iBI-s_hdzfzWQUarT3MUrmUQl-Q",
         },
         .zmultiformats = .{
             .url = "https://github.com/zen-eth/multiformats-zig/archive/main.tar.gz",
-            .hash = "zmultiformats-0.1.0-6A8pcfMWBQDp8HneiCSGNfumvIlDoHdW9OA_MPnH_8tW",
+            .hash = "zmultiformats-0.1.0-6A8pca4MBQAOeUuxppEgwy_j0U_FVNK6h7swLzzDrCZ0",
         },
     },
     .paths = .{
