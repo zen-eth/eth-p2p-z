@@ -1,10 +1,10 @@
-const std = @import("std");
-const p2p_conn = @import("../../conn.zig");
 const lsquic = @cImport({
     @cInclude("lsquic.h");
     @cInclude("lsquic_types.h");
     @cInclude("lsxpack_header.h");
 });
+const std = @import("std");
+const p2p_conn = @import("../../conn.zig");
 const Allocator = std.mem.Allocator;
 const xev = @import("xev");
 const UDP = xev.UDP;
@@ -28,13 +28,23 @@ pub const QuicEngine = struct {
 
     socket: UDP,
 
+    socket_address: std.net.Address,
+
     allocator: Allocator,
 
-    is_client: bool,
+    is_initiator: bool,
 
-    pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, is_client: bool) !void {
+    read_buffer: [1500]u8, // Typical MTU size for UDP packets
+
+    c_read: xev.Completion,
+
+    read_state: UDP.State,
+
+    transport: *QuicTransport,
+
+    pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, socket_address: std.net.Address, transport: *QuicTransport, is_initiator: bool) !void {
         var flags: c_uint = 0;
-        if (!is_client) {
+        if (!is_initiator) {
             flags |= lsquic.LSENG_SERVER;
         }
 
@@ -68,8 +78,70 @@ pub const QuicEngine = struct {
             .engine = engine.?,
             .allocator = allocator,
             .socket = socket,
-            .is_client = is_client,
+            .socket_address = socket_address,
+            .read_buffer = std.mem.zeroes([1500]u8),
+            .c_read = .{},
+            .read_state = undefined,
+            .transport = transport,
+            .is_initiator = is_initiator,
         };
+    }
+
+    pub fn start(self: *QuicEngine) !void {
+        self.socket.read(&self.transport.io_event_loop.loop, &self.c_read, &self.read_state, .{ .slice = &self.read_buffer }, QuicEngine, self, QuicEngine.readCallback);
+    }
+
+    fn readCallback(
+        ctx: ?*QuicEngine,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        _: *xev.UDP.State,
+        address: std.net.Address,
+        _: xev.UDP,
+        b: xev.ReadBuffer,
+        r: xev.ReadError!usize,
+    ) xev.CallbackAction {
+        const self = ctx.?;
+
+        const n = r catch |err| {
+            switch (err) {
+                error.EOF => {},
+                else => std.log.warn("UDP read failed with error: {any}. Disarming read.", .{err}),
+            }
+
+            return .disarm;
+        };
+
+        if (n == 0) {
+            return .disarm;
+        }
+
+        const result = lsquic.lsquic_engine_packet_in(
+            self.engine,
+            b.slice.ptr,
+            n,
+            @ptrCast(&self.socket_address.any),
+            @ptrCast(&address.any),
+            self,
+            0,
+        );
+
+        if (result < 0) {
+            std.log.warn("QUIC engine packet in failed", .{});
+            return .disarm;
+        }
+
+        return .rearm;
+    }
+
+    fn processConns(self: *QuicEngine) void {
+        lsquic.lsquic_engine_process_conns(self.engine);
+
+        var diff: c_int = 0;
+        if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff)) {
+            // const timer = xev.Timer.init() catch unreachable;
+            // const c_timer = self.transport.io_event_loop.completion_pool.create() catch unreachable;
+        }
     }
 
     fn getSslContext(
@@ -113,7 +185,6 @@ pub const QuicListener = struct {
     pub fn init(self: *QuicListener, address: std.net.Address, transport: *QuicTransport) ListenError!void {
         const server = try UDP.init(address);
         try server.bind(address);
-
         self.address = address;
         self.server = server;
         self.transport = transport;
@@ -136,15 +207,20 @@ pub const QuicTransport = struct {
 
     allocator: Allocator,
 
-    pub fn init() !void {
+    pub fn init(self: *QuicTransport, loop: *io_loop.ThreadEventLoop, allocator: Allocator) !void {
         // Initialize the QUIC transport layer
         const result = lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT);
         if (result != 0) {
             return error.InitializationFailed;
         }
+        self.* = .{
+            .ssl_context = undefined,
+            .io_event_loop = loop,
+            .allocator = allocator,
+        };
     }
 
-    pub fn deinit() void {
+    pub fn deinit(_: *QuicTransport) void {
         // Cleanup the QUIC transport layer
         lsquic.lsquic_global_cleanup();
     }
@@ -190,11 +266,11 @@ fn onNewConn(ctx: ?*anyopaque, conn: ?*lsquic.lsquic_conn_t) callconv(.c) ?*lsqu
     lsquic_conn.* = .{
         .conn = conn.?,
         .engine = engine,
-        .direction = if (engine.is_client) p2p_conn.Direction.OUTBOUND else p2p_conn.Direction.INBOUND,
+        .direction = if (engine.is_initiator) p2p_conn.Direction.OUTBOUND else p2p_conn.Direction.INBOUND,
     };
     const conn_ctx: *lsquic.lsquic_conn_ctx_t = @ptrCast(@alignCast(lsquic_conn));
     lsquic.lsquic_conn_set_ctx(conn, conn_ctx);
-    if (!engine.is_client) {
+    if (!engine.is_initiator) {
         onHskDone(conn, lsquic.LSQ_HSK_OK);
     }
     // Handle new connection logic here
@@ -253,14 +329,31 @@ fn onClose(
 }
 
 test "lsquic transport initialization" {
-    try QuicTransport.init();
-    defer QuicTransport.deinit();
+    var loop: io_loop.ThreadEventLoop = undefined;
+    try loop.init(std.testing.allocator);
+    defer {
+        loop.close();
+        loop.deinit();
+    }
+    var transport: QuicTransport = undefined;
+    try transport.init(&loop, std.testing.allocator);
+    defer transport.deinit();
 }
 
 test "lsquic engine initialization" {
+    var loop: io_loop.ThreadEventLoop = undefined;
+    try loop.init(std.testing.allocator);
+    defer {
+        loop.close();
+        loop.deinit();
+    }
+    var transport: QuicTransport = undefined;
+    try transport.init(&loop, std.testing.allocator);
+    defer transport.deinit();
+
     const addr = try std.net.Address.parseIp4("127.0.0.1", 9999);
     const udp = try UDP.init(addr);
     var engine: QuicEngine = undefined;
-    try QuicEngine.init(&engine, std.testing.allocator, udp, false);
+    try engine.init(std.testing.allocator, udp, addr, &transport, false);
     defer lsquic.lsquic_engine_destroy(engine.engine);
 }
