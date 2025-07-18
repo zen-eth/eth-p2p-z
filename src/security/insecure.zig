@@ -7,7 +7,7 @@ const p2p_conn = @import("../conn.zig");
 const std = @import("std");
 const security = @import("../security/lib.zig");
 const io_loop = @import("../thread_event_loop.zig");
-const xev_tcp = @import("../transport/tcp/xev.zig");
+const xev_tcp = @import("../transport/tcp/lib.zig");
 
 pub const InsecureChannel = struct {
     protocol_descriptor: ProtocolDescriptor,
@@ -148,11 +148,11 @@ pub const InsecureHandler = struct {
                 };
                 self.on_handshake_callback(self.on_handshake_context, session);
                 if (ctx.conn.direction() == .INBOUND) {
-                    const server_handler = xev_tcp.ServerEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
+                    const server_handler = xev_tcp.xev_transport.ServerEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
                     const server_handler_any = server_handler.any();
                     ctx.pipeline.addLast("server_echo_handler", server_handler_any) catch unreachable;
                 } else {
-                    const client_handler = xev_tcp.ClientEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
+                    const client_handler = xev_tcp.xev_transport.ClientEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
                     const client_handler_any = client_handler.any();
                     ctx.pipeline.addLast("client_echo_handler", client_handler_any) catch unreachable;
                 }
