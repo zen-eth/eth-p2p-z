@@ -1,4 +1,5 @@
 const std = @import("std");
+const ProtoGenStep = @import("gremlin").ProtoGenStep;
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -27,6 +28,20 @@ pub fn build(b: *std.Build) void {
     });
     const zmultiformats_module = zmultiformats_dep.module("multiformats-zig");
 
+    const gremlin_dep = b.dependency("gremlin", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const gremlin_module = gremlin_dep.module("gremlin");
+
+    const protobuf = ProtoGenStep.create(
+        b,
+        .{
+            .proto_sources = b.path("src/proto"),
+            .target = b.path("src/proto"),
+        },
+    );
+
     const root_module = b.addModule("zig-libp2p", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -34,6 +49,7 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addImport("xev", libxev_module);
     root_module.addImport("multiformats", zmultiformats_module);
+    root_module.addImport("gremlin", gremlin_module);
 
     const libp2p_lib = b.addLibrary(.{
         .name = "zig-libp2p",
@@ -54,6 +70,8 @@ pub fn build(b: *std.Build) void {
 
     libp2p_exe.root_module.addImport("xev", libxev_module);
     libp2p_exe.root_module.addImport("multiformats", zmultiformats_module);
+    libp2p_exe.root_module.addImport("gremlin", gremlin_module);
+    libp2p_exe.step.dependOn(&protobuf.step);
 
     b.installArtifact(libp2p_exe);
 
@@ -91,6 +109,7 @@ pub fn build(b: *std.Build) void {
         .filters = filters orelse &.{},
     });
 
+    libp2p_lib_unit_tests.step.dependOn(&protobuf.step);
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
 
     const libp2p_exe_unit_tests = b.addTest(.{
@@ -99,14 +118,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // exe_unit_tests.root_module.addImport("libuv", libuv_module);
-    // exe_unit_tests.root_module.addImport("multiformats-zig", multiformats_zig_module);
     libp2p_exe_unit_tests.root_module.addImport("xev", libxev_module);
     libp2p_exe_unit_tests.root_module.addImport("multiformats", zmultiformats_module);
-    // // for exe, lib, tests, etc.
-    // exe_unit_tests.root_module.addImport("aio", zig_aio_module);
-    // // for coroutines api
-    // exe_unit_tests.root_module.addImport("coro", zig_coro_module);
+    libp2p_exe_unit_tests.root_module.addImport("gremlin", gremlin_module);
+    libp2p_exe_unit_tests.step.dependOn(&protobuf.step);
+
     const run_libp2p_exe_unit_tests = b.addRunArtifact(libp2p_exe_unit_tests);
 
     // Similar to creating the run step earlier, this exposes a `test` step to
