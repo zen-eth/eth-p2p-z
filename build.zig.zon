@@ -25,14 +25,6 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // .@"multiformats-zig" = .{
-        //     .url = "https://github.com/zen-eth/multiformats-zig/archive/main.tar.gz",
-        //     .hash = "1220041512f3b82076a2b601864a2afa5123e786c54e7317a6627c5c83d813e9ca19",
-        // },
-        // .libuv = .{
-        //     .url = "https://github.com/zen-eth/zig-libuv/archive/refs/heads/main.zip",
-        //     .hash = "1220fd9f66231bcae161c8ef630a528179d6435e4e083f784e8ff0cd46c0990ed9b5",
-        // },
         .libxev = .{
             .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.zip",
             .hash = "libxev-0.0.0-86vtc2UaEwDfiTKX3iBI-s_hdzfzWQUarT3MUrmUQl-Q",
@@ -40,6 +32,10 @@
         .zmultiformats = .{
             .url = "https://github.com/zen-eth/multiformats-zig/archive/main.tar.gz",
             .hash = "zmultiformats-0.1.0-6A8pca4MBQAOeUuxppEgwy_j0U_FVNK6h7swLzzDrCZ0",
+        },
+        .gremlin = .{
+            .url = "git+https://github.com/octopus-foundation/gremlin.zig#fccfe2659f24497199d86404e0ef7dbc79e033d2",
+            .hash = "gremlin-0.0.0-E2s91bN4DgDYbb4QNxl4ZT5nEEhNBkk5ngfVasDbsnNF",
         },
     },
     .paths = .{
