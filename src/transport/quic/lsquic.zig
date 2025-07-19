@@ -87,8 +87,10 @@ pub const QuicEngine = struct {
         };
     }
 
-    pub fn start(self: *QuicEngine) !void {
+    pub fn start(self: *QuicEngine) void {
         self.socket.read(&self.transport.io_event_loop.loop, &self.c_read, &self.read_state, .{ .slice = &self.read_buffer }, QuicEngine, self, QuicEngine.readCallback);
+
+        self.processConns();
     }
 
     fn readCallback(
@@ -137,11 +139,33 @@ pub const QuicEngine = struct {
     fn processConns(self: *QuicEngine) void {
         lsquic.lsquic_engine_process_conns(self.engine);
 
-        var diff: c_int = 0;
-        if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff)) {
-            // const timer = xev.Timer.init() catch unreachable;
-            // const c_timer = self.transport.io_event_loop.completion_pool.create() catch unreachable;
+        var diff_us: c_int = 0;
+        if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff_us) > 0) {
+            const timer = xev.Timer.init() catch unreachable;
+            const c_timer = self.transport.io_event_loop.completion_pool.create() catch unreachable;
+            const next_ms = @divFloor(@as(u64, @intCast(diff_us)), std.time.us_per_ms);
+            timer.run(&self.transport.io_event_loop.loop, c_timer, next_ms, QuicEngine, self, processConnsCallback);
         }
+    }
+
+    pub fn processConnsCallback(
+        ctx: ?*QuicEngine,
+        _: *xev.Loop,
+        c: *xev.Completion,
+        r: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        const engine = ctx.?;
+        const transport = engine.transport;
+        defer transport.io_event_loop.completion_pool.destroy(c);
+
+        _ = r catch |err| {
+            std.log.warn("QUIC engine process conns timer failed with error: {}", .{err});
+            return .disarm;
+        };
+
+        engine.processConns();
+
+        return .disarm;
     }
 
     fn getSslContext(
@@ -251,6 +275,9 @@ fn packetsOut(
         msg.iov = @ptrCast(spec.iov.?);
         msg.iovlen = @intCast(spec.iovlen);
 
+        if (xev.backend == .epoll or xev.backend == .io_uring) {
+            // TODO: try to use libxev's sendmsg function
+        }
         _ = std.posix.sendmsg(engine.socket.fd, &msg, 0) catch |err| {
             std.debug.panic("sendmsgPosix failed with: {s}", .{@errorName(err)});
         };
