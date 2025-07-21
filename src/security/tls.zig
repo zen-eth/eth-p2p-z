@@ -4,20 +4,29 @@ const Allocator = std.mem.Allocator;
 const keys_proto = @import("../proto/keys.proto.zig");
 
 /// This is the prefix libp2p uses for signing the certificate extension.
-const certificate_prefix = "libp2p-tls-handshake:";
+const CertificatePrefix = "libp2p-tls-handshake:";
 /// This is the OID for the libp2p self-signed certificate extension.
-const libp2p_extension_oid = "1.3.6.1.4.1.53594.1.1";
+const Libp2pExtensionOid = "1.3.6.1.4.1.53594.1.1";
+/// The offset to apply to the certificate's notBefore field.
+const CertNotBeforeOffsetSeconds = -3600; // 1 hour before current time
+/// The offset to apply to the certificate's notAfter field.
+const CertNotAfterOffsetSeconds = 365 * 24 * 3600; // 1 year after current time
 
 pub const Error = error{
     CertCreationFailed,
     CertNameCreationFailed,
     CertVersionSetFailed,
+    CertSerialCreationFailed,
     CertSerialSetFailed,
     CertPKeySetFailed,
     CertIssuerSetFailed,
+    CertValidPeriodSetFailed,
     CertSubjectSetFailed,
+    CertExtCreationFailed,
     CertExtSetFailed,
+    CertSignCreationFailed,
     PubKeyTODerFailed,
+    RawPubKeyGetFailed,
     OpenSSLFailed,
     InvalidOID,
     SignDataFailed,
@@ -33,7 +42,7 @@ pub const Error = error{
 /// `subjectKey` param represents the subject's key pair. Its public key is the certificate's
 /// main public key, and its private key signs the certificate.
 ///
-/// A pointer to the newly created X509 certificate, or an error returned.
+/// The returned certificate is owned by the caller and must be freed with `ssl.X509_free()`.
 pub fn buildCert(
     allocator: Allocator,
     hostKey: *ssl.EVP_PKEY,
@@ -44,27 +53,28 @@ pub fn buildCert(
 
     if (ssl.X509_set_version(cert, ssl.X509_VERSION_3) <= 0) return error.CertVersionSetFailed;
 
-    const serial = ssl.ASN1_INTEGER_new() orelse return error.OpenSSLFailed;
+    const serial = ssl.ASN1_INTEGER_new() orelse return error.CertSerialCreationFailed;
     defer ssl.ASN1_INTEGER_free(serial);
-    if (ssl.ASN1_INTEGER_set_int64(serial, std.time.milliTimestamp()) <= 0) return error.OpenSSLFailed;
+
+    var random_bytes_buf: [8]u8 = undefined;
+    std.crypto.random.bytes(&random_bytes_buf);
+    const random_serial: i64 = @bitCast(random_bytes_buf);
+
+    if (ssl.ASN1_INTEGER_set_int64(serial, random_serial) <= 0) return error.CertSerialSetFailed;
     if (ssl.X509_set_serialNumber(cert, serial) <= 0) return error.CertSerialSetFailed;
 
     if (ssl.X509_set_pubkey(cert, subjectKey) <= 0) return error.CertPKeySetFailed;
 
     const name = ssl.X509_NAME_new() orelse return error.CertNameCreationFailed;
     defer ssl.X509_NAME_free(name);
-    if (ssl.X509_NAME_add_entry_by_txt(name, "C", ssl.MBSTRING_ASC, "CN", -1, -1, 0) <= 0) return error.OpenSSLFailed;
-    if (ssl.X509_NAME_add_entry_by_txt(name, "O", ssl.MBSTRING_ASC, "libp2p", -1, -1, 0) <= 0) return error.OpenSSLFailed;
-    if (ssl.X509_NAME_add_entry_by_txt(name, "CN", ssl.MBSTRING_ASC, "libp2p", -1, -1, 0) <= 0) return error.OpenSSLFailed;
+    if (ssl.X509_NAME_add_entry_by_txt(name, "C", ssl.MBSTRING_ASC, "CN", -1, -1, 0) <= 0) return error.CertNameCreationFailed;
+    if (ssl.X509_NAME_add_entry_by_txt(name, "O", ssl.MBSTRING_ASC, "libp2p", -1, -1, 0) <= 0) return error.CertNameCreationFailed;
+    if (ssl.X509_NAME_add_entry_by_txt(name, "CN", ssl.MBSTRING_ASC, "libp2p", -1, -1, 0) <= 0) return error.CertNameCreationFailed;
     if (ssl.X509_set_issuer_name(cert, name) <= 0) return error.CertIssuerSetFailed;
     if (ssl.X509_set_subject_name(cert, name) <= 0) return error.CertSubjectSetFailed;
 
-    // const now = std.time.timestamp();
-    // if (ssl.X509_set_notBefore(cert, now - 3600) <= 0) return error.OpenSSLFailed;
-    // if (ssl.X509_set_notAfter(cert, now + 365 * 24 * 3600) <= 0) return error.OpenSSLFailed;
-
-    if (ssl.X509_gmtime_adj(ssl.X509_get_notBefore(cert), -3600) == null) return error.OpenSSLFailed;
-    if (ssl.X509_gmtime_adj(ssl.X509_get_notAfter(cert), 365 * 24 * 3600) == null) return error.OpenSSLFailed;
+    if (ssl.X509_gmtime_adj(ssl.X509_get_notBefore(cert), CertNotBeforeOffsetSeconds) == null) return error.CertValidPeriodSetFailed;
+    if (ssl.X509_gmtime_adj(ssl.X509_get_notAfter(cert), CertNotAfterOffsetSeconds) == null) return error.CertValidPeriodSetFailed;
 
     var subj_pubkey_ptr: [*c]u8 = null;
     const subj_pubkey_len = ssl.i2d_PUBKEY(subjectKey, &subj_pubkey_ptr);
@@ -72,10 +82,10 @@ pub fn buildCert(
     defer ssl.OPENSSL_free(subj_pubkey_ptr);
     const subject_pubkey_der = subj_pubkey_ptr[0..@intCast(subj_pubkey_len)];
 
-    const data_to_sign = try allocator.alloc(u8, certificate_prefix.len + subject_pubkey_der.len);
+    const data_to_sign = try allocator.alloc(u8, CertificatePrefix.len + subject_pubkey_der.len);
     defer allocator.free(data_to_sign);
-    @memcpy(data_to_sign[0..certificate_prefix.len], certificate_prefix);
-    @memcpy(data_to_sign[certificate_prefix.len..], subject_pubkey_der);
+    @memcpy(data_to_sign[0..CertificatePrefix.len], CertificatePrefix);
+    @memcpy(data_to_sign[CertificatePrefix.len..], subject_pubkey_der);
 
     const signature = try signData(allocator, hostKey, data_to_sign);
     defer allocator.free(signature);
@@ -87,7 +97,7 @@ pub fn buildCert(
     const ext_value_der_len = try createExtension(host_pubkey_proto, signature, &ext_value_der);
     defer ssl.OPENSSL_free(ext_value_der);
 
-    try addExtension(cert, libp2p_extension_oid, true, ext_value_der[0..@intCast(ext_value_der_len)]);
+    try addExtension(cert, Libp2pExtensionOid, true, ext_value_der[0..@intCast(ext_value_der_len)]);
 
     if (ssl.X509_sign(cert, subjectKey, null) <= 0) {
         return error.SignCertFailed;
@@ -97,7 +107,8 @@ pub fn buildCert(
 }
 
 /// Encodes a public key into the libp2p PublicKey protobuf format.
-fn createProtobufEncodedPublicKey(allocator: std.mem.Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
+/// The caller owns the returned slice.
+fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
     const raw_pubkey = try getRawPublicKeyBytes(allocator, pkey);
     defer allocator.free(raw_pubkey);
 
@@ -136,24 +147,25 @@ fn createProtobufEncodedPublicKey(allocator: std.mem.Allocator, pkey: *ssl.EVP_P
 }
 
 /// Gets the raw public key bytes from an EVP_PKEY.
-fn getRawPublicKeyBytes(allocator: std.mem.Allocator, pkey: *ssl.EVP_PKEY) ![]u8 {
+/// The caller owns the returned slice.
+fn getRawPublicKeyBytes(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]u8 {
     var len: usize = 0;
-    if (ssl.EVP_PKEY_get_raw_public_key(pkey, null, &len) == 0) return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_get_raw_public_key(pkey, null, &len) == 0) return error.RawPubKeyGetFailed;
     const buf = try allocator.alloc(u8, len);
     if (ssl.EVP_PKEY_get_raw_public_key(pkey, buf.ptr, &len) == 0) {
         allocator.free(buf);
-        return error.OpenSSLFailed;
+        return error.RawPubKeyGetFailed;
     }
     return buf;
 }
 
 /// Signs arbitrary data using the private key within an EVP_PKEY.
-fn signData(allocator: std.mem.Allocator, pkey: *ssl.EVP_PKEY, data: []const u8) ![]u8 {
-    const ctx = ssl.EVP_MD_CTX_new() orelse return error.OpenSSLFailed;
+/// The caller owns the returned slice.
+fn signData(allocator: Allocator, pkey: *ssl.EVP_PKEY, data: []const u8) ![]u8 {
+    const ctx = ssl.EVP_MD_CTX_new() orelse return error.CertSignCreationFailed;
     defer ssl.EVP_MD_CTX_free(ctx);
 
     const message_digest: ?*const ssl.EVP_MD = switch (ssl.EVP_PKEY_base_id(pkey)) {
-        // TODO: Check if secp256k1 is supported by OpenSSL.
         ssl.EVP_PKEY_ED25519 => null,
 
         ssl.EVP_PKEY_EC, ssl.EVP_PKEY_RSA => ssl.EVP_sha256(),
@@ -162,85 +174,88 @@ fn signData(allocator: std.mem.Allocator, pkey: *ssl.EVP_PKEY, data: []const u8)
     };
 
     if (ssl.EVP_DigestSignInit(ctx, null, message_digest, null, pkey) <= 0) {
-        return error.OpenSSLFailed;
+        return error.CertSignCreationFailed;
     }
 
     var sig_len: usize = 0;
     if (ssl.EVP_DigestSign(ctx, null, &sig_len, data.ptr, data.len) <= 0) {
-        return error.SignFailed;
+        return error.CertSignCreationFailed;
     }
 
     const sig_buf = try allocator.alloc(u8, sig_len);
     errdefer allocator.free(sig_buf);
 
     if (ssl.EVP_DigestSign(ctx, sig_buf.ptr, &sig_len, data.ptr, data.len) <= 0) {
-        return error.SignFailed;
+        return error.CertSignCreationFailed;
     }
     return sig_buf;
 }
 
 /// Creates the DER-encoded value for the libp2p extension.
-/// The value is a SEQUENCE of two OCTET STRINGs.
+/// The value is a SEQUENCE of two OCTET STRINGs. The caller is responsible for
+/// freeing the memory pointed to by `out` using `ssl.OPENSSL_free()`.
 fn createExtension(host_pubkey_proto: []const u8, signature: []const u8, out: [*c][*c]u8) !c_int {
-    const seq_stack = ssl.sk_ASN1_TYPE_new_null() orelse return error.OpenSSLFailed;
+    const seq_stack = ssl.sk_ASN1_TYPE_new_null() orelse return error.CertExtCreationFailed;
     defer ssl.sk_ASN1_TYPE_free(seq_stack);
 
-    const host_key_str = ssl.ASN1_OCTET_STRING_new() orelse return error.OpenSSLFailed;
+    const host_key_str = ssl.ASN1_OCTET_STRING_new() orelse return error.CertExtCreationFailed;
     if (ssl.ASN1_OCTET_STRING_set(host_key_str, host_pubkey_proto.ptr, @intCast(host_pubkey_proto.len)) == 0) {
         ssl.ASN1_OCTET_STRING_free(host_key_str);
-        return error.OpenSSLFailed;
+        return error.CertExtSetFailed;
     }
 
     const host_key_type = ssl.ASN1_TYPE_new() orelse {
         ssl.ASN1_OCTET_STRING_free(host_key_str);
-        return error.OpenSSLFailed;
+        return error.CertExtCreationFailed;
     };
     ssl.ASN1_TYPE_set(host_key_type, ssl.V_ASN1_OCTET_STRING, host_key_str);
 
     if (ssl.sk_ASN1_TYPE_push(seq_stack, host_key_type) <= 0) {
         ssl.ASN1_TYPE_free(host_key_type);
-        return error.OpenSSLFailed;
+        return error.CertExtSetFailed;
     }
 
-    const sig_str = ssl.ASN1_OCTET_STRING_new() orelse return error.OpenSSLFailed;
+    const sig_str = ssl.ASN1_OCTET_STRING_new() orelse return error.CertExtCreationFailed;
     if (ssl.ASN1_OCTET_STRING_set(sig_str, signature.ptr, @intCast(signature.len)) == 0) {
         ssl.ASN1_OCTET_STRING_free(sig_str);
-        return error.OpenSSLFailed;
+        return error.CertExtSetFailed;
     }
 
     const sig_type = ssl.ASN1_TYPE_new() orelse {
         ssl.ASN1_OCTET_STRING_free(sig_str);
-        return error.OpenSSLFailed;
+        return error.CertExtCreationFailed;
     };
     ssl.ASN1_TYPE_set(sig_type, ssl.V_ASN1_OCTET_STRING, sig_str);
 
     if (ssl.sk_ASN1_TYPE_push(seq_stack, sig_type) <= 0) {
         ssl.ASN1_TYPE_free(sig_type);
-        return error.OpenSSLFailed;
+        return error.CertExtSetFailed;
     }
 
     const len = ssl.i2d_ASN1_SEQUENCE_ANY(seq_stack, out);
-    if (len <= 0) return error.OpenSSLFailed;
+    if (len <= 0) return error.CertExtCreationFailed;
 
     return len;
 }
 
-/// A generic helper to add a DER-encoded extension to a certificate.
+/// Adds a DER-encoded extension to a certificate.
 fn addExtension(cert: *ssl.X509, oid_str: [*:0]const u8, is_critical: bool, der_data: []const u8) !void {
     const obj = ssl.OBJ_txt2obj(oid_str, 1) orelse return error.InvalidOID;
     defer ssl.ASN1_OBJECT_free(obj);
 
-    const octet_string = ssl.ASN1_OCTET_STRING_new() orelse return error.OpenSSLFailed;
+    const octet_string = ssl.ASN1_OCTET_STRING_new() orelse return error.CertExtCreationFailed;
     defer ssl.ASN1_OCTET_STRING_free(octet_string);
-    if (ssl.ASN1_OCTET_STRING_set(octet_string, der_data.ptr, @intCast(der_data.len)) == 0) return error.OpenSSLFailed;
+    if (ssl.ASN1_OCTET_STRING_set(octet_string, der_data.ptr, @intCast(der_data.len)) == 0) return error.CertExtSetFailed;
 
-    const ext = ssl.X509_EXTENSION_create_by_OBJ(null, obj, if (is_critical) 1 else 0, octet_string) orelse return error.OpenSSLFailed;
+    const ext = ssl.X509_EXTENSION_create_by_OBJ(null, obj, if (is_critical) 1 else 0, octet_string) orelse return error.CertExtCreationFailed;
     defer ssl.X509_EXTENSION_free(ext);
 
     if (ssl.X509_add_ext(cert, ext, -1) <= 0) return error.CertExtSetFailed;
 }
 
-/// Converts an X509 certificate to PEM format for testing.
+/// Converts an X509 certificate to PEM format using the provided allocator.
+/// The caller owns the returned slice and must free it.
+/// Returns error.OpenSSLFailed on failure.
 fn x509ToPem(allocator: Allocator, cert: *ssl.X509) ![]u8 {
     const bio = ssl.BIO_new(ssl.BIO_s_mem()) orelse return error.OpenSSLFailed;
     defer _ = ssl.BIO_free(bio);
@@ -258,7 +273,7 @@ fn x509ToPem(allocator: Allocator, cert: *ssl.X509) ![]u8 {
     return allocator.dupe(u8, data_ptr[0..@intCast(len)]);
 }
 
-test "Build certificate" {
+test "Build certificate using Ed25519 keys" {
     const fs = std.fs.cwd();
     const file_path = "test_cert.pem";
 
@@ -296,6 +311,7 @@ test "Build certificate" {
     const cert = try buildCert(std.testing.allocator, host_key, subject_key);
     defer ssl.X509_free(cert);
 
+    // TODO: Write the certificate to a file for checking the cert file outside, will use assert once verify side is implemented.
     const file = try std.fs.cwd().createFile("test_cert.pem", .{ .truncate = true });
     defer file.close();
     const pem_buf = try x509ToPem(std.testing.allocator, cert);
