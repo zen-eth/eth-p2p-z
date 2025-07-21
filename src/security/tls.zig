@@ -241,6 +241,22 @@ fn addExtension(cert: *ssl.X509, oid_str: [*:0]const u8, is_critical: bool, der_
 }
 
 /// Converts an X509 certificate to PEM format.
+/// 
+/// This function takes an X509 certificate and converts it to PEM format using OpenSSL.
+/// The resulting PEM-encoded certificate is returned as a byte slice allocated using the provided allocator.
+/// 
+/// Parameters:
+/// - `allocator`: The memory allocator used to allocate the returned byte slice.
+/// - `cert`: A pointer to the X509 certificate to be converted.
+/// 
+/// Returns:
+/// - A byte slice containing the PEM-encoded certificate.
+/// 
+/// Errors:
+/// - `error.OpenSSLFailed`: If OpenSSL fails during the conversion process.
+/// 
+/// Memory Ownership:
+/// - The caller is responsible for freeing the returned byte slice using the same allocator.
 fn x509ToPem(allocator: Allocator, cert: *ssl.X509) ![]u8 {
     const bio = ssl.BIO_new(ssl.BIO_s_mem()) orelse return error.OpenSSLFailed;
     defer _ = ssl.BIO_free(bio);
