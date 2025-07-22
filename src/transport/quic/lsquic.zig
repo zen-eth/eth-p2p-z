@@ -259,7 +259,6 @@ pub const QuicStream = struct {
 pub const QuicListener = struct {
     /// The error type returned by the `init` function. Want to remain the underlying error type, so we used `anyerror`.
     pub const ListenError = anyerror;
-
     /// The QuicEngine that this listener is associated with, if any.
     engine: ?QuicEngine,
 
@@ -271,7 +270,7 @@ pub const QuicListener = struct {
     accept_callback_ctx: ?*anyopaque = null,
 
     /// Initialize the listener with the given transport and accept callback.
-    pub fn init(self: *QuicListener, transport: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!QuicConnection) void) ListenError!void {
+    pub fn init(self: *QuicListener, transport: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!QuicConnection) void) void {
         self.* = .{
             .engine = null,
             .transport = transport,
@@ -285,7 +284,18 @@ pub const QuicListener = struct {
         // TODO: should we close the server here?
     }
 
-    pub fn listen(_: *QuicListener, _: std.net.Address) void {}
+    pub fn listen(self: *QuicListener, address: std.net.Address) ListenError!void {
+        if (self.engine != null) {
+            return error.AlreadyListening;
+        }
+
+        const socket = try UDP.init(address);
+        var engine: QuicEngine = undefined;
+        try engine.init(self.transport.allocator, socket, self.transport, false);
+        self.engine = engine;
+        engine.onAccept(self.accept_callback_ctx, self.accept_callback);
+        engine.start();
+    }
 };
 
 pub const QuicTransport = struct {
@@ -342,9 +352,9 @@ pub const QuicTransport = struct {
         dialer.connect(peer_address, callback_ctx, callback);
     }
 
-    pub fn newListener(self: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) !QuicListener {
+    pub fn newListener(self: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) QuicListener {
         var listener: QuicListener = undefined;
-        try listener.init(self, accept_callback_ctx, accept_callback);
+        listener.init(self, accept_callback_ctx, accept_callback);
         return listener;
     }
 
