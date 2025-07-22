@@ -5,11 +5,11 @@ const lsquic = @cImport({
 });
 const std = @import("std");
 const p2p_conn = @import("../../conn.zig");
-const Allocator = std.mem.Allocator;
 const xev = @import("xev");
-const UDP = xev.UDP;
 const io_loop = @import("../../thread_event_loop.zig");
 const ssl = @import("ssl");
+const Allocator = std.mem.Allocator;
+const UDP = xev.UDP;
 const posix = std.posix;
 
 const MaxStreamDataBidiRemote = 64 * 1024 * 1024; // 64 MB
@@ -62,6 +62,10 @@ pub const QuicEngine = struct {
 
     connecting: ?Connecting,
 
+    accept_callback: ?*const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void,
+
+    accept_callback_ctx: ?*anyopaque,
+
     pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, transport: *QuicTransport, is_initiator: bool) !void {
         var flags: c_uint = 0;
         if (!is_initiator) {
@@ -110,6 +114,8 @@ pub const QuicEngine = struct {
             .transport = transport,
             .is_initiator = is_initiator,
             .connecting = null,
+            .accept_callback = null,
+            .accept_callback_ctx = null,
         };
     }
 
@@ -146,6 +152,11 @@ pub const QuicEngine = struct {
         );
 
         self.processConns();
+    }
+
+    pub fn onAccept(self: *QuicEngine, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) void {
+        self.accept_callback = accept_callback;
+        self.accept_callback_ctx = accept_callback_ctx;
     }
 
     fn readCallback(
@@ -246,27 +257,27 @@ pub const QuicStream = struct {
 };
 
 pub const QuicListener = struct {
-    pub const AcceptError = Allocator.Error || xev.AcceptError || error{AsyncNotifyFailed};
     /// The error type returned by the `init` function. Want to remain the underlying error type, so we used `anyerror`.
     pub const ListenError = anyerror;
-    /// The address to listen on.
-    address: std.net.Address,
-    /// The server to accept connections from.
-    server: UDP,
+
+    /// The QuicEngine that this listener is associated with, if any.
+    engine: ?QuicEngine,
+
     /// The transport that created this listener.
     transport: *QuicTransport,
 
-    accept_callback: ?*const fn (instance: ?*anyopaque, res: anyerror!p2p_conn.AnyConn) void = null,
+    accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!QuicConnection) void,
 
-    accept_callback_instance: ?*anyopaque = null,
+    accept_callback_ctx: ?*anyopaque = null,
 
-    /// Initialize the listener with the given address, backlog, and transport.
-    pub fn init(self: *QuicListener, address: std.net.Address, transport: *QuicTransport) ListenError!void {
-        const server = try UDP.init(address);
-        try server.bind(address);
-        self.address = address;
-        self.server = server;
-        self.transport = transport;
+    /// Initialize the listener with the given transport and accept callback.
+    pub fn init(self: *QuicListener, transport: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!QuicConnection) void) ListenError!void {
+        self.* = .{
+            .engine = null,
+            .transport = transport,
+            .accept_callback = accept_callback,
+            .accept_callback_ctx = accept_callback_ctx,
+        };
     }
 
     /// Deinitialize the listener.
@@ -274,7 +285,7 @@ pub const QuicListener = struct {
         // TODO: should we close the server here?
     }
 
-    pub fn accept(_: *QuicListener, _: ?*anyopaque, _: *const fn (instance: ?*anyopaque, res: anyerror!p2p_conn.AnyConn) void) void {}
+    pub fn listen(_: *QuicListener, _: std.net.Address) void {}
 };
 
 pub const QuicTransport = struct {
@@ -329,6 +340,12 @@ pub const QuicTransport = struct {
         };
 
         dialer.connect(peer_address, callback_ctx, callback);
+    }
+
+    pub fn newListener(self: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) !QuicListener {
+        var listener: QuicListener = undefined;
+        try listener.init(self, accept_callback_ctx, accept_callback);
+        return listener;
     }
 
     fn getOrCreateDialer(self: *QuicTransport, peer_address: std.net.Address) !QuicEngine {
