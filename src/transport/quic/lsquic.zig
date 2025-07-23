@@ -251,9 +251,78 @@ pub const QuicConnection = struct {
 };
 
 pub const QuicStream = struct {
+    const WriteRequest = struct {
+        data: std.ArrayList(u8),
+        total_written: usize = 0,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void,
+    };
+
     stream: *lsquic.lsquic_stream_t,
+
     conn: *QuicConnection,
+
     engine: *QuicEngine,
+
+    allocator: Allocator,
+
+    pending_writes: std.ArrayList(WriteRequest),
+
+    active_write: ?WriteRequest,
+
+    pub fn init(self: *QuicStream, stream: *lsquic.lsquic_stream_t, conn: *QuicConnection, engine: *QuicEngine, allocator: Allocator) void {
+        self.* = .{
+            .stream = stream,
+            .conn = conn,
+            .engine = engine,
+            .allocator = allocator,
+            .pending_writes = std.ArrayList(WriteRequest).init(allocator),
+            .active_write = null,
+        };
+    }
+
+    pub fn deinit(self: *QuicStream) void {
+        for (self.pending_writes.items) |*req| {
+            req.data.deinit();
+        }
+        self.pending_writes.deinit();
+
+        if (self.active_write) |*req| {
+            req.data.deinit();
+        }
+    }
+
+    pub fn write(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
+        var data_copy = std.ArrayList(u8).init(self.allocator);
+        data_copy.appendSlice(data) catch |err| {
+            callback(callback_ctx, err);
+            return;
+        };
+
+        const write_req = WriteRequest{
+            .data = data_copy,
+            .callback_ctx = callback_ctx,
+            .callback = callback,
+        };
+
+        self.pending_writes.append(write_req) catch |err| {
+            data_copy.deinit();
+            callback(callback_ctx, err);
+            return;
+        };
+
+        self.processNextWrite();
+    }
+
+    fn processNextWrite(self: *QuicStream) void {
+        if (self.active_write != null or self.pending_writes.items.len == 0) {
+            return;
+        }
+
+        self.active_write = self.pending_writes.orderedRemove(0);
+
+        _ = lsquic.lsquic_stream_wantwrite(self.stream, 1);
+    }
 };
 
 pub const QuicListener = struct {
@@ -261,7 +330,6 @@ pub const QuicListener = struct {
     pub const ListenError = anyerror;
     /// The QuicEngine that this listener is associated with, if any.
     engine: ?QuicEngine,
-
     /// The transport that created this listener.
     transport: *QuicTransport,
 
@@ -290,6 +358,7 @@ pub const QuicListener = struct {
         }
 
         const socket = try UDP.init(address);
+        try socket.bind(address);
         var engine: QuicEngine = undefined;
         try engine.init(self.transport.allocator, socket, self.transport, false);
         self.engine = engine;
@@ -458,11 +527,7 @@ fn onNewStream(ctx: ?*anyopaque, stream: ?*lsquic.lsquic_stream_t) callconv(.c) 
     const engine: *QuicEngine = @ptrCast(@alignCast(ctx.?));
     const conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(lsquic.lsquic_stream_conn(stream.?))));
     const lsquic_stream: *QuicStream = engine.allocator.create(QuicStream) catch unreachable;
-    lsquic_stream.* = .{
-        .stream = stream.?,
-        .conn = conn,
-        .engine = engine,
-    };
+    lsquic_stream.init(stream.?, conn, engine, engine.allocator);
     const stream_ctx: *lsquic.lsquic_stream_ctx_t = @ptrCast(@alignCast(lsquic_stream)); // Handle new stream logic here
     std.debug.print("New stream established: {any}\n", .{stream});
     return stream_ctx;
@@ -480,8 +545,36 @@ fn onWrite(
     stream: ?*lsquic.lsquic_stream_t,
     stream_ctx: ?*lsquic.lsquic_stream_ctx_t,
 ) callconv(.c) void {
-    _ = stream;
-    _ = stream_ctx;
+    const self: *QuicStream = @ptrCast(@alignCast(stream_ctx.?));
+
+    var active_req = self.active_write orelse return;
+
+    const n_written = lsquic.lsquic_stream_write(stream.?, active_req.data.items.ptr, active_req.data.items.len);
+
+    if (n_written < 0) {
+        active_req.callback(active_req.callback_ctx, error.WriteFailed);
+        active_req.data.deinit();
+        self.active_write = null;
+        _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
+        self.processNextWrite();
+        return;
+    }
+
+    const written_usize: usize = @intCast(n_written);
+    active_req.total_written += written_usize;
+    active_req.data.replaceRange(0, written_usize, &.{}) catch unreachable;
+
+    if (active_req.data.items.len == 0) {
+        active_req.callback(active_req.callback_ctx, active_req.total_written);
+        active_req.data.deinit();
+        self.active_write = null;
+
+        if (self.pending_writes.items.len > 0) {
+            self.processNextWrite();
+        } else {
+            _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
+        }
+    }
 }
 
 fn onClose(
