@@ -270,6 +270,10 @@ pub const QuicStream = struct {
 
     active_write: ?WriteRequest,
 
+    read_callback: ?*const fn (ctx: ?*anyopaque, res: anyerror![]const u8) anyerror!void,
+
+    read_callback_ctx: ?*anyopaque,
+
     pub fn init(self: *QuicStream, stream: *lsquic.lsquic_stream_t, conn: *QuicConnection, engine: *QuicEngine, allocator: Allocator) void {
         self.* = .{
             .stream = stream,
@@ -278,6 +282,8 @@ pub const QuicStream = struct {
             .allocator = allocator,
             .pending_writes = std.ArrayList(WriteRequest).init(allocator),
             .active_write = null,
+            .read_callback = null,
+            .read_callback_ctx = null,
         };
     }
 
@@ -290,6 +296,22 @@ pub const QuicStream = struct {
         if (self.active_write) |*req| {
             req.data.deinit();
         }
+    }
+
+    /// Registers a callback to be invoked when data is received on this stream.
+    /// The callback can return an error to indicate a failure in processing the data,
+    /// which will result in the stream being closed.
+    pub fn onData(self: *QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]const u8) anyerror!void) void {
+        self.read_callback = callback;
+        self.read_callback_ctx = callback_ctx;
+        _ = lsquic.lsquic_stream_wantread(self.stream, 1);
+    }
+
+    /// Stops listening for incoming data. The registered callback will no longer be called.
+    pub fn readStop(self: *QuicStream) void {
+        _ = lsquic.lsquic_stream_wantread(self.stream, 0);
+        self.read_callback = null;
+        self.read_callback_ctx = null;
     }
 
     pub fn write(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
@@ -537,8 +559,40 @@ fn onRead(
     stream: ?*lsquic.lsquic_stream_t,
     stream_ctx: ?*lsquic.lsquic_stream_ctx_t,
 ) callconv(.c) void {
-    _ = stream;
-    _ = stream_ctx;
+    const self: *QuicStream = @ptrCast(@alignCast(stream_ctx.?));
+    const s = stream.?;
+
+    const cb = self.read_callback orelse return;
+    const cb_ctx = self.read_callback_ctx;
+
+    var buf: [4096]u8 = undefined;
+
+    while (true) {
+        const n_read = lsquic.lsquic_stream_read(s, &buf, buf.len);
+
+        if (n_read > 0) {
+            cb(cb_ctx, buf[0..@intCast(n_read)]) catch |user_err| {
+                std.log.warn("User read callback failed with error: {any}. Closing stream {any}.", .{ user_err, s });
+                _ = lsquic.lsquic_stream_close(s);
+                return;
+            };
+        } else if (n_read == 0) {
+            // End of Stream. The remote peer has closed its writing side.
+            cb(cb_ctx, error.EndOfStream) catch |user_err| {
+                std.log.warn("User read callback failed on EndOfStream with error: {any}. Closing stream {any}.", .{ user_err, s });
+                _ = lsquic.lsquic_stream_close(s);
+                return;
+            };
+            break;
+        } else {
+            cb(cb_ctx, error.ReadFailed) catch |user_err| {
+                std.log.warn("User read callback failed on ReadFailed with error: {any}. Closing stream {any}.", .{ user_err, s });
+                _ = lsquic.lsquic_stream_close(s);
+                return;
+            };
+            break;
+        }
+    }
 }
 
 fn onWrite(
