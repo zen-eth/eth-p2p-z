@@ -137,7 +137,8 @@ fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]
 
             const curve_nid = ssl.EC_GROUP_get_curve_name(group);
             switch (curve_nid) {
-                ssl.NID_secp256k1 => break :blk 2,
+                // TODO: BoringSSL does not support SECP256K1
+                ssl.NID_secp256k1 => return error.UnsupportedKeyType,
                 ssl.NID_X9_62_prime256v1 => break :blk 3,
                 else => return error.UnsupportedKeyType,
             }

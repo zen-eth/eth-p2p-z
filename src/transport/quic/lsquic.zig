@@ -105,12 +105,12 @@ pub const QuicEngine = struct {
         try std.posix.getsockname(socket.fd, &local_address.any, &local_socklen);
 
         self.* = .{
-            .ssl_context = undefined,
+            .ssl_context = transport.ssl_context,
             .engine = engine.?,
             .allocator = allocator,
             .socket = socket,
             .local_address = local_address,
-            .read_buffer = std.mem.zeroes([1500]u8),
+            .read_buffer = undefined,
             .c_read = undefined,
             .read_state = undefined,
             .transport = transport,
@@ -430,27 +430,73 @@ pub const QuicTransport = struct {
     cert_key_type: keys_proto.KeyType,
 
     pub fn init(self: *QuicTransport, loop: *io_loop.ThreadEventLoop, host_keypair: *ssl.EVP_PKEY, cert_key_type: keys_proto.KeyType, allocator: Allocator) !void {
+        ssl.OpenSSL_add_all_algorithms();
         const result = lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT);
         if (result != 0) {
             return error.InitializationFailed;
         }
 
-        const cert_alg = switch (cert_key_type) {
-            keys_proto.KeyType.ED25519 => ssl.EVP_PKEY_ED25519,
-            keys_proto.KeyType.RSA => ssl.EVP_PKEY_RSA,
-            keys_proto.KeyType.SECP256K1 => ssl.NID_secp256k1,
-            keys_proto.KeyType.ECDSA => ssl.NID_X9_62_prime256v1,
-            else => return error.UnsupportedKeyType,
-        };
-
-        const pctx = ssl.EVP_PKEY_CTX_new_id(cert_alg, null) orelse return error.OpenSSLFailed;
-        if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
-            return error.OpenSSLFailed;
-        }
         var maybe_subject_key: ?*ssl.EVP_PKEY = null;
-        if (ssl.EVP_PKEY_keygen(pctx, &maybe_subject_key) == 0) {
-            return error.OpenSSLFailed;
+
+        if (cert_key_type == .ECDSA or cert_key_type == .SECP256K1) {
+            const curve_nid = switch (cert_key_type) {
+                .ECDSA => ssl.NID_X9_62_prime256v1,
+                // TODO: SECP256K1 is not supported in BoringSSL
+                .SECP256K1 => unreachable,
+                else => unreachable,
+            };
+
+            var maybe_params: ?*ssl.EVP_PKEY = null;
+            {
+                const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_EC, null) orelse return error.OpenSSLFailed;
+                defer ssl.EVP_PKEY_CTX_free(pctx);
+
+                if (ssl.EVP_PKEY_paramgen_init(pctx) <= 0) {
+                    return error.OpenSSLFailed;
+                }
+
+                if (ssl.EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, curve_nid) <= 0) {
+                    return error.OpenSSLFailed;
+                }
+
+                if (ssl.EVP_PKEY_paramgen(pctx, &maybe_params) <= 0) {
+                    return error.OpenSSLFailed;
+                }
+            }
+            const params = maybe_params orelse return error.OpenSSLFailed;
+            defer ssl.EVP_PKEY_free(params);
+
+            {
+                const kctx = ssl.EVP_PKEY_CTX_new(params, null) orelse return error.OpenSSLFailed;
+                defer ssl.EVP_PKEY_CTX_free(kctx);
+
+                if (ssl.EVP_PKEY_keygen_init(kctx) <= 0) {
+                    return error.OpenSSLFailed;
+                }
+
+                if (ssl.EVP_PKEY_keygen(kctx, &maybe_subject_key) <= 0) {
+                    return error.OpenSSLFailed;
+                }
+            }
+        } else {
+            const key_alg_id = switch (cert_key_type) {
+                .ED25519 => ssl.EVP_PKEY_ED25519,
+                .RSA => ssl.EVP_PKEY_RSA,
+                else => unreachable,
+            };
+
+            const pctx = ssl.EVP_PKEY_CTX_new_id(key_alg_id, null) orelse return error.OpenSSLFailed;
+            defer ssl.EVP_PKEY_CTX_free(pctx);
+
+            if (ssl.EVP_PKEY_keygen_init(pctx) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_keygen(pctx, &maybe_subject_key) <= 0) {
+                return error.OpenSSLFailed;
+            }
         }
+
         const subject_key = maybe_subject_key orelse return error.OpenSSLFailed;
 
         const cert = try tls.buildCert(allocator, host_keypair, subject_key);
@@ -780,7 +826,8 @@ test "lsquic transport initialization" {
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
+    try transport.init(&loop, host_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
+
     defer transport.deinit();
 }
 
