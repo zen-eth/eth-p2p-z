@@ -99,7 +99,15 @@ pub fn buildCert(
 
     try addExtension(cert, Libp2pExtensionOid, true, ext_value_der[0..@intCast(ext_value_der_len)]);
 
-    if (ssl.X509_sign(cert, subjectKey, null) <= 0) {
+    const message_digest: ?*const ssl.EVP_MD = switch (ssl.EVP_PKEY_base_id(subjectKey)) {
+        ssl.EVP_PKEY_ED25519 => null,
+
+        ssl.EVP_PKEY_EC, ssl.EVP_PKEY_RSA => ssl.EVP_sha256(),
+
+        else => return error.UnsupportedKeyType,
+    };
+
+    if (ssl.X509_sign(cert, subjectKey, message_digest) <= 0) {
         return error.SignCertFailed;
     }
 

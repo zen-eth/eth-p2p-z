@@ -8,6 +8,8 @@ const p2p_conn = @import("../../conn.zig");
 const xev = @import("xev");
 const io_loop = @import("../../thread_event_loop.zig");
 const ssl = @import("ssl");
+const keys_proto = @import("../../proto/keys.proto.zig");
+const tls = @import("../../security/tls.zig");
 const Allocator = std.mem.Allocator;
 const UDP = xev.UDP;
 const posix = std.posix;
@@ -109,7 +111,7 @@ pub const QuicEngine = struct {
             .socket = socket,
             .local_address = local_address,
             .read_buffer = std.mem.zeroes([1500]u8),
-            .c_read = .{},
+            .c_read = undefined,
             .read_state = undefined,
             .transport = transport,
             .is_initiator = is_initiator,
@@ -419,23 +421,59 @@ pub const QuicTransport = struct {
 
     connecting: ?Connecting,
 
-    pub fn init(self: *QuicTransport, loop: *io_loop.ThreadEventLoop, allocator: Allocator) !void {
+    host_keypair: *ssl.EVP_PKEY,
+
+    subject_keypair: *ssl.EVP_PKEY,
+
+    cert: *ssl.X509,
+
+    cert_key_type: keys_proto.KeyType,
+
+    pub fn init(self: *QuicTransport, loop: *io_loop.ThreadEventLoop, host_keypair: *ssl.EVP_PKEY, cert_key_type: keys_proto.KeyType, allocator: Allocator) !void {
         const result = lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT);
         if (result != 0) {
             return error.InitializationFailed;
         }
+
+        const cert_alg = switch (cert_key_type) {
+            keys_proto.KeyType.ED25519 => ssl.EVP_PKEY_ED25519,
+            keys_proto.KeyType.RSA => ssl.EVP_PKEY_RSA,
+            keys_proto.KeyType.SECP256K1 => ssl.NID_secp256k1,
+            keys_proto.KeyType.ECDSA => ssl.NID_X9_62_prime256v1,
+            else => return error.UnsupportedKeyType,
+        };
+
+        const pctx = ssl.EVP_PKEY_CTX_new_id(cert_alg, null) orelse return error.OpenSSLFailed;
+        if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
+            return error.OpenSSLFailed;
+        }
+        var maybe_subject_key: ?*ssl.EVP_PKEY = null;
+        if (ssl.EVP_PKEY_keygen(pctx, &maybe_subject_key) == 0) {
+            return error.OpenSSLFailed;
+        }
+        const subject_key = maybe_subject_key orelse return error.OpenSSLFailed;
+
+        const cert = try tls.buildCert(allocator, host_keypair, subject_key);
+
         self.* = .{
-            .ssl_context = undefined,
+            .ssl_context = try initSslContext(host_keypair, cert),
             .io_event_loop = loop,
             .allocator = allocator,
             .connecting = null,
             .dialer_v4 = null,
             .dialer_v6 = null,
+            .host_keypair = host_keypair,
+            .cert_key_type = cert_key_type,
+            .subject_keypair = subject_key,
+            .cert = cert,
         };
     }
 
-    pub fn deinit(_: *QuicTransport) void {
+    pub fn deinit(self: *QuicTransport) void {
         lsquic.lsquic_global_cleanup();
+        ssl.SSL_CTX_free(self.ssl_context);
+        ssl.EVP_PKEY_free(self.subject_keypair);
+        ssl.X509_free(self.cert);
     }
 
     pub fn dial(self: *QuicTransport, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) void {
@@ -487,7 +525,42 @@ pub const QuicTransport = struct {
             else => return error.UnsupportedAddressFamily,
         }
     }
+
+    fn initSslContext(host_keypair: *ssl.EVP_PKEY, cert: *ssl.X509) !*ssl.SSL_CTX {
+        const ssl_ctx = ssl.SSL_CTX_new(ssl.TLS_method()) orelse return error.InitializationFailed;
+
+        if (ssl.SSL_CTX_set_min_proto_version(ssl_ctx, ssl.TLS1_3_VERSION) == 0)
+            return error.InitializationFailed;
+
+        if (ssl.SSL_CTX_set_max_proto_version(ssl_ctx, ssl.TLS1_3_VERSION) == 0)
+            return error.InitializationFailed;
+
+        if (ssl.SSL_CTX_set_options(ssl_ctx, ssl.SSL_OP_NO_TLSv1 | ssl.SSL_OP_NO_TLSv1_1 | ssl.SSL_OP_NO_TLSv1_2 | ssl.SSL_OP_NO_COMPRESSION | ssl.SSL_OP_NO_SSLv2 | ssl.SSL_OP_NO_SSLv3) == 0)
+            return error.InitializationFailed;
+
+        ssl.SSL_CTX_set_verify(ssl_ctx, ssl.SSL_VERIFY_PEER | ssl.SSL_VERIFY_FAIL_IF_NO_PEER_CERT | ssl.SSL_VERIFY_CLIENT_ONCE, libp2pVerifyCallback);
+
+        if (ssl.SSL_CTX_use_PrivateKey(ssl_ctx, host_keypair) == 0) {
+            @panic("SSL_CTX_use_PrivateKey failed");
+        }
+
+        if (ssl.SSL_CTX_use_certificate(ssl_ctx, cert) == 0) {
+            @panic("SSL_CTX_use_certificate failed");
+        }
+
+        return ssl_ctx;
+    }
 };
+
+fn libp2pVerifyCallback(status: c_int, ctx: ?*ssl.X509_STORE_CTX) callconv(.c) c_int {
+    // TODO: Implement proper verification logic
+    _ = ctx;
+    if (status != 1) {
+        std.debug.print("SSL verification failed with status: {}\n", .{status});
+        return 0;
+    }
+    return 1;
+}
 
 fn packetsOut(
     ctx: ?*anyopaque,
@@ -693,8 +766,21 @@ test "lsquic transport initialization" {
         loop.close();
         loop.deinit();
     }
+
+    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_host_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
+
+    defer ssl.EVP_PKEY_free(host_key);
+
     var transport: QuicTransport = undefined;
-    try transport.init(&loop, std.testing.allocator);
+    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
     defer transport.deinit();
 }
 
@@ -705,8 +791,21 @@ test "lsquic engine initialization" {
         loop.close();
         loop.deinit();
     }
+
+    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_host_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
+
+    defer ssl.EVP_PKEY_free(host_key);
+
     var transport: QuicTransport = undefined;
-    try transport.init(&loop, std.testing.allocator);
+    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
     defer transport.deinit();
 
     const addr = try std.net.Address.parseIp4("127.0.0.1", 9999);
