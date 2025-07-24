@@ -585,6 +585,13 @@ fn onRead(
             };
             break;
         } else {
+            // TODO: Support windows?
+            const err = posix.errno(n_read);
+            if (err == posix.E.AGAIN) {
+                _ = lsquic.lsquic_stream_wantread(s, 1);
+                return;
+            }
+
             cb(cb_ctx, error.ReadFailed) catch |user_err| {
                 std.log.warn("User read callback failed on ReadFailed with error: {any}. Closing stream {any}.", .{ user_err, s });
                 _ = lsquic.lsquic_stream_close(s);
