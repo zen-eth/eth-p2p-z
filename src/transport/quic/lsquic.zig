@@ -251,6 +251,15 @@ pub const QuicConnection = struct {
 };
 
 pub const QuicStream = struct {
+    pub const Error = error{
+        StreamClosed,
+        ConnectionReset,
+        Unexpected,
+        WriteFailed,
+        ReadFailed,
+        EndOfStream,
+    };
+
     const WriteRequest = struct {
         data: std.ArrayList(u8),
         total_written: usize = 0,
@@ -585,16 +594,31 @@ fn onRead(
             };
             break;
         } else {
-            // TODO: Support windows?
+            // NOTE: Error handling for lsquic_stream_read on Windows platforms is not implemented.
+            // On Windows, error codes may differ and additional handling may be required here.
             const err = posix.errno(n_read);
             if (err == posix.E.AGAIN) {
                 _ = lsquic.lsquic_stream_wantread(s, 1);
                 return;
             }
 
-            cb(cb_ctx, error.ReadFailed) catch |user_err| {
+            const fatal_err = switch (err) {
+                posix.E.BADF => error.StreamClosed,
+                posix.E.CONNRESET => error.ConnectionReset,
+                // Only E.AGAIN, E.BADF, and E.CONNRESET are expected here; any other errno is unexpected.
+                else => blk: {
+                    std.log.warn("Unexpected errno from lsquic_stream_read (expected E.AGAIN, E.BADF, E.CONNRESET): {}", .{@intFromEnum(err)});
+                    break :blk error.Unexpected;
+                },
+            };
+
+            cb(cb_ctx, fatal_err) catch |user_err| {
                 std.log.warn("User read callback failed on ReadFailed with error: {any}. Closing stream {any}.", .{ user_err, s });
-                _ = lsquic.lsquic_stream_close(s);
+                // When fatal error occurs, the stream should already be closed.
+                // This should not happen, but we handle it gracefully.
+                if (fatal_err == error.Unexpected) {
+                    _ = lsquic.lsquic_stream_close(s);
+                }
                 return;
             };
             break;
@@ -608,42 +632,58 @@ fn onWrite(
 ) callconv(.c) void {
     const self: *QuicStream = @ptrCast(@alignCast(stream_ctx.?));
 
-    var active_req = self.active_write orelse return;
+    // Get a pointer to the active request, not a copy.
+    if (self.active_write) |*active_req| {
+        const n_written = lsquic.lsquic_stream_write(stream.?, active_req.data.items.ptr, active_req.data.items.len);
+        if (n_written < 0) {
+            // NOTE: Error handling for lsquic_stream_write on Windows platforms is not implemented.
+            // On Windows, error codes may differ and additional handling may be required here.
+            // If the error is E.AGAIN, we should wait for the next write event.
+            const err = posix.errno(n_written);
+            if (err == posix.E.AGAIN) {
+                _ = lsquic.lsquic_stream_wantwrite(stream.?, 1);
+                return;
+            }
 
-    const n_written = lsquic.lsquic_stream_write(stream.?, active_req.data.items.ptr, active_req.data.items.len);
-
-    if (n_written < 0) {
-        active_req.callback(active_req.callback_ctx, error.WriteFailed);
-        active_req.data.deinit();
-        self.active_write = null;
-        _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
-        self.processNextWrite();
-        return;
-    }
-
-    const written_usize: usize = @intCast(n_written);
-    active_req.total_written += written_usize;
-    active_req.data.replaceRange(0, written_usize, &.{}) catch unreachable;
-
-    if (active_req.data.items.len == 0) {
-        active_req.callback(active_req.callback_ctx, active_req.total_written);
-        active_req.data.deinit();
-        self.active_write = null;
-
-        if (self.pending_writes.items.len > 0) {
-            self.processNextWrite();
+            std.log.warn("lsquic_stream_write failed with error: {}", .{@intFromEnum(err)});
+            active_req.callback(active_req.callback_ctx, error.WriteFailed);
+            active_req.data.deinit();
+            self.active_write = null;
+            return;
+        } else if (n_written == 0) {
+            // `lsquic_stream_write` returned 0, it means that you should try writing later.
+            _ = lsquic.lsquic_stream_wantwrite(stream.?, 1);
+            return;
         } else {
-            _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
+            const written_usize: usize = @intCast(n_written);
+            active_req.total_written += written_usize;
+            active_req.data.replaceRange(0, written_usize, &.{}) catch unreachable;
+
+            if (active_req.data.items.len == 0) {
+                active_req.callback(active_req.callback_ctx, active_req.total_written);
+                active_req.data.deinit();
+                self.active_write = null;
+
+                if (self.pending_writes.items.len > 0) {
+                    self.processNextWrite();
+                } else {
+                    _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
+                }
+            }
         }
+    } else {
+        _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
+        return;
     }
 }
 
 fn onClose(
-    stream: ?*lsquic.lsquic_stream_t,
+    _: ?*lsquic.lsquic_stream_t,
     stream_ctx: ?*lsquic.lsquic_stream_ctx_t,
 ) callconv(.c) void {
-    _ = stream;
-    _ = stream_ctx;
+    const self: *QuicStream = @ptrCast(@alignCast(stream_ctx.?));
+    self.deinit();
+    self.engine.allocator.destroy(self);
 }
 
 test "lsquic transport initialization" {
