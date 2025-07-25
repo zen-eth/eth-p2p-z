@@ -30,6 +30,16 @@ const stream_if: lsquic.lsquic_stream_if = lsquic.lsquic_stream_if{
     .on_close = onClose,
 };
 
+pub const QuicConnManager = struct {
+    connections: std.ArrayList(QuicConnection),
+    allocator: Allocator,
+
+    pub fn init(self: *QuicConnManager, allocator: Allocator) void {
+        self.connections = std.ArrayList(QuicConnection).init(allocator);
+        self.allocator = allocator;
+    }
+};
+
 pub const QuicEngine = struct {
     pub const Error = error{
         InitializationFailed,
@@ -141,8 +151,8 @@ pub const QuicEngine = struct {
         _ = lsquic.lsquic_engine_connect(
             self.engine,
             lsquic.N_LSQVER,
-            @ptrCast(&self.local_address.any),
-            @ptrCast(&peer_address.any),
+            @ptrCast(&self.local_address.in),
+            @ptrCast(&peer_address.in),
             self,
             null, // TODO: Check if we should pass conn ctx earlier
             null,
@@ -198,8 +208,8 @@ pub const QuicEngine = struct {
             self.engine,
             b.slice.ptr,
             n,
-            @ptrCast(&self.local_address.any),
-            @ptrCast(&peer_address.any),
+            @ptrCast(&self.local_address.in),
+            @ptrCast(&peer_address.in),
             self,
             0,
         );
