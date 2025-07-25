@@ -167,7 +167,7 @@ pub const QuicEngine = struct {
         _: *xev.Completion,
         _: *xev.UDP.State,
         address: std.net.Address,
-        _: xev.UDP,
+        socket: xev.UDP,
         b: xev.ReadBuffer,
         r: xev.ReadError!usize,
     ) xev.CallbackAction {
@@ -186,12 +186,20 @@ pub const QuicEngine = struct {
             return .disarm;
         }
 
+        var peer_address: std.net.Address = undefined;
+        var peer_socklen: posix.socklen_t = @sizeOf(std.net.Address);
+        std.posix.getpeername(socket.fd, &peer_address.any, &peer_socklen) catch unreachable;
+
+        std.debug.print("QUIC engine received from {}\n", .{address});
+        std.debug.print("QUIC engine received1 from {}\n", .{peer_address});
+        std.debug.print("QUIC engine received2 from {}\n", .{self.local_address});
+
         const result = lsquic.lsquic_engine_packet_in(
             self.engine,
             b.slice.ptr,
             n,
             @ptrCast(&self.local_address.any),
-            @ptrCast(&address.any),
+            @ptrCast(&peer_address.any),
             self,
             0,
         );
@@ -431,6 +439,7 @@ pub const QuicTransport = struct {
 
     pub fn init(self: *QuicTransport, loop: *io_loop.ThreadEventLoop, host_keypair: *ssl.EVP_PKEY, cert_key_type: keys_proto.KeyType, allocator: Allocator) !void {
         ssl.OpenSSL_add_all_algorithms();
+
         const result = lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT);
         if (result != 0) {
             return error.InitializationFailed;
@@ -860,4 +869,78 @@ test "lsquic engine initialization" {
     var engine: QuicEngine = undefined;
     try engine.init(std.testing.allocator, udp, &transport, false);
     defer lsquic.lsquic_engine_destroy(engine.engine);
+}
+
+test "lsquic transport dialing and listening" {
+    var server_loop: io_loop.ThreadEventLoop = undefined;
+    try server_loop.init(std.testing.allocator);
+    defer {
+        server_loop.close();
+        server_loop.deinit();
+    }
+
+    const server_pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(server_pctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_server_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(server_pctx, &maybe_server_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const server_key = maybe_server_key orelse return error.OpenSSLFailed;
+
+    defer ssl.EVP_PKEY_free(server_key);
+
+    var server: QuicTransport = undefined;
+    try server.init(&server_loop, server_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
+
+    defer server.deinit();
+
+    var listener = server.newListener(null, struct {
+        pub fn callback(_: ?*anyopaque, res: anyerror!QuicConnection) void {
+            if (res) |conn| {
+                std.debug.print("Server accepted QUIC connection successfully: {any}\n", .{conn});
+            } else |err| {
+                std.debug.print("Server failed to accept QUIC connection: {any}\n", .{err});
+            }
+        }
+    }.callback);
+
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 9997);
+
+    try listener.listen(addr);
+
+    var loop: io_loop.ThreadEventLoop = undefined;
+    try loop.init(std.testing.allocator);
+    defer {
+        loop.close();
+        loop.deinit();
+    }
+
+    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_host_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
+
+    defer ssl.EVP_PKEY_free(host_key);
+
+    var transport: QuicTransport = undefined;
+    try transport.init(&loop, host_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
+
+    defer transport.deinit();
+
+    transport.dial(addr, null, struct {
+        pub fn callback(_: ?*anyopaque, res: anyerror!QuicConnection) void {
+            if (res) |conn| {
+                std.debug.print("Dialed QUIC connection successfully: {any}\n", .{conn});
+            } else |err| {
+                std.debug.print("Failed to dial QUIC connection: {any}\n", .{err});
+            }
+        }
+    }.callback);
 }
