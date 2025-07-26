@@ -32,6 +32,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const lsquic_zig_dep = b.dependency("lsquic_zig", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const lsquic_module = lsquic_zig_dep.module("lsquic");
+
+    const lsquic_zig_artifact = lsquic_zig_dep.artifact("lsquic");
     const lsquic_artifact = lsquic_dep.artifact("lsquic");
     const ssl_dep = lsquic_dep.builder.dependency("boringssl", .{
         .target = target,
@@ -67,6 +74,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("xev", libxev_module);
     root_module.addImport("multiformats", zmultiformats_module);
     root_module.addImport("ssl", ssl_module);
+    root_module.addImport("lsquic", lsquic_module);
     root_module.addIncludePath(lsquic_dep.path("include"));
     root_module.addImport("gremlin", gremlin_module);
     root_module.addImport("peer_id", peer_id_module);
@@ -79,6 +87,7 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
     });
     libp2p_lib.linkLibrary(lsquic_artifact);
+    libp2p_lib.linkLibrary(lsquic_zig_artifact);
     libp2p_lib.linkSystemLibrary("zlib");
 
     b.installArtifact(libp2p_lib);
@@ -98,6 +107,7 @@ pub fn build(b: *std.Build) void {
     libp2p_exe.step.dependOn(&protobuf.step);
 
     libp2p_exe.linkLibrary(lsquic_artifact);
+    libp2p_exe.linkLibrary(lsquic_zig_artifact);
     libp2p_exe.linkSystemLibrary("zlib");
     b.installArtifact(libp2p_exe);
 
@@ -135,7 +145,14 @@ pub fn build(b: *std.Build) void {
         .filters = filters orelse &.{},
     });
 
+    libp2p_lib_unit_tests.root_module.addIncludePath(lsquic_dep.path("include"));
+    libp2p_lib_unit_tests.root_module.addImport("xev", libxev_module);
+    libp2p_lib_unit_tests.root_module.addImport("multiformats", zmultiformats_module);
+    libp2p_lib_unit_tests.root_module.addImport("ssl", ssl_module);
+    libp2p_lib_unit_tests.root_module.addImport("lsquic", lsquic_module);
+
     libp2p_lib_unit_tests.linkLibrary(lsquic_artifact);
+    libp2p_lib_unit_tests.linkLibrary(lsquic_zig_artifact);
     libp2p_lib_unit_tests.linkSystemLibrary("zlib");
 
     libp2p_lib_unit_tests.step.dependOn(&protobuf.step);
@@ -156,6 +173,7 @@ pub fn build(b: *std.Build) void {
     libp2p_exe_unit_tests.step.dependOn(&protobuf.step);
 
     libp2p_exe_unit_tests.linkLibrary(lsquic_artifact);
+    libp2p_exe_unit_tests.linkLibrary(lsquic_zig_artifact);
     libp2p_exe_unit_tests.linkSystemLibrary("zlib");
     // // for exe, lib, tests, etc.
     // exe_unit_tests.root_module.addImport("aio", zig_aio_module);

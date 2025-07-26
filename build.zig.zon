@@ -41,6 +41,10 @@
             .url = "git+https://github.com/zen-eth/lsquic.git#585b456f165acd02a68b64c56cf126a596718fac",
             .hash = "lsquic-0.0.0-jO7gdp8dAADM0lQxub9u0psWph_fUuNTbYWMvpNE_VtY",
         },
+        .lsquic_zig = .{
+            .url = "git+https://github.com/zen-eth/lsquic.zig.git#a3e0434aa36abd8ff366c340e515efa07b55679c",
+            .hash = "lsquic_zig-0.0.0-Q3LEcM-WAABFDb1Dblvmz7bUN75dsvAHv0c-cXuazPvy",
+        },
     },
     .paths = .{
         "build.zig",
