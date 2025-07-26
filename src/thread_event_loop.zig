@@ -436,7 +436,9 @@ pub const ThreadEventLoop = struct {
                 },
                 .quic_connect => |action_data| {
                     const engine = action_data.engine;
-                    // std.debug.print("QUIC engine connecting to {}\n", .{engine});
+                    std.debug.print("QUIC engine connecting777 to {*}\n", .{engine});
+                    std.debug.print("QUIC engine connecting777 to {any}\n", .{engine.connecting});
+
                     engine.doConnect(action_data.peer_address, action_data.callback_ctx, action_data.callback);
                 },
             }
