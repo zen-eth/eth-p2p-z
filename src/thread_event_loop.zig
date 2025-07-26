@@ -5,6 +5,7 @@ const Intrusive = @import("concurrent/mpsc_queue.zig").Intrusive;
 const Future = @import("concurrent/future.zig").Future;
 const conn = @import("conn.zig");
 const xev_tcp = @import("transport/tcp/xev.zig");
+const quic = @import("transport/quic/lsquic.zig");
 
 /// Memory pool for managing completion objects in the event loop.
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
@@ -80,6 +81,10 @@ pub const IOAction = union(enum) {
         /// The timeout for the close operation in milliseconds.
         timeout_ms: u64,
     },
+    quic_start: struct {
+        engine: *quic.QuicEngine,
+    },
+    quic_connect: struct { engine: *quic.QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!quic.QuicConnection) void },
 };
 
 /// Represents a queued message for I/O operations in the event loop.
@@ -424,6 +429,15 @@ pub const ThreadEventLoop = struct {
                         .callback = action_data.callback,
                     };
                     channel.socket.shutdown(loop, c, CloseCtx, close_ctx, xev_tcp.XevSocketChannel.shutdownCB);
+                },
+                .quic_start => |action_data| {
+                    const engine = action_data.engine;
+                    engine.doStart();
+                },
+                .quic_connect => |action_data| {
+                    const engine = action_data.engine;
+                    // std.debug.print("QUIC engine connecting to {}\n", .{engine});
+                    engine.doConnect(action_data.peer_address, action_data.callback_ctx, action_data.callback);
                 },
             }
             self.allocator.destroy(m);
