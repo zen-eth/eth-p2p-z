@@ -68,34 +68,45 @@ pub const QuicEngine = struct {
 
     accept_callback_ctx: ?*anyopaque,
 
-    engine_settings: lsquic.lsquic_engine_settings,
-
-    lsquic_engine_api: lsquic.lsquic_engine_api,
-
-    lsquic_stream_interface: lsquic.lsquic_stream_if = .{
-        .on_new_conn = onNewConn,
-        .on_conn_closed = onConnClosed,
-        .on_hsk_done = onHskDone,
-        .on_new_stream = onNewStream,
-        .on_read = onRead,
-        .on_write = onWrite,
-        .on_close = onClose,
-    },
-
     pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, transport: *QuicTransport, is_initiator: bool) !void {
         var flags: c_uint = 0;
         if (!is_initiator) {
             flags |= lsquic.LSENG_SERVER;
         }
 
+        var engine_settings: lsquic.lsquic_engine_settings = undefined;
+        lsquic.lsquic_engine_init_settings(&engine_settings, flags);
+
+        engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
+        engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
+        engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
+        engine_settings.es_idle_timeout = IdleTimeoutSeconds;
+        engine_settings.es_handshake_to = HandshakeTimeoutMicroseconds;
+
+        var err_buf: [100]u8 = undefined;
+        if (lsquic.lsquic_engine_check_settings(
+            &engine_settings,
+            flags,
+            &err_buf,
+            100,
+        ) == 1) {
+            std.log.warn("lsquic_engine_check_settings failed: {any}", .{err_buf});
+            return error.InitializationFailed;
+        }
+
+        const engine_api: lsquic.lsquic_engine_api = .{ .ea_settings = &engine_settings, .ea_stream_if = &stream_if, .ea_stream_if_ctx = self, .ea_packets_out = packetsOut, .ea_packets_out_ctx = self, .ea_get_ssl_ctx = getSslContext };
+        const engine = lsquic.lsquic_engine_new(flags, &engine_api);
+        if (engine == null) {
+            return error.InitializationFailed;
+        }
+
         var local_address: std.net.Address = undefined;
         var local_socklen: posix.socklen_t = @sizeOf(std.net.Address);
         try std.posix.getsockname(socket.fd, &local_address.any, &local_socklen);
 
-        // --- 修复：先初始化基本字段，避免循环引用 ---
         self.* = .{
             .ssl_context = transport.ssl_context,
-            .engine = undefined, // 稍后初始化
+            .engine = engine.?,
             .allocator = allocator,
             .socket = socket,
             .local_address = local_address,
@@ -107,54 +118,7 @@ pub const QuicEngine = struct {
             .connecting = null,
             .accept_callback = null,
             .accept_callback_ctx = null,
-            .engine_settings = undefined, // 稍后初始化
-            .lsquic_stream_interface = .{
-                .on_new_conn = onNewConn,
-                .on_conn_closed = onConnClosed,
-                .on_hsk_done = onHskDone,
-                .on_new_stream = onNewStream,
-                .on_read = onRead,
-                .on_write = onWrite,
-                .on_close = onClose,
-            },
-            .lsquic_engine_api = undefined, // 稍后初始化
         };
-
-        // --- 现在分步初始化依赖字段 ---
-
-        // 1. 初始化 engine_settings
-        lsquic.lsquic_engine_init_settings(&self.engine_settings, flags);
-        self.engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
-        self.engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
-        self.engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
-        self.engine_settings.es_idle_timeout = IdleTimeoutSeconds;
-        self.engine_settings.es_handshake_to = HandshakeTimeoutMicroseconds;
-
-        self.lsquic_engine_api = .{
-            .ea_settings = &self.engine_settings,
-            .ea_stream_if = &self.lsquic_stream_interface,
-            .ea_stream_if_ctx = self,
-            .ea_packets_out = packetsOut,
-            .ea_packets_out_ctx = self,
-            .ea_get_ssl_ctx = getSslContext,
-        };
-
-        // 3. 初始化 engine
-        self.engine = lsquic.lsquic_engine_new(flags, &self.lsquic_engine_api) orelse return error.InitializationFailed;
-
-        // 4. 验证设置
-        var err_buf: [100]u8 = undefined;
-        if (lsquic.lsquic_engine_check_settings(
-            &self.engine_settings,
-            flags,
-            &err_buf,
-            100,
-        ) == 1) {
-            std.log.warn("lsquic_engine_check_settings failed: {any}", .{err_buf});
-            return error.InitializationFailed;
-        }
-
-        std.debug.print("QUIC engine initialized with settings: {any}\n", .{self.engine});
     }
 
     pub fn doStart(self: *QuicEngine) void {
@@ -174,18 +138,15 @@ pub const QuicEngine = struct {
     }
 
     pub fn doConnect(self: *QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) void {
-        std.debug.print("QUIC engine connecting22 to {*}\n", .{self});
         if (self.connecting != null) {
             callback(callback_ctx, error.AlreadyConnecting);
             return;
         }
-        std.debug.print("QUIC engine connecting22 with address {any}\n", .{self.connecting});
         self.connecting = .{
             .address = peer_address,
             .callback_ctx = callback_ctx,
             .callback = callback,
         };
-        std.debug.print("QUIC engine connecting with address {}\n", .{peer_address});
         self.doStart();
 
         _ = lsquic.lsquic_engine_connect(
@@ -202,18 +163,13 @@ pub const QuicEngine = struct {
             null,
             0,
         );
-        std.debug.print("QUIC engine connecting with address {} after connect\n", .{peer_address});
         self.processConns();
     }
 
     pub fn connect(self: *QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) void {
-        std.debug.print("QUIC engine connecting000 to {*}\n", .{self});
         if (self.transport.io_event_loop.inEventLoopThread()) {
             self.doConnect(peer_address, callback_ctx, callback);
         } else {
-            std.debug.print("QUIC engine connecting666 to {*}\n", .{self});
-            std.debug.print("QUIC engine connecting666 to {any}\n", .{self.connecting});
-
             const message = io_loop.IOMessage{
                 .action = .{ .quic_connect = .{
                     .engine = self,
@@ -279,9 +235,7 @@ pub const QuicEngine = struct {
     }
 
     pub fn processConns(self: *QuicEngine) void {
-        std.debug.print("QUIC engine processing connections{}\n", .{123});
         lsquic.lsquic_engine_process_conns(self.engine);
-        std.debug.print("QUIC engine processing connections{}\n", .{456});
 
         var diff_us: c_int = 0;
         if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff_us) > 0) {
@@ -291,7 +245,6 @@ pub const QuicEngine = struct {
             const c_timer = self.transport.io_event_loop.completion_pool.create() catch unreachable;
             const next_ms = @divFloor(@as(u64, @intCast(diff_us)), std.time.us_per_ms);
             timer.run(&self.transport.io_event_loop.loop, c_timer, next_ms, QuicEngine, self, processConnsCallback);
-            std.debug.print("QUIC engine processing connections with timer {}\n", .{timer});
         }
     }
 
@@ -441,15 +394,13 @@ pub const QuicListener = struct {
     /// The error type returned by the `init` function. Want to remain the underlying error type, so we used `anyerror`.
     pub const ListenError = anyerror;
     /// The QuicEngine that this listener is associated with, if any.
-    engine: ?*QuicEngine,
+    engine: ?QuicEngine,
     /// The transport that created this listener.
     transport: *QuicTransport,
 
     accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!QuicConnection) void,
 
     accept_callback_ctx: ?*anyopaque = null,
-
-    listening: bool,
 
     /// Initialize the listener with the given transport and accept callback.
     pub fn init(self: *QuicListener, transport: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!QuicConnection) void) void {
@@ -458,40 +409,27 @@ pub const QuicListener = struct {
             .transport = transport,
             .accept_callback = accept_callback,
             .accept_callback_ctx = accept_callback_ctx,
-            .listening = false,
         };
     }
 
     /// Deinitialize the listener.
-    pub fn deinit(self: *QuicListener) void {
-        if (self.engine) |engine| {
-            lsquic.lsquic_engine_destroy(engine.engine);
-            self.transport.allocator.destroy(engine);
-            self.engine = null;
-        }
-    }
+    pub fn deinit(_: *QuicListener) void {}
 
     pub fn listen(self: *QuicListener, address: std.net.Address) ListenError!void {
-        if (self.listening) {
+        if (self.engine != null) {
             return error.AlreadyListening;
         }
 
         const socket = try UDP.init(address);
         try socket.bind(address);
 
-        var bound_address: std.net.Address = undefined;
-        var bound_socklen: posix.socklen_t = @sizeOf(std.net.Address);
-        try std.posix.getsockname(socket.fd, &bound_address.any, &bound_socklen);
-
-        std.debug.print("Listener bound to: {}\n", .{bound_address});
-
-        const engine = try self.transport.allocator.create(QuicEngine);
+        var engine: QuicEngine = undefined;
         try engine.init(self.transport.allocator, socket, self.transport, false);
 
         self.engine = engine;
-        engine.onAccept(self.accept_callback_ctx, self.accept_callback);
-        engine.start();
-        self.listening = true;
+        self.engine.?.onAccept(self.accept_callback_ctx, self.accept_callback);
+        self.engine.?.start();
+        std.debug.print("QUIC listener started on engine: {?}\n", .{self.engine.?.accept_callback_ctx});
     }
 };
 
@@ -510,9 +448,9 @@ pub const QuicTransport = struct {
 
     allocator: Allocator,
 
-    dialer_v4: ?*QuicEngine,
+    dialer_v4: ?QuicEngine,
 
-    dialer_v6: ?*QuicEngine,
+    dialer_v6: ?QuicEngine,
 
     connecting: ?Connecting,
 
@@ -525,8 +463,6 @@ pub const QuicTransport = struct {
     cert_key_type: keys_proto.KeyType,
 
     pub fn init(self: *QuicTransport, loop: *io_loop.ThreadEventLoop, host_keypair: *ssl.EVP_PKEY, cert_key_type: keys_proto.KeyType, allocator: Allocator) !void {
-        ssl.OpenSSL_add_all_algorithms();
-
         const result = lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT);
         if (result != 0) {
             return error.InitializationFailed;
@@ -612,14 +548,6 @@ pub const QuicTransport = struct {
     }
 
     pub fn deinit(self: *QuicTransport) void {
-        if (self.dialer_v4) |dialer| {
-            lsquic.lsquic_engine_destroy(dialer.engine);
-            self.allocator.destroy(dialer);
-        }
-        if (self.dialer_v6) |dialer| {
-            lsquic.lsquic_engine_destroy(dialer.engine);
-            self.allocator.destroy(dialer);
-        }
         lsquic.lsquic_global_cleanup();
         ssl.SSL_CTX_free(self.ssl_context);
         ssl.EVP_PKEY_free(self.subject_keypair);
@@ -646,7 +574,7 @@ pub const QuicTransport = struct {
         return listener;
     }
 
-    fn getOrCreateDialer(self: *QuicTransport, peer_address: std.net.Address) !*QuicEngine {
+    fn getOrCreateDialer(self: *QuicTransport, peer_address: std.net.Address) !QuicEngine {
         switch (peer_address.any.family) {
             posix.AF.INET => {
                 if (self.dialer_v4) |dialer| {
@@ -654,7 +582,7 @@ pub const QuicTransport = struct {
                 }
 
                 const socket = try UDP.init(peer_address);
-                var engine = try self.allocator.create(QuicEngine);
+                var engine: QuicEngine = undefined;
                 try engine.init(self.allocator, socket, self, true);
 
                 self.dialer_v4 = engine;
@@ -666,7 +594,7 @@ pub const QuicTransport = struct {
                 }
 
                 const socket = try UDP.init(peer_address);
-                var engine = try self.allocator.create(QuicEngine);
+                var engine: QuicEngine = undefined;
                 try engine.init(self.allocator, socket, self, true);
 
                 self.dialer_v6 = engine;
@@ -967,43 +895,43 @@ test "lsquic engine initialization" {
 }
 
 test "lsquic transport dialing and listening" {
-    // var server_loop: io_loop.ThreadEventLoop = undefined;
-    // try server_loop.init(std.testing.allocator);
-    // defer {
-    //     server_loop.close();
-    //     server_loop.deinit();
-    // }
+    var server_loop: io_loop.ThreadEventLoop = undefined;
+    try server_loop.init(std.testing.allocator);
+    defer {
+        server_loop.close();
+        server_loop.deinit();
+    }
 
-    // const server_pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-    // if (ssl.EVP_PKEY_keygen_init(server_pctx) == 0) {
-    //     return error.OpenSSLFailed;
-    // }
-    // var maybe_server_key: ?*ssl.EVP_PKEY = null;
-    // if (ssl.EVP_PKEY_keygen(server_pctx, &maybe_server_key) == 0) {
-    //     return error.OpenSSLFailed;
-    // }
-    // const server_key = maybe_server_key orelse return error.OpenSSLFailed;
+    const server_pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(server_pctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_server_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(server_pctx, &maybe_server_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const server_key = maybe_server_key orelse return error.OpenSSLFailed;
 
-    // defer ssl.EVP_PKEY_free(server_key);
+    defer ssl.EVP_PKEY_free(server_key);
 
-    // var server: QuicTransport = undefined;
-    // try server.init(&server_loop, server_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
+    var server: QuicTransport = undefined;
+    try server.init(&server_loop, server_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
 
-    // defer server.deinit();
+    defer server.deinit();
 
-    // var listener = server.newListener(null, struct {
-    //     pub fn callback(_: ?*anyopaque, res: anyerror!QuicConnection) void {
-    //         if (res) |conn| {
-    //             std.debug.print("Server accepted QUIC connection successfully: {any}\n", .{conn});
-    //         } else |err| {
-    //             std.debug.print("Server failed to accept QUIC connection: {any}\n", .{err});
-    //         }
-    //     }
-    // }.callback);
+    var listener = server.newListener(null, struct {
+        pub fn callback(_: ?*anyopaque, res: anyerror!QuicConnection) void {
+            if (res) |conn| {
+                std.debug.print("Server accepted QUIC connection successfully: {any}\n", .{conn});
+            } else |err| {
+                std.debug.print("Server failed to accept QUIC connection: {any}\n", .{err});
+            }
+        }
+    }.callback);
 
-    // const addr = try std.net.Address.parseIp4("127.0.0.1", 9997);
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 9997);
 
-    // try listener.listen(addr);
+    try listener.listen(addr);
 
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
@@ -1028,7 +956,6 @@ test "lsquic transport dialing and listening" {
     try transport.init(&loop, host_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
 
     defer transport.deinit();
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 9997);
     transport.dial(addr, null, struct {
         pub fn callback(_: ?*anyopaque, res: anyerror!QuicConnection) void {
             if (res) |conn| {
@@ -1039,5 +966,5 @@ test "lsquic transport dialing and listening" {
         }
     }.callback);
 
-    std.time.sleep(200 * std.time.ns_per_ms); // 等待 200 毫秒
+    std.time.sleep(200 * std.time.ns_per_ms);
 }

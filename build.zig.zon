@@ -27,7 +27,7 @@
     .dependencies = .{
         .libxev = .{
             .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.zip",
-            .hash = "libxev-0.0.0-86vtc2UaEwDfiTKX3iBI-s_hdzfzWQUarT3MUrmUQl-Q",
+            .hash = "libxev-0.0.0-86vtcx8dEwDfl6p4tGVxCygft8oOsggfba9JO-k28J2x",
         },
         .zmultiformats = .{
             .url = "https://github.com/zen-eth/multiformats-zig/archive/main.tar.gz",
@@ -38,8 +38,8 @@
             .hash = "gremlin-0.0.0-E2s91bN4DgDYbb4QNxl4ZT5nEEhNBkk5ngfVasDbsnNF",
         },
         .lsquic = .{
-            .url = "git+https://github.com/zen-eth/lsquic.git#2440030f9f636c00304fa09c064b829eae3376e0",
-            .hash = "lsquic-0.0.0-jO7gdhAXAAAcMreeC2FoU9XUSvzKsnoZeJIryvnTfk62",
+            .url = "git+https://github.com/zen-eth/lsquic.git#805230b3e7e9125edcbfbe7ed38b506dc3177fba",
+            .hash = "lsquic-0.0.0-jO7gdgsXAAB71SZigmHE0XEuO-ET-A6ZL7WkP_VIQUnf",
         },
     },
     .paths = .{
