@@ -233,7 +233,7 @@ const stream_if: lsquic.StreamIf = lsquic.StreamIf{
         lsquic.engine.Engine.processConns(self.engine);
  
          var diff_us: c_int = 0;
-        if (!lsquic.engine.Engine.earliestAdvTick(self.engine, &diff_us)) {
+        if (lsquic.engine.Engine.earliestAdvTick(self.engine, &diff_us)) {
              std.debug.print("QUIC engine processing connections with diff_us {}\n", .{diff_us});
              const timer = xev.Timer.init() catch unreachable;
              const c_timer = self.transport.io_event_loop.completion_pool.create() catch unreachable;
