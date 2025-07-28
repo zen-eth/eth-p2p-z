@@ -11,6 +11,8 @@ pub const thread_event_loop = @import("thread_event_loop.zig");
 pub const transport = @import("transport/lib.zig");
 pub const multistream = @import("multistream/lib.zig");
 pub const security = @import("security/lib.zig");
+pub const proto_handler = @import("proto_handler.zig");
+pub const @"switch" = @import("switch.zig");
 
 test {
     std.testing.refAllDeclsRecursive(@This());

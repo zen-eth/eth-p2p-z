@@ -13,6 +13,7 @@ const tls = @import("../../security/tls.zig");
 const Allocator = std.mem.Allocator;
 const UDP = xev.UDP;
 const posix = std.posix;
+const protoMsgHandler = @import("../../proto_handler.zig").AnyProtocolMessageHandler;
 
 const MaxStreamDataBidiRemote = 64 * 1024 * 1024; // 64 MB
 const MaxStreamDataBidiLocal = 64 * 1024 * 1024; // 64 MB
@@ -39,7 +40,7 @@ pub const QuicEngine = struct {
     const Connecting = struct {
         address: std.net.Address,
         callback_ctx: ?*anyopaque,
-        callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void,
+        callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
     };
 
     ssl_context: *ssl.SSL_CTX,
@@ -137,7 +138,7 @@ pub const QuicEngine = struct {
         }
     }
 
-    pub fn doConnect(self: *QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) void {
+    pub fn doConnect(self: *QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         if (self.connecting != null) {
             callback(callback_ctx, error.AlreadyConnecting);
             return;
@@ -166,7 +167,7 @@ pub const QuicEngine = struct {
         self.processConns();
     }
 
-    pub fn connect(self: *QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) void {
+    pub fn connect(self: *QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             self.doConnect(peer_address, callback_ctx, callback);
         } else {
@@ -282,6 +283,36 @@ pub const QuicConnection = struct {
     conn: *lsquic.lsquic_conn_t,
     engine: *QuicEngine,
     direction: p2p_conn.Direction,
+    new_stream_ctx: ?NewStreamCtx,
+
+    pub const Error = error{
+        NewStreamNotFinished,
+    };
+
+    pub const NewStreamCtx = struct {
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (callback_ctx: ?*anyopaque, stream: anyerror!*QuicStream) void,
+    };
+
+    pub fn newStream(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, stream: anyerror!*QuicStream) void) void {
+        if (self.new_stream_ctx != null) {
+            callback(callback_ctx, error.NewStreamNotFinished);
+            return;
+        }
+
+        if (lsquic.lsquic_conn_n_pending_streams(self.conn) != 0) {
+            // If there are pending streams, we should not create a new one.
+            callback(callback_ctx, error.NewStreamNotFinished);
+            return;
+        }
+
+        self.new_stream_ctx = .{
+            .callback_ctx = callback_ctx,
+            .callback = callback,
+        };
+
+        lsquic.lsquic_conn_make_stream(self.conn);
+    }
 };
 
 pub const QuicStream = struct {
@@ -317,6 +348,8 @@ pub const QuicStream = struct {
 
     read_callback_ctx: ?*anyopaque,
 
+    proto_msg_handler: protoMsgHandler,
+
     pub fn init(self: *QuicStream, stream: *lsquic.lsquic_stream_t, conn: *QuicConnection, engine: *QuicEngine, allocator: Allocator) void {
         self.* = .{
             .stream = stream,
@@ -327,6 +360,7 @@ pub const QuicStream = struct {
             .active_write = null,
             .read_callback = null,
             .read_callback_ctx = null,
+            .proto_msg_handler = undefined,
         };
     }
 
@@ -339,6 +373,10 @@ pub const QuicStream = struct {
         if (self.active_write) |*req| {
             req.data.deinit();
         }
+    }
+
+    pub fn setProtoMsgHandler(self: *QuicStream, handler: protoMsgHandler) void {
+        self.proto_msg_handler = handler;
     }
 
     /// Registers a callback to be invoked when data is received on this stream.
@@ -554,7 +592,7 @@ pub const QuicTransport = struct {
         ssl.X509_free(self.cert);
     }
 
-    pub fn dial(self: *QuicTransport, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) void {
+    pub fn dial(self: *QuicTransport, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         if (self.connecting != null) {
             callback(callback_ctx, error.AlreadyConnecting);
             return;
@@ -679,6 +717,7 @@ pub fn onNewConn(ctx: ?*anyopaque, conn: ?*lsquic.lsquic_conn_t) callconv(.c) ?*
     // TODO: Can it use a pool for connections?
     const lsquic_conn: *QuicConnection = engine.allocator.create(QuicConnection) catch unreachable;
     lsquic_conn.* = .{
+        .new_stream_ctx = null,
         .conn = conn.?,
         .engine = engine,
         .direction = if (engine.is_initiator) p2p_conn.Direction.OUTBOUND else p2p_conn.Direction.INBOUND,
@@ -710,8 +749,13 @@ pub fn onNewStream(ctx: ?*anyopaque, stream: ?*lsquic.lsquic_stream_t) callconv(
     const conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(lsquic.lsquic_stream_conn(stream.?))));
     const lsquic_stream: *QuicStream = engine.allocator.create(QuicStream) catch unreachable;
     lsquic_stream.init(stream.?, conn, engine, engine.allocator);
-    const stream_ctx: *lsquic.lsquic_stream_ctx_t = @ptrCast(@alignCast(lsquic_stream)); // Handle new stream logic here
+
+    const stream_ctx: *lsquic.lsquic_stream_ctx_t = @ptrCast(@alignCast(lsquic_stream));
     std.debug.print("New stream established: {any}\n", .{stream});
+
+    if (conn.direction == p2p_conn.Direction.OUTBOUND) {
+        conn.new_stream_ctx.?.callback(conn.new_stream_ctx.?.callback_ctx, lsquic_stream);
+    }
     return stream_ctx;
 }
 
@@ -957,7 +1001,7 @@ test "lsquic transport dialing and listening" {
 
     defer transport.deinit();
     transport.dial(addr, null, struct {
-        pub fn callback(_: ?*anyopaque, res: anyerror!QuicConnection) void {
+        pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
             if (res) |conn| {
                 std.debug.print("Dialed QUIC connection successfully: {any}\n", .{conn});
             } else |err| {

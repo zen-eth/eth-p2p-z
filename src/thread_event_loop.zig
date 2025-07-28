@@ -84,7 +84,7 @@ pub const IOAction = union(enum) {
     quic_start: struct {
         engine: *quic.QuicEngine,
     },
-    quic_connect: struct { engine: *quic.QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!quic.QuicConnection) void },
+    quic_connect: struct { engine: *quic.QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void },
 };
 
 /// Represents a queued message for I/O operations in the event loop.
