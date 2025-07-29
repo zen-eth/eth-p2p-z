@@ -1,6 +1,10 @@
 const std = @import("std");
 const quic = @import("../transport/quic/root.zig").lsquic_transport;
 const proto_handler = @import("../proto_handler.zig");
+const @"switch" = @import("../switch.zig");
+const io_loop = @import("../thread_event_loop.zig");
+const ssl = @import("ssl");
+const keys_proto = @import("../proto/keys.proto.zig");
 
 pub const DiscardProtocolHandler = struct {
     allocator: std.mem.Allocator,
@@ -16,13 +20,11 @@ pub const DiscardProtocolHandler = struct {
         const handler = stream.engine.allocator.create(DiscardInitiator) catch unreachable;
         handler.* = .{
             .stream = stream,
-            .ctx = callback_ctx,
+            .callback_ctx = callback_ctx,
             .callback = callback,
+            .allocator = self.allocator,
         };
-        stream.proto_msg_handler = handler.any();
-
-        const sender = DiscardSender.init(stream, self.allocator);
-        callback(callback_ctx, sender);
+        stream.setProtoMsgHandler(handler.any());
     }
 
     pub fn onResponderStart(
@@ -71,20 +73,23 @@ pub const DiscardProtocolHandler = struct {
 pub const DiscardInitiator = struct {
     stream: *quic.QuicStream,
 
-    ctx: ?*anyopaque,
+    callback_ctx: ?*anyopaque,
 
-    callback: *const fn (ctx: ?*anyopaque, res: anyerror!*anyopaque) void,
+    callback: *const fn (ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
+
+    allocator: std.mem.Allocator,
 
     const Self = @This();
 
     pub fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
         self.stream = stream;
-        self.callback(self.ctx, self);
+        const sender = DiscardSender.init(stream, self.allocator);
+        self.callback(self.callback_ctx, sender);
     }
 
     pub fn onMessage(self: *Self, _: *quic.QuicStream, msg: []const u8) anyerror!void {
         std.log.warn("Discard protocol received a message: {s}", .{msg});
-        self.callback(self.ctx, error.InvalidMessage);
+        self.callback(self.callback_ctx, error.InvalidMessage);
         return error.InvalidMessage;
     }
 
@@ -204,3 +209,41 @@ pub const DiscardSender = struct {
         self.stream.write(message, callback_ctx, callback);
     }
 };
+
+test "discard protocol using switch" {
+    const allocator = std.testing.allocator;
+
+    var loop: io_loop.ThreadEventLoop = undefined;
+    try loop.init(std.testing.allocator);
+    defer {
+        loop.close();
+        loop.deinit();
+    }
+
+    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_host_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
+
+    defer ssl.EVP_PKEY_free(host_key);
+
+    var transport: quic.QuicTransport = undefined;
+    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
+    defer transport.deinit();
+
+    var switch1: @"switch".Switch = undefined;
+    switch1.init(allocator, &transport);
+    defer switch1.deinit();
+
+    const switch1_listen_address = try std.net.Address.parseIp4("127.0.0.1", 8767);
+    switch1.listen(switch1_listen_address, null, struct {
+        pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {
+            // Handle the callback
+        }
+    }.callback);
+}

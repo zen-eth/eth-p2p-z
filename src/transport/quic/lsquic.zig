@@ -738,6 +738,10 @@ pub fn onNewConn(ctx: ?*anyopaque, conn: ?*lsquic.lsquic_conn_t) callconv(.c) ?*
     lsquic.lsquic_conn_set_ctx(conn, conn_ctx);
     if (!engine.is_initiator) {
         onHskDone(conn, lsquic.LSQ_HSK_OK);
+        engine.accept_callback.?(
+            engine.accept_callback_ctx,
+            lsquic_conn,
+        );
     }
     // Handle new connection logic here
     std.debug.print("New connection established: {any}\n", .{conn});
@@ -765,9 +769,8 @@ pub fn onNewStream(ctx: ?*anyopaque, stream: ?*lsquic.lsquic_stream_t) callconv(
     const stream_ctx: *lsquic.lsquic_stream_ctx_t = @ptrCast(@alignCast(lsquic_stream));
     std.debug.print("New stream established: {any}\n", .{stream});
 
-    if (conn.direction == p2p_conn.Direction.OUTBOUND) {
-        conn.new_stream_ctx.?.callback(conn.new_stream_ctx.?.callback_ctx, lsquic_stream);
-    }
+    conn.new_stream_ctx.?.callback(conn.new_stream_ctx.?.callback_ctx, lsquic_stream);
+    conn.new_stream_ctx = null; // Clear the context after invoking the callback
     return stream_ctx;
 }
 

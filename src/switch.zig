@@ -17,6 +17,30 @@ pub const Switch = struct {
 
     listeners: std.StringArrayHashMap(quic.QuicListener),
 
+    pub fn init(self: *Switch, allocator: Allocator, transport: *quic.QuicTransport) void {
+        self.* = Switch{
+            .proto_handlers = std.ArrayList(proto_handler.AnyProtocolHandler).init(allocator),
+            .transport = transport,
+            .connections = std.StringArrayHashMap(*quic.QuicConnection).init(allocator),
+            .allocator = allocator,
+            .listeners = std.StringArrayHashMap(quic.QuicListener).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Switch) void {
+        // TODO: Properly close all connections and listeners.
+        self.proto_handlers.deinit();
+        self.connections.deinit();
+
+        for (self.listeners.values()) |listener| {
+            if (listener.accept_callback_ctx) |ctx| {
+                const value: *Switch.AcceptCallbackCtx = @ptrCast(@alignCast(ctx));
+                self.allocator.destroy(value);
+            }
+        }
+        self.listeners.deinit();
+    }
+
     const AcceptCallbackCtx = struct {
         @"switch": *Switch,
         // user-defined context for the callback
