@@ -12,6 +12,7 @@ pub const transport = @import("transport/lib.zig");
 pub const multistream = @import("multistream/lib.zig");
 pub const security = @import("security/lib.zig");
 pub const proto_handler = @import("proto_handler.zig");
+pub const discard_proto = @import("protocols/discard.zig");
 pub const @"switch" = @import("switch.zig");
 
 test {

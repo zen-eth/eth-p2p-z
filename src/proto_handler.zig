@@ -2,9 +2,9 @@ const quic = @import("./transport/quic/root.zig").lsquic_transport;
 
 // TODO: Make the stream type generic to allow different stream types.
 pub const ProtocolHandlerVTable = struct {
-    onInitiatorStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!*anyopaque) void) void,
+    onInitiatorStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) void,
 
-    onResponderStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!*anyopaque) void) void,
+    onResponderStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) void,
 };
 
 pub const AnyProtocolHandler = struct {
@@ -14,11 +14,11 @@ pub const AnyProtocolHandler = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn onInitiatorStart(self: *Self, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!*anyopaque) void) void {
+    pub fn onInitiatorStart(self: *Self, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) void {
         self.vtable.onInitiatorStartFn(self.instance, stream, callback_ctx, callback);
     }
 
-    pub fn onResponderStart(self: *Self, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!*anyopaque) void) void {
+    pub fn onResponderStart(self: *Self, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) void {
         self.vtable.onResponderStartFn(self.instance, stream, callback_ctx, callback);
     }
 };

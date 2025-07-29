@@ -22,7 +22,7 @@ pub const Switch = struct {
         // user-defined context for the callback
         callback_ctx: ?*anyopaque,
         // user-defined callback function
-        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!*anyopaque) void,
+        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
         fn acceptCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
             const self: *AcceptCallbackCtx = @ptrCast(@alignCast(ctx.?));
@@ -66,7 +66,7 @@ pub const Switch = struct {
         // user-defined context for the callback
         callback_ctx: ?*anyopaque,
         // user-defined callback function
-        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!*anyopaque) void,
+        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
         fn connectCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
             const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
@@ -108,7 +108,7 @@ pub const Switch = struct {
         address: std.net.Address,
         protocols: []const []const u8,
         callback_ctx: ?*anyopaque,
-        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!*anyopaque) void,
+        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) void {
         const connect_ctx = self.allocator.create(ConnectCallbackCtx) catch unreachable;
         connect_ctx.* = ConnectCallbackCtx{
@@ -135,7 +135,7 @@ pub const Switch = struct {
         self: *Switch,
         address: std.net.Address,
         callback_ctx: ?*anyopaque,
-        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!*anyopaque) void,
+        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) void {
         const address_str = std.fmt.allocPrint(self.allocator, "{}", .{address}) catch unreachable;
         defer self.allocator.free(address_str);
