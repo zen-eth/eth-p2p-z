@@ -15,8 +15,53 @@ pub const Switch = struct {
 
     allocator: Allocator,
 
+    listeners: std.StringArrayHashMap(quic.QuicListener),
+
+    const AcceptCallbackCtx = struct {
+        @"switch": *Switch,
+        // user-defined context for the callback
+        callback_ctx: ?*anyopaque,
+        // user-defined callback function
+        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!*anyopaque) void,
+
+        fn acceptCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
+            const self: *AcceptCallbackCtx = @ptrCast(@alignCast(ctx.?));
+            const conn = res catch |err| {
+                self.callback(self.callback_ctx, err);
+                return;
+            };
+
+            conn.onStream(self, newStreamCallback);
+        }
+
+        fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
+            const self: *AcceptCallbackCtx = @ptrCast(@alignCast(ctx.?));
+            const stream = res catch |err| {
+                self.callback(self.callback_ctx, err);
+                return;
+            };
+
+            // TODO: To use multistreams, we need to find the protocol handler for the stream.
+            // For now, we just use the first protocol handler.
+            self.@"switch".proto_handlers.items[0].onResponderStart(stream, self.callback_ctx, self.callback);
+
+            // `onResponderStart` should set the stream's protocol message handler.
+            stream.proto_msg_handler.onActivated(stream) catch |err| {
+                std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, stream });
+                self.callback(self.callback_ctx, err);
+                // TODO: Close the stream properly.
+                return;
+            };
+            // Here we would typically activate the protocol handler for the stream.
+            // For now, we just log the new stream.
+            std.debug.print("New stream established: {any}\n", .{stream});
+            self.@"switch".allocator.destroy(self);
+        }
+    };
+
     const ConnectCallbackCtx = struct {
         @"switch": *Switch,
+
         protocols: []const []const u8,
         // user-defined context for the callback
         callback_ctx: ?*anyopaque,
@@ -44,6 +89,13 @@ pub const Switch = struct {
             // For now, we just use the first protocol handler.
             self.@"switch".proto_handlers.items[0].onInitiatorStart(stream, self.callback_ctx, self.callback);
 
+            // `onInitiatorStart` should set the stream's protocol message handler.
+            stream.proto_msg_handler.onActivated(stream) catch |err| {
+                std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, stream });
+                self.callback(self.callback_ctx, err);
+                // TODO: Close the stream properly.
+                return;
+            };
             // Here we would typically activate the protocol handler for the stream.
             // For now, we just log the new stream.
             std.debug.print("New stream established: {any}\n", .{stream});
@@ -58,7 +110,7 @@ pub const Switch = struct {
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!*anyopaque) void,
     ) void {
-        const connect_ctx = self.transport.allocator.create(ConnectCallbackCtx) catch unreachable;
+        const connect_ctx = self.allocator.create(ConnectCallbackCtx) catch unreachable;
         connect_ctx.* = ConnectCallbackCtx{
             .@"switch" = self,
             .protocols = protocols,
@@ -66,11 +118,7 @@ pub const Switch = struct {
             .callback = callback,
         };
 
-        const address_str = std.fmt.allocPrint(self.allocator, "{}", .{address}) catch |err| {
-            callback(callback_ctx, err);
-            self.allocator.destroy(connect_ctx);
-            return;
-        };
+        const address_str = std.fmt.allocPrint(self.allocator, "{}", .{address}) catch unreachable;
         defer self.allocator.free(address_str);
 
         // Check if the connection already exists.
@@ -80,6 +128,37 @@ pub const Switch = struct {
         } else {
             // Dial the peer and pass the connect context as the callback context.
             self.transport.dial(address, connect_ctx, ConnectCallbackCtx.connectCallback);
+        }
+    }
+
+    pub fn listen(
+        self: *Switch,
+        address: std.net.Address,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!*anyopaque) void,
+    ) void {
+        const address_str = std.fmt.allocPrint(self.allocator, "{}", .{address}) catch unreachable;
+        defer self.allocator.free(address_str);
+
+        if (self.listeners.getPtr(address_str)) |existing_listener| {
+            existing_listener.listen(address) catch |err| {
+                std.log.warn("Failed to start listener on {s}: {s}", .{ address_str, @errorName(err) });
+                return;
+            };
+        } else {
+            const accept_callback_ctx = self.allocator.create(AcceptCallbackCtx) catch unreachable;
+            accept_callback_ctx.* = AcceptCallbackCtx{
+                .@"switch" = self,
+                .callback_ctx = callback_ctx,
+                .callback = callback,
+            };
+            var listener = self.transport.newListener(accept_callback_ctx, AcceptCallbackCtx.acceptCallback);
+            listener.listen(address) catch |err| {
+                self.allocator.destroy(accept_callback_ctx);
+                std.log.warn("Failed to start listener on {s}: {s}", .{ address_str, @errorName(err) });
+                return;
+            };
+            self.listeners.put(address_str, listener) catch unreachable;
         }
     }
 };

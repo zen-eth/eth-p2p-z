@@ -24,11 +24,11 @@ pub const AnyProtocolHandler = struct {
 };
 
 pub const ProtocolMessageHandlerVTable = struct {
-    onActivatedFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream) void,
+    onActivatedFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream) anyerror!void,
 
-    onMessageFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, message: []const u8) void,
+    onMessageFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, message: []const u8) anyerror!void,
 
-    onCloseFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream) void,
+    onCloseFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream) anyerror!void,
 };
 
 pub const AnyProtocolMessageHandler = struct {
@@ -38,15 +38,15 @@ pub const AnyProtocolMessageHandler = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn onActivated(self: *Self, stream: *quic.QuicStream) void {
-        self.vtable.onActivatedFn(self.instance, stream);
+    pub fn onActivated(self: *Self, stream: *quic.QuicStream) !void {
+        try self.vtable.onActivatedFn(self.instance, stream);
     }
 
-    pub fn onMessage(self: *Self, stream: *quic.QuicStream, message: []const u8) void {
-        self.vtable.onMessageFn(self.instance, stream, message);
+    pub fn onMessage(self: *Self, stream: *quic.QuicStream, message: []const u8) !void {
+        try self.vtable.onMessageFn(self.instance, stream, message);
     }
 
-    pub fn onClose(self: *Self, stream: *quic.QuicStream) void {
-        self.vtable.onCloseFn(self.instance, stream);
+    pub fn onClose(self: *Self, stream: *quic.QuicStream) !void {
+        try self.vtable.onCloseFn(self.instance, stream);
     }
 };

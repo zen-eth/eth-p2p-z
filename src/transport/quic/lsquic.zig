@@ -65,7 +65,7 @@ pub const QuicEngine = struct {
 
     connecting: ?Connecting,
 
-    accept_callback: ?*const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void,
+    accept_callback: ?*const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
 
     accept_callback_ctx: ?*anyopaque,
 
@@ -184,7 +184,7 @@ pub const QuicEngine = struct {
         }
     }
 
-    pub fn onAccept(self: *QuicEngine, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) void {
+    pub fn onAccept(self: *QuicEngine, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         self.accept_callback = accept_callback;
         self.accept_callback_ctx = accept_callback_ctx;
     }
@@ -293,6 +293,18 @@ pub const QuicConnection = struct {
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, stream: anyerror!*QuicStream) void,
     };
+
+    pub fn onStream(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, stream: anyerror!*QuicStream) void) void {
+        if (self.new_stream_ctx != null) {
+            callback(callback_ctx, error.NewStreamNotFinished);
+            return;
+        }
+
+        self.new_stream_ctx = .{
+            .callback_ctx = callback_ctx,
+            .callback = callback,
+        };
+    }
 
     pub fn newStream(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, stream: anyerror!*QuicStream) void) void {
         if (self.new_stream_ctx != null) {
@@ -436,12 +448,12 @@ pub const QuicListener = struct {
     /// The transport that created this listener.
     transport: *QuicTransport,
 
-    accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!QuicConnection) void,
+    accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!*QuicConnection) void,
 
     accept_callback_ctx: ?*anyopaque = null,
 
     /// Initialize the listener with the given transport and accept callback.
-    pub fn init(self: *QuicListener, transport: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!QuicConnection) void) void {
+    pub fn init(self: *QuicListener, transport: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         self.* = .{
             .engine = null,
             .transport = transport,
@@ -606,7 +618,7 @@ pub const QuicTransport = struct {
         dialer.connect(peer_address, callback_ctx, callback);
     }
 
-    pub fn newListener(self: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (ctx: ?*anyopaque, res: anyerror!QuicConnection) void) QuicListener {
+    pub fn newListener(self: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) QuicListener {
         var listener: QuicListener = undefined;
         listener.init(self, accept_callback_ctx, accept_callback);
         return listener;
@@ -766,33 +778,27 @@ pub fn onRead(
     const self: *QuicStream = @ptrCast(@alignCast(stream_ctx.?));
     const s = stream.?;
 
-    const cb = self.read_callback orelse return;
-    const cb_ctx = self.read_callback_ctx;
-
     var buf: [4096]u8 = undefined;
 
     while (true) {
         const n_read = lsquic.lsquic_stream_read(s, &buf, buf.len);
 
         if (n_read > 0) {
-            cb(cb_ctx, buf[0..@intCast(n_read)]) catch |user_err| {
-                std.log.warn("User read callback failed with error: {any}. Closing stream {any}.", .{ user_err, s });
+            self.proto_msg_handler.onMessage(self, buf[0..@intCast(n_read)]) catch |err| {
+                std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, s });
                 _ = lsquic.lsquic_stream_close(s);
                 return;
             };
         } else if (n_read == 0) {
             // End of Stream. The remote peer has closed its writing side.
-            cb(cb_ctx, error.EndOfStream) catch |user_err| {
-                std.log.warn("User read callback failed on EndOfStream with error: {any}. Closing stream {any}.", .{ user_err, s });
-                _ = lsquic.lsquic_stream_close(s);
-                return;
-            };
-            break;
+            _ = lsquic.lsquic_stream_close(s);
+            return;
         } else {
             // NOTE: Error handling for lsquic_stream_read on Windows platforms is not implemented.
             // On Windows, error codes may differ and additional handling may be required here.
             const err = posix.errno(n_read);
             if (err == posix.E.AGAIN) {
+                std.debug.print("lsquic_stream_read returned E.AGAIN, waiting for more data.\n", .{});
                 _ = lsquic.lsquic_stream_wantread(s, 1);
                 return;
             }
@@ -807,16 +813,11 @@ pub fn onRead(
                 },
             };
 
-            cb(cb_ctx, fatal_err) catch |user_err| {
-                std.log.warn("User read callback failed on ReadFailed with error: {any}. Closing stream {any}.", .{ user_err, s });
-                // When fatal error occurs, the stream should already be closed.
-                // This should not happen, but we handle it gracefully.
-                if (fatal_err == error.Unexpected) {
-                    _ = lsquic.lsquic_stream_close(s);
-                }
-                return;
-            };
-            break;
+            // If the error is the expected E.BADF or E.CONNRESET, the stream should be already closed.
+            if (fatal_err == error.Unexpected) {
+                _ = lsquic.lsquic_stream_close(s);
+            }
+            return;
         }
     }
 }
@@ -836,6 +837,7 @@ pub fn onWrite(
             // If the error is E.AGAIN, we should wait for the next write event.
             const err = posix.errno(n_written);
             if (err == posix.E.AGAIN) {
+                std.debug.print("lsquic_stream_write returned E.AGAIN, waiting for more space to write.\n", .{});
                 _ = lsquic.lsquic_stream_wantwrite(stream.?, 1);
                 return;
             }
@@ -877,6 +879,9 @@ pub fn onClose(
     stream_ctx: ?*lsquic.lsquic_stream_ctx_t,
 ) callconv(.c) void {
     const self: *QuicStream = @ptrCast(@alignCast(stream_ctx.?));
+    self.proto_msg_handler.onClose(self) catch |err| {
+        std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, self.stream });
+    };
     self.deinit();
     self.engine.allocator.destroy(self);
 }
@@ -964,7 +969,7 @@ test "lsquic transport dialing and listening" {
     defer server.deinit();
 
     var listener = server.newListener(null, struct {
-        pub fn callback(_: ?*anyopaque, res: anyerror!QuicConnection) void {
+        pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
             if (res) |conn| {
                 std.debug.print("Server accepted QUIC connection successfully: {any}\n", .{conn});
             } else |err| {
