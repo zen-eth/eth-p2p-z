@@ -216,10 +216,6 @@ test "discard protocol using switch" {
 
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
-    defer {
-        loop.close();
-        loop.deinit();
-    }
 
     const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
     if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
@@ -235,11 +231,15 @@ test "discard protocol using switch" {
 
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
-    defer transport.deinit();
 
     var switch1: @"switch".Switch = undefined;
     switch1.init(allocator, &transport);
     defer switch1.deinit();
+    defer transport.deinit();
+    defer {
+        loop.close();
+        loop.deinit();
+    }
     var discard_handler = DiscardProtocolHandler{
         .allocator = allocator,
     };
@@ -255,10 +255,6 @@ test "discard protocol using switch" {
 
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
-    defer {
-        cl_loop.close();
-        cl_loop.deinit();
-    }
 
     const cl_pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
     if (ssl.EVP_PKEY_keygen_init(cl_pctx) == 0) {
@@ -274,12 +270,15 @@ test "discard protocol using switch" {
 
     var cl_transport: quic.QuicTransport = undefined;
     try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
-    defer cl_transport.deinit();
 
     var switch2: @"switch".Switch = undefined;
     switch2.init(allocator, &cl_transport);
     defer switch2.deinit();
-
+    defer cl_transport.deinit();
+    defer {
+        cl_loop.close();
+        cl_loop.deinit();
+    }
     var discard_handler2 = DiscardProtocolHandler{
         .allocator = allocator,
     };
