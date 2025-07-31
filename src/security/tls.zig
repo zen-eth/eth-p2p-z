@@ -3,6 +3,10 @@ const ssl = @import("ssl");
 const Allocator = std.mem.Allocator;
 const keys_proto = @import("../proto/keys.proto.zig");
 
+pub const ALPN = "libp2p";
+
+pub const ALPN_PROTOS = @as([1]u8, .{@intCast(ALPN.len)}) ++ ALPN;
+
 /// This is the prefix libp2p uses for signing the certificate extension.
 const CertificatePrefix = "libp2p-tls-handshake:";
 /// This is the OID for the libp2p self-signed certificate extension.
@@ -280,6 +284,36 @@ fn x509ToPem(allocator: Allocator, cert: *ssl.X509) ![]u8 {
     }
 
     return allocator.dupe(u8, data_ptr[0..@intCast(len)]);
+}
+
+pub fn alpnSelectCallbackfn(ssl_handle: ?*ssl.SSL, out: [*c][*c]const u8, out_len: [*c]u8, in_protos: [*c]const u8, in_len: c_uint, _: ?*anyopaque) callconv(.c) c_int {
+    _ = ssl_handle;
+
+    const mutable_out: [*c][*c]u8 = @ptrCast(out);
+
+    const result: c_int = ssl.SSL_select_next_proto(
+        mutable_out,
+        out_len,
+        ALPN_PROTOS.ptr,
+        @intCast(ALPN_PROTOS.len),
+        in_protos,
+        in_len,
+    );
+
+    std.debug.print("alpnSelectCallbackfn called with result: {}\n", .{result});
+    if (result == ssl.OPENSSL_NPN_NEGOTIATED) {
+        return ssl.SSL_TLSEXT_ERR_OK;
+    } else {
+        return ssl.SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+}
+
+pub fn libp2pVerifyCallback(status: c_int, ctx: ?*ssl.X509_STORE_CTX) callconv(.c) c_int {
+    // TODO: Implement proper verification logic
+    _ = ctx;
+    std.debug.print("libp2pVerifyCallback called with status: {}\n", .{status});
+
+    return 1;
 }
 
 test "Build certificate using Ed25519 keys" {

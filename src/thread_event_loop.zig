@@ -85,6 +85,11 @@ pub const IOAction = union(enum) {
         engine: *quic.QuicEngine,
     },
     quic_connect: struct { engine: *quic.QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void },
+    quic_new_stream: struct {
+        conn: *quic.QuicConnection,
+        new_stream_ctx: ?*anyopaque,
+        new_stream_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void,
+    },
 };
 
 /// Represents a queued message for I/O operations in the event loop.
@@ -440,6 +445,11 @@ pub const ThreadEventLoop = struct {
                     std.debug.print("QUIC engine connecting777 to {any}\n", .{engine.connecting});
 
                     engine.doConnect(action_data.peer_address, action_data.callback_ctx, action_data.callback);
+                },
+                .quic_new_stream => |action_data| {
+                    const quic_conn = action_data.conn;
+                    std.debug.print("QUIC engine newStream with ctx: {any}\n", .{action_data.new_stream_ctx});
+                    quic_conn.doNewStream(action_data.new_stream_ctx, action_data.new_stream_callback);
                 },
             }
             self.allocator.destroy(m);

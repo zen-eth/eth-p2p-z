@@ -32,11 +32,15 @@ pub const Switch = struct {
         self.proto_handlers.deinit();
         self.connections.deinit();
 
-        for (self.listeners.values()) |listener| {
+        var iter = self.listeners.iterator();
+        while (iter.next()) |entry| {
+            const listener = entry.value_ptr;
             if (listener.accept_callback_ctx) |ctx| {
                 const value: *Switch.AcceptCallbackCtx = @ptrCast(@alignCast(ctx));
                 self.allocator.destroy(value);
             }
+
+            self.allocator.free(entry.key_ptr.*);
         }
         self.listeners.deinit();
     }
@@ -92,17 +96,28 @@ pub const Switch = struct {
         // user-defined callback function
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
+        notify: std.Thread.ResetEvent,
+
+        conn: *quic.QuicConnection,
+
         fn connectCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
+            std.debug.print("Connect callback called with ctx: {any}\n", .{ctx});
             const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
-            const conn = res catch |err| {
+            // TODO: Should check v4 or v6 address and also multiple transports situation.
+            // For now, we assume v4.
+            // defer self.@"switch".transport.dialer_v4.?.connecting = null;
+            self.conn = res catch |err| {
                 self.callback(self.callback_ctx, err);
                 return;
             };
-
-            conn.newStream(self, newStreamCallback);
+            std.debug.print("Connection established111: {*}\n", .{self.conn});
+            self.notify.set();
+            std.debug.print("Connection established2222: {*}\n", .{self.conn});
+            // conn.newStream(self, newStreamCallback);
         }
 
         fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
+            std.debug.print("New stream callback called with ctx: {any}\n", .{ctx});
             const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
             const stream = res catch |err| {
                 self.callback(self.callback_ctx, err);
@@ -140,6 +155,8 @@ pub const Switch = struct {
             .protocols = protocols,
             .callback_ctx = callback_ctx,
             .callback = callback,
+            .notify = .{},
+            .conn = undefined,
         };
 
         const address_str = std.fmt.allocPrint(self.allocator, "{}", .{address}) catch unreachable;
@@ -148,10 +165,20 @@ pub const Switch = struct {
         // Check if the connection already exists.
         if (self.connections.get(address_str)) |conn| {
             // If the connection already exists, we can just create a new stream on it.
+            connect_ctx.conn = conn;
+            connect_ctx.notify.set();
             conn.newStream(connect_ctx, ConnectCallbackCtx.newStreamCallback);
         } else {
             // Dial the peer and pass the connect context as the callback context.
             self.transport.dial(address, connect_ctx, ConnectCallbackCtx.connectCallback);
+            connect_ctx.notify.wait();
+            std.debug.print("Connection established5555: {*}\n", .{connect_ctx.conn});
+            // connect_ctx.conn.newStream(connect_ctx, ConnectCallbackCtx.newStreamCallback);
+
+            // std.time.sleep( * std.time.us_per_s);
+            // connect_ctx.conn.engine.allocator.destroy(connect_ctx.conn);
+            // self.allocator.destroy(connect_ctx);
+
         }
     }
 
@@ -160,15 +187,15 @@ pub const Switch = struct {
         address: std.net.Address,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
-    ) void {
+    ) !void {
         const address_str = std.fmt.allocPrint(self.allocator, "{}", .{address}) catch unreachable;
-        defer self.allocator.free(address_str);
 
-        if (self.listeners.getPtr(address_str)) |existing_listener| {
-            existing_listener.listen(address) catch |err| {
-                std.log.warn("Failed to start listener on {s}: {s}", .{ address_str, @errorName(err) });
-                return;
-            };
+        const gop = self.listeners.getOrPut(address_str) catch unreachable;
+
+        if (gop.found_existing) {
+            self.allocator.free(address_str);
+            try gop.value_ptr.listen(address);
+            return;
         } else {
             const accept_callback_ctx = self.allocator.create(AcceptCallbackCtx) catch unreachable;
             accept_callback_ctx.* = AcceptCallbackCtx{
@@ -176,13 +203,16 @@ pub const Switch = struct {
                 .callback_ctx = callback_ctx,
                 .callback = callback,
             };
-            var listener = self.transport.newListener(accept_callback_ctx, AcceptCallbackCtx.acceptCallback);
-            listener.listen(address) catch |err| {
+
+            gop.value_ptr.* = self.transport.newListener(accept_callback_ctx, AcceptCallbackCtx.acceptCallback);
+
+            gop.value_ptr.listen(address) catch |err| {
                 self.allocator.destroy(accept_callback_ctx);
+                const removed_entry = self.listeners.fetchOrderedRemove(address_str).?;
+                self.allocator.free(removed_entry.key);
                 std.log.warn("Failed to start listener on {s}: {s}", .{ address_str, @errorName(err) });
-                return;
+                return error.ListenerStartFailed;
             };
-            self.listeners.put(address_str, listener) catch unreachable;
         }
     }
 };
