@@ -37,7 +37,10 @@
             .url = "git+https://github.com/octopus-foundation/gremlin.zig#fccfe2659f24497199d86404e0ef7dbc79e033d2",
             .hash = "gremlin-0.0.0-E2s91bN4DgDYbb4QNxl4ZT5nEEhNBkk5ngfVasDbsnNF",
         },
-        .lsquic = .{ .url = "git+https://github.com/zen-eth/lsquic.git#802f1e2539b8967f3924a23b4dc72c0051598f95", .hash = "lsquic-0.0.0-jO7gdgsXAAA40DSdZvSkkq0ECUy2dKkT_t_unSI69gPK" },
+        .lsquic = .{
+            .url = "git+https://github.com/zen-eth/lsquic.git#585b456f165acd02a68b64c56cf126a596718fac",
+            .hash = "lsquic-0.0.0-jO7gdp8dAADM0lQxub9u0psWph_fUuNTbYWMvpNE_VtY",
+        },
     },
     .paths = .{
         "build.zig",

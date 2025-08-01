@@ -11,30 +11,33 @@ pub const Switch = struct {
 
     // TODO: Once peerid is implemented, we can use it to identify connections.
     // For now, we use the peer address as the key.
-    connections: std.StringArrayHashMap(*quic.QuicConnection),
+    outgoing_connections: std.StringArrayHashMap(*quic.QuicConnection),
 
     allocator: Allocator,
 
     listeners: std.StringArrayHashMap(quic.QuicListener),
 
+    incoming_connections: std.ArrayList(*quic.QuicConnection),
+
     pub fn init(self: *Switch, allocator: Allocator, transport: *quic.QuicTransport) void {
         self.* = Switch{
             .proto_handlers = std.ArrayList(proto_handler.AnyProtocolHandler).init(allocator),
             .transport = transport,
-            .connections = std.StringArrayHashMap(*quic.QuicConnection).init(allocator),
+            .outgoing_connections = std.StringArrayHashMap(*quic.QuicConnection).init(allocator),
             .allocator = allocator,
             .listeners = std.StringArrayHashMap(quic.QuicListener).init(allocator),
+            .incoming_connections = std.ArrayList(*quic.QuicConnection).init(allocator),
         };
     }
 
     pub fn deinit(self: *Switch) void {
         // TODO: Properly close all connections and listeners.
         self.proto_handlers.deinit();
-        self.connections.deinit();
+        self.outgoing_connections.deinit();
 
         var iter = self.listeners.iterator();
         while (iter.next()) |entry| {
-            const listener = entry.value_ptr;
+            const listener = entry.value_ptr.*;
             if (listener.accept_callback_ctx) |ctx| {
                 const value: *Switch.AcceptCallbackCtx = @ptrCast(@alignCast(ctx));
                 self.allocator.destroy(value);
@@ -60,6 +63,11 @@ pub const Switch = struct {
             };
 
             conn.onStream(self, newStreamCallback);
+            conn.close_ctx = .{
+                .callback = Switch.onOutgoingConnectionClose,
+                .callback_ctx = self.@"switch",
+            };
+            self.@"switch".incoming_connections.append(conn) catch unreachable;
         }
 
         fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
@@ -103,17 +111,24 @@ pub const Switch = struct {
         fn connectCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
             std.debug.print("Connect callback called with ctx: {any}\n", .{ctx});
             const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
-            // TODO: Should check v4 or v6 address and also multiple transports situation.
-            // For now, we assume v4.
-            // defer self.@"switch".transport.dialer_v4.?.connecting = null;
+
             self.conn = res catch |err| {
                 self.callback(self.callback_ctx, err);
                 return;
             };
-            std.debug.print("Connection established111: {*}\n", .{self.conn});
+
+            self.conn.close_ctx = .{
+                .callback = Switch.onOutgoingConnectionClose,
+                .callback_ctx = self.@"switch",
+            };
+
+            self.@"switch".outgoing_connections.put(
+                std.fmt.allocPrint(self.@"switch".allocator, "{}", .{self.conn.connect_ctx.?.address}) catch unreachable,
+                self.conn,
+            ) catch unreachable;
+            // Can't call newStream in the callback directly, it will cause a re-entrancy issue.
             self.notify.set();
-            std.debug.print("Connection established2222: {*}\n", .{self.conn});
-            // conn.newStream(self, newStreamCallback);
+            std.debug.print("Connection established: {*}\n", .{self.conn});
         }
 
         fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
@@ -138,7 +153,6 @@ pub const Switch = struct {
             // Here we would typically activate the protocol handler for the stream.
             // For now, we just log the new stream.
             std.debug.print("New stream established: {any}\n", .{stream});
-            self.@"switch".allocator.destroy(self);
         }
     };
 
@@ -163,7 +177,7 @@ pub const Switch = struct {
         defer self.allocator.free(address_str);
 
         // Check if the connection already exists.
-        if (self.connections.get(address_str)) |conn| {
+        if (self.outgoing_connections.get(address_str)) |conn| {
             // If the connection already exists, we can just create a new stream on it.
             connect_ctx.conn = conn;
             connect_ctx.notify.set();
@@ -214,5 +228,44 @@ pub const Switch = struct {
                 return error.ListenerStartFailed;
             };
         }
+    }
+
+    fn onOutgoingConnectionClose(ctx: ?*anyopaque, conn: *quic.QuicConnection) void {
+        const self: *Switch = @ptrCast(@alignCast(ctx.?));
+
+        const address_str = std.fmt.allocPrint(self.allocator, "{}", .{conn.connect_ctx.?.address}) catch unreachable;
+        defer self.allocator.free(address_str);
+
+        if (self.outgoing_connections.fetchOrderedRemove(address_str)) |removed_entry| {
+            // The value of the entry is the connection pointer, which is the same as `conn`.
+            // The key is the address string, which was allocated and stored in the HashMap.
+            // We must free the key's memory.
+            self.allocator.free(removed_entry.key);
+            const conn_ctx: *ConnectCallbackCtx = @ptrCast(@alignCast(removed_entry.value.connect_ctx.?.callback_ctx));
+            self.allocator.destroy(conn_ctx);
+        }
+        // The connection object itself is managed by the QuicEngine's allocator
+        // and is destroyed in `onConnClosed` after this callback returns.
+        // So we should NOT destroy `conn` here.
+    }
+
+    fn onIncomingConnectionClose(ctx: ?*anyopaque, conn: *quic.QuicConnection) void {
+        const self: *Switch = @ptrCast(@alignCast(ctx.?));
+
+        for (self.incoming_connections.items, 0..) |item, i| {
+            if (item == conn) {
+                // Found the connection, now remove it by its index.
+                _ = self.incoming_connections.orderedRemove(i);
+
+                // The connection is removed from the list, but we do not need to free it here.
+                // It will be closed and cleaned up by the QuicEngine.
+                std.debug.print("Incoming connection closed and removed from list: {any}\n", .{conn});
+                return;
+            }
+        }
+
+        // This code is reached if the connection was not found in the list, which might
+        // indicate a logic error elsewhere, but is safe to ignore for now.
+        std.debug.print("Could not find incoming connection in list to remove: {any}\n", .{conn});
     }
 };
