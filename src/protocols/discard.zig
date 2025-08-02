@@ -9,7 +9,28 @@ const keys_proto = @import("../proto/keys.proto.zig");
 pub const DiscardProtocolHandler = struct {
     allocator: std.mem.Allocator,
 
+    initiator: ?*DiscardInitiator,
+
+    responder: ?*DiscardResponder,
+
     const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return Self{
+            .allocator = allocator,
+            .initiator = null,
+            .responder = null,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.initiator) |initiator| {
+            self.allocator.destroy(initiator);
+        }
+        if (self.responder) |responder| {
+            self.allocator.destroy(responder);
+        }
+    }
 
     pub fn onInitiatorStart(
         self: *Self,
@@ -19,24 +40,30 @@ pub const DiscardProtocolHandler = struct {
     ) void {
         const handler = stream.engine.allocator.create(DiscardInitiator) catch unreachable;
         handler.* = .{
+            .sender = undefined,
             .stream = stream,
             .callback_ctx = callback_ctx,
             .callback = callback,
             .allocator = self.allocator,
         };
+        self.initiator = handler;
         stream.setProtoMsgHandler(handler.any());
     }
 
     pub fn onResponderStart(
-        _: *Self,
+        self: *Self,
         stream: *quic.QuicStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) void {
         const handler = stream.engine.allocator.create(DiscardResponder) catch unreachable;
-        handler.* = .{};
-        stream.proto_msg_handler = handler.any();
-        callback(callback_ctx, null);
+        handler.* = .{
+            .callback_ctx = callback_ctx,
+            .callback = callback,
+        };
+        self.responder = handler;
+        std.debug.print("313123123\n", .{});
+        stream.setProtoMsgHandler(handler.any());
     }
 
     pub fn vtableOnResponderStartFn(
@@ -79,11 +106,15 @@ pub const DiscardInitiator = struct {
 
     allocator: std.mem.Allocator,
 
+    sender: *DiscardSender,
+
     const Self = @This();
 
     pub fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
         self.stream = stream;
-        const sender = DiscardSender.init(stream, self.allocator);
+        const sender = self.allocator.create(DiscardSender) catch unreachable;
+        sender.* = DiscardSender.init(stream);
+        self.sender = sender;
         self.callback(self.callback_ctx, sender);
     }
 
@@ -93,8 +124,9 @@ pub const DiscardInitiator = struct {
         return error.InvalidMessage;
     }
 
-    pub fn onClose(_: *Self, _: *quic.QuicStream) anyerror!void {
-        // No operation for discard protocol.
+    pub fn onClose(self: *Self, _: *quic.QuicStream) anyerror!void {
+        std.debug.print("Discard protocol stream closed\n", .{});
+        self.allocator.destroy(self.sender);
     }
 
     pub fn send(self: *Self, message: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
@@ -139,12 +171,16 @@ pub const DiscardInitiator = struct {
 };
 
 pub const DiscardResponder = struct {
+    callback_ctx: ?*anyopaque,
+
+    callback: *const fn (ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
+
     const Self = @This();
 
     pub fn onActivated(_: *Self, _: *quic.QuicStream) anyerror!void {}
 
     pub fn onMessage(_: *Self, _: *quic.QuicStream, msg: []const u8) anyerror!void {
-        std.log.debug("Discard protocol received a message: {s}", .{msg});
+        std.debug.print("Discard protocol received a message: {s}", .{msg});
     }
 
     pub fn onClose(_: *Self, _: *quic.QuicStream) anyerror!void {
@@ -191,19 +227,15 @@ pub const DiscardResponder = struct {
 pub const DiscardSender = struct {
     stream: *quic.QuicStream,
 
-    allocator: std.mem.Allocator,
-
     const Self = @This();
 
-    pub fn init(stream: *quic.QuicStream, allocator: std.mem.Allocator) *Self {
-        const self = allocator.create(Self) catch unreachable;
-        self.* = .{ .stream = stream, .allocator = allocator };
-        return self;
+    pub fn init(stream: *quic.QuicStream) Self {
+        return Self{
+            .stream = stream,
+        };
     }
 
-    pub fn deinit(self: *Self) void {
-        self.allocator.destroy(self);
-    }
+    pub fn deinit(_: *Self) void {}
 
     pub fn send(self: *Self, message: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
         self.stream.write(message, callback_ctx, callback);
@@ -241,9 +273,8 @@ test "discard protocol using switch" {
     switch1.init(allocator, &transport);
     defer switch1.deinit();
 
-    var discard_handler = DiscardProtocolHandler{
-        .allocator = allocator,
-    };
+    var discard_handler = DiscardProtocolHandler.init(allocator);
+    defer discard_handler.deinit();
     switch1.proto_handlers.append(discard_handler.any()) catch unreachable;
 
     try switch1.listen(switch1_listen_address, null, struct {
@@ -280,28 +311,54 @@ test "discard protocol using switch" {
     switch2.init(allocator, &cl_transport);
     defer switch2.deinit();
 
-    var discard_handler2 = DiscardProtocolHandler{
-        .allocator = allocator,
-    };
+    var discard_handler2 = DiscardProtocolHandler.init(allocator);
+    defer discard_handler2.deinit();
     switch2.proto_handlers.append(discard_handler2.any()) catch unreachable;
 
     std.time.sleep(200 * std.time.ns_per_ms);
 
+    const TestNewStreamCallback = struct {
+        mutex: std.Thread.ResetEvent,
+
+        sender: *DiscardSender,
+
+        const Self = @This();
+        pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            const sender_ptr = res catch |err| {
+                std.log.warn("Failed to start stream: {}", .{err});
+                self.mutex.set();
+                return;
+            };
+            self.sender = @ptrCast(@alignCast(sender_ptr.?));
+            std.log.info("Stream started successfully", .{});
+            self.mutex.set();
+        }
+    };
+    var callback: TestNewStreamCallback = .{
+        .mutex = .{},
+        .sender = undefined,
+    };
     switch2.newStream(
         switch1_listen_address,
         &.{"discard"},
-        null,
-        struct {
-            pub fn callback(_: ?*anyopaque, res: anyerror!?*anyopaque) void {
-                _ = res catch |err| {
-                    std.log.warn("Failed to start stream: {}", .{err});
-                    return;
-                };
-                std.log.info("Stream started successfully", .{});
-            }
-        }.callback,
+        &callback,
+        TestNewStreamCallback.callback,
     );
 
+    callback.mutex.wait();
     std.debug.print("Switch 2 is trying to connect to Switch 1 at address: {}\n", .{switch1_listen_address});
-    std.time.sleep(1000 * std.time.ns_per_ms);
+    callback.sender.send("Hello from Switch 2", null, struct {
+        pub fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
+            if (res) |size| {
+                std.debug.print("Message sent successfully, size: {}\n", .{size});
+            } else |err| {
+                std.debug.print("Failed to send message: {}\n", .{err});
+            }
+        }
+    }.callback_);
+
+    std.time.sleep(500 * std.time.ns_per_ms);
+
+    callback.sender.stream.close(null, null);
 }

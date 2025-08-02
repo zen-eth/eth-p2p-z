@@ -1,5 +1,5 @@
 const quic = @import("./transport/quic/root.zig").lsquic_transport;
-
+const std = @import("std");
 // TODO: Make the stream type generic to allow different stream types.
 pub const ProtocolHandlerVTable = struct {
     onInitiatorStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) void,
@@ -43,6 +43,7 @@ pub const AnyProtocolMessageHandler = struct {
     }
 
     pub fn onMessage(self: *Self, stream: *quic.QuicStream, message: []const u8) !void {
+        std.debug.print("Handling message: {any}\n", .{message});
         try self.vtable.onMessageFn(self.instance, stream, message);
     }
 

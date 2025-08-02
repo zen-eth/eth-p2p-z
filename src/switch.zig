@@ -35,6 +35,7 @@ pub const Switch = struct {
         // will be triggered for each, handling removal and cleanup.
         var out_iter = self.outgoing_connections.iterator();
         while (out_iter.next()) |entry| {
+            std.debug.print("Closing outgoing connection: {*}\n", .{entry.value_ptr});
             entry.value_ptr.*.close(null, null); // Close the connection, which will trigger the close callback.
             std.time.sleep(100 * std.time.ns_per_ms); // Give some time for the close callback to run.
         }
@@ -45,8 +46,10 @@ pub const Switch = struct {
         // 2. Close all incoming connections. The onIncomingConnectionClose callback
         // will be triggered for each, handling removal and cleanup.
         for (self.incoming_connections.items) |conn| {
+            std.debug.print("Closing incoming connection: {*}\n", .{conn});
             conn.close(null, null); // Close the connection, which will trigger the close callback.
             std.time.sleep(100 * std.time.ns_per_ms); // Give some time for the close callback to run.
+
         }
         // After all close callbacks have run, the list should be empty.
         // We deinit it to free the list's own memory.
@@ -114,8 +117,7 @@ pub const Switch = struct {
             };
             // Here we would typically activate the protocol handler for the stream.
             // For now, we just log the new stream.
-            std.debug.print("New stream established: {any}\n", .{stream});
-            self.@"switch".allocator.destroy(self);
+            std.debug.print("Accept new stream established: {*}\n", .{stream});
         }
     };
 
@@ -178,7 +180,7 @@ pub const Switch = struct {
             };
             // Here we would typically activate the protocol handler for the stream.
             // For now, we just log the new stream.
-            std.debug.print("New stream established: {any}\n", .{stream});
+            std.debug.print("New stream established: {*}\n", .{stream});
         }
     };
 
@@ -213,7 +215,7 @@ pub const Switch = struct {
             self.transport.dial(address, connect_ctx, ConnectCallbackCtx.connectCallback);
             connect_ctx.notify.wait();
             std.debug.print("Connection established5555: {*}\n", .{connect_ctx.conn});
-            // connect_ctx.conn.newStream(connect_ctx, ConnectCallbackCtx.newStreamCallback);
+            connect_ctx.conn.newStream(connect_ctx, ConnectCallbackCtx.newStreamCallback);
 
             // std.time.sleep( * std.time.us_per_s);
             // connect_ctx.conn.engine.allocator.destroy(connect_ctx.conn);
