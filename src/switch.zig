@@ -31,21 +31,43 @@ pub const Switch = struct {
     }
 
     pub fn deinit(self: *Switch) void {
-        // TODO: Properly close all connections and listeners.
-        self.proto_handlers.deinit();
+        // 1. Close all outgoing connections. The onOutgoingConnectionClose callback
+        // will be triggered for each, handling removal and cleanup.
+        var out_iter = self.outgoing_connections.iterator();
+        while (out_iter.next()) |entry| {
+            entry.value_ptr.*.close(null, null); // Close the connection, which will trigger the close callback.
+            std.time.sleep(100 * std.time.ns_per_ms); // Give some time for the close callback to run.
+        }
+        // After all close callbacks have run, the map should be empty.
+        // We deinit it to free the map's own memory.
         self.outgoing_connections.deinit();
 
-        var iter = self.listeners.iterator();
-        while (iter.next()) |entry| {
-            const listener = entry.value_ptr.*;
-            if (listener.accept_callback_ctx) |ctx| {
-                const value: *Switch.AcceptCallbackCtx = @ptrCast(@alignCast(ctx));
-                self.allocator.destroy(value);
-            }
+        // 2. Close all incoming connections. The onIncomingConnectionClose callback
+        // will be triggered for each, handling removal and cleanup.
+        for (self.incoming_connections.items) |conn| {
+            conn.close(null, null); // Close the connection, which will trigger the close callback.
+            std.time.sleep(100 * std.time.ns_per_ms); // Give some time for the close callback to run.
+        }
+        // After all close callbacks have run, the list should be empty.
+        // We deinit it to free the list's own memory.
+        self.incoming_connections.deinit();
 
+        // 3. Close all listeners and free their resources.
+        var listener_iter = self.listeners.iterator();
+        while (listener_iter.next()) |entry| {
+            var listener = entry.value_ptr.*;
+            listener.deinit(); // This should close the listener's engine.
+
+            if (listener.accept_callback_ctx) |ctx| {
+                const accept_ctx: *AcceptCallbackCtx = @ptrCast(@alignCast(ctx));
+                self.allocator.destroy(accept_ctx);
+            }
             self.allocator.free(entry.key_ptr.*);
         }
         self.listeners.deinit();
+
+        // 4. Finally, deinit the protocol handlers list.
+        self.proto_handlers.deinit();
     }
 
     const AcceptCallbackCtx = struct {
@@ -64,8 +86,10 @@ pub const Switch = struct {
 
             conn.onStream(self, newStreamCallback);
             conn.close_ctx = .{
-                .callback = Switch.onOutgoingConnectionClose,
+                .callback = Switch.onIncomingConnectionClose,
                 .callback_ctx = self.@"switch",
+                .ud_callback = null,
+                .ud_callback_ctx = null,
             };
             self.@"switch".incoming_connections.append(conn) catch unreachable;
         }
@@ -120,6 +144,8 @@ pub const Switch = struct {
             self.conn.close_ctx = .{
                 .callback = Switch.onOutgoingConnectionClose,
                 .callback_ctx = self.@"switch",
+                .ud_callback = null,
+                .ud_callback_ctx = null,
             };
 
             self.@"switch".outgoing_connections.put(
@@ -230,8 +256,13 @@ pub const Switch = struct {
         }
     }
 
-    fn onOutgoingConnectionClose(ctx: ?*anyopaque, conn: *quic.QuicConnection) void {
+    fn onOutgoingConnectionClose(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
         const self: *Switch = @ptrCast(@alignCast(ctx.?));
+
+        const conn = res catch |err| {
+            std.log.warn("Connection close callback failed with error: {any}", .{err});
+            return;
+        };
 
         const address_str = std.fmt.allocPrint(self.allocator, "{}", .{conn.connect_ctx.?.address}) catch unreachable;
         defer self.allocator.free(address_str);
@@ -249,8 +280,13 @@ pub const Switch = struct {
         // So we should NOT destroy `conn` here.
     }
 
-    fn onIncomingConnectionClose(ctx: ?*anyopaque, conn: *quic.QuicConnection) void {
+    fn onIncomingConnectionClose(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
         const self: *Switch = @ptrCast(@alignCast(ctx.?));
+
+        const conn = res catch |err| {
+            std.log.warn("Connection close callback failed with error: {any}", .{err});
+            return;
+        };
 
         for (self.incoming_connections.items, 0..) |item, i| {
             if (item == conn) {
@@ -259,13 +295,11 @@ pub const Switch = struct {
 
                 // The connection is removed from the list, but we do not need to free it here.
                 // It will be closed and cleaned up by the QuicEngine.
-                std.debug.print("Incoming connection closed and removed from list: {any}\n", .{conn});
                 return;
             }
         }
 
         // This code is reached if the connection was not found in the list, which might
         // indicate a logic error elsewhere, but is safe to ignore for now.
-        std.debug.print("Could not find incoming connection in list to remove: {any}\n", .{conn});
     }
 };

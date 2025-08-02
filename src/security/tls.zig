@@ -316,6 +316,13 @@ pub fn libp2pVerifyCallback(status: c_int, ctx: ?*ssl.X509_STORE_CTX) callconv(.
     return 1;
 }
 
+pub fn libp2pVerifyCallback1(cert_ctx: ?*ssl.X509_STORE_CTX, ctx: ?*anyopaque) callconv(.c) c_int {
+    _ = cert_ctx;
+    _ = ctx;
+    std.debug.print("libp2pVerifyCallback1 called\n", .{});
+    return 1;
+}
+
 test "Build certificate using Ed25519 keys" {
     const fs = std.fs.cwd();
     const file_path = "test_cert.pem";

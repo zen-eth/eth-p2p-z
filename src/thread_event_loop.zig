@@ -85,6 +85,11 @@ pub const IOAction = union(enum) {
         engine: *quic.QuicEngine,
     },
     quic_connect: struct { engine: *quic.QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void },
+    quic_close_connection: struct {
+        conn: *quic.QuicConnection,
+        callback_ctx: ?*anyopaque,
+        callback: ?*const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void,
+    },
     quic_new_stream: struct {
         conn: *quic.QuicConnection,
         new_stream_ctx: ?*anyopaque,
@@ -443,6 +448,11 @@ pub const ThreadEventLoop = struct {
                     const engine = action_data.engine;
 
                     engine.doConnect(action_data.peer_address, action_data.callback_ctx, action_data.callback);
+                },
+                .quic_close_connection => |action_data| {
+                    const quic_conn = action_data.conn;
+                    std.debug.print("QUIC engine closeConnection with ctx: {any}\n", .{action_data.callback_ctx});
+                    quic_conn.doClose(action_data.callback_ctx, action_data.callback);
                 },
                 .quic_new_stream => |action_data| {
                     const quic_conn = action_data.conn;

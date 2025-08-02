@@ -305,7 +305,12 @@ pub const QuicConnection = struct {
 
     pub const CloseCtx = struct {
         callback_ctx: ?*anyopaque,
-        callback: *const fn (callback_ctx: ?*anyopaque, conn: *QuicConnection) void,
+        // This callback is registered at the time of connection connected,
+        // it is used that the connection is closed not by the user, but by the engine.
+        callback: *const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
+        ud_callback_ctx: ?*anyopaque,
+        // This callback is used to notify the user that the connection is closed.
+        ud_callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
     };
 
     pub fn onStream(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, stream: anyerror!*QuicStream) void) void {
@@ -349,6 +354,24 @@ pub const QuicConnection = struct {
         };
         lsquic.lsquic_conn_make_stream(self.conn);
 
+        self.engine.processConns();
+    }
+
+    pub fn close(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+        if (self.engine.transport.io_event_loop.inEventLoopThread()) {
+            self.doClose(callback_ctx, callback);
+        } else {
+            const message = io_loop.IOMessage{
+                .action = .{ .quic_close_connection = .{ .conn = self, .callback_ctx = callback_ctx, .callback = callback } },
+            };
+            self.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
+        }
+    }
+
+    pub fn doClose(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+        self.close_ctx.?.ud_callback_ctx = callback_ctx;
+        self.close_ctx.?.ud_callback = callback;
+        lsquic.lsquic_conn_close(self.conn);
         self.engine.processConns();
     }
 };
@@ -661,7 +684,7 @@ pub const QuicTransport = struct {
             return error.InitializationFailed;
 
         ssl.SSL_CTX_set_verify(ssl_ctx, ssl.SSL_VERIFY_PEER | ssl.SSL_VERIFY_FAIL_IF_NO_PEER_CERT | ssl.SSL_VERIFY_CLIENT_ONCE, tls.libp2pVerifyCallback);
-
+        ssl.SSL_CTX_set_cert_verify_callback(ssl_ctx, tls.libp2pVerifyCallback1, null);
         const signature_algs: []const u16 = &.{ ssl.SSL_SIGN_ED25519, ssl.SSL_SIGN_ECDSA_SECP256R1_SHA256, ssl.SSL_SIGN_RSA_PKCS1_SHA256 };
         if (ssl.SSL_CTX_set_verify_algorithm_prefs(ssl_ctx, signature_algs.ptr, @intCast(signature_algs.len)) == 0)
             @panic("SSL_CTX_set_verify_algorithm_prefs failed\n");
@@ -763,9 +786,14 @@ pub fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_st
 
 pub fn onConnClosed(conn: ?*lsquic.lsquic_conn_t) callconv(.c) void {
     const lsquic_conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(conn.?)));
-    if (lsquic_conn.close_ctx) |*close_ctx| {
+    if (lsquic_conn.close_ctx) |close_ctx| {
         close_ctx.callback(close_ctx.callback_ctx, lsquic_conn);
+        std.debug.print("Connection closed with callback: {any}\n", .{close_ctx.callback});
+        if (close_ctx.ud_callback) |ud_callback| {
+            ud_callback(close_ctx.ud_callback_ctx, lsquic_conn);
+        }
     }
+    std.debug.print("Connection closed: {any}\n", .{conn});
     lsquic.lsquic_conn_set_ctx(conn, null);
     lsquic_conn.engine.allocator.destroy(lsquic_conn);
     std.debug.print("Connection closed: {any}\n", .{conn});
