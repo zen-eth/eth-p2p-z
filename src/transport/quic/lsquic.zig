@@ -15,63 +15,81 @@ const UDP = xev.UDP;
 const posix = std.posix;
 const protoMsgHandler = @import("../../proto_handler.zig").AnyProtocolMessageHandler;
 
+// Maximum stream data for bidirectional streams
 const MaxStreamDataBidiRemote = 64 * 1024 * 1024; // 64 MB
+// Maximum stream data for bidirectional streams (local side)
 const MaxStreamDataBidiLocal = 64 * 1024 * 1024; // 64 MB
+// Maximum number of bidirectional streams
 const MaxStreamsBidi = 1000;
-const IdleTimeoutSeconds = 120;
+// Idle timeout for connections in seconds
+const IdleTimeoutSeconds = 120; // 2 minutes
+// Handshake timeout in microseconds
 const HandshakeTimeoutMicroseconds = 10 * std.time.us_per_s; // 10 seconds
 
+/// Stream interface for lsquic
 const stream_if: lsquic.lsquic_stream_if = lsquic.lsquic_stream_if{
     .on_new_conn = onNewConn,
     .on_conn_closed = onConnClosed,
     .on_hsk_done = onHskDone,
     .on_new_stream = onNewStream,
-    .on_read = onRead,
-    .on_write = onWrite,
-    .on_close = onClose,
+    .on_read = onStreamRead,
+    .on_write = onStreamWrite,
+    .on_close = onStreamClose,
 };
 
+/// QUIC engine that manages QUIC connections and streams.
+/// It handles reading from the UDP socket, processing incoming packets, and managing connections.
+/// It also provides methods for starting the engine, connecting to peers, and accepting incoming connections.
+/// It uses the lsquic library for QUIC protocol handling and integrates with the event loop for asynchronous operations.
+/// All the lsquic API calls are scheduled to run in the event loop thread, ensuring thread safety.
+/// It assumes that the event loop is running in a single-threaded environment.
+/// It supports both client and server modes, allowing it to initiate connections or accept incoming ones.
 pub const QuicEngine = struct {
     pub const Error = error{
         InitializationFailed,
         AlreadyConnecting,
     };
 
+    // SSL context for the QUIC engine
     ssl_context: *ssl.SSL_CTX,
-
+    // The lsquic engine instance
     engine: *lsquic.lsquic_engine_t,
-
+    // The UDP socket used for QUIC communication
     socket: UDP,
-
+    // Local address of the QUIC engine
     local_address: std.net.Address,
-
+    // Allocator for memory management
     allocator: Allocator,
-
-    is_initiator: bool,
-
-    read_buffer: [1500]u8, // Typical MTU size for UDP packets
-
+    // Indicates whether the engine is in client mode
+    is_client_mode: bool,
+    // Read buffer for incoming QUIC packets
+    // Typical MTU size for UDP packets
+    read_buffer: [1500]u8,
+    // Completion object for reading from the UDP socket
     c_read: xev.Completion,
-
+    // State for reading from the UDP socket
     read_state: UDP.State,
-
+    // The transport layer that this engine is part of
+    // This is used to access the transport's event loop and other properties.
     transport: *QuicTransport,
-
-    accept_callback: ?*const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
-
-    accept_callback_ctx: ?*anyopaque,
-
+    // Context for the listen operation
+    // This is set when the engine is in server mode and is waiting for incoming connections.
+    listen_ctx: ?QuicConnection.ListenCtx,
+    // Timer for processing QUIC connections
     process_timer: xev.Timer,
-
+    // Completion object for the process timer
     c_process_timer: xev.Completion,
-
+    // Completion object for canceling the process timer
     c_process_timer_cancel: xev.Completion,
-
+    // Context for connecting to a peer
+    // This is used when the engine is in client mode and is initiating a connection to a peer.
+    // The functions in the QuicEngine will be called in the same thread as the event loop.
+    // It means that no locks are needed for the engine.
     connect_ctx: ?QuicConnection.ConnectCtx,
 
-    pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, transport: *QuicTransport, is_initiator: bool) !void {
+    pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, transport: *QuicTransport, is_client_mode: bool) !void {
         var flags: c_uint = 0;
-        if (!is_initiator) {
+        if (!is_client_mode) {
             flags |= lsquic.LSENG_SERVER;
         }
 
@@ -115,9 +133,8 @@ pub const QuicEngine = struct {
             .c_read = undefined,
             .read_state = undefined,
             .transport = transport,
-            .is_initiator = is_initiator,
-            .accept_callback = null,
-            .accept_callback_ctx = null,
+            .is_client_mode = is_client_mode,
+            .listen_ctx = null,
             .process_timer = try xev.Timer.init(),
             .c_process_timer = .{},
             .c_process_timer_cancel = .{},
@@ -125,22 +142,34 @@ pub const QuicEngine = struct {
         };
     }
 
+    /// doStart is a private method that starts the QUIC engine by initiating the read operation on the UDP socket.
+    /// It is called from the `start` method to ensure that the read operation is scheduled in the event loop thread.
     pub fn doStart(self: *QuicEngine) void {
         self.socket.read(&self.transport.io_event_loop.loop, &self.c_read, &self.read_state, .{ .slice = &self.read_buffer }, QuicEngine, self, readCallback);
         self.processConns();
     }
 
+    /// Starts the QUIC engine by initiating the read operation on the UDP socket.
+    /// This function should be called after the engine is initialized.
+    /// It sets up the read callback to handle incoming QUIC packets and starts processing connections.
+    /// It is thread-safe and can be called from any thread.
     pub fn start(self: *QuicEngine) void {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             self.doStart();
         } else {
             const message = io_loop.IOMessage{
-                .action = .{ .quic_start = .{ .engine = self } },
+                .action = .{ .quic_engine_start = .{ .engine = self } },
             };
             self.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
+    /// Initiates a QUIC connection to the specified peer address.
+    /// If a connection is already in progress, it returns an error.
+    /// If the connection is successful, it invokes the callback with the new `QuicConnection`.
+    /// If the connection fails, it invokes the callback with an error.
+    /// This function is called from the event loop thread to ensure thread safety.
+    /// It should not be called directly from other threads.
     pub fn doConnect(self: *QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         self.connect_ctx = .{
             .address = peer_address,
@@ -156,7 +185,7 @@ pub const QuicEngine = struct {
             @ptrCast(&self.local_address.any),
             @ptrCast(&peer_address.any),
             self,
-            null, // TODO: Check if we should pass conn ctx earlier
+            null,
             null,
             0,
             null,
@@ -164,9 +193,16 @@ pub const QuicEngine = struct {
             null,
             0,
         );
+
         self.processConns();
     }
 
+    /// Initiates a QUIC connection to the specified peer address.
+    /// If a connection is already in progress, it returns an error.
+    /// If the connection is successful, it invokes the callback with the new `QuicConnection`.
+    /// If the connection fails, it invokes the callback with an error.
+    /// This function is not thread-safe and should not be called from multiple threads concurrently.
+    /// Queueuing this operation is recommended.
     pub fn connect(self: *QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         if (self.connect_ctx != null) {
             callback(callback_ctx, error.AlreadyConnecting);
@@ -189,12 +225,39 @@ pub const QuicEngine = struct {
         }
     }
 
-    pub fn onAccept(self: *QuicEngine, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
-        self.accept_callback = accept_callback;
-        self.accept_callback_ctx = accept_callback_ctx;
+    pub fn onListen(self: *QuicEngine, listen_callback_ctx: ?*anyopaque, listen_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+        self.listen_ctx = .{
+            .callback_ctx = listen_callback_ctx,
+            .callback = listen_callback,
+        };
     }
 
-    pub fn readCallback(
+    pub fn processConns(self: *QuicEngine) void {
+        lsquic.lsquic_engine_process_conns(self.engine);
+
+        var diff_us: c_int = 0;
+        if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff_us) > 0) {
+            // Calculate the next timer interval in milliseconds
+            // If diff_us is negative or less than the clock granularity, we set it to the clock granularity.
+            // This ensures that we do not set a timer with a negative or zero interval.
+            // The clock granularity is defined in lsquic.h as LSQUIC_DF_CLOCK_GRANULARITY.
+            // It is typically set to 1000 microseconds (1 millisecond).
+            // This means that the timer will be set to fire at least every 1 millisecond.
+            // If the difference is less than the clock granularity, we set the timer to fire at the clock granularity.
+            // If the difference is greater than or equal to the clock granularity, we calculate the next timer interval in milliseconds.
+            // This is done to ensure that the engine processes connections at a regular interval,
+            // which is important for maintaining the performance and responsiveness of the QUIC engine.
+            // The timer is used to schedule the next processing of connections,
+            // allowing the engine to handle incoming packets and manage connections efficiently.
+            const next_ms = if (diff_us >= lsquic.LSQUIC_DF_CLOCK_GRANULARITY)
+                @divFloor(@as(u64, @intCast(diff_us)), std.time.us_per_ms)
+            else if (diff_us <= 0) 0 else @divFloor(@as(u64, @intCast(lsquic.LSQUIC_DF_CLOCK_GRANULARITY)), std.time.us_per_ms);
+            std.debug.print("QUIC engine processing connections with next_ms {}\n", .{next_ms});
+            self.process_timer.reset(&self.transport.io_event_loop.loop, &self.c_process_timer, &self.c_process_timer_cancel, next_ms, QuicEngine, self, processConnsCallback);
+        }
+    }
+
+    fn readCallback(
         ctx: ?*QuicEngine,
         _: *xev.Loop,
         _: *xev.Completion,
@@ -206,20 +269,16 @@ pub const QuicEngine = struct {
     ) xev.CallbackAction {
         const self = ctx.?;
 
+        // For UDP read errors, we log the error and continue to listen.
         const n = r catch |err| {
-            switch (err) {
-                error.EOF => {},
-                else => std.log.warn("UDP read failed with error: {any}. Disarming read.", .{err}),
-            }
-
-            return .disarm;
+            std.log.warn("UDP read failed with error: {any}. Continuing to listen.", .{err});
+            return .rearm;
         };
 
+        // If no bytes were read, we rearm the read operation to continue listening.
         if (n == 0) {
-            return .disarm;
+            return .rearm;
         }
-
-        std.debug.print("QUIC engine received {} bytes from {}\n", .{ n, address });
 
         const result = lsquic.lsquic_engine_packet_in(
             self.engine,
@@ -231,9 +290,10 @@ pub const QuicEngine = struct {
             0,
         );
 
+        // If the packet processing failed, we log the error and rearm the read operation.
         if (result < 0) {
-            std.log.warn("QUIC engine packet in failed{}", .{result});
-            return .disarm;
+            std.log.warn("QUIC engine packet in failed {}\n", .{result});
+            return .rearm;
         }
 
         self.processConns();
@@ -241,20 +301,7 @@ pub const QuicEngine = struct {
         return .rearm;
     }
 
-    pub fn processConns(self: *QuicEngine) void {
-        lsquic.lsquic_engine_process_conns(self.engine);
-
-        var diff_us: c_int = 0;
-        if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff_us) > 0) {
-            const next_ms = if (diff_us >= lsquic.LSQUIC_DF_CLOCK_GRANULARITY)
-                @divFloor(@as(u64, @intCast(diff_us)), std.time.us_per_ms)
-            else if (diff_us <= 0) 0 else @divFloor(@as(u64, @intCast(lsquic.LSQUIC_DF_CLOCK_GRANULARITY)), std.time.us_per_ms);
-            std.debug.print("QUIC engine processing connections with next_ms {}\n", .{next_ms});
-            self.process_timer.reset(&self.transport.io_event_loop.loop, &self.c_process_timer, &self.c_process_timer_cancel, next_ms, QuicEngine, self, processConnsCallback);
-        }
-    }
-
-    pub fn processConnsCallback(
+    fn processConnsCallback(
         ctx: ?*QuicEngine,
         _: *xev.Loop,
         _: *xev.Completion,
@@ -272,7 +319,7 @@ pub const QuicEngine = struct {
         return .disarm;
     }
 
-    pub fn getSslContext(
+    fn getSslContext(
         peer_ctx: ?*anyopaque,
         _: ?*const lsquic.struct_sockaddr,
     ) callconv(.c) ?*lsquic.struct_ssl_ctx_st {
@@ -294,6 +341,11 @@ pub const QuicConnection = struct {
     pub const Error = error{
         NewStreamNotFinished,
         AlreadyAccepting,
+    };
+
+    pub const ListenCtx = struct {
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
     };
 
     pub const ConnectCtx = struct {
@@ -532,7 +584,7 @@ pub const QuicListener = struct {
         self.engine = undefined;
         const engine_ptr = &self.engine.?;
         try engine_ptr.init(self.transport.allocator, socket, self.transport, false);
-        engine_ptr.onAccept(self.accept_callback_ctx, self.accept_callback);
+        engine_ptr.onListen(self.accept_callback_ctx, self.accept_callback);
         engine_ptr.start();
         std.debug.print("QUIC listener started on engine: {*}\n", .{&self.engine});
     }
@@ -784,13 +836,13 @@ pub fn onNewConn(ctx: ?*anyopaque, conn: ?*lsquic.lsquic_conn_t) callconv(.c) ?*
         .on_stream_ctx = null,
         .conn = conn.?,
         .engine = engine,
-        .direction = if (engine.is_initiator) p2p_conn.Direction.OUTBOUND else p2p_conn.Direction.INBOUND,
+        .direction = if (engine.is_client_mode) p2p_conn.Direction.OUTBOUND else p2p_conn.Direction.INBOUND,
     };
     engine.connect_ctx = null; // Clear the connect context after use
     const conn_ctx: *lsquic.lsquic_conn_ctx_t = @ptrCast(@alignCast(lsquic_conn));
     lsquic.lsquic_conn_set_ctx(conn, conn_ctx);
 
-    if (!engine.is_initiator) {
+    if (!engine.is_client_mode) {
         onHskDone(conn, lsquic.LSQ_HSK_OK);
     }
     // Handle new connection logic here
@@ -807,10 +859,7 @@ pub fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_st
     } else {
         const lsquic_conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(conn.?)));
         if (lsquic_conn.direction == p2p_conn.Direction.INBOUND) {
-            lsquic_conn.engine.accept_callback.?(
-                lsquic_conn.engine.accept_callback_ctx,
-                lsquic_conn,
-            );
+            lsquic_conn.engine.listen_ctx.?.callback(lsquic_conn.engine.listen_ctx.?.callback_ctx, lsquic_conn);
         } else {
             lsquic_conn.connect_ctx.?.callback(lsquic_conn.connect_ctx.?.callback_ctx, lsquic_conn);
         }
@@ -855,7 +904,7 @@ pub fn onNewStream(ctx: ?*anyopaque, stream: ?*lsquic.lsquic_stream_t) callconv(
     return stream_ctx;
 }
 
-pub fn onRead(
+pub fn onStreamRead(
     stream: ?*lsquic.lsquic_stream_t,
     stream_ctx: ?*lsquic.lsquic_stream_ctx_t,
 ) callconv(.c) void {
@@ -907,7 +956,7 @@ pub fn onRead(
     }
 }
 
-pub fn onWrite(
+pub fn onStreamWrite(
     stream: ?*lsquic.lsquic_stream_t,
     stream_ctx: ?*lsquic.lsquic_stream_ctx_t,
 ) callconv(.c) void {
@@ -962,7 +1011,7 @@ pub fn onWrite(
     }
 }
 
-pub fn onClose(
+pub fn onStreamClose(
     _: ?*lsquic.lsquic_stream_t,
     stream_ctx: ?*lsquic.lsquic_stream_ctx_t,
 ) callconv(.c) void {

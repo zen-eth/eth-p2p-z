@@ -81,7 +81,7 @@ pub const IOAction = union(enum) {
         /// The timeout for the close operation in milliseconds.
         timeout_ms: u64,
     },
-    quic_start: struct {
+    quic_engine_start: struct {
         engine: *quic.QuicEngine,
     },
     quic_connect: struct { engine: *quic.QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void },
@@ -451,18 +451,16 @@ pub const ThreadEventLoop = struct {
                     };
                     channel.socket.shutdown(loop, c, CloseCtx, close_ctx, xev_tcp.XevSocketChannel.shutdownCB);
                 },
-                .quic_start => |action_data| {
+                .quic_engine_start => |action_data| {
                     const engine = action_data.engine;
                     engine.doStart();
                 },
                 .quic_connect => |action_data| {
                     const engine = action_data.engine;
-
                     engine.doConnect(action_data.peer_address, action_data.callback_ctx, action_data.callback);
                 },
                 .quic_close_connection => |action_data| {
                     const quic_conn = action_data.conn;
-                    std.debug.print("QUIC engine closeConnection with ctx: {any}\n", .{action_data.callback_ctx});
                     quic_conn.doClose(action_data.callback_ctx, action_data.callback);
                 },
                 .quic_new_stream => |action_data| {
