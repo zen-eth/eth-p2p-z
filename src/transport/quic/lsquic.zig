@@ -391,7 +391,7 @@ pub const QuicConnection = struct {
         callback_ctx: ?*anyopaque,
         // This callback is registered at the time of connection connected,
         // it is used that the connection is closed not by the user, but by the engine.
-        callback: *const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
+        callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
         active_callback_ctx: ?*anyopaque,
         // This callback is passed by the user when closing the connection,
         // it is called when the connection is closed by the user.
@@ -455,8 +455,18 @@ pub const QuicConnection = struct {
     }
 
     pub fn doClose(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
-        self.close_ctx.?.active_callback_ctx = callback_ctx;
-        self.close_ctx.?.active_callback = callback;
+        if (self.close_ctx) |*close_ctx| {
+            // If we are already closing the connection, we just update the callback context and callback.
+            close_ctx.active_callback_ctx = callback_ctx;
+            close_ctx.active_callback = callback;
+        } else {
+            self.close_ctx = .{
+                .callback_ctx = null,
+                .callback = null,
+                .active_callback_ctx = callback_ctx,
+                .active_callback = callback,
+            };
+        }
         lsquic.lsquic_conn_close(self.conn);
         self.engine.processConns();
     }
@@ -883,7 +893,9 @@ fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_status
 pub fn onConnClosed(conn: ?*lsquic.lsquic_conn_t) callconv(.c) void {
     const lsquic_conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(conn.?)));
     if (lsquic_conn.close_ctx) |close_ctx| {
-        close_ctx.callback(close_ctx.callback_ctx, lsquic_conn);
+        if (close_ctx.callback) |callback| {
+            callback(close_ctx.callback_ctx, lsquic_conn);
+        }
         if (close_ctx.active_callback) |active_callback| {
             active_callback(close_ctx.active_callback_ctx, lsquic_conn);
         }
@@ -1028,134 +1040,146 @@ fn onStreamClose(
     self.conn.engine.allocator.destroy(self);
 }
 
-// test "lsquic transport initialization" {
-//     var loop: io_loop.ThreadEventLoop = undefined;
-//     try loop.init(std.testing.allocator);
-//     defer {
-//         loop.close();
-//         loop.deinit();
-//     }
+test "lsquic transport initialization" {
+    var loop: io_loop.ThreadEventLoop = undefined;
+    try loop.init(std.testing.allocator);
+    defer loop.deinit();
 
-//     const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-//     if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     var maybe_host_key: ?*ssl.EVP_PKEY = null;
-//     if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     const host_key = maybe_host_key orelse return error.OpenSSLFailed;
+    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_host_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
 
-//     defer ssl.EVP_PKEY_free(host_key);
+    defer ssl.EVP_PKEY_free(host_key);
 
-//     var transport: QuicTransport = undefined;
-//     try transport.init(&loop, host_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
+    var transport: QuicTransport = undefined;
+    try transport.init(&loop, host_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
 
-//     defer transport.deinit();
-// }
+    defer transport.deinit();
+}
 
-// test "lsquic engine initialization" {
-//     var loop: io_loop.ThreadEventLoop = undefined;
-//     try loop.init(std.testing.allocator);
-//     defer {
-//         loop.close();
-//         loop.deinit();
-//     }
+test "lsquic engine initialization" {
+    var loop: io_loop.ThreadEventLoop = undefined;
+    try loop.init(std.testing.allocator);
+    defer loop.deinit();
 
-//     const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-//     if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     var maybe_host_key: ?*ssl.EVP_PKEY = null;
-//     if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     const host_key = maybe_host_key orelse return error.OpenSSLFailed;
+    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_host_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
 
-//     defer ssl.EVP_PKEY_free(host_key);
+    defer ssl.EVP_PKEY_free(host_key);
 
-//     var transport: QuicTransport = undefined;
-//     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
-//     defer transport.deinit();
+    var transport: QuicTransport = undefined;
+    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
+    defer transport.deinit();
 
-//     const addr = try std.net.Address.parseIp4("127.0.0.1", 9999);
-//     const udp = try UDP.init(addr);
-//     var engine: QuicEngine = undefined;
-//     try engine.init(std.testing.allocator, udp, &transport, false);
-//     defer lsquic.lsquic_engine_destroy(engine.engine);
-// }
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 9999);
+    const udp = try UDP.init(addr);
+    var engine: QuicEngine = undefined;
+    try engine.init(std.testing.allocator, udp, &transport, false);
+    defer lsquic.lsquic_engine_destroy(engine.engine);
+}
 
-// test "lsquic transport dialing and listening" {
-//     var server_loop: io_loop.ThreadEventLoop = undefined;
-//     try server_loop.init(std.testing.allocator);
-//     defer {
-//         server_loop.close();
-//         server_loop.deinit();
-//     }
+test "lsquic transport dialing and listening" {
+    var server_loop: io_loop.ThreadEventLoop = undefined;
+    try server_loop.init(std.testing.allocator);
+    defer server_loop.deinit();
 
-//     const server_pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-//     if (ssl.EVP_PKEY_keygen_init(server_pctx) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     var maybe_server_key: ?*ssl.EVP_PKEY = null;
-//     if (ssl.EVP_PKEY_keygen(server_pctx, &maybe_server_key) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     const server_key = maybe_server_key orelse return error.OpenSSLFailed;
+    const server_pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(server_pctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_server_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(server_pctx, &maybe_server_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const server_key = maybe_server_key orelse return error.OpenSSLFailed;
 
-//     defer ssl.EVP_PKEY_free(server_key);
+    defer ssl.EVP_PKEY_free(server_key);
 
-//     var server: QuicTransport = undefined;
-//     try server.init(&server_loop, server_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
+    var server: QuicTransport = undefined;
+    try server.init(&server_loop, server_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
 
-//     defer server.deinit();
+    defer server.deinit();
 
-//     var listener = server.newListener(null, struct {
-//         pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
-//             if (res) |conn| {
-//                 std.debug.print("Server accepted QUIC connection successfully: {any}\n", .{conn});
-//             } else |err| {
-//                 std.debug.print("Server failed to accept QUIC connection: {any}\n", .{err});
-//             }
-//         }
-//     }.callback);
+    var listener = server.newListener(null, struct {
+        pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
+            if (res) |conn| {
+                std.debug.print("Server accepted QUIC connection successfully: {*}\n", .{conn});
+            } else |err| {
+                std.debug.print("Server failed to accept QUIC connection: {}\n", .{err});
+            }
+        }
+    }.callback);
 
-//     const addr = try std.net.Address.parseIp4("127.0.0.1", 9997);
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 9997);
 
-//     try listener.listen(addr);
+    try listener.listen(addr);
 
-//     var loop: io_loop.ThreadEventLoop = undefined;
-//     try loop.init(std.testing.allocator);
-//     defer {
-//         loop.close();
-//         loop.deinit();
-//     }
+    var loop: io_loop.ThreadEventLoop = undefined;
+    try loop.init(std.testing.allocator);
+    defer loop.deinit();
 
-//     const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-//     if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     var maybe_host_key: ?*ssl.EVP_PKEY = null;
-//     if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     const host_key = maybe_host_key orelse return error.OpenSSLFailed;
+    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_host_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
 
-//     defer ssl.EVP_PKEY_free(host_key);
+    defer ssl.EVP_PKEY_free(host_key);
 
-//     var transport: QuicTransport = undefined;
-//     try transport.init(&loop, host_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
+    var transport: QuicTransport = undefined;
+    try transport.init(&loop, host_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
 
-//     defer transport.deinit();
-//     transport.dial(addr, null, struct {
-//         pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
-//             if (res) |conn| {
-//                 std.debug.print("Dialed QUIC connection successfully: {any}\n", .{conn});
-//             } else |err| {
-//                 std.debug.print("Failed to dial QUIC connection: {any}\n", .{err});
-//             }
-//         }
-//     }.callback);
+    defer transport.deinit();
 
-//     std.time.sleep(200 * std.time.ns_per_ms);
-// }
+    const DialCtx = struct {
+        conn: *QuicConnection,
+        notify: std.Thread.ResetEvent,
+
+        const Self = @This();
+        fn callback(ctx: ?*anyopaque, res: anyerror!*QuicConnection) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            if (res) |conn| {
+                std.debug.print("Dialed QUIC connection successfully: {*}\n", .{conn});
+                self.conn = conn;
+            } else |err| {
+                std.debug.print("Failed to dial QUIC connection: {}\n", .{err});
+            }
+            self.notify.set();
+        }
+    };
+
+    var dial_ctx = DialCtx{
+        .conn = undefined,
+        .notify = .{},
+    };
+    transport.dial(addr, &dial_ctx, DialCtx.callback);
+    dial_ctx.notify.wait();
+
+    std.debug.print("Dialed QUIC connection222: {*}\n", .{dial_ctx.conn});
+    dial_ctx.conn.close(null, struct {
+        pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
+            if (res) |closed_conn| {
+                std.debug.print("Closed QUIC connection successfully: {*}\n", .{closed_conn});
+            } else |err| {
+                std.debug.print("Failed to close QUIC connection: {}\n", .{err});
+            }
+        }
+    }.callback);
+}
