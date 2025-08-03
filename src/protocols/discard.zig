@@ -179,7 +179,7 @@ pub const DiscardResponder = struct {
     pub fn onActivated(_: *Self, _: *quic.QuicStream) anyerror!void {}
 
     pub fn onMessage(_: *Self, _: *quic.QuicStream, msg: []const u8) anyerror!void {
-        std.debug.print("Discard protocol received a message: {s}", .{msg});
+        std.debug.print("Discard protocol responder received a message: {s}\n", .{msg});
     }
 
     pub fn onClose(_: *Self, _: *quic.QuicStream) anyerror!void {
@@ -247,10 +247,7 @@ test "discard protocol using switch" {
 
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
-    defer {
-        loop.close();
-        loop.deinit();
-    }
+    defer loop.deinit();
 
     const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
     if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
@@ -286,10 +283,7 @@ test "discard protocol using switch" {
 
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
-    defer {
-        cl_loop.close();
-        cl_loop.deinit();
-    }
+    defer cl_loop.deinit();
     const cl_pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
     if (ssl.EVP_PKEY_keygen_init(cl_pctx) == 0) {
         return error.OpenSSLFailed;
@@ -313,8 +307,6 @@ test "discard protocol using switch" {
     var discard_handler2 = DiscardProtocolHandler.init(allocator);
     defer discard_handler2.deinit();
     switch2.proto_handlers.append(discard_handler2.any()) catch unreachable;
-
-    std.time.sleep(200 * std.time.ns_per_ms);
 
     const TestNewStreamCallback = struct {
         mutex: std.Thread.ResetEvent,
@@ -346,7 +338,6 @@ test "discard protocol using switch" {
     );
 
     callback.mutex.wait();
-    std.debug.print("Switch 2 is trying to connect to Switch 1 at address: {}\n", .{switch1_listen_address});
     callback.sender.send("Hello from Switch 2", null, struct {
         pub fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
             if (res) |size| {
@@ -360,12 +351,9 @@ test "discard protocol using switch" {
     std.time.sleep(500 * std.time.ns_per_ms);
 
     callback.sender.stream.close(null, struct {
-        pub fn callback_(_: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
-            if (res) |stream| {
-                std.debug.print("Stream closed successfully: {}\n", .{stream});
-            } else |err| {
-                std.debug.print("Failed to close stream: {}\n", .{err});
-            }
-        }
+        pub fn callback_(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
     }.callback_);
+
+    // Wait for the streams to close and the callbacks to complete.
+    // std.time.sleep(5 * std.time.ns_per_s);
 }

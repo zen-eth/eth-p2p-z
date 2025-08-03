@@ -39,23 +39,24 @@ pub const Switch = struct {
     }
 
     pub fn deinit(self: *Switch) void {
-        // 1. Close all outgoing connections. The onOutgoingConnectionClose callback
+        // Close all outgoing connections. The onOutgoingConnectionClose callback
         // will be triggered for each, handling removal and cleanup.
         var out_iter = self.outgoing_connections.iterator();
         while (out_iter.next()) |entry| {
+            // TODO: Use a pool for the close context to avoid frequent allocations.
             const close_ctx = self.allocator.create(ConnectionCloseCallbackCtx) catch unreachable;
             close_ctx.* = ConnectionCloseCallbackCtx{
                 .notify = .{},
                 .@"switch" = self,
             };
             entry.value_ptr.*.close(close_ctx, ConnectionCloseCallbackCtx.closeCallback); // Close the connection, which will trigger the close callback.
-            close_ctx.notify.wait(); // Wait for the close callback to run.
+            close_ctx.notify.wait();
+            self.allocator.destroy(close_ctx);
         }
-        // After all close callbacks have run, the map should be empty.
-        // We deinit it to free the map's own memory.
+
         self.outgoing_connections.deinit();
 
-        // 2. Close all incoming connections. The onIncomingConnectionClose callback
+        // Close all incoming connections. The onIncomingConnectionClose callback
         // will be triggered for each, handling removal and cleanup.
         for (self.incoming_connections.items) |conn| {
             const close_ctx = self.allocator.create(ConnectionCloseCallbackCtx) catch unreachable;
@@ -65,12 +66,12 @@ pub const Switch = struct {
             };
             conn.close(close_ctx, ConnectionCloseCallbackCtx.closeCallback); // Close the connection, which will trigger the close callback.
             close_ctx.notify.wait(); // Wait for the close callback to run.
+            self.allocator.destroy(close_ctx); // Clean up the close context.
         }
-        // After all close callbacks have run, the list should be empty.
-        // We deinit it to free the list's own memory.
+
         self.incoming_connections.deinit();
 
-        // 3. Close all listeners and free their resources.
+        // Close all listeners and free their resources.
         var listener_iter = self.listeners.iterator();
         while (listener_iter.next()) |entry| {
             var listener = entry.value_ptr.*;
@@ -84,7 +85,6 @@ pub const Switch = struct {
         }
         self.listeners.deinit();
 
-        // 4. Finally, deinit the protocol handlers list.
         self.proto_handlers.deinit();
     }
 
@@ -94,11 +94,9 @@ pub const Switch = struct {
         @"switch": *Switch,
 
         fn closeCallback(ctx: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {
-            std.debug.print("Connection close callback invoked.\n", .{});
             const self: *ConnectionCloseCallbackCtx = @ptrCast(@alignCast(ctx.?));
             // Notify that the connection has been closed.
             self.notify.set();
-            self.@"switch".allocator.destroy(self);
         }
     };
 
@@ -141,11 +139,13 @@ pub const Switch = struct {
             stream.proto_msg_handler.onActivated(stream) catch |err| {
                 std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, stream });
                 self.callback(self.callback_ctx, err);
-                // TODO: Close the stream properly.
+                stream.close(null, struct {
+                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+                        // Handle stream close if needed.
+                    }
+                }.callback);
                 return;
             };
-            // Here we would typically activate the protocol handler for the stream.
-            // For now, we just log the new stream.
         }
     };
 
@@ -200,12 +200,14 @@ pub const Switch = struct {
             stream.proto_msg_handler.onActivated(stream) catch |err| {
                 std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, stream });
                 self.callback(self.callback_ctx, err);
-                // TODO: Close the stream properly.
+
+                stream.close(null, struct {
+                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+                        // Handle stream close if needed.
+                    }
+                }.callback);
                 return;
             };
-            // Here we would typically activate the protocol handler for the stream.
-            // For now, we just log the new stream.
-            std.debug.print("New stream established: {*}\n", .{stream});
         }
     };
 
@@ -236,9 +238,9 @@ pub const Switch = struct {
             connect_ctx.notify.set();
             conn.newStream(connect_ctx, ConnectCallbackCtx.newStreamCallback);
         } else {
-            // Dial the peer and pass the connect context as the callback context.
             self.transport.dial(address, connect_ctx, ConnectCallbackCtx.connectCallback);
             connect_ctx.notify.wait();
+            // TODO: Need check if the event loop thread is same with lsquic thread. If not, we could try to make new stream asynchronously.
             connect_ctx.conn.newStream(connect_ctx, ConnectCallbackCtx.newStreamCallback);
         }
     }
@@ -295,10 +297,16 @@ pub const Switch = struct {
             self.allocator.free(removed_entry.key);
             const conn_ctx: *ConnectCallbackCtx = @ptrCast(@alignCast(removed_entry.value.connect_ctx.?.callback_ctx));
             self.allocator.destroy(conn_ctx);
+
+            // The connection object itself is managed by the QuicEngine's allocator
+            // and is destroyed in `onConnClosed` after this callback returns.
+            // So we should NOT destroy `conn` here.
+            return;
         }
-        // The connection object itself is managed by the QuicEngine's allocator
-        // and is destroyed in `onConnClosed` after this callback returns.
-        // So we should NOT destroy `conn` here.
+
+        // If the connection was not found in the outgoing connections, it might have been closed already.
+        // This might indicate a logic error elsewhere, but is safe to ignore
+        std.log.warn("Outgoing connection close callback invoked, but connection not found in the outgoing connections list.", .{});
     }
 
     fn onIncomingConnectionClose(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
@@ -322,5 +330,6 @@ pub const Switch = struct {
 
         // This code is reached if the connection was not found in the list, which might
         // indicate a logic error elsewhere, but is safe to ignore for now.
+        std.log.warn("Incoming connection close callback invoked, but connection not found in the list.", .{});
     }
 };

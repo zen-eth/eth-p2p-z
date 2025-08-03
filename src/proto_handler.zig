@@ -43,7 +43,6 @@ pub const AnyProtocolMessageHandler = struct {
     }
 
     pub fn onMessage(self: *Self, stream: *quic.QuicStream, message: []const u8) !void {
-        std.debug.print("Handling message: {any}\n", .{message});
         try self.vtable.onMessageFn(self.instance, stream, message);
     }
 

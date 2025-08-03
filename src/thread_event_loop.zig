@@ -465,7 +465,6 @@ pub const ThreadEventLoop = struct {
                 },
                 .quic_new_stream => |action_data| {
                     const quic_conn = action_data.conn;
-                    std.debug.print("QUIC engine newStream with ctx: {any}\n", .{action_data.new_stream_ctx});
                     quic_conn.doNewStream(action_data.new_stream_ctx, action_data.new_stream_callback);
                 },
                 .quic_write_stream => |action_data| {
