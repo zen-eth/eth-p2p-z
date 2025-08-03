@@ -88,7 +88,7 @@ pub const IOAction = union(enum) {
     quic_close_connection: struct {
         conn: *quic.QuicConnection,
         callback_ctx: ?*anyopaque,
-        callback: ?*const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void,
+        callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void,
     },
     quic_new_stream: struct {
         conn: *quic.QuicConnection,
@@ -104,7 +104,7 @@ pub const IOAction = union(enum) {
     quic_close_stream: struct {
         stream: *quic.QuicStream,
         callback_ctx: ?*anyopaque,
-        callback: ?*const fn (ctx: ?*anyopaque, res: anyerror!void) void,
+        callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void,
     },
 };
 
@@ -470,12 +470,10 @@ pub const ThreadEventLoop = struct {
                 },
                 .quic_write_stream => |action_data| {
                     const stream = action_data.stream;
-                    std.debug.print("QUIC engine writeStream with ctx: {any}\n", .{action_data.callback_ctx});
                     stream.doWrite(action_data.data, action_data.callback_ctx, action_data.callback);
                 },
                 .quic_close_stream => |action_data| {
                     const stream = action_data.stream;
-                    std.debug.print("QUIC engine closeStream with ctx: {any}\n", .{action_data.callback_ctx});
                     stream.doClose(action_data.callback_ctx, action_data.callback);
                 },
             }

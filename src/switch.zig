@@ -3,9 +3,17 @@ const quic = @import("./transport/quic/root.zig").lsquic_transport;
 const proto_handler = @import("./proto_handler.zig");
 const Allocator = std.mem.Allocator;
 
+/// The Switch struct is the main entry point for managing connections and protocol handlers.
+/// It acts as a central hub for handling incoming and outgoing connections,
+/// as well as managing protocol handlers for different protocols.
+/// It supports multiple transports, but currently only one transport is supported at a time.
+/// The Switch is responsible for creating and managing connections, listeners, and protocol handlers.
+/// It also provides methods for dialing peers, listening for incoming connections,
+/// and handling protocol messages.
 pub const Switch = struct {
     proto_handlers: std.ArrayList(proto_handler.AnyProtocolHandler),
 
+    // TODO: In the future, we should support multiple transports.
     // Only one transport is supported at a time.
     transport: *quic.QuicTransport,
 
@@ -35,9 +43,13 @@ pub const Switch = struct {
         // will be triggered for each, handling removal and cleanup.
         var out_iter = self.outgoing_connections.iterator();
         while (out_iter.next()) |entry| {
-            std.debug.print("Closing outgoing connection: {*}\n", .{entry.value_ptr});
-            entry.value_ptr.*.close(null, null); // Close the connection, which will trigger the close callback.
-            std.time.sleep(100 * std.time.ns_per_ms); // Give some time for the close callback to run.
+            const close_ctx = self.allocator.create(ConnectionCloseCallbackCtx) catch unreachable;
+            close_ctx.* = ConnectionCloseCallbackCtx{
+                .notify = .{},
+                .@"switch" = self,
+            };
+            entry.value_ptr.*.close(close_ctx, ConnectionCloseCallbackCtx.closeCallback); // Close the connection, which will trigger the close callback.
+            close_ctx.notify.wait(); // Wait for the close callback to run.
         }
         // After all close callbacks have run, the map should be empty.
         // We deinit it to free the map's own memory.
@@ -46,10 +58,13 @@ pub const Switch = struct {
         // 2. Close all incoming connections. The onIncomingConnectionClose callback
         // will be triggered for each, handling removal and cleanup.
         for (self.incoming_connections.items) |conn| {
-            std.debug.print("Closing incoming connection: {*}\n", .{conn});
-            conn.close(null, null); // Close the connection, which will trigger the close callback.
-            std.time.sleep(100 * std.time.ns_per_ms); // Give some time for the close callback to run.
-
+            const close_ctx = self.allocator.create(ConnectionCloseCallbackCtx) catch unreachable;
+            close_ctx.* = ConnectionCloseCallbackCtx{
+                .notify = .{},
+                .@"switch" = self,
+            };
+            conn.close(close_ctx, ConnectionCloseCallbackCtx.closeCallback); // Close the connection, which will trigger the close callback.
+            close_ctx.notify.wait(); // Wait for the close callback to run.
         }
         // After all close callbacks have run, the list should be empty.
         // We deinit it to free the list's own memory.
@@ -61,8 +76,8 @@ pub const Switch = struct {
             var listener = entry.value_ptr.*;
             listener.deinit(); // This should close the listener's engine.
 
-            if (listener.accept_callback_ctx) |ctx| {
-                const accept_ctx: *AcceptCallbackCtx = @ptrCast(@alignCast(ctx));
+            if (listener.listen_callback_ctx) |ctx| {
+                const accept_ctx: *ListenCallbackCtx = @ptrCast(@alignCast(ctx));
                 self.allocator.destroy(accept_ctx);
             }
             self.allocator.free(entry.key_ptr.*);
@@ -73,15 +88,29 @@ pub const Switch = struct {
         self.proto_handlers.deinit();
     }
 
-    const AcceptCallbackCtx = struct {
+    const ConnectionCloseCallbackCtx = struct {
+        notify: std.Thread.ResetEvent,
+
+        @"switch": *Switch,
+
+        fn closeCallback(ctx: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {
+            std.debug.print("Connection close callback invoked.\n", .{});
+            const self: *ConnectionCloseCallbackCtx = @ptrCast(@alignCast(ctx.?));
+            // Notify that the connection has been closed.
+            self.notify.set();
+            self.@"switch".allocator.destroy(self);
+        }
+    };
+
+    const ListenCallbackCtx = struct {
         @"switch": *Switch,
         // user-defined context for the callback
         callback_ctx: ?*anyopaque,
         // user-defined callback function
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
-        fn acceptCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
-            const self: *AcceptCallbackCtx = @ptrCast(@alignCast(ctx.?));
+        fn listenCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
+            const self: *ListenCallbackCtx = @ptrCast(@alignCast(ctx.?));
             const conn = res catch |err| {
                 self.callback(self.callback_ctx, err);
                 return;
@@ -98,7 +127,7 @@ pub const Switch = struct {
         }
 
         fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
-            const self: *AcceptCallbackCtx = @ptrCast(@alignCast(ctx.?));
+            const self: *ListenCallbackCtx = @ptrCast(@alignCast(ctx.?));
             const stream = res catch |err| {
                 self.callback(self.callback_ctx, err);
                 return;
@@ -117,7 +146,6 @@ pub const Switch = struct {
             };
             // Here we would typically activate the protocol handler for the stream.
             // For now, we just log the new stream.
-            std.debug.print("Accept new stream established: {*}\n", .{stream});
         }
     };
 
@@ -135,7 +163,6 @@ pub const Switch = struct {
         conn: *quic.QuicConnection,
 
         fn connectCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
-            std.debug.print("Connect callback called with ctx: {any}\n", .{ctx});
             const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
 
             self.conn = res catch |err| {
@@ -156,11 +183,9 @@ pub const Switch = struct {
             ) catch unreachable;
             // Can't call newStream in the callback directly, it will cause a re-entrancy issue.
             self.notify.set();
-            std.debug.print("Connection established: {*}\n", .{self.conn});
         }
 
         fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
-            std.debug.print("New stream callback called with ctx: {any}\n", .{ctx});
             const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
             const stream = res catch |err| {
                 self.callback(self.callback_ctx, err);
@@ -214,13 +239,7 @@ pub const Switch = struct {
             // Dial the peer and pass the connect context as the callback context.
             self.transport.dial(address, connect_ctx, ConnectCallbackCtx.connectCallback);
             connect_ctx.notify.wait();
-            std.debug.print("Connection established5555: {*}\n", .{connect_ctx.conn});
             connect_ctx.conn.newStream(connect_ctx, ConnectCallbackCtx.newStreamCallback);
-
-            // std.time.sleep( * std.time.us_per_s);
-            // connect_ctx.conn.engine.allocator.destroy(connect_ctx.conn);
-            // self.allocator.destroy(connect_ctx);
-
         }
     }
 
@@ -239,14 +258,14 @@ pub const Switch = struct {
             try gop.value_ptr.listen(address);
             return;
         } else {
-            const accept_callback_ctx = self.allocator.create(AcceptCallbackCtx) catch unreachable;
-            accept_callback_ctx.* = AcceptCallbackCtx{
+            const accept_callback_ctx = self.allocator.create(ListenCallbackCtx) catch unreachable;
+            accept_callback_ctx.* = ListenCallbackCtx{
                 .@"switch" = self,
                 .callback_ctx = callback_ctx,
                 .callback = callback,
             };
 
-            gop.value_ptr.* = self.transport.newListener(accept_callback_ctx, AcceptCallbackCtx.acceptCallback);
+            gop.value_ptr.* = self.transport.newListener(accept_callback_ctx, ListenCallbackCtx.listenCallback);
 
             gop.value_ptr.listen(address) catch |err| {
                 self.allocator.destroy(accept_callback_ctx);

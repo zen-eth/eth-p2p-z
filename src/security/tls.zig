@@ -367,7 +367,6 @@ pub fn alpnSelectCallbackfn(ssl_handle: ?*ssl.SSL, out: [*c][*c]const u8, out_le
         in_len,
     );
 
-    std.debug.print("alpnSelectCallbackfn called with result: {}\n", .{result});
     if (result == ssl.OPENSSL_NPN_NEGOTIATED) {
         return ssl.SSL_TLSEXT_ERR_OK;
     } else {
@@ -375,18 +374,10 @@ pub fn alpnSelectCallbackfn(ssl_handle: ?*ssl.SSL, out: [*c][*c]const u8, out_le
     }
 }
 
-pub fn libp2pVerifyCallback(status: c_int, ctx: ?*ssl.X509_STORE_CTX) callconv(.c) c_int {
-    // TODO: Implement proper verification logic
-    _ = ctx;
-    std.debug.print("libp2pVerifyCallback called with status: {}\n", .{status});
-
-    return 1;
-}
-
-pub fn libp2pVerifyCallback1(cert_ctx: ?*ssl.X509_STORE_CTX, ctx: ?*anyopaque) callconv(.c) c_int {
+pub fn libp2pVerifyCallback(cert_ctx: ?*ssl.X509_STORE_CTX, ctx: ?*anyopaque) callconv(.c) c_int {
     _ = cert_ctx;
     _ = ctx;
-    std.debug.print("libp2pVerifyCallback1 called\n", .{});
+    // TODO: Implement certificate verification logic if needed.
     return 1;
 }
 

@@ -62,7 +62,6 @@ pub const DiscardProtocolHandler = struct {
             .callback = callback,
         };
         self.responder = handler;
-        std.debug.print("313123123\n", .{});
         stream.setProtoMsgHandler(handler.any());
     }
 
@@ -360,5 +359,13 @@ test "discard protocol using switch" {
 
     std.time.sleep(500 * std.time.ns_per_ms);
 
-    callback.sender.stream.close(null, null);
+    callback.sender.stream.close(null, struct {
+        pub fn callback_(_: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
+            if (res) |stream| {
+                std.debug.print("Stream closed successfully: {}\n", .{stream});
+            } else |err| {
+                std.debug.print("Failed to close stream: {}\n", .{err});
+            }
+        }
+    }.callback_);
 }

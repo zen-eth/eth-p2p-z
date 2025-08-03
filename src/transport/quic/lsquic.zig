@@ -252,7 +252,6 @@ pub const QuicEngine = struct {
             const next_ms = if (diff_us >= lsquic.LSQUIC_DF_CLOCK_GRANULARITY)
                 @divFloor(@as(u64, @intCast(diff_us)), std.time.us_per_ms)
             else if (diff_us <= 0) 0 else @divFloor(@as(u64, @intCast(lsquic.LSQUIC_DF_CLOCK_GRANULARITY)), std.time.us_per_ms);
-            std.debug.print("QUIC engine processing connections with next_ms {}\n", .{next_ms});
             self.process_timer.reset(&self.transport.io_event_loop.loop, &self.c_process_timer, &self.c_process_timer_cancel, next_ms, QuicEngine, self, processConnsCallback);
         }
     }
@@ -348,13 +347,23 @@ pub const QuicEngine = struct {
     }
 };
 
+/// QUIC connection that represents a single QUIC connection.
+/// It manages the connection state, streams, and callbacks for new streams.
+/// It provides methods for creating new streams, closing the connection, and handling incoming streams.
+/// It is associated with a `QuicEngine` and uses the lsquic library for QUIC protocol handling.
 pub const QuicConnection = struct {
     conn: *lsquic.lsquic_conn_t,
+
     engine: *QuicEngine,
+
     direction: p2p_conn.Direction,
+    // Callback context for when a new stream is created in the client mode.
     new_stream_ctx: ?NewStreamCtx,
+
     connect_ctx: ?ConnectCtx,
+
     close_ctx: ?CloseCtx,
+    // Callback context for when a new stream is created in the server mode.
     on_stream_ctx: ?NewStreamCtx,
 
     pub const Error = error{
@@ -433,7 +442,7 @@ pub const QuicConnection = struct {
         self.engine.processConns();
     }
 
-    pub fn close(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+    pub fn close(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         if (self.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doClose(callback_ctx, callback);
         } else {
@@ -444,7 +453,7 @@ pub const QuicConnection = struct {
         }
     }
 
-    pub fn doClose(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+    pub fn doClose(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         self.close_ctx.?.active_callback_ctx = callback_ctx;
         self.close_ctx.?.active_callback = callback;
         lsquic.lsquic_conn_close(self.conn);
@@ -452,6 +461,12 @@ pub const QuicConnection = struct {
     }
 };
 
+/// QUIC stream that represents a single QUIC stream.
+/// It manages the stream state, data writing, and reading operations.
+/// It provides methods for writing data to the stream, closing the stream, and handling incoming data.
+/// It is associated with a `QuicConnection` and uses the lsquic library for QUIC protocol handling.
+/// It supports asynchronous write operations with callbacks for completion.
+/// It also supports protocol message handling through a `protoMsgHandler`.
 pub const QuicStream = struct {
     pub const Error = error{
         StreamClosed,
@@ -462,6 +477,9 @@ pub const QuicStream = struct {
         EndOfStream,
     };
 
+    /// Represents a write request for the QUIC stream.
+    /// It contains the data to be written, the total number of bytes written so far,
+    /// a context for the callback, and the callback function itself.
     const WriteRequest = struct {
         data: std.ArrayList(u8),
         total_written: usize = 0,
@@ -516,7 +534,7 @@ pub const QuicStream = struct {
         }
     }
 
-    pub fn close(self: *QuicStream, callback_ctx: ?*anyopaque, callback: ?*const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+    pub fn close(self: *QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicStream) void) void {
         if (self.conn.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doClose(callback_ctx, callback);
         } else {
@@ -527,11 +545,19 @@ pub const QuicStream = struct {
         }
     }
 
-    pub fn doClose(self: *QuicStream, _: ?*anyopaque, _: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!void) void) void {
+    pub fn doClose(self: *QuicStream, _: ?*anyopaque, _: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicStream) void) void {
         _ = lsquic.lsquic_stream_close(self.stream);
         self.conn.engine.processConns();
     }
 
+    /// Writes data to the QUIC stream asynchronously.
+    /// It appends the data to a list of pending writes and processes the next write operation.
+    /// If the write operation fails, it invokes the callback with the error.
+    /// If the write operation is successful, it schedules the next write operation.
+    /// This function is called from the event loop thread to ensure thread safety.
+    /// It should not be called directly from other threads.
+    /// Because the data may be eventually written successfully by the QUIC engine `onStreamWrite` callback multiple times,
+    /// it queues the write request and processes it asynchronously.
     pub fn doWrite(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
         var data_copy = std.ArrayList(u8).init(self.conn.engine.allocator);
         data_copy.appendSlice(data) catch |err| {
@@ -565,6 +591,11 @@ pub const QuicStream = struct {
     }
 };
 
+/// QUIC listener that listens for incoming QUIC connections.
+/// It initializes a UDP socket, binds it to the specified address, and starts the QUIC engine.
+/// It provides methods for initializing the listener, starting to listen for incoming connections,
+/// and accepting new connections.
+/// The listener is associated with a `QuicTransport` and uses a callback to notify when a new connection is accepted.
 pub const QuicListener = struct {
     /// The error type returned by the `init` function. Want to remain the underlying error type, so we used `anyerror`.
     pub const ListenError = anyerror;
@@ -572,24 +603,27 @@ pub const QuicListener = struct {
     engine: ?QuicEngine,
     /// The transport that created this listener.
     transport: *QuicTransport,
+    /// The callback to be invoked when a new connection is accepted.
+    listen_callback: *const fn (instance: ?*anyopaque, res: anyerror!*QuicConnection) void,
+    /// The context for the listen callback, if any.
+    listen_callback_ctx: ?*anyopaque = null,
 
-    accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!*QuicConnection) void,
-
-    accept_callback_ctx: ?*anyopaque = null,
-
-    /// Initialize the listener with the given transport and accept callback.
-    pub fn init(self: *QuicListener, transport: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (instance: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+    /// Initialize the listener with the given transport and listen callback.
+    pub fn init(self: *QuicListener, transport: *QuicTransport, listen_callback_ctx: ?*anyopaque, listen_callback: *const fn (instance: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         self.* = .{
             .engine = null,
             .transport = transport,
-            .accept_callback = accept_callback,
-            .accept_callback_ctx = accept_callback_ctx,
+            .listen_callback = listen_callback,
+            .listen_callback_ctx = listen_callback_ctx,
         };
     }
 
     /// Deinitialize the listener.
     pub fn deinit(_: *QuicListener) void {}
 
+    /// Starts listening for incoming QUIC connections on the specified address.
+    /// It initializes a UDP socket, binds it to the address, and starts the QUIC engine.
+    /// If the listener is already started, it returns an error.
     pub fn listen(self: *QuicListener, address: std.net.Address) ListenError!void {
         const socket = try UDP.init(address);
         try socket.bind(address);
@@ -597,9 +631,8 @@ pub const QuicListener = struct {
         self.engine = undefined;
         const engine_ptr = &self.engine.?;
         try engine_ptr.init(self.transport.allocator, socket, self.transport, false);
-        engine_ptr.onListen(self.accept_callback_ctx, self.accept_callback);
+        engine_ptr.onListen(self.listen_callback_ctx, self.listen_callback);
         engine_ptr.start();
-        std.debug.print("QUIC listener started on engine: {*}\n", .{&self.engine});
     }
 };
 
@@ -737,7 +770,7 @@ pub const QuicTransport = struct {
         // It is set to verify the peer's certificate and fail if no peer certificate is provided.
         // It also sets the callback for certificate verification.
         ssl.SSL_CTX_set_verify(ssl_ctx, ssl.SSL_VERIFY_PEER | ssl.SSL_VERIFY_FAIL_IF_NO_PEER_CERT | ssl.SSL_VERIFY_CLIENT_ONCE, null);
-        ssl.SSL_CTX_set_cert_verify_callback(ssl_ctx, tls.libp2pVerifyCallback1, null);
+        ssl.SSL_CTX_set_cert_verify_callback(ssl_ctx, tls.libp2pVerifyCallback, null);
 
         // Set the certificate algorithm preferences for the SSL context.
         if (ssl.SSL_CTX_set_verify_algorithm_prefs(ssl_ctx, SignatureAlgs.ptr, @intCast(SignatureAlgs.len)) == 0)
