@@ -38,7 +38,7 @@ pub const DiscardProtocolHandler = struct {
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) void {
-        const handler = stream.engine.allocator.create(DiscardInitiator) catch unreachable;
+        const handler = stream.conn.engine.allocator.create(DiscardInitiator) catch unreachable;
         handler.* = .{
             .sender = undefined,
             .stream = stream,
@@ -56,7 +56,7 @@ pub const DiscardProtocolHandler = struct {
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) void {
-        const handler = stream.engine.allocator.create(DiscardResponder) catch unreachable;
+        const handler = stream.conn.engine.allocator.create(DiscardResponder) catch unreachable;
         handler.* = .{
             .callback_ctx = callback_ctx,
             .callback = callback,

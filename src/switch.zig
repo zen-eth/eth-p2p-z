@@ -91,8 +91,8 @@ pub const Switch = struct {
             conn.close_ctx = .{
                 .callback = Switch.onIncomingConnectionClose,
                 .callback_ctx = self.@"switch",
-                .ud_callback = null,
-                .ud_callback_ctx = null,
+                .active_callback_ctx = null,
+                .active_callback = null,
             };
             self.@"switch".incoming_connections.append(conn) catch unreachable;
         }
@@ -146,8 +146,8 @@ pub const Switch = struct {
             self.conn.close_ctx = .{
                 .callback = Switch.onOutgoingConnectionClose,
                 .callback_ctx = self.@"switch",
-                .ud_callback = null,
-                .ud_callback_ctx = null,
+                .active_callback = null,
+                .active_callback_ctx = null,
             };
 
             self.@"switch".outgoing_connections.put(

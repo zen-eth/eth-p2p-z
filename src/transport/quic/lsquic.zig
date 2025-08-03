@@ -225,13 +225,11 @@ pub const QuicEngine = struct {
         }
     }
 
-    pub fn onListen(self: *QuicEngine, listen_callback_ctx: ?*anyopaque, listen_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
-        self.listen_ctx = .{
-            .callback_ctx = listen_callback_ctx,
-            .callback = listen_callback,
-        };
-    }
-
+    /// Processes incoming QUIC connections and streams.
+    /// This function is called periodically to handle incoming packets and manage connections.
+    /// It processes the connections in the lsquic engine and schedules the next processing based on the earliest advertised tick.
+    /// It is called from the event loop thread to ensure thread safety.
+    /// It should not be called directly from other threads.
     pub fn processConns(self: *QuicEngine) void {
         lsquic.lsquic_engine_process_conns(self.engine);
 
@@ -257,6 +255,10 @@ pub const QuicEngine = struct {
         }
     }
 
+    /// Callback for processing packets received from the UDP socket.
+    /// This function is called when the UDP socket receives data.
+    /// It processes the received data by passing it to the lsquic engine for further handling.
+    /// This function is not thread-safe and should not be called from multiple threads concurrently.
     fn readCallback(
         ctx: ?*QuicEngine,
         _: *xev.Loop,
@@ -301,6 +303,9 @@ pub const QuicEngine = struct {
         return .rearm;
     }
 
+    /// Callback for processing connections in the QUIC engine.
+    /// This function is called periodically to handle incoming packets and manage connections.
+    /// It processes the connections in the lsquic engine and schedules the next processing based on the earliest advertised tick.
     fn processConnsCallback(
         ctx: ?*QuicEngine,
         _: *xev.Loop,
@@ -319,6 +324,7 @@ pub const QuicEngine = struct {
         return .disarm;
     }
 
+    /// Get the SSL context for a given peer.
     fn getSslContext(
         peer_ctx: ?*anyopaque,
         _: ?*const lsquic.struct_sockaddr,
@@ -326,6 +332,17 @@ pub const QuicEngine = struct {
         const self: *QuicEngine = @ptrCast(@alignCast(peer_ctx.?));
         const res: *lsquic.struct_ssl_ctx_st = @ptrCast(@alignCast(self.ssl_context));
         return res;
+    }
+
+    /// Callback for when a new QUIC connection is established.
+    /// This function is called by the lsquic library when a new connection is created in the server mode.
+    /// It creates a new `QuicConnection` instance and invokes the listen callback if set.
+    /// This function is not thread-safe and should not be called from multiple threads concurrently.
+    fn onListen(self: *QuicEngine, listen_callback_ctx: ?*anyopaque, listen_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+        self.listen_ctx = .{
+            .callback_ctx = listen_callback_ctx,
+            .callback = listen_callback,
+        };
     }
 };
 
@@ -364,9 +381,10 @@ pub const QuicConnection = struct {
         // This callback is registered at the time of connection connected,
         // it is used that the connection is closed not by the user, but by the engine.
         callback: *const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
-        ud_callback_ctx: ?*anyopaque,
-        // This callback is used to notify the user that the connection is closed.
-        ud_callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
+        active_callback_ctx: ?*anyopaque,
+        // This callback is passed by the user when closing the connection,
+        // it is called when the connection is closed by the user.
+        active_callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
     };
 
     pub fn onStream(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, stream: anyerror!*QuicStream) void) void {
@@ -425,8 +443,8 @@ pub const QuicConnection = struct {
     }
 
     pub fn doClose(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
-        self.close_ctx.?.ud_callback_ctx = callback_ctx;
-        self.close_ctx.?.ud_callback = callback;
+        self.close_ctx.?.active_callback_ctx = callback_ctx;
+        self.close_ctx.?.active_callback = callback;
         lsquic.lsquic_conn_close(self.conn);
         self.engine.processConns();
     }
@@ -453,23 +471,17 @@ pub const QuicStream = struct {
 
     conn: *QuicConnection,
 
-    engine: *QuicEngine,
-
-    allocator: Allocator,
-
     pending_writes: std.ArrayList(WriteRequest),
 
     active_write: ?WriteRequest,
 
     proto_msg_handler: protoMsgHandler,
 
-    pub fn init(self: *QuicStream, stream: *lsquic.lsquic_stream_t, conn: *QuicConnection, engine: *QuicEngine, allocator: Allocator) void {
+    pub fn init(self: *QuicStream, stream: *lsquic.lsquic_stream_t, conn: *QuicConnection) void {
         self.* = .{
             .stream = stream,
             .conn = conn,
-            .engine = engine,
-            .allocator = allocator,
-            .pending_writes = std.ArrayList(WriteRequest).init(allocator),
+            .pending_writes = std.ArrayList(WriteRequest).init(conn.engine.allocator),
             .active_write = null,
             .proto_msg_handler = undefined,
         };
@@ -492,34 +504,34 @@ pub const QuicStream = struct {
     }
 
     pub fn write(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
-        if (self.engine.transport.io_event_loop.inEventLoopThread()) {
+        if (self.conn.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doWrite(data, callback_ctx, callback);
         } else {
             const message = io_loop.IOMessage{
                 .action = .{ .quic_write_stream = .{ .stream = self, .data = data, .callback_ctx = callback_ctx, .callback = callback } },
             };
-            self.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
+            self.conn.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
     pub fn close(self: *QuicStream, callback_ctx: ?*anyopaque, callback: ?*const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
-        if (self.engine.transport.io_event_loop.inEventLoopThread()) {
+        if (self.conn.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doClose(callback_ctx, callback);
         } else {
             const message = io_loop.IOMessage{
                 .action = .{ .quic_close_stream = .{ .stream = self, .callback_ctx = callback_ctx, .callback = callback } },
             };
-            self.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
+            self.conn.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
     pub fn doClose(self: *QuicStream, _: ?*anyopaque, _: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!void) void) void {
         _ = lsquic.lsquic_stream_close(self.stream);
-        self.engine.processConns();
+        self.conn.engine.processConns();
     }
 
     pub fn doWrite(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
-        var data_copy = std.ArrayList(u8).init(self.allocator);
+        var data_copy = std.ArrayList(u8).init(self.conn.engine.allocator);
         data_copy.appendSlice(data) catch |err| {
             callback(callback_ctx, err);
             return;
@@ -547,7 +559,6 @@ pub const QuicStream = struct {
 
         self.active_write = self.pending_writes.orderedRemove(0);
 
-        std.debug.print("QUIC stream processing next write with {} bytes\n", .{self.active_write.?.data.items.len});
         _ = lsquic.lsquic_stream_wantwrite(self.stream, 1);
     }
 };
@@ -825,7 +836,7 @@ pub fn packetsOut(
     return @intCast(n_specs);
 }
 
-pub fn onNewConn(ctx: ?*anyopaque, conn: ?*lsquic.lsquic_conn_t) callconv(.c) ?*lsquic.lsquic_conn_ctx_t {
+fn onNewConn(ctx: ?*anyopaque, conn: ?*lsquic.lsquic_conn_t) callconv(.c) ?*lsquic.lsquic_conn_ctx_t {
     const engine: *QuicEngine = @ptrCast(@alignCast(ctx.?));
     // TODO: Can it use a pool for connections?
     const lsquic_conn: *QuicConnection = engine.allocator.create(QuicConnection) catch unreachable;
@@ -842,18 +853,16 @@ pub fn onNewConn(ctx: ?*anyopaque, conn: ?*lsquic.lsquic_conn_t) callconv(.c) ?*
     const conn_ctx: *lsquic.lsquic_conn_ctx_t = @ptrCast(@alignCast(lsquic_conn));
     lsquic.lsquic_conn_set_ctx(conn, conn_ctx);
 
+    // Server side will not call onHskDone, so we need to call it manually.
     if (!engine.is_client_mode) {
         onHskDone(conn, lsquic.LSQ_HSK_OK);
     }
-    // Handle new connection logic here
-    std.debug.print("New connection established: {any}\n", .{conn});
+
     return conn_ctx;
 }
 
-pub fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_status) callconv(.c) void {
-    std.debug.print("Handshake done for connection {any} with status {any}\n", .{ conn, status });
+fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_status) callconv(.c) void {
     if (status != lsquic.LSQ_HSK_OK and status != lsquic.LSQ_HSK_RESUMED_OK) {
-        std.debug.print("Handshake failed for connection {any} with status {any}\n", .{ conn, status });
         _ = lsquic.lsquic_conn_close(conn);
         return;
     } else {
@@ -870,41 +879,35 @@ pub fn onConnClosed(conn: ?*lsquic.lsquic_conn_t) callconv(.c) void {
     const lsquic_conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(conn.?)));
     if (lsquic_conn.close_ctx) |close_ctx| {
         close_ctx.callback(close_ctx.callback_ctx, lsquic_conn);
-        std.debug.print("Connection closed with callback: {any}\n", .{close_ctx.callback});
-        if (close_ctx.ud_callback) |ud_callback| {
-            ud_callback(close_ctx.ud_callback_ctx, lsquic_conn);
+        if (close_ctx.active_callback) |active_callback| {
+            active_callback(close_ctx.active_callback_ctx, lsquic_conn);
         }
     }
-    std.debug.print("Connection closed: {any}\n", .{conn});
     lsquic.lsquic_conn_set_ctx(conn, null);
     lsquic_conn.engine.allocator.destroy(lsquic_conn);
-    std.debug.print("Connection closed: {any}\n", .{conn});
 }
 
-pub fn onNewStream(ctx: ?*anyopaque, stream: ?*lsquic.lsquic_stream_t) callconv(.c) ?*lsquic.lsquic_stream_ctx_t {
+fn onNewStream(ctx: ?*anyopaque, stream: ?*lsquic.lsquic_stream_t) callconv(.c) ?*lsquic.lsquic_stream_ctx_t {
     const engine: *QuicEngine = @ptrCast(@alignCast(ctx.?));
     const conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(lsquic.lsquic_stream_conn(stream.?))));
     const lsquic_stream: *QuicStream = engine.allocator.create(QuicStream) catch unreachable;
-    lsquic_stream.init(stream.?, conn, engine, engine.allocator);
+    lsquic_stream.init(stream.?, conn);
 
     const stream_ctx: *lsquic.lsquic_stream_ctx_t = @ptrCast(@alignCast(lsquic_stream));
-    std.debug.print("New stream established1: {any}\n", .{stream});
     if (conn.direction == p2p_conn.Direction.INBOUND) {
-        // If the connection is inbound, we should notify the user about the new stream.
         if (conn.on_stream_ctx) |on_stream_ctx| {
-            std.debug.print("New stream established2333: {any}\n", .{stream});
             on_stream_ctx.callback(on_stream_ctx.callback_ctx, lsquic_stream);
         }
-    } else if (conn.new_stream_ctx) |new_stream_ctx| {
-        std.debug.print("New stream established2444: {any}\n", .{stream});
-        // If the connection is outbound, we should invoke the new stream callback.
-        new_stream_ctx.callback(new_stream_ctx.callback_ctx, lsquic_stream);
+    } else {
+        if (conn.new_stream_ctx) |new_stream_ctx| {
+            new_stream_ctx.callback(new_stream_ctx.callback_ctx, lsquic_stream);
+            conn.new_stream_ctx = null; // Clear the new stream context after use
+        }
     }
-    conn.new_stream_ctx = null; // Clear the context after invoking the callback
     return stream_ctx;
 }
 
-pub fn onStreamRead(
+fn onStreamRead(
     stream: ?*lsquic.lsquic_stream_t,
     stream_ctx: ?*lsquic.lsquic_stream_ctx_t,
 ) callconv(.c) void {
@@ -916,10 +919,8 @@ pub fn onStreamRead(
     while (true) {
         const n_read = lsquic.lsquic_stream_read(s, &buf, buf.len);
         if (n_read > 0) {
-            std.debug.print("Read {} bytes from stream {*}\n", .{ n_read, s });
-            std.debug.print("Data: {any}\n", .{self.proto_msg_handler});
             self.proto_msg_handler.onMessage(self, buf[0..@intCast(n_read)]) catch |err| {
-                std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, s });
+                std.log.warn("Protocol message handler failed with error: {}. ", .{err});
                 _ = lsquic.lsquic_stream_close(s);
                 return;
             };
@@ -932,7 +933,7 @@ pub fn onStreamRead(
             // On Windows, error codes may differ and additional handling may be required here.
             const err = posix.errno(n_read);
             if (err == posix.E.AGAIN) {
-                std.debug.print("lsquic_stream_read returned E.AGAIN, waiting for more data.\n", .{});
+                std.log.warn("lsquic_stream_read returned E.AGAIN, waiting for more data.\n", .{});
                 _ = lsquic.lsquic_stream_wantread(s, 1);
                 return;
             }
@@ -966,19 +967,18 @@ pub fn onStreamWrite(
     if (self.active_write) |*active_req| {
         const n_written = lsquic.lsquic_stream_write(stream.?, active_req.data.items.ptr, active_req.data.items.len);
 
-        std.debug.print("QUIC stream write {} bytes to stream {any}\n", .{ n_written, stream.? });
         if (n_written < 0) {
             // NOTE: Error handling for lsquic_stream_write on Windows platforms is not implemented.
             // On Windows, error codes may differ and additional handling may be required here.
             // If the error is E.AGAIN, we should wait for the next write event.
             const err = posix.errno(n_written);
             if (err == posix.E.AGAIN) {
-                std.debug.print("lsquic_stream_write returned E.AGAIN, waiting for more space to write.\n", .{});
+                std.log.warn("lsquic_stream_write returned E.AGAIN, waiting for more space to write.\n", .{});
                 _ = lsquic.lsquic_stream_wantwrite(stream.?, 1);
                 return;
             }
 
-            std.log.warn("lsquic_stream_write failed with error: {}", .{@intFromEnum(err)});
+            std.log.warn("lsquic_stream_write failed with error: {}", .{err});
             active_req.callback(active_req.callback_ctx, error.WriteFailed);
             active_req.data.deinit();
             self.active_write = null;
@@ -1011,17 +1011,16 @@ pub fn onStreamWrite(
     }
 }
 
-pub fn onStreamClose(
+fn onStreamClose(
     _: ?*lsquic.lsquic_stream_t,
     stream_ctx: ?*lsquic.lsquic_stream_ctx_t,
 ) callconv(.c) void {
-    std.debug.print("QUIC stream closed: {*}\n", .{stream_ctx.?});
     const self: *QuicStream = @ptrCast(@alignCast(stream_ctx.?));
     self.proto_msg_handler.onClose(self) catch |err| {
-        std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, self.stream });
+        std.log.warn("Protocol message handler failed with error: {}.", .{err});
     };
     self.deinit();
-    self.engine.allocator.destroy(self);
+    self.conn.engine.allocator.destroy(self);
 }
 
 test "lsquic transport initialization" {
