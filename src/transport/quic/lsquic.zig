@@ -26,6 +26,8 @@ const IdleTimeoutSeconds = 120; // 2 minutes
 // Handshake timeout in microseconds
 const HandshakeTimeoutMicroseconds = 10 * std.time.us_per_s; // 10 seconds
 
+const SignatureAlgs: []const u16 = &.{ ssl.SSL_SIGN_ED25519, ssl.SSL_SIGN_ECDSA_SECP256R1_SHA256, ssl.SSL_SIGN_RSA_PKCS1_SHA256 };
+
 /// Stream interface for lsquic
 const stream_if: lsquic.lsquic_stream_if = lsquic.lsquic_stream_if{
     .on_new_conn = onNewConn,
@@ -601,6 +603,13 @@ pub const QuicListener = struct {
     }
 };
 
+/// QUIC transport that manages QUIC connections and listeners.
+/// It provides methods for initializing the transport, dialing peers, and creating listeners.
+/// It uses the lsquic library for QUIC protocol handling and integrates with the event loop for asynchronous operations.
+/// The transport is responsible for managing the SSL context, key pairs, and certificates used for QUIC connections.
+/// It supports both client and server modes, allowing it to initiate connections or accept incoming ones.
+/// The transport is not thread-safe and should be used from a single thread, typically the event loop thread.
+/// It provides methods for dialing peers, creating listeners, and managing QUIC connections.
 pub const QuicTransport = struct {
     pub const DialError = Allocator.Error || xev.ConnectError || error{ AsyncNotifyFailed, AlreadyConnecting, UnsupportedAddressFamily, InitializationFailed };
 
@@ -618,7 +627,7 @@ pub const QuicTransport = struct {
 
     subject_keypair: *ssl.EVP_PKEY,
 
-    cert: *ssl.X509,
+    subject_cert: *ssl.X509,
 
     cert_key_type: keys_proto.KeyType,
 
@@ -628,81 +637,20 @@ pub const QuicTransport = struct {
             return error.InitializationFailed;
         }
 
-        var maybe_subject_key: ?*ssl.EVP_PKEY = null;
+        const subject_keypair = try tls.generateKeyPair(cert_key_type);
 
-        if (cert_key_type == .ECDSA or cert_key_type == .SECP256K1) {
-            const curve_nid = switch (cert_key_type) {
-                .ECDSA => ssl.NID_X9_62_prime256v1,
-                // TODO: SECP256K1 is not supported in BoringSSL
-                .SECP256K1 => unreachable,
-                else => unreachable,
-            };
-
-            var maybe_params: ?*ssl.EVP_PKEY = null;
-            {
-                const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_EC, null) orelse return error.OpenSSLFailed;
-                defer ssl.EVP_PKEY_CTX_free(pctx);
-
-                if (ssl.EVP_PKEY_paramgen_init(pctx) <= 0) {
-                    return error.OpenSSLFailed;
-                }
-
-                if (ssl.EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, curve_nid) <= 0) {
-                    return error.OpenSSLFailed;
-                }
-
-                if (ssl.EVP_PKEY_paramgen(pctx, &maybe_params) <= 0) {
-                    return error.OpenSSLFailed;
-                }
-            }
-            const params = maybe_params orelse return error.OpenSSLFailed;
-            defer ssl.EVP_PKEY_free(params);
-
-            {
-                const kctx = ssl.EVP_PKEY_CTX_new(params, null) orelse return error.OpenSSLFailed;
-                defer ssl.EVP_PKEY_CTX_free(kctx);
-
-                if (ssl.EVP_PKEY_keygen_init(kctx) <= 0) {
-                    return error.OpenSSLFailed;
-                }
-
-                if (ssl.EVP_PKEY_keygen(kctx, &maybe_subject_key) <= 0) {
-                    return error.OpenSSLFailed;
-                }
-            }
-        } else {
-            const key_alg_id = switch (cert_key_type) {
-                .ED25519 => ssl.EVP_PKEY_ED25519,
-                .RSA => ssl.EVP_PKEY_RSA,
-                else => unreachable,
-            };
-
-            const pctx = ssl.EVP_PKEY_CTX_new_id(key_alg_id, null) orelse return error.OpenSSLFailed;
-            defer ssl.EVP_PKEY_CTX_free(pctx);
-
-            if (ssl.EVP_PKEY_keygen_init(pctx) <= 0) {
-                return error.OpenSSLFailed;
-            }
-
-            if (ssl.EVP_PKEY_keygen(pctx, &maybe_subject_key) <= 0) {
-                return error.OpenSSLFailed;
-            }
-        }
-
-        const subject_key = maybe_subject_key orelse return error.OpenSSLFailed;
-
-        const cert = try tls.buildCert(allocator, host_keypair, subject_key);
+        const subject_cert = try tls.buildCert(allocator, host_keypair, subject_keypair);
 
         self.* = .{
-            .ssl_context = try initSslContext(subject_key, cert),
+            .ssl_context = try initSslContext(subject_keypair, subject_cert),
             .io_event_loop = loop,
             .allocator = allocator,
             .dialer_v4 = null,
             .dialer_v6 = null,
             .host_keypair = host_keypair,
             .cert_key_type = cert_key_type,
-            .subject_keypair = subject_key,
-            .cert = cert,
+            .subject_keypair = subject_keypair,
+            .subject_cert = subject_cert,
         };
     }
 
@@ -710,7 +658,7 @@ pub const QuicTransport = struct {
         lsquic.lsquic_global_cleanup();
         ssl.SSL_CTX_free(self.ssl_context);
         ssl.EVP_PKEY_free(self.subject_keypair);
-        ssl.X509_free(self.cert);
+        ssl.X509_free(self.subject_cert);
     }
 
     // Initiates a QUIC connection to the specified peer address.
@@ -728,9 +676,12 @@ pub const QuicTransport = struct {
         dialer.connect(peer_address, callback_ctx, callback);
     }
 
-    pub fn newListener(self: *QuicTransport, accept_callback_ctx: ?*anyopaque, accept_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) QuicListener {
+    /// Creates a new QUIC listener that listens for incoming connections.
+    /// The listener is initialized with the provided listen callback and context.
+    /// The listener can be used to accept incoming QUIC connections.
+    pub fn newListener(self: *QuicTransport, listen_callback_ctx: ?*anyopaque, listen_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) QuicListener {
         var listener: QuicListener = undefined;
-        listener.init(self, accept_callback_ctx, accept_callback);
+        listener.init(self, listen_callback_ctx, listen_callback);
         return listener;
     }
 
@@ -769,21 +720,30 @@ pub const QuicTransport = struct {
     fn initSslContext(subject_key: *ssl.EVP_PKEY, cert: *ssl.X509) !*ssl.SSL_CTX {
         const ssl_ctx = ssl.SSL_CTX_new(ssl.TLS_method()) orelse return error.InitializationFailed;
 
+        // Limit the protocol versions to TLS 1.3 only.
+        // This is required for QUIC to work properly.
         if (ssl.SSL_CTX_set_min_proto_version(ssl_ctx, ssl.TLS1_3_VERSION) == 0)
             return error.InitializationFailed;
 
         if (ssl.SSL_CTX_set_max_proto_version(ssl_ctx, ssl.TLS1_3_VERSION) == 0)
             return error.InitializationFailed;
 
+        // Disable older protocols and compression.
         if (ssl.SSL_CTX_set_options(ssl_ctx, ssl.SSL_OP_NO_TLSv1 | ssl.SSL_OP_NO_TLSv1_1 | ssl.SSL_OP_NO_TLSv1_2 | ssl.SSL_OP_NO_COMPRESSION | ssl.SSL_OP_NO_SSLv2 | ssl.SSL_OP_NO_SSLv3) == 0)
             return error.InitializationFailed;
 
-        ssl.SSL_CTX_set_verify(ssl_ctx, ssl.SSL_VERIFY_PEER | ssl.SSL_VERIFY_FAIL_IF_NO_PEER_CERT | ssl.SSL_VERIFY_CLIENT_ONCE, tls.libp2pVerifyCallback);
+        // Set the custom verification callback for the SSL context.
+        // This callback is used to verify the peer's certificate.
+        // It is set to verify the peer's certificate and fail if no peer certificate is provided.
+        // It also sets the callback for certificate verification.
+        ssl.SSL_CTX_set_verify(ssl_ctx, ssl.SSL_VERIFY_PEER | ssl.SSL_VERIFY_FAIL_IF_NO_PEER_CERT | ssl.SSL_VERIFY_CLIENT_ONCE, null);
         ssl.SSL_CTX_set_cert_verify_callback(ssl_ctx, tls.libp2pVerifyCallback1, null);
-        const signature_algs: []const u16 = &.{ ssl.SSL_SIGN_ED25519, ssl.SSL_SIGN_ECDSA_SECP256R1_SHA256, ssl.SSL_SIGN_RSA_PKCS1_SHA256 };
-        if (ssl.SSL_CTX_set_verify_algorithm_prefs(ssl_ctx, signature_algs.ptr, @intCast(signature_algs.len)) == 0)
+
+        // Set the certificate algorithm preferences for the SSL context.
+        if (ssl.SSL_CTX_set_verify_algorithm_prefs(ssl_ctx, SignatureAlgs.ptr, @intCast(SignatureAlgs.len)) == 0)
             @panic("SSL_CTX_set_verify_algorithm_prefs failed\n");
 
+        // Set the SSL context to use the provided subject key and certificate.
         if (ssl.SSL_CTX_use_PrivateKey(ssl_ctx, subject_key) == 0) {
             @panic("SSL_CTX_use_PrivateKey failed");
         }
@@ -792,17 +752,18 @@ pub const QuicTransport = struct {
             @panic("SSL_CTX_use_certificate failed");
         }
 
+        // Set the ALPN protocols for the SSL context.
         if (ssl.SSL_CTX_set_alpn_protos(ssl_ctx, tls.ALPN_PROTOS.ptr, @intCast(tls.ALPN_PROTOS.len)) != 0) {
             return error.InitializationFailed;
         }
-
+        // Set the ALPN select callback for the SSL context.
         ssl.SSL_CTX_set_alpn_select_cb(ssl_ctx, tls.alpnSelectCallbackfn, null);
 
         return ssl_ctx;
     }
 };
 
-pub fn packetsOut(
+fn packetsOut(
     ctx: ?*anyopaque,
     specs: ?[*]const lsquic.lsquic_out_spec,
     n_specs: u32,
@@ -812,25 +773,24 @@ pub fn packetsOut(
     for (specs.?[0..n_specs]) |spec| {
         const dest_sa: ?*const std.posix.sockaddr = @ptrCast(@alignCast(spec.dest_sa));
         if (dest_sa == null) {
-            @panic("sendmsgPosix: dest_sa is null");
+            std.log.warn("sendmsgPosix: dest_sa is null\n", .{});
+            return -1;
         }
         msg.name = dest_sa;
         msg.namelen = switch (dest_sa.?.family) {
             std.posix.AF.INET => @sizeOf(std.posix.sockaddr.in),
             std.posix.AF.INET6 => @sizeOf(std.posix.sockaddr.in6),
-            else => @panic("Unsupported address family"),
+            else => unreachable,
         };
 
         msg.iov = @ptrCast(spec.iov.?);
         msg.iovlen = @intCast(spec.iovlen);
 
-        if (xev.backend == .epoll or xev.backend == .io_uring) {
-            // TODO: try to use libxev's sendmsg function
-        }
-        const sent_bytes = std.posix.sendmsg(engine.socket.fd, &msg, 0) catch |err| {
-            std.debug.panic("sendmsgPosix failed with: {s}", .{@errorName(err)});
+        _ = std.posix.sendmsg(engine.socket.fd, &msg, 0) catch |err| {
+            std.log.warn("sendmsgPosix failed with: {}", .{err});
+            // TODO: Check the error.WouldBlock, it should copy the data to the buffer and use libxev's write function
+            return -1;
         };
-        std.debug.print("QUIC sent {} bytes to {}\n", .{ sent_bytes, dest_sa.? });
     }
 
     return @intCast(n_specs);

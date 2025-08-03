@@ -38,6 +38,73 @@ pub const Error = error{
     UnsupportedKeyType,
 };
 
+/// Generates a new key pair based on the specified key type.
+/// This is a helper function to encapsulate the complexity of key generation using OpenSSL.
+pub fn generateKeyPair(cert_key_type: keys_proto.KeyType) !*ssl.EVP_PKEY {
+    var maybe_subject_keypair: ?*ssl.EVP_PKEY = null;
+
+    if (cert_key_type == .ECDSA or cert_key_type == .SECP256K1) {
+        const curve_nid = switch (cert_key_type) {
+            .ECDSA => ssl.NID_X9_62_prime256v1,
+            // TODO: SECP256K1 is not supported in BoringSSL
+            .SECP256K1 => unreachable,
+            else => unreachable,
+        };
+
+        var maybe_params: ?*ssl.EVP_PKEY = null;
+        {
+            const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_EC, null) orelse return error.OpenSSLFailed;
+            defer ssl.EVP_PKEY_CTX_free(pctx);
+
+            if (ssl.EVP_PKEY_paramgen_init(pctx) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, curve_nid) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_paramgen(pctx, &maybe_params) <= 0) {
+                return error.OpenSSLFailed;
+            }
+        }
+        const params = maybe_params orelse return error.OpenSSLFailed;
+        defer ssl.EVP_PKEY_free(params);
+
+        {
+            const kctx = ssl.EVP_PKEY_CTX_new(params, null) orelse return error.OpenSSLFailed;
+            defer ssl.EVP_PKEY_CTX_free(kctx);
+
+            if (ssl.EVP_PKEY_keygen_init(kctx) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_keygen(kctx, &maybe_subject_keypair) <= 0) {
+                return error.OpenSSLFailed;
+            }
+        }
+    } else {
+        const key_alg_id = switch (cert_key_type) {
+            .ED25519 => ssl.EVP_PKEY_ED25519,
+            .RSA => ssl.EVP_PKEY_RSA,
+            else => unreachable,
+        };
+
+        const pctx = ssl.EVP_PKEY_CTX_new_id(key_alg_id, null) orelse return error.OpenSSLFailed;
+        defer ssl.EVP_PKEY_CTX_free(pctx);
+
+        if (ssl.EVP_PKEY_keygen_init(pctx) <= 0) {
+            return error.OpenSSLFailed;
+        }
+
+        if (ssl.EVP_PKEY_keygen(pctx, &maybe_subject_keypair) <= 0) {
+            return error.OpenSSLFailed;
+        }
+    }
+
+    return maybe_subject_keypair orelse return error.OpenSSLFailed;
+}
+
 /// Builds a self-signed X.509 certificate suitable for libp2p's TLS handshake,
 /// The caller owns the returned certificate and must free it with ssl.X509.free().
 ///
