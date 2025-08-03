@@ -5,6 +5,7 @@ const @"switch" = @import("../switch.zig");
 const io_loop = @import("../thread_event_loop.zig");
 const ssl = @import("ssl");
 const keys_proto = @import("../proto/keys.proto.zig");
+const tls = @import("../security/tls.zig");
 
 pub const DiscardProtocolHandler = struct {
     allocator: std.mem.Allocator,
@@ -249,16 +250,7 @@ test "discard protocol using switch" {
     try loop.init(std.testing.allocator);
     defer loop.deinit();
 
-    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
-        return error.OpenSSLFailed;
-    }
-    var maybe_host_key: ?*ssl.EVP_PKEY = null;
-    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
-        return error.OpenSSLFailed;
-    }
-    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
-
+    const host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: quic.QuicTransport = undefined;
@@ -279,21 +271,14 @@ test "discard protocol using switch" {
         }
     }.callback);
 
+    // Wait for the switch to start listening.
     std.time.sleep(200 * std.time.ns_per_ms);
 
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
     defer cl_loop.deinit();
-    const cl_pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-    if (ssl.EVP_PKEY_keygen_init(cl_pctx) == 0) {
-        return error.OpenSSLFailed;
-    }
-    var maybe_cl_host_key: ?*ssl.EVP_PKEY = null;
-    if (ssl.EVP_PKEY_keygen(cl_pctx, &maybe_cl_host_key) == 0) {
-        return error.OpenSSLFailed;
-    }
-    const cl_host_key = maybe_cl_host_key orelse return error.OpenSSLFailed;
 
+    const cl_host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(cl_host_key);
 
     var cl_transport: quic.QuicTransport = undefined;
@@ -348,12 +333,9 @@ test "discard protocol using switch" {
         }
     }.callback_);
 
-    std.time.sleep(500 * std.time.ns_per_ms);
+    std.time.sleep(200 * std.time.ns_per_ms);
 
     callback.sender.stream.close(null, struct {
         pub fn callback_(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
     }.callback_);
-
-    // Wait for the streams to close and the callbacks to complete.
-    // std.time.sleep(5 * std.time.ns_per_s);
 }
