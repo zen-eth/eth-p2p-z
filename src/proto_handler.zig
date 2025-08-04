@@ -1,12 +1,18 @@
 const quic = @import("./transport/quic/root.zig").lsquic_transport;
 const std = @import("std");
 // TODO: Make the stream type generic to allow different stream types.
+/// This is the protocol binding interface for QUIC protocol message handlers.
+/// It registers the protocol handler with the QUIC transport and provides
+/// methods to handle protocol-specific messages.
 pub const ProtocolHandlerVTable = struct {
     onInitiatorStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) void,
 
     onResponderStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) void,
 };
 
+/// This struct represents a protocol handler that can be used with the QUIC transport.
+/// It contains an instance of the protocol handler and a vtable that defines the
+/// methods to be called when the protocol is started by the initiator or responder.
 pub const AnyProtocolHandler = struct {
     instance: *anyopaque,
     vtable: *const ProtocolHandlerVTable,
@@ -23,6 +29,10 @@ pub const AnyProtocolHandler = struct {
     }
 };
 
+/// This is the protocol message handler interface for QUIC protocol messages.
+/// It defines the methods that need to be implemented by any protocol message handler.
+/// The methods are called when the protocol is activated, when a message is received,
+/// and when the stream is closed.
 pub const ProtocolMessageHandlerVTable = struct {
     onActivatedFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream) anyerror!void,
 
@@ -31,6 +41,10 @@ pub const ProtocolMessageHandlerVTable = struct {
     onCloseFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream) anyerror!void,
 };
 
+/// This struct represents a protocol message handler that can be used with the QUIC transport.
+/// It contains an instance of the protocol message handler and a vtable that defines
+/// the methods to be called when the protocol is activated, when a message is received,
+/// and when the stream is closed.
 pub const AnyProtocolMessageHandler = struct {
     instance: *anyopaque,
     vtable: *const ProtocolMessageHandlerVTable,

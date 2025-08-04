@@ -59,6 +59,8 @@ pub const DiscardProtocolHandler = struct {
     ) void {
         const handler = stream.conn.engine.allocator.create(DiscardResponder) catch unreachable;
         handler.* = .{
+            .total_received = 0,
+            .message_count = 0,
             .callback_ctx = callback_ctx,
             .callback = callback,
         };
@@ -175,12 +177,19 @@ pub const DiscardResponder = struct {
 
     callback: *const fn (ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
+    total_received: usize,
+
+    message_count: usize,
+
     const Self = @This();
 
     pub fn onActivated(_: *Self, _: *quic.QuicStream) anyerror!void {}
 
-    pub fn onMessage(_: *Self, _: *quic.QuicStream, msg: []const u8) anyerror!void {
-        std.debug.print("Discard protocol responder received a message: {s}\n", .{msg});
+    pub fn onMessage(self: *Self, _: *quic.QuicStream, msg: []const u8) anyerror!void {
+        self.total_received += msg.len;
+        self.message_count += 1;
+
+        std.debug.print("Discard protocol responder received message #{}: {} bytes (total: {} bytes)\n", .{ self.message_count, msg.len, self.total_received });
     }
 
     pub fn onClose(_: *Self, _: *quic.QuicStream) anyerror!void {
@@ -334,6 +343,183 @@ test "discard protocol using switch" {
     }.callback_);
 
     std.time.sleep(200 * std.time.ns_per_ms);
+
+    callback.sender.stream.close(null, struct {
+        pub fn callback_(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+    }.callback_);
+}
+
+test "discard protocol using switch with 1MB data" {
+    const allocator = std.testing.allocator;
+    const switch1_listen_address = try std.net.Address.parseIp4("127.0.0.1", 8767);
+
+    var loop: io_loop.ThreadEventLoop = undefined;
+    try loop.init(std.testing.allocator);
+    defer loop.deinit();
+
+    const host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(host_key);
+
+    var transport: quic.QuicTransport = undefined;
+    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
+    // defer transport.deinit();
+
+    var switch1: @"switch".Switch = undefined;
+    switch1.init(allocator, &transport);
+    defer switch1.deinit();
+
+    var discard_handler = DiscardProtocolHandler.init(allocator);
+    defer discard_handler.deinit();
+    switch1.proto_handlers.append(discard_handler.any()) catch unreachable;
+
+    try switch1.listen(switch1_listen_address, null, struct {
+        pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {
+            // Handle the callback
+        }
+    }.callback);
+
+    // Wait for the switch to start listening.
+    std.time.sleep(200 * std.time.ns_per_ms);
+
+    var cl_loop: io_loop.ThreadEventLoop = undefined;
+    try cl_loop.init(allocator);
+    defer cl_loop.deinit();
+
+    const cl_host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(cl_host_key);
+
+    var cl_transport: quic.QuicTransport = undefined;
+    try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
+    // defer cl_transport.deinit();
+
+    var switch2: @"switch".Switch = undefined;
+    switch2.init(allocator, &cl_transport);
+    defer switch2.deinit();
+
+    var discard_handler2 = DiscardProtocolHandler.init(allocator);
+    defer discard_handler2.deinit();
+    switch2.proto_handlers.append(discard_handler2.any()) catch unreachable;
+
+    const TestNewStreamCallback = struct {
+        mutex: std.Thread.ResetEvent,
+        sender: *DiscardSender,
+
+        const Self = @This();
+        pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            const sender_ptr = res catch |err| {
+                std.log.warn("Failed to start stream: {}", .{err});
+                self.mutex.set();
+                return;
+            };
+            self.sender = @ptrCast(@alignCast(sender_ptr.?));
+            std.log.info("Stream started successfully", .{});
+            self.mutex.set();
+        }
+    };
+
+    var callback: TestNewStreamCallback = .{
+        .mutex = .{},
+        .sender = undefined,
+    };
+
+    switch2.newStream(
+        switch1_listen_address,
+        &.{"discard"},
+        &callback,
+        TestNewStreamCallback.callback,
+    );
+
+    callback.mutex.wait();
+
+    // --- NEW: Loop sending logic to send approximately 1MB of data ---
+    const SendContext = struct {
+        total_sent: std.atomic.Value(usize),
+        total_messages: usize,
+        completed_sends: std.atomic.Value(usize),
+        completion_event: std.Thread.ResetEvent,
+        failed: std.atomic.Value(bool),
+
+        const Self = @This();
+
+        pub fn sendCallback(ctx: ?*anyopaque, res: anyerror!usize) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+
+            if (res) |size| {
+                _ = self.total_sent.fetchAdd(size, .monotonic);
+                std.debug.print("Message sent successfully, size: {}, total sent: {}\n", .{ size, self.total_sent.load(.monotonic) });
+            } else |err| {
+                std.debug.print("Failed to send message: {s}\n", .{@errorName(err)});
+                self.failed.store(true, .monotonic);
+            }
+
+            // Check if this was the last message
+            const completed = self.completed_sends.fetchAdd(1, .monotonic) + 1;
+            if (completed >= self.total_messages) {
+                self.completion_event.set();
+            }
+        }
+    };
+
+    // Configuration for the data sending
+    const MESSAGE_SIZE = 1024; // 1KB per message
+    const TARGET_TOTAL_SIZE = 1024 * 1024; // 1MB total
+    const TOTAL_MESSAGES = TARGET_TOTAL_SIZE / MESSAGE_SIZE;
+
+    // Create the message payload (1KB of data)
+    var message_buffer: [MESSAGE_SIZE]u8 = undefined;
+    for (&message_buffer, 0..) |*byte, i| {
+        byte.* = @intCast(i % 256); // Fill with repeating pattern
+    }
+
+    var send_context = SendContext{
+        .total_sent = std.atomic.Value(usize).init(0),
+        .total_messages = TOTAL_MESSAGES,
+        .completed_sends = std.atomic.Value(usize).init(0),
+        .completion_event = .{},
+        .failed = std.atomic.Value(bool).init(false),
+    };
+
+    std.debug.print("Starting to send {} messages of {} bytes each (total: {} bytes)\n", .{ TOTAL_MESSAGES, MESSAGE_SIZE, TARGET_TOTAL_SIZE });
+
+    // Send all messages in a loop
+    for (0..TOTAL_MESSAGES) |i| {
+        // Add a sequence number to each message for debugging
+        const sequence_bytes = std.mem.asBytes(&i);
+        @memcpy(message_buffer[0..@sizeOf(usize)], sequence_bytes);
+
+        callback.sender.send(&message_buffer, &send_context, SendContext.sendCallback);
+
+        // Optional: Add a small delay to avoid overwhelming the system
+        if (i % 100 == 0) {
+            std.time.sleep(1 * std.time.ns_per_ms); // 1ms delay every 100 messages
+        }
+    }
+
+    std.debug.print("All {} messages queued for sending, waiting for completion...\n", .{TOTAL_MESSAGES});
+
+    // Wait for all sends to complete
+    send_context.completion_event.wait();
+
+    if (send_context.failed.load(.monotonic)) {
+        std.debug.print("Some messages failed to send!\n", .{});
+    } else {
+        std.debug.print("Successfully sent all messages! Total bytes: {}\n", .{send_context.total_sent.load(.monotonic)});
+    }
+
+    // Give some time for the responder to process all messages
+    std.time.sleep(500 * std.time.ns_per_ms);
+
+    const received_messages = discard_handler.responder.?.message_count;
+    const total_received = discard_handler.responder.?.total_received;
+    std.debug.print("Discard protocol responder received {} messages, total bytes: {}\n", .{ received_messages, total_received });
+    const total_sent = send_context.total_sent.load(.monotonic);
+    const total_messages = send_context.total_messages;
+    std.debug.print("Discard protocol sender sent {} messages, total bytes: {}\n", .{ total_messages, total_sent });
+    try std.testing.expectEqual(
+        total_sent,
+        total_received,
+    );
 
     callback.sender.stream.close(null, struct {
         pub fn callback_(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
