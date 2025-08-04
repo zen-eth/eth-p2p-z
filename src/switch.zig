@@ -71,6 +71,7 @@ pub const Switch = struct {
 
         self.incoming_connections.deinit();
 
+        self.transport.deinit(); // Deinitialize the transport.
         // Close all listeners and free their resources.
         var listener_iter = self.listeners.iterator();
         while (listener_iter.next()) |entry| {

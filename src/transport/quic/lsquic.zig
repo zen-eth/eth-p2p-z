@@ -1111,7 +1111,9 @@ test "lsquic transport dialing and listening" {
     var server: QuicTransport = undefined;
     try server.init(&server_loop, server_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
 
-    defer server.deinit();
+    defer {
+        server.deinit();
+    }
 
     var listener = server.newListener(null, struct {
         pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
@@ -1122,6 +1124,7 @@ test "lsquic transport dialing and listening" {
             }
         }
     }.callback);
+    defer listener.deinit();
 
     const addr = try std.net.Address.parseIp4("127.0.0.1", 9997);
 
@@ -1146,7 +1149,9 @@ test "lsquic transport dialing and listening" {
     var transport: QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
 
-    defer transport.deinit();
+    defer {
+        transport.deinit();
+    }
 
     const DialCtx = struct {
         conn: *QuicConnection,
@@ -1182,4 +1187,6 @@ test "lsquic transport dialing and listening" {
             }
         }
     }.callback);
+
+    std.time.sleep(std.time.ns_per_s * 1); // Wait for the connection to close
 }

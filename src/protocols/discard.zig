@@ -255,7 +255,7 @@ test "discard protocol using switch" {
 
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
-    defer transport.deinit();
+    // defer transport.deinit();
 
     var switch1: @"switch".Switch = undefined;
     switch1.init(allocator, &transport);
@@ -283,7 +283,7 @@ test "discard protocol using switch" {
 
     var cl_transport: quic.QuicTransport = undefined;
     try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
-    defer cl_transport.deinit();
+    // defer cl_transport.deinit();
 
     var switch2: @"switch".Switch = undefined;
     switch2.init(allocator, &cl_transport);
