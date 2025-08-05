@@ -1,6 +1,7 @@
 const std = @import("std");
-const quic = @import("./transport/quic/root.zig").lsquic_transport;
-const proto_handler = @import("./proto_handler.zig");
+const libp2p = @import("root.zig");
+const quic = libp2p.transport.quic;
+const protocols = libp2p.protocols;
 const Allocator = std.mem.Allocator;
 
 /// The Switch struct is the main entry point for managing connections and protocol handlers.
@@ -11,7 +12,7 @@ const Allocator = std.mem.Allocator;
 /// It also provides methods for dialing peers, listening for incoming connections,
 /// and handling protocol messages.
 pub const Switch = struct {
-    proto_handlers: std.ArrayList(proto_handler.AnyProtocolHandler),
+    proto_handlers: std.ArrayList(protocols.AnyProtocolHandler),
 
     // TODO: In the future, we should support multiple transports.
     // Only one transport is supported at a time.
@@ -29,7 +30,7 @@ pub const Switch = struct {
 
     pub fn init(self: *Switch, allocator: Allocator, transport: *quic.QuicTransport) void {
         self.* = Switch{
-            .proto_handlers = std.ArrayList(proto_handler.AnyProtocolHandler).init(allocator),
+            .proto_handlers = std.ArrayList(protocols.AnyProtocolHandler).init(allocator),
             .transport = transport,
             .outgoing_connections = std.StringArrayHashMap(*quic.QuicConnection).init(allocator),
             .allocator = allocator,
@@ -215,14 +216,14 @@ pub const Switch = struct {
     pub fn newStream(
         self: *Switch,
         address: std.net.Address,
-        protocols: []const []const u8,
+        protos: []const []const u8,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) void {
         const connect_ctx = self.allocator.create(ConnectCallbackCtx) catch unreachable;
         connect_ctx.* = ConnectCallbackCtx{
             .@"switch" = self,
-            .protocols = protocols,
+            .protocols = protos,
             .callback_ctx = callback_ctx,
             .callback = callback,
             .notify = .{},

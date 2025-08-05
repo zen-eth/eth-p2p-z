@@ -1,11 +1,12 @@
 const std = @import("std");
+const libp2p = @import("./root.zig");
 const mem = std.mem;
 const testing = std.testing;
 const Thread = std.Thread;
 const Allocator = mem.Allocator;
 const io_loop = @import("thread_event_loop.zig");
 
-pub const SecuritySession = @import("./security/session.zig").Session;
+pub const SecuritySession = libp2p.security.Session;
 pub const Direction = enum { INBOUND, OUTBOUND };
 
 // TODO: Check if this interface is needed. Because only `ConnUpgrader` uses it.

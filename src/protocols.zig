@@ -1,5 +1,11 @@
-const quic = @import("./transport/quic/root.zig").lsquic_transport;
 const std = @import("std");
+const libp2p = @import("root.zig");
+const quic = libp2p.transport.quic;
+
+pub const discard = @import("protocols/discard.zig");
+
+pub const ProtocolId = []const u8;
+
 // TODO: Make the stream type generic to allow different stream types.
 /// This is the protocol binding interface for QUIC protocol message handlers.
 /// It registers the protocol handler with the QUIC transport and provides

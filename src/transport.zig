@@ -1,6 +1,19 @@
 const std = @import("std");
 const conn = @import("conn.zig");
 
+pub const tcp = @import("transport/tcp.zig");
+pub const TcpTransport = tcp.XevTransport;
+pub const TcpListener = tcp.XevListener;
+pub const TcpConnection = tcp.XevSocketChannel;
+
+pub const quic = @import("transport/quic.zig");
+pub const QuicTransport = quic.QuicTransport;
+pub const QuicListener = quic.QuicListener;
+pub const QuicConnection = quic.QuicConnection;
+pub const QuicStream = quic.QuicStream;
+
+pub const ConnectionUpgrader = @import("transport/upgrader.zig").ConnUpgrader;
+
 /// Listener interface for accepting incoming connections.
 /// This is a type-erased interface that allows
 /// different implementations of listeners to be used interchangeably.

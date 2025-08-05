@@ -1,11 +1,12 @@
 const std = @import("std");
+const libp2p = @import("root.zig");
 const Allocator = std.mem.Allocator;
 const xev = @import("xev");
 const Intrusive = @import("concurrent/mpsc_queue.zig").Intrusive;
 const Future = @import("concurrent/future.zig").Future;
 const conn = @import("conn.zig");
-const xev_tcp = @import("transport/tcp/xev.zig");
-const quic = @import("transport/quic/lsquic.zig");
+const xev_tcp = libp2p.transport.tcp;
+const quic = libp2p.transport.quic;
 
 /// Memory pool for managing completion objects in the event loop.
 const CompletionPool = std.heap.MemoryPool(xev.Completion);

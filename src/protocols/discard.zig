@@ -1,6 +1,7 @@
 const std = @import("std");
-const quic = @import("../transport/quic/root.zig").lsquic_transport;
-const proto_handler = @import("../proto_handler.zig");
+const libp2p = @import("../root.zig");
+const quic = libp2p.transport.quic;
+const protocols = libp2p.protocols;
 const @"switch" = @import("../switch.zig");
 const io_loop = @import("../thread_event_loop.zig");
 const ssl = @import("ssl");
@@ -89,12 +90,12 @@ pub const DiscardProtocolHandler = struct {
     }
 
     // --- Static VTable Instance ---
-    const vtable_instance = proto_handler.ProtocolHandlerVTable{
+    const vtable_instance = protocols.ProtocolHandlerVTable{
         .onInitiatorStartFn = vtableOnInitiatorStartFn,
         .onResponderStartFn = vtableOnResponderStartFn,
     };
 
-    pub fn any(self: *Self) proto_handler.AnyProtocolHandler {
+    pub fn any(self: *Self) protocols.AnyProtocolHandler {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 };
@@ -161,13 +162,13 @@ pub const DiscardInitiator = struct {
     }
 
     // --- Static VTable Instance ---
-    const vtable_instance = proto_handler.ProtocolMessageHandlerVTable{
+    const vtable_instance = protocols.ProtocolMessageHandlerVTable{
         .onActivatedFn = vtableOnActivatedFn,
         .onMessageFn = vtableOnMessageFn,
         .onCloseFn = vtableOnCloseFn,
     };
 
-    pub fn any(self: *Self) proto_handler.AnyProtocolMessageHandler {
+    pub fn any(self: *Self) protocols.AnyProtocolMessageHandler {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 };
@@ -222,13 +223,13 @@ pub const DiscardResponder = struct {
     }
 
     // --- Static VTable Instance ---
-    const vtable_instance = proto_handler.ProtocolMessageHandlerVTable{
+    const vtable_instance = protocols.ProtocolMessageHandlerVTable{
         .onActivatedFn = vtableOnActivatedFn,
         .onMessageFn = vtableOnMessageFn,
         .onCloseFn = vtableOnCloseFn,
     };
 
-    pub fn any(self: *Self) proto_handler.AnyProtocolMessageHandler {
+    pub fn any(self: *Self) protocols.AnyProtocolMessageHandler {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 };
