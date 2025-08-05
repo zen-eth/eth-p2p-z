@@ -30,7 +30,7 @@
             .hash = "libxev-0.0.0-86vtcx8dEwDfl6p4tGVxCygft8oOsggfba9JO-k28J2x",
         },
         .zmultiformats = .{
-            .url = "https://github.com/zen-eth/multiformats-zig/archive/main.tar.gz#c1dddcd13f92d7a51ba25db7611fba7ffff2fc76",
+            .url = "https://github.com/zen-eth/multiformats-zig/archive/main.tar.gz",
             .hash = "zmultiformats-0.1.0-6A8pca4MBQAOeUuxppEgwy_j0U_FVNK6h7swLzzDrCZ0",
         },
         .gremlin = .{
