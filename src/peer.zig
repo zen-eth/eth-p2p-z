@@ -258,7 +258,7 @@ test "PeerId fromCid with invalid codec" {
     const testing = std.testing;
 
     const hash = try Multihash(64).wrap(MULTIHASH_SHA256_CODE, &[_]u8{0} ** 32);
-    const invalid_cid = try CID(64).newV1(Multicodec.RAW, hash); // 使用 RAW 而不是 LIBP2P_KEY
+    const invalid_cid = try CID(64).newV1(Multicodec.RAW, hash);
 
     try testing.expectError(ParseError.InvalidCidType, PeerId.fromCid(invalid_cid));
 }
