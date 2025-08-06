@@ -151,44 +151,15 @@ pub const Switch = struct {
         }
     };
 
-    const ConnectCallbackCtx = struct {
+    const StreamCallbackCtx = struct {
         @"switch": *Switch,
-
-        protocols: []const []const u8,
-        // user-defined context for the callback
         callback_ctx: ?*anyopaque,
-        // user-defined callback function
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
-        notify: std.Thread.ResetEvent,
-
-        conn: *quic.QuicConnection,
-
-        fn connectCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
-            const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
-
-            self.conn = res catch |err| {
-                self.callback(self.callback_ctx, err);
-                return;
-            };
-
-            self.conn.close_ctx = .{
-                .callback = Switch.onOutgoingConnectionClose,
-                .callback_ctx = self.@"switch",
-                .active_callback = null,
-                .active_callback_ctx = null,
-            };
-
-            self.@"switch".outgoing_connections.put(
-                std.fmt.allocPrint(self.@"switch".allocator, "{}", .{self.conn.connect_ctx.?.address}) catch unreachable,
-                self.conn,
-            ) catch unreachable;
-            // Can't call newStream in the callback directly, it will cause a re-entrancy issue.
-            self.notify.set();
-        }
-
         fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
-            const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
+            const self: *StreamCallbackCtx = @ptrCast(@alignCast(ctx.?));
+            defer self.@"switch".allocator.destroy(self);
+
             const stream = res catch |err| {
                 self.callback(self.callback_ctx, err);
                 return;
@@ -204,14 +175,114 @@ pub const Switch = struct {
                 self.callback(self.callback_ctx, err);
 
                 stream.close(null, struct {
-                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
-                        // Handle stream close if needed.
-                    }
+                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
                 }.callback);
                 return;
             };
         }
     };
+
+    const ConnectCallbackCtx = struct {
+        @"switch": *Switch,
+        address: std.net.Address,
+        protos: []const []const u8,
+        user_callback_ctx: ?*anyopaque,
+        user_callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
+
+        fn connectCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
+            const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
+            defer self.@"switch".allocator.destroy(self);
+
+            const conn = res catch |err| {
+                std.log.warn("Connection failed: {}", .{err});
+                self.user_callback(self.user_callback_ctx, err);
+                return;
+            };
+
+            conn.close_ctx = .{
+                .callback = Switch.onOutgoingConnectionClose,
+                .callback_ctx = self.@"switch",
+                .active_callback = null,
+                .active_callback_ctx = null,
+            };
+
+            const address_str = std.fmt.allocPrint(self.@"switch".allocator, "{}", .{self.address}) catch unreachable;
+            self.@"switch".outgoing_connections.put(address_str, conn) catch unreachable;
+
+            std.log.debug("Connection established to {}", .{self.address});
+
+            const stream_ctx = self.@"switch".allocator.create(StreamCallbackCtx) catch unreachable;
+            stream_ctx.* = StreamCallbackCtx{
+                .@"switch" = self.@"switch",
+                .callback_ctx = self.user_callback_ctx,
+                .callback = self.user_callback,
+            };
+
+            conn.newStream(stream_ctx, StreamCallbackCtx.newStreamCallback);
+        }
+    };
+
+    // const ConnectCallbackCtx = struct {
+    //     @"switch": *Switch,
+
+    //     protocols: []const []const u8,
+    //     // user-defined context for the callback
+    //     callback_ctx: ?*anyopaque,
+    //     // user-defined callback function
+    //     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
+
+    //     notify: std.Thread.ResetEvent,
+
+    //     conn: *quic.QuicConnection,
+
+    //     fn connectCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
+    //         const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
+
+    //         self.conn = res catch |err| {
+    //             self.callback(self.callback_ctx, err);
+    //             return;
+    //         };
+
+    //         self.conn.close_ctx = .{
+    //             .callback = Switch.onOutgoingConnectionClose,
+    //             .callback_ctx = self.@"switch",
+    //             .active_callback = null,
+    //             .active_callback_ctx = null,
+    //         };
+
+    //         self.@"switch".outgoing_connections.put(
+    //             std.fmt.allocPrint(self.@"switch".allocator, "{}", .{self.conn.connect_ctx.?.address}) catch unreachable,
+    //             self.conn,
+    //         ) catch unreachable;
+    //         // Can't call newStream in the callback directly, it will cause a re-entrancy issue.
+    //         self.notify.set();
+    //     }
+
+    //     fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
+    //         const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
+    //         const stream = res catch |err| {
+    //             self.callback(self.callback_ctx, err);
+    //             return;
+    //         };
+
+    //         // TODO: To use multistreams, we need to find the protocol handler for the stream.
+    //         // For now, we just use the first protocol handler.
+    //         self.@"switch".proto_handlers.items[0].onInitiatorStart(stream, self.callback_ctx, self.callback);
+
+    //         // `onInitiatorStart` should set the stream's protocol message handler.
+    //         stream.proto_msg_handler.onActivated(stream) catch |err| {
+    //             std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, stream });
+    //             self.callback(self.callback_ctx, err);
+
+    //             stream.close(null, struct {
+    //                 fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+    //                     // Handle stream close if needed.
+    //                 }
+    //             }.callback);
+    //             return;
+    //         };
+    //     }
+    // };
 
     pub fn newStream(
         self: *Switch,
@@ -220,30 +291,30 @@ pub const Switch = struct {
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) void {
-        const connect_ctx = self.allocator.create(ConnectCallbackCtx) catch unreachable;
-        connect_ctx.* = ConnectCallbackCtx{
-            .@"switch" = self,
-            .protocols = protos,
-            .callback_ctx = callback_ctx,
-            .callback = callback,
-            .notify = .{},
-            .conn = undefined,
-        };
-
         const address_str = std.fmt.allocPrint(self.allocator, "{}", .{address}) catch unreachable;
         defer self.allocator.free(address_str);
 
         // Check if the connection already exists.
         if (self.outgoing_connections.get(address_str)) |conn| {
             // If the connection already exists, we can just create a new stream on it.
-            connect_ctx.conn = conn;
-            connect_ctx.notify.set();
-            conn.newStream(connect_ctx, ConnectCallbackCtx.newStreamCallback);
+            const stream_ctx = self.allocator.create(StreamCallbackCtx) catch unreachable;
+            stream_ctx.* = StreamCallbackCtx{
+                .@"switch" = self,
+                .callback_ctx = callback_ctx,
+                .callback = callback,
+            };
+
+            conn.newStream(stream_ctx, StreamCallbackCtx.newStreamCallback);
         } else {
+            const connect_ctx = self.allocator.create(ConnectCallbackCtx) catch unreachable;
+            connect_ctx.* = ConnectCallbackCtx{
+                .@"switch" = self,
+                .address = address,
+                .protos = protos,
+                .user_callback_ctx = callback_ctx,
+                .user_callback = callback,
+            };
             self.transport.dial(address, connect_ctx, ConnectCallbackCtx.connectCallback);
-            connect_ctx.notify.wait();
-            // TODO: Need check if the event loop thread is same with lsquic thread. If not, we could try to make new stream asynchronously.
-            connect_ctx.conn.newStream(connect_ctx, ConnectCallbackCtx.newStreamCallback);
         }
     }
 
@@ -297,8 +368,6 @@ pub const Switch = struct {
             // The key is the address string, which was allocated and stored in the HashMap.
             // We must free the key's memory.
             self.allocator.free(removed_entry.key);
-            const conn_ctx: *ConnectCallbackCtx = @ptrCast(@alignCast(removed_entry.value.connect_ctx.?.callback_ctx));
-            self.allocator.destroy(conn_ctx);
 
             // The connection object itself is managed by the QuicEngine's allocator
             // and is destroyed in `onConnClosed` after this callback returns.
