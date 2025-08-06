@@ -340,6 +340,12 @@ pub const ThreadEventLoop = struct {
 
     /// Stops the event loop and joins the thread.
     pub fn close(self: *Self) void {
+        if (self.inEventLoopThread()) {
+            std.debug.print("Stopping event loop from within the event loop thread\n", .{});
+            self.loop.stop();
+            return;
+        }
+
         self.stop_notifier.notify() catch |err| {
             std.log.warn("Error notifying stop: {}\n", .{err});
         };

@@ -279,6 +279,8 @@ pub const QuicEngine = struct {
             return .rearm;
         };
 
+        std.debug.print("DiscardSender processing next read: {s}\n", .{b.slice});
+
         // If no bytes were read, we rearm the read operation to continue listening.
         if (n == 0) {
             return .rearm;
@@ -571,18 +573,21 @@ pub const QuicStream = struct {
     /// Because the data may be eventually written successfully by the QUIC engine `onStreamWrite` callback multiple times,
     /// it queues the write request and processes it asynchronously.
     pub fn doWrite(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
+        std.debug.print("DiscardSender queuing message: {s}\n", .{data});
         var data_copy = std.ArrayList(u8).init(self.conn.engine.allocator);
         data_copy.appendSlice(data) catch |err| {
             callback(callback_ctx, err);
             return;
         };
 
+        std.debug.print("DiscardSender queued message111: {s}\n", .{data_copy.items});
         const write_req = WriteRequest{
             .data = data_copy,
             .callback_ctx = callback_ctx,
             .callback = callback,
         };
 
+        std.debug.print("DiscardSender queued message222: {s}\n", .{write_req.data.items});
         self.pending_writes.append(write_req) catch |err| {
             data_copy.deinit();
             callback(callback_ctx, err);
@@ -598,7 +603,7 @@ pub const QuicStream = struct {
         }
 
         self.active_write = self.pending_writes.orderedRemove(0);
-
+        std.debug.print("DiscardSender processing next write: {any}\n", .{self.active_write.?});
         _ = lsquic.lsquic_stream_wantwrite(self.stream, 1);
     }
 };
@@ -936,7 +941,9 @@ fn onStreamRead(
 
     while (true) {
         const n_read = lsquic.lsquic_stream_read(s, &buf, buf.len);
+        std.debug.print("DiscardSender read {} bytes from stream\n", .{n_read});
         if (n_read > 0) {
+            std.debug.print("DiscardSender read {s} bytes from stream\n", .{buf[0..@intCast(n_read)]});
             self.proto_msg_handler.onMessage(self, buf[0..@intCast(n_read)]) catch |err| {
                 std.log.warn("Protocol message handler failed with error: {}. ", .{err});
                 _ = lsquic.lsquic_stream_close(s);
@@ -1019,7 +1026,7 @@ pub fn onStreamWrite(
                 if (self.pending_writes.items.len > 0) {
                     self.processNextWrite();
                 } else {
-                    _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
+                    // _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
                 }
             }
         }
