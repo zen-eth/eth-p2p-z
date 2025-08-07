@@ -45,6 +45,11 @@ pub const Switch = struct {
     pub fn deinit(self: *Switch) void {
         self.is_stopping = true;
         self.outgoingConnectionCloseAndClean();
+        // Because the `doClose` function of the `QuicEngine` may schedule a timer task, when it runs, the engine
+        // may be freed by `deinit` of `QuicTransport` or `QuicListener`, so we need to wait for a short time.
+        // Give some time for the connections to close gracefully.
+        // **Note**: Is 2s enough?
+        std.time.sleep(2 * std.time.ns_per_s);
     }
 
     const ListenCallbackCtx = struct {
@@ -343,8 +348,9 @@ pub const Switch = struct {
         // Because the `doClose` function of the `QuicEngine` may schedule a timer task, when it runs, the engine
         // may be freed by `deinit` of `QuicTransport` or `QuicListener`, so we need to wait for a short time.
         // Give some time for the connections to close gracefully.
-        // **Note**: Is 100ms enough?
-        std.time.sleep(100 * std.time.ns_per_ms);
+        // **Note**: Is 1s enough?
+        std.time.sleep(1 * std.time.ns_per_s);
+
         self.outgoing_connections.deinit();
         self.incoming_connections.deinit();
 
