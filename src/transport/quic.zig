@@ -278,15 +278,11 @@ pub const QuicEngine = struct {
             std.log.warn("UDP read failed with error: {any}. Continuing to listen.", .{err});
             return .rearm;
         };
-
-        std.debug.print("DiscardSender processing next read: {s}\n", .{b.slice});
-
-        // If no bytes were read, we rearm the read operation to continue listening.
         if (n == 0) {
             return .rearm;
         }
 
-        const result = lsquic.lsquic_engine_packet_in(
+        _ = lsquic.lsquic_engine_packet_in(
             self.engine,
             b.slice.ptr,
             n,
@@ -297,10 +293,10 @@ pub const QuicEngine = struct {
         );
 
         // If the packet processing failed, we log the error and rearm the read operation.
-        if (result < 0) {
-            std.log.warn("QUIC engine packet in failed {}\n", .{result});
-            return .rearm;
-        }
+        // if (result < 0) {
+        //     std.log.warn("QUIC engine packet in failed {}\n", .{result});
+        //     return .rearm;
+        // }
 
         self.processConns();
 
@@ -573,21 +569,18 @@ pub const QuicStream = struct {
     /// Because the data may be eventually written successfully by the QUIC engine `onStreamWrite` callback multiple times,
     /// it queues the write request and processes it asynchronously.
     pub fn doWrite(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
-        std.debug.print("DiscardSender queuing message: {s}\n", .{data});
         var data_copy = std.ArrayList(u8).init(self.conn.engine.allocator);
         data_copy.appendSlice(data) catch |err| {
             callback(callback_ctx, err);
             return;
         };
 
-        std.debug.print("DiscardSender queued message111: {s}\n", .{data_copy.items});
         const write_req = WriteRequest{
             .data = data_copy,
             .callback_ctx = callback_ctx,
             .callback = callback,
         };
 
-        std.debug.print("DiscardSender queued message222: {s}\n", .{write_req.data.items});
         self.pending_writes.append(write_req) catch |err| {
             data_copy.deinit();
             callback(callback_ctx, err);
@@ -603,7 +596,6 @@ pub const QuicStream = struct {
         }
 
         self.active_write = self.pending_writes.orderedRemove(0);
-        std.debug.print("DiscardSender processing next write: {any}\n", .{self.active_write.?});
         _ = lsquic.lsquic_stream_wantwrite(self.stream, 1);
     }
 };
@@ -710,6 +702,12 @@ pub const QuicTransport = struct {
 
     pub fn deinit(self: *QuicTransport) void {
         self.io_event_loop.close();
+        // Event loop may be closed in a different thread(current thread or event loop thread), so we wait for it to close gracefully.
+        // This is necessary to ensure that all pending operations are completed before destroying the QUIC engine
+        // and SSL context.
+        // This is especially important for the QUIC engine, which may have pending connections or streams
+        // that need to be processed before the engine is destroyed.
+        std.time.sleep(300 * std.time.ns_per_ms);
         if (self.dialer_v4) |*dialer| {
             lsquic.lsquic_engine_destroy(dialer.engine);
         }
@@ -941,9 +939,7 @@ fn onStreamRead(
 
     while (true) {
         const n_read = lsquic.lsquic_stream_read(s, &buf, buf.len);
-        std.debug.print("DiscardSender read {} bytes from stream\n", .{n_read});
         if (n_read > 0) {
-            std.debug.print("DiscardSender read {s} bytes from stream\n", .{buf[0..@intCast(n_read)]});
             self.proto_msg_handler.onMessage(self, buf[0..@intCast(n_read)]) catch |err| {
                 std.log.warn("Protocol message handler failed with error: {}. ", .{err});
                 _ = lsquic.lsquic_stream_close(s);
@@ -1185,7 +1181,6 @@ test "lsquic transport dialing and listening" {
     transport.dial(addr, &dial_ctx, DialCtx.callback);
     dial_ctx.notify.wait();
 
-    std.debug.print("Dialed QUIC connection222: {*}\n", .{dial_ctx.conn});
     dial_ctx.conn.close(null, struct {
         pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
             if (res) |closed_conn| {
