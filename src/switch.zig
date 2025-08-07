@@ -1,3 +1,8 @@
+const lsquic = @cImport({
+    @cInclude("lsquic.h");
+    @cInclude("lsquic_types.h");
+    @cInclude("lsxpack_header.h");
+});
 const std = @import("std");
 const libp2p = @import("root.zig");
 const quic = libp2p.transport.quic;
@@ -30,6 +35,8 @@ pub const Switch = struct {
 
     is_stopping: bool,
 
+    is_stopped: std.atomic.Value(bool),
+
     pub fn init(self: *Switch, allocator: Allocator, transport: *quic.QuicTransport) void {
         self.* = Switch{
             .proto_handlers = std.ArrayList(protocols.AnyProtocolHandler).init(allocator),
@@ -39,17 +46,18 @@ pub const Switch = struct {
             .listeners = std.StringArrayHashMap(quic.QuicListener).init(allocator),
             .incoming_connections = std.ArrayList(*quic.QuicConnection).init(allocator),
             .is_stopping = false,
+            .is_stopped = std.atomic.Value(bool).init(false),
         };
     }
 
     pub fn deinit(self: *Switch) void {
         self.is_stopping = true;
+        const total_connections = self.outgoing_connections.count() + self.incoming_connections.items.len;
         self.outgoingConnectionCloseAndClean();
-        // Because the `doClose` function of the `QuicEngine` may schedule a timer task, when it runs, the engine
-        // may be freed by `deinit` of `QuicTransport` or `QuicListener`, so we need to wait for a short time.
-        // Give some time for the connections to close gracefully.
-        // **Note**: Is 2s enough?
-        std.time.sleep(2 * std.time.ns_per_s);
+        // If there are no connections,`outgoingConnectionCloseAndClean` will be called in current thread so that no need wait.
+        if (total_connections > 0) {
+            std.time.sleep(2000 * std.time.ns_per_ms);
+        }
     }
 
     const ListenCallbackCtx = struct {
@@ -345,12 +353,6 @@ pub const Switch = struct {
     }
 
     fn cleanResources(self: *Switch) void {
-        // Because the `doClose` function of the `QuicEngine` may schedule a timer task, when it runs, the engine
-        // may be freed by `deinit` of `QuicTransport` or `QuicListener`, so we need to wait for a short time.
-        // Give some time for the connections to close gracefully.
-        // **Note**: Is 1s enough?
-        std.time.sleep(1 * std.time.ns_per_s);
-
         self.outgoing_connections.deinit();
         self.incoming_connections.deinit();
 
@@ -366,6 +368,10 @@ pub const Switch = struct {
             }
             self.allocator.free(entry.key_ptr.*);
         }
+        // Call it here because the listeners and transports all used quic engine,
+        // so we need to clean up the global state.
+        // TODO: Can we not expose lsquic to switch?
+        lsquic.lsquic_global_cleanup();
         self.listeners.deinit();
 
         self.proto_handlers.deinit();

@@ -702,19 +702,13 @@ pub const QuicTransport = struct {
 
     pub fn deinit(self: *QuicTransport) void {
         self.io_event_loop.close();
-        // Event loop may be closed in a different thread(current thread or event loop thread), so we wait for it to close gracefully.
-        // This is necessary to ensure that all pending operations are completed before destroying the QUIC engine
-        // and SSL context.
-        // This is especially important for the QUIC engine, which may have pending connections or streams
-        // that need to be processed before the engine is destroyed.
-        std.time.sleep(300 * std.time.ns_per_ms);
+
         if (self.dialer_v4) |*dialer| {
             lsquic.lsquic_engine_destroy(dialer.engine);
         }
         if (self.dialer_v6) |*dialer| {
             lsquic.lsquic_engine_destroy(dialer.engine);
         }
-        lsquic.lsquic_global_cleanup();
         ssl.SSL_CTX_free(self.ssl_context);
         ssl.EVP_PKEY_free(self.subject_keypair);
         ssl.X509_free(self.subject_cert);
