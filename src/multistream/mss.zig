@@ -6,6 +6,9 @@ const Allocator = std.mem.Allocator;
 const p2p_conn = libp2p.conn;
 const uvarint = @import("multiformats").uvarint;
 
+/// The Multistream Negotiator is responsible for negotiating the protocol to use
+/// for a given connection/stream. It handles the multistream handshake process and
+/// manages the state of the negotiation.
 pub const Negotiator = struct {
     const MULTISTREAM_PROTO = "/multistream/1.0.0";
     const MESSAGE_SUFFIX = "\n";
@@ -279,6 +282,8 @@ pub const Negotiator = struct {
     }
 };
 
+/// The MultistreamSelectHandler is responsible for managing the multistream negotiation process.
+/// It handles the selection of the appropriate protocol for a given connection/stream.
 pub const MultistreamSelectHandler = struct {
     allocator: Allocator,
     // Flat map of protocol IDs to their handlers, if a group of protocols
