@@ -1,4 +1,7 @@
 const lsquic = @import("lsquic");
+
+const Engine = lsquic.Engine;
+
 const std = @import("std");
 const p2p_conn = @import("../../conn.zig");
 const xev = @import("xev");
@@ -40,7 +43,7 @@ pub const QuicEngine = struct {
 
     ssl_context: *ssl.SSL_CTX,
 
-    engine: *lsquic.engine.Engine,
+    engine: *engine.Engine,
 
     socket: UDP,
 
@@ -67,11 +70,11 @@ pub const QuicEngine = struct {
     pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, transport: *QuicTransport, is_initiator: bool) !void {
         var flags: c_uint = 0;
         if (!is_initiator) {
-            flags |= lsquic.engine.EngineFlags.SERVER;
+            flags |= engine.EngineFlags.SERVER;
         }
 
-        var engine_settings: lsquic.engine.Settings = undefined;
-        lsquic.engine.Settings.init(&engine_settings, flags);
+        var engine_settings: engine.Settings = undefined;
+        engine.Settings.init(&engine_settings, flags);
 
         engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
         engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
@@ -80,16 +83,16 @@ pub const QuicEngine = struct {
         engine_settings.es_handshake_to = HandshakeTimeoutMicroseconds;
 
         var err_buf: [100]u8 = undefined;
-        if (lsquic.engine.Settings.check(
+        if (engine.Settings.check(
             &engine_settings,
             flags,
             &err_buf,
         )) {
-            std.log.warn("lsquic_engine_check_settings failed: {any}", .{err_buf});
+            std.log.warn("engine_check_settings failed: {any}", .{err_buf});
             return error.InitializationFailed;
         }
 
-        const engine_api: lsquic.engine.EngineApi = lsquic.engine.EngineApi.init(
+        const engine_api: engine.EngineApi = engine.EngineApi.init(
             &engine_settings,
             &stream_if,
             self,
@@ -98,7 +101,7 @@ pub const QuicEngine = struct {
             null,
             getSslContext,
         );
-        const engine = try lsquic.engine.Engine.new(flags, &engine_api);
+        const engine = try engine.Engine.new(flags, &engine_api);
 
         var local_address: std.net.Address = undefined;
         var local_socklen: posix.socklen_t = @sizeOf(std.net.Address);
@@ -230,10 +233,10 @@ pub const QuicEngine = struct {
     }
 
     pub fn processConns(self: *QuicEngine) void {
-        lsquic.engine.Engine.processConns(self.engine);
+        engine.Engine.processConns(self.engine);
 
         var diff_us: c_int = 0;
-        if (lsquic.engine.Engine.earliestAdvTick(self.engine, &diff_us)) {
+        if (engine.Engine.earliestAdvTick(self.engine, &diff_us)) {
             std.debug.print("QUIC engine processing connections with diff_us {}\n", .{diff_us});
             const timer = xev.Timer.init() catch unreachable;
             const c_timer = self.transport.io_event_loop.completion_pool.create() catch unreachable;
@@ -861,7 +864,7 @@ test "lsquic transport initialization" {
     defer transport.deinit();
 }
 
-test "lsquic engine initialization" {
+test "engine initialization" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
     defer {
@@ -893,6 +896,7 @@ test "lsquic engine initialization" {
 }
 
 test "lsquic transport dialing and listening" {
+    std.debug.assert(false);
     var server_loop: io_loop.ThreadEventLoop = undefined;
     try server_loop.init(std.testing.allocator);
     defer {
