@@ -454,7 +454,6 @@ pub const QuicConnection = struct {
     }
 
     pub fn doClose(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
-        std.debug.print("Closing QUIC connection\n", .{});
         if (self.close_ctx) |*close_ctx| {
             // If we are already closing the connection, we just update the callback context and callback.
             close_ctx.active_callback_ctx = callback_ctx;
@@ -468,7 +467,6 @@ pub const QuicConnection = struct {
             };
         }
         lsquic.lsquic_conn_close(self.conn);
-        std.debug.print("QUIC connection closed\n", .{});
         self.engine.processConns();
     }
 };
@@ -894,9 +892,7 @@ fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_status
 }
 
 pub fn onConnClosed(conn: ?*lsquic.lsquic_conn_t) callconv(.c) void {
-    std.debug.print("Closing QUIC connection4444\n", .{});
     const lsquic_conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(conn.?)));
-    std.debug.print("QUIC connection closed55555: {*}\n", .{lsquic_conn});
     if (lsquic_conn.close_ctx) |close_ctx| {
         if (close_ctx.callback) |callback| {
             callback(close_ctx.callback_ctx, lsquic_conn);
@@ -907,7 +903,6 @@ pub fn onConnClosed(conn: ?*lsquic.lsquic_conn_t) callconv(.c) void {
     }
     lsquic.lsquic_conn_set_ctx(conn, null);
     lsquic_conn.engine.allocator.destroy(lsquic_conn);
-    std.debug.print("QUIC connection closed111\n", .{});
 }
 
 fn onNewStream(ctx: ?*anyopaque, stream: ?*lsquic.lsquic_stream_t) callconv(.c) ?*lsquic.lsquic_stream_ctx_t {
@@ -925,7 +920,6 @@ fn onNewStream(ctx: ?*anyopaque, stream: ?*lsquic.lsquic_stream_t) callconv(.c) 
         if (conn.new_stream_ctx) |new_stream_ctx| {
             new_stream_ctx.callback(new_stream_ctx.callback_ctx, lsquic_stream);
             conn.new_stream_ctx = null; // Clear the new stream context after use
-            std.debug.print("New stream created\n", .{});
         }
     }
     return stream_ctx;

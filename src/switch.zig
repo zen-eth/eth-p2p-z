@@ -18,8 +18,6 @@ const mss = libp2p.mss;
 /// It also provides methods for dialing peers, listening for incoming connections,
 /// and handling protocol messages.
 pub const Switch = struct {
-    proto_handlers: std.ArrayList(protocols.AnyProtocolHandler),
-
     mss_handler: mss.MultistreamSelectHandler,
 
     // TODO: In the future, we should support multiple transports.
@@ -42,7 +40,6 @@ pub const Switch = struct {
 
     pub fn init(self: *Switch, allocator: Allocator, transport: *quic.QuicTransport) void {
         self.* = Switch{
-            .proto_handlers = std.ArrayList(protocols.AnyProtocolHandler).init(allocator),
             .transport = transport,
             .outgoing_connections = std.StringArrayHashMap(*quic.QuicConnection).init(allocator),
             .allocator = allocator,
@@ -302,6 +299,14 @@ pub const Switch = struct {
         }
     }
 
+    pub fn addProtocolHandler(
+        self: *Switch,
+        proto_id: protocols.ProtocolId,
+        handler: protocols.AnyProtocolHandler,
+    ) !void {
+        try self.mss_handler.addProtocolHandler(proto_id, handler);
+    }
+
     fn onOutgoingConnectionClose(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
         const self: *Switch = @ptrCast(@alignCast(ctx.?));
 
@@ -421,6 +426,6 @@ pub const Switch = struct {
         lsquic.lsquic_global_cleanup();
         self.listeners.deinit();
 
-        self.proto_handlers.deinit();
+        self.mss_handler.deinit();
     }
 };

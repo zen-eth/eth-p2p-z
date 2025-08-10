@@ -107,7 +107,7 @@ pub const Negotiator = struct {
 
             // check proposed protocols exists in the supported protocols
             for (proposed_protocols.?) |proto_id| {
-                if (!self.supported_protocols.contains(proto_id)) {
+                if (!supported_protocols.contains(proto_id)) {
                     return NegotiatorError.ProposedProtocolNotSupported;
                 }
             }
@@ -334,6 +334,7 @@ pub const MultistreamSelectHandler = struct {
         }
 
         fn deinit(self: *NegotiationSession) void {
+            self.allocator.free(self.buffer.buf);
             self.negotiator.deinit();
             self.allocator.destroy(self);
         }
@@ -447,8 +448,8 @@ pub const MultistreamSelectHandler = struct {
         self.supported_protocols.deinit();
     }
 
-    pub fn addProtocol(self: *Self, protocol_id: []const u8, handler: protocols.AnyProtocolHandler) !void {
-        try self.supported_protocols.put(protocol_id, handler);
+    pub fn addProtocolHandler(self: *Self, proto_id: protocols.ProtocolId, handler: protocols.AnyProtocolHandler) !void {
+        try self.supported_protocols.put(proto_id, handler);
     }
 
     // Protocol handler implementation
@@ -472,7 +473,6 @@ pub const MultistreamSelectHandler = struct {
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
-        std.debug.print("Responder started\n", .{});
         const handler = self.allocator.create(NegotiationSession) catch unreachable;
         errdefer handler.deinit();
         try handler.init(self.allocator, null, &self.supported_protocols, stream, callback_ctx, callback, false);
