@@ -11,9 +11,9 @@ pub const ProtocolId = []const u8;
 /// It registers the protocol handler with the QUIC transport and provides
 /// methods to handle protocol-specific messages.
 pub const ProtocolHandlerVTable = struct {
-    onInitiatorStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) void,
+    onInitiatorStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) anyerror!void,
 
-    onResponderStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) void,
+    onResponderStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) anyerror!void,
 };
 
 /// This struct represents a protocol handler that can be used with the QUIC transport.
@@ -26,12 +26,12 @@ pub const AnyProtocolHandler = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn onInitiatorStart(self: *Self, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) void {
-        self.vtable.onInitiatorStartFn(self.instance, stream, callback_ctx, callback);
+    pub fn onInitiatorStart(self: *Self, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) !void {
+        return self.vtable.onInitiatorStartFn(self.instance, stream, callback_ctx, callback);
     }
 
-    pub fn onResponderStart(self: *Self, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) void {
-        self.vtable.onResponderStartFn(self.instance, stream, callback_ctx, callback);
+    pub fn onResponderStart(self: *Self, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) !void {
+        return self.vtable.onResponderStartFn(self.instance, stream, callback_ctx, callback);
     }
 };
 

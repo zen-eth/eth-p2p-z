@@ -8,6 +8,7 @@ const libp2p = @import("root.zig");
 const quic = libp2p.transport.quic;
 const protocols = libp2p.protocols;
 const Allocator = std.mem.Allocator;
+const mss = libp2p.mss;
 
 /// The Switch struct is the main entry point for managing connections and protocol handlers.
 /// It acts as a central hub for handling incoming and outgoing connections,
@@ -18,6 +19,8 @@ const Allocator = std.mem.Allocator;
 /// and handling protocol messages.
 pub const Switch = struct {
     proto_handlers: std.ArrayList(protocols.AnyProtocolHandler),
+
+    mss_handler: mss.MultistreamSelectHandler,
 
     // TODO: In the future, we should support multiple transports.
     // Only one transport is supported at a time.
@@ -47,6 +50,7 @@ pub const Switch = struct {
             .incoming_connections = std.ArrayList(*quic.QuicConnection).init(allocator),
             .is_stopping = false,
             .is_stopped = std.atomic.Value(bool).init(false),
+            .mss_handler = mss.MultistreamSelectHandler.init(allocator),
         };
     }
 
@@ -91,19 +95,24 @@ pub const Switch = struct {
                 return;
             };
 
-            // TODO: To use multistreams, we need to find the protocol handler for the stream.
-            // For now, we just use the first protocol handler.
-            self.@"switch".proto_handlers.items[0].onResponderStart(stream, self.callback_ctx, self.callback);
+            self.@"switch".mss_handler.onResponderStart(stream, self.callback_ctx, self.callback) catch |err| {
+                std.log.warn("Failed to start responder: {}", .{err});
+                self.callback(self.callback_ctx, err);
+
+                // Can't call `stream.close` here because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet.
+                stream.deinit();
+                stream.conn.engine.allocator.destroy(stream);
+                return;
+            };
 
             // `onResponderStart` should set the stream's protocol message handler.
             stream.proto_msg_handler.onActivated(stream) catch |err| {
                 std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, stream });
                 self.callback(self.callback_ctx, err);
-                stream.close(null, struct {
-                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
-                        // Handle stream close if needed.
-                    }
-                }.callback);
+
+                // Can't call `stream.close` here because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet.
+                stream.deinit();
+                stream.conn.engine.allocator.destroy(stream);
                 return;
             };
         }
@@ -111,6 +120,7 @@ pub const Switch = struct {
 
     const StreamCallbackCtx = struct {
         @"switch": *Switch,
+        proposed_protocols: []const []const u8,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
@@ -123,18 +133,27 @@ pub const Switch = struct {
                 return;
             };
 
-            // TODO: To use multistreams, we need to find the protocol handler for the stream.
-            // For now, we just use the first protocol handler.
-            self.@"switch".proto_handlers.items[0].onInitiatorStart(stream, self.callback_ctx, self.callback);
+            stream.proposed_protocols = self.proposed_protocols;
+
+            self.@"switch".mss_handler.onInitiatorStart(stream, self.callback_ctx, self.callback) catch |err| {
+                std.log.warn("Failed to start initiator: {}", .{err});
+                self.callback(self.callback_ctx, err);
+
+                // Can't call `stream.close` here because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet.
+                // stream.deinit();
+                // stream.conn.engine.allocator.destroy(stream);
+                std.debug.print("Failed to start initiator1111: {}\n", .{err});
+                return;
+            };
 
             // `onInitiatorStart` should set the stream's protocol message handler.
             stream.proto_msg_handler.onActivated(stream) catch |err| {
-                std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, stream });
+                std.log.warn("Proto message handler failed with error: {}. ", .{err});
                 self.callback(self.callback_ctx, err);
 
-                stream.close(null, struct {
-                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-                }.callback);
+                // Can't call `stream.close` here because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet.
+                stream.deinit();
+                stream.conn.engine.allocator.destroy(stream);
                 return;
             };
         }
@@ -143,7 +162,7 @@ pub const Switch = struct {
     const ConnectCallbackCtx = struct {
         @"switch": *Switch,
         address: std.net.Address,
-        protos: []const []const u8,
+        proposed_protocols: []const []const u8,
         user_callback_ctx: ?*anyopaque,
         user_callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
@@ -174,6 +193,7 @@ pub const Switch = struct {
                 .@"switch" = self.@"switch",
                 .callback_ctx = self.user_callback_ctx,
                 .callback = self.user_callback,
+                .proposed_protocols = self.proposed_protocols,
             };
 
             conn.newStream(stream_ctx, StreamCallbackCtx.newStreamCallback);
@@ -183,7 +203,7 @@ pub const Switch = struct {
     pub fn newStream(
         self: *Switch,
         address: std.net.Address,
-        protos: []const []const u8,
+        proposed_protocols: []const []const u8,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) void {
@@ -202,6 +222,7 @@ pub const Switch = struct {
                 .@"switch" = self,
                 .callback_ctx = callback_ctx,
                 .callback = callback,
+                .proposed_protocols = proposed_protocols,
             };
 
             conn.newStream(stream_ctx, StreamCallbackCtx.newStreamCallback);
@@ -210,7 +231,7 @@ pub const Switch = struct {
             connect_ctx.* = ConnectCallbackCtx{
                 .@"switch" = self,
                 .address = address,
-                .protos = protos,
+                .proposed_protocols = proposed_protocols,
                 .user_callback_ctx = callback_ctx,
                 .user_callback = callback,
             };
