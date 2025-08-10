@@ -347,9 +347,9 @@ pub const MultistreamSelectHandler = struct {
                     std.log.warn("Failed to start initiator: {}. ", .{err});
                     self.user_callback(self.user_callback_ctx, err);
 
-                    // Can't call `stream.close` here because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet.
-                    self.stream.deinit();
-                    self.stream.conn.engine.allocator.destroy(self.stream);
+                    self.stream.close(null, struct {
+                        fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                    }.callback);
                     return;
                 };
             } else {
@@ -357,14 +357,14 @@ pub const MultistreamSelectHandler = struct {
                     std.log.warn("Failed to start responder: {}. ", .{err});
                     self.user_callback(self.user_callback_ctx, err);
 
-                    // Can't call `stream.close` here because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet.
-                    self.stream.deinit();
-                    self.stream.conn.engine.allocator.destroy(self.stream);
+                    self.stream.close(null, struct {
+                        fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                    }.callback);
                     return;
                 };
             }
 
-            self.stream.proto_msg_handler.onActivated(self.stream) catch |err| {
+            self.stream.proto_msg_handler.?.onActivated(self.stream) catch |err| {
                 std.log.warn("Proto message handler failed with error: {}. ", .{err});
                 self.user_callback(self.user_callback_ctx, err);
 
@@ -379,7 +379,7 @@ pub const MultistreamSelectHandler = struct {
                 // to the selected protocol handler.
                 // This is necessary to ensure that any remaining data in the buffer
                 // is not lost and can be processed by the selected protocol handler.
-                self.stream.proto_msg_handler.onMessage(self.stream, self.buffer.readableSlice(0)) catch |err| {
+                self.stream.proto_msg_handler.?.onMessage(self.stream, self.buffer.readableSlice(0)) catch |err| {
                     std.log.warn("Proto message handler onMessage failed with error: {}. ", .{err});
                     self.user_callback(self.user_callback_ctx, err);
 
@@ -459,6 +459,7 @@ pub const MultistreamSelectHandler = struct {
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
         const handler = self.allocator.create(NegotiationSession) catch unreachable;
+        errdefer handler.deinit();
         try handler.init(self.allocator, stream.proposed_protocols, &self.supported_protocols, stream, callback_ctx, callback, true);
         // Set the negotiation session as the stream's handler
         // This handler will NEVER be replaced - it stays for the entire stream lifetime
@@ -473,6 +474,7 @@ pub const MultistreamSelectHandler = struct {
     ) !void {
         std.debug.print("Responder started\n", .{});
         const handler = self.allocator.create(NegotiationSession) catch unreachable;
+        errdefer handler.deinit();
         try handler.init(self.allocator, null, &self.supported_protocols, stream, callback_ctx, callback, false);
         // Set the negotiation session as the stream's handler
         // This handler will NEVER be replaced - it stays for the entire stream lifetime

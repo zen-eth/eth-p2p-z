@@ -99,20 +99,35 @@ pub const Switch = struct {
                 std.log.warn("Failed to start responder: {}", .{err});
                 self.callback(self.callback_ctx, err);
 
-                // Can't call `stream.close` here because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet.
-                stream.deinit();
-                stream.conn.engine.allocator.destroy(stream);
+                // TODO: There is an error thrown in the lsquic library when close the stream in the server mode.
+                // So that right now the stream will be closed when the connection close function called.
+                // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
+                // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
+                // stream.close(null, struct {
+                //     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                // }.callback);
+                // stream.deinit();
+                // stream.conn.engine.allocator.destroy(stream);
                 return;
             };
 
             // `onResponderStart` should set the stream's protocol message handler.
-            stream.proto_msg_handler.onActivated(stream) catch |err| {
+            stream.proto_msg_handler.?.onActivated(stream) catch |err| {
                 std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, stream });
                 self.callback(self.callback_ctx, err);
 
-                // Can't call `stream.close` here because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet.
-                stream.deinit();
-                stream.conn.engine.allocator.destroy(stream);
+                // TODO: There is an error thrown in the lsquic library when close the stream in the server mode.
+                // So that right now the stream will be closed when the connection close function called.
+                // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
+                // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
+                // stream.close(null, struct {
+                //     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                // }.callback);
+                // stream.proto_msg_handler.onClose(stream) catch |e| {
+                //     std.log.warn("Protocol message handler failed with error: {}.", .{e});
+                // };
+                // stream.deinit();
+                // stream.conn.engine.allocator.destroy(stream);
                 return;
             };
         }
@@ -139,19 +154,30 @@ pub const Switch = struct {
                 std.log.warn("Failed to start initiator: {}", .{err});
                 self.callback(self.callback_ctx, err);
 
-                // Can't call `stream.close` here because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet.
-                // stream.deinit();
-                // stream.conn.engine.allocator.destroy(stream);
+                // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
+                // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
+                stream.close(null, struct {
+                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                }.callback);
+                stream.deinit();
+                stream.conn.engine.allocator.destroy(stream);
                 std.debug.print("Failed to start initiator1111: {}\n", .{err});
                 return;
             };
 
             // `onInitiatorStart` should set the stream's protocol message handler.
-            stream.proto_msg_handler.onActivated(stream) catch |err| {
+            stream.proto_msg_handler.?.onActivated(stream) catch |err| {
                 std.log.warn("Proto message handler failed with error: {}. ", .{err});
                 self.callback(self.callback_ctx, err);
 
-                // Can't call `stream.close` here because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet.
+                // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
+                // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
+                stream.close(null, struct {
+                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                }.callback);
+                stream.proto_msg_handler.?.onClose(stream) catch |e| {
+                    std.log.warn("Protocol message handler failed with error: {}.", .{e});
+                };
                 stream.deinit();
                 stream.conn.engine.allocator.destroy(stream);
                 return;

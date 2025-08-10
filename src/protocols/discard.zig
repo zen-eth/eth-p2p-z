@@ -261,6 +261,7 @@ test "discard protocol using switch" {
     var discard_handler = DiscardProtocolHandler.init(allocator);
     defer discard_handler.deinit();
     switch1.proto_handlers.append(discard_handler.any()) catch unreachable;
+    try switch1.mss_handler.addProtocol("discard", discard_handler.any());
 
     try switch1.listen(switch1_listen_address, null, struct {
         pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {
@@ -293,6 +294,7 @@ test "discard protocol using switch" {
     var discard_handler2 = DiscardProtocolHandler.init(allocator);
     defer discard_handler2.deinit();
     switch2.proto_handlers.append(discard_handler2.any()) catch unreachable;
+    try switch2.mss_handler.addProtocol("discard", discard_handler2.any());
 
     const TestNewStreamCallback = struct {
         mutex: std.Thread.ResetEvent,
