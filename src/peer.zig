@@ -75,19 +75,15 @@ pub const PeerId = struct {
     /// Validates that the multihash uses a supported algorithm
     pub fn fromMultihash(multi_hash: Multihash(64)) !Self {
         switch (multi_hash.getCode()) {
-            MULTIHASH_SHA256_CODE => {
-                return Self{ .multihash = multi_hash };
-            },
+            MULTIHASH_SHA256_CODE => {},
             MULTIHASH_IDENTITY_CODE => {
-                if (multi_hash.getSize() <= MAX_INLINE_KEY_LENGTH) {
-                    return Self{ .multihash = multi_hash };
+                if (multi_hash.getSize() > MAX_INLINE_KEY_LENGTH) {
+                    return ParseError.UnsupportedCode;
                 }
-                return ParseError.UnsupportedCode;
             },
-            else => {
-                return ParseError.UnsupportedCode;
-            },
+            else => return ParseError.UnsupportedCode,
         }
+        return Self{ .multihash = multi_hash };
     }
 
     /// Converts a CID to a peer ID, if possible
@@ -123,20 +119,16 @@ pub const PeerId = struct {
     }
 
     /// Returns a base58-encoded string of this PeerId
-    pub fn toBase58(source: []const u8, dest: []u8) ![]const u8 {
-        return multibase.MultiBaseCodec.Base58Impl.encodeBtc(dest, source);
+    pub fn toBase58(self: *const Self, dest: []u8) ![]const u8 {
+        var bytes_buffer: [128]u8 = undefined; // Sufficient for a 64-byte digest multihash
+        const source_bytes = try self.toBytes(&bytes_buffer);
+        return multibase.MultiBaseCodec.Base58Impl.encodeBtc(dest, source_bytes);
     }
 
-    /// Encodes a peer ID as a CID of the public key
-    /// Returns a CIDv1 with Libp2pKey codec and the peer ID's multihash
+    /// Encodes a peer ID as a CID of the public key.
+    /// Returns a CIDv1 with Libp2pKey codec and the peer ID's multihash.
     /// If the peer ID is invalid, this will return an error
     pub fn toCid(self: *const Self) !CID(64) {
-        // Validate that the multihash is supported
-        switch (self.multihash.getCode()) {
-            MULTIHASH_SHA256_CODE, MULTIHASH_IDENTITY_CODE => {},
-            else => return ParseError.InvalidCidType,
-        }
-
         // Create a CIDv1 with Libp2pKey codec and the peer ID's multihash
         return try CID(64).newV1(Multicodec.LIBP2P_KEY, self.multihash);
     }
@@ -224,15 +216,10 @@ test "PeerId base58 string round trip" {
 
     const original_peer_id = try PeerId.random();
 
-    const original_peer_id_bytes_len = original_peer_id.toBytesLen();
-    const original_peer_id_bytes = try allocator.alloc(u8, original_peer_id_bytes_len);
-    defer allocator.free(original_peer_id_bytes);
-    const source = try original_peer_id.toBytes(original_peer_id_bytes);
-
     const original_peer_id_base58_len = original_peer_id.toBase58Len();
-    const base58_str = try allocator.alloc(u8, original_peer_id_base58_len);
-    defer allocator.free(base58_str);
-    const actual_base58_str = try PeerId.toBase58(source, base58_str);
+    const base58_str_buffer = try allocator.alloc(u8, original_peer_id_base58_len);
+    defer allocator.free(base58_str_buffer);
+    const actual_base58_str = try original_peer_id.toBase58(base58_str_buffer);
 
     const reconstructed_peer_id = try PeerId.fromBase58(allocator, actual_base58_str);
 
@@ -274,8 +261,7 @@ test "PeerId fromMultihash with unsupported code" {
 test "PeerId fromMultihash with oversized identity hash" {
     const testing = std.testing;
 
-    var large_data: [50]u8 = undefined;
-    @memset(&large_data, 0x42);
+    const large_data = [_]u8{0x42} ** 50;
 
     const oversized_identity_hash = try Multihash(64).wrap(MULTIHASH_IDENTITY_CODE, &large_data);
 

@@ -148,7 +148,7 @@ pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY)
 
 /// Gets the raw public key bytes from an EVP_PKEY.
 /// The caller owns the returned slice.
-pub fn getRawPublicKeyBytes(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]u8 {
+fn getRawPublicKeyBytes(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]u8 {
     var len: usize = 0;
     if (ssl.EVP_PKEY_get_raw_public_key(pkey, null, &len) == 0) return error.RawPubKeyGetFailed;
     const buf = try allocator.alloc(u8, len);
