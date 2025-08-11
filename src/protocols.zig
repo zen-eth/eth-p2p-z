@@ -3,6 +3,7 @@ const libp2p = @import("root.zig");
 const quic = libp2p.transport.quic;
 
 pub const discard = @import("protocols/discard.zig");
+pub const mss = @import("protocols/mss.zig");
 
 pub const ProtocolId = []const u8;
 

@@ -8,7 +8,7 @@ const libp2p = @import("root.zig");
 const quic = libp2p.transport.quic;
 const protocols = libp2p.protocols;
 const Allocator = std.mem.Allocator;
-const mss = libp2p.mss;
+const mss = protocols.mss;
 
 /// The Switch struct is the main entry point for managing connections and protocol handlers.
 /// It acts as a central hub for handling incoming and outgoing connections,
