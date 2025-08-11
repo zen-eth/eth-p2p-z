@@ -20,6 +20,7 @@ pub const Negotiator = struct {
     const MAX_PROTOCOL_ID_LENGTH = MAX_MULTISTREAM_MESSAGE_LENGTH - MESSAGE_SUFFIX_LENGTH;
     const MAX_LENGTH_BYTES = 2;
     const TOTAL_MESSAGE_LENGTH = MAX_LENGTH_BYTES + MAX_MULTISTREAM_MESSAGE_LENGTH;
+    const NEGOTIATION_TIMEOUT_SECONDS = 10;
 
     pub const NegotiatorError = error{
         ProtocolIdTooLong,
@@ -136,7 +137,7 @@ pub const Negotiator = struct {
     }
 
     pub fn startNegotiate(self: *Self, writer: anytype) !void {
-        const buffer = if (self.is_initiator) self.allocator.alloc(u8, TOTAL_MESSAGE_LENGTH * 2) catch unreachable else self.allocator.alloc(u8, TOTAL_MESSAGE_LENGTH) catch unreachable;
+        const buffer = if (self.is_initiator) try self.allocator.alloc(u8, TOTAL_MESSAGE_LENGTH * 2) else try self.allocator.alloc(u8, TOTAL_MESSAGE_LENGTH);
 
         var proto_buffer = std.io.fixedBufferStream(buffer);
         const proto_writer = proto_buffer.writer();
@@ -335,7 +336,7 @@ pub const MultistreamSelectHandler = struct {
                 .proposed_protocols = proposed_protocols,
             };
 
-            try self.negotiator.init(allocator, std.time.ns_per_s * 10, stream.proposed_protocols, supported_protocols, &self.buffer, is_initiator, self, NegotiationSession.onNegotiationComplete);
+            try self.negotiator.init(allocator, std.time.ns_per_s * Negotiator.NEGOTIATION_TIMEOUT_SECONDS, proposed_protocols, supported_protocols, &self.buffer, is_initiator, self, NegotiationSession.onNegotiationComplete);
         }
 
         fn deinit(self: *NegotiationSession) void {

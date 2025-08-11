@@ -265,7 +265,6 @@ test "discard protocol using switch" {
     try switch1.listen(switch1_listen_address, null, struct {
         pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {
             // Handle the callback
-            std.debug.print("Switch 1 started listening\n", .{});
         }
     }.callback);
 
@@ -302,10 +301,8 @@ test "discard protocol using switch" {
         const Self = @This();
         pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(ctx.?));
-            const sender_ptr = res catch |err| {
-                std.log.warn("Failed to start stream1111: {}", .{err});
+            const sender_ptr = res catch {
                 self.mutex.set();
-                std.debug.print("Failed to start stream1112221: {}\n", .{err});
                 return;
             };
             self.sender = @ptrCast(@alignCast(sender_ptr.?));

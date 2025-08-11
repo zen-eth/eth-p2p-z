@@ -158,7 +158,6 @@ pub const Switch = struct {
                 }.callback);
                 stream.deinit();
                 stream.conn.engine.allocator.destroy(stream);
-                std.debug.print("Failed to start initiator1111: {}\n", .{err});
                 return;
             };
 

@@ -559,7 +559,7 @@ pub const QuicStream = struct {
     }
 
     pub fn doClose(self: *QuicStream, _: ?*anyopaque, _: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicStream) void) void {
-        _ = lsquic.lsquic_stream_shutdown(self.stream, 2);
+        _ = lsquic.lsquic_stream_close(self.stream);
         self.conn.engine.processConns();
     }
 
