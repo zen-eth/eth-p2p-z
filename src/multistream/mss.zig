@@ -337,6 +337,7 @@ pub const MultistreamSelectHandler = struct {
             };
 
             try self.negotiator.init(allocator, std.time.ns_per_s * Negotiator.NEGOTIATION_TIMEOUT_SECONDS, proposed_protocols, supported_protocols, &self.buffer, is_initiator, self, NegotiationSession.onNegotiationComplete);
+            errdefer self.negotiator.deinit();
         }
 
         fn deinit(self: *NegotiationSession) void {
@@ -466,7 +467,7 @@ pub const MultistreamSelectHandler = struct {
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
         const handler = self.allocator.create(NegotiationSession) catch unreachable;
-        errdefer handler.deinit();
+        errdefer self.allocator.destroy(handler);
         try handler.init(self.allocator, stream.proposed_protocols, &self.supported_protocols, stream, callback_ctx, callback, true);
         // Set the negotiation session as the stream's handler
         // This handler will NEVER be replaced - it stays for the entire stream lifetime
@@ -480,7 +481,7 @@ pub const MultistreamSelectHandler = struct {
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
         const handler = self.allocator.create(NegotiationSession) catch unreachable;
-        errdefer handler.deinit();
+        errdefer self.allocator.destroy(handler);
         try handler.init(self.allocator, null, &self.supported_protocols, stream, callback_ctx, callback, false);
         // Set the negotiation session as the stream's handler
         // This handler will NEVER be replaced - it stays for the entire stream lifetime
