@@ -72,20 +72,20 @@ message TopicDescriptor {
 		repeated bytes keys = 2;
 
 		enum AuthMode {
-			NONE = 0;
-			KEY = 1;
-			WOT = 2;
+			NONE = 0; // no authentication, anyone can publish
+			KEY = 1; // only messages signed by keys in the topic descriptor are accepted
+			WOT = 2; // web of trust, certificates can allow publisher set to grow
 		}
 	}
 
 	message EncOpts {
 		optional EncMode mode = 1;
-		repeated bytes keyHashes = 2;
+		repeated bytes keyHashes = 2; // the hashes of the shared keys used (salted)
 
 		enum EncMode {
-			NONE = 0;
-			SHAREDKEY = 1;
-			WOT = 2;
+			NONE = 0; // no encryption, anyone can read
+			SHAREDKEY = 1; // messages are encrypted with shared key
+			WOT = 2; // web of trust, certificates can allow publisher set to grow
 		}
 	}
 }
