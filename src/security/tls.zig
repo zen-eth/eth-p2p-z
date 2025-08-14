@@ -40,14 +40,15 @@ pub const Error = error{
 
 /// Generates a new key pair based on the specified key type.
 /// This is a helper function to encapsulate the complexity of key generation using OpenSSL.
+/// Note: SECP256K1 is not supported and will result in an `Error.UnsupportedKeyType`.
 pub fn generateKeyPair(cert_key_type: keys_proto.KeyType) !*ssl.EVP_PKEY {
     var maybe_subject_keypair: ?*ssl.EVP_PKEY = null;
 
     if (cert_key_type == .ECDSA or cert_key_type == .SECP256K1) {
         const curve_nid = switch (cert_key_type) {
             .ECDSA => ssl.NID_X9_62_prime256v1,
-            // TODO: SECP256K1 is not supported in BoringSSL
-            .SECP256K1 => unreachable,
+            // SECP256K1 is not supported in BoringSSL
+            .SECP256K1 => return error.UnsupportedKeyType,
             else => unreachable,
         };
 
@@ -187,7 +188,7 @@ pub fn buildCert(
 
 /// Encodes a public key into the libp2p PublicKey protobuf format.
 /// The caller owns the returned slice.
-fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
+pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
     const raw_pubkey = try getRawPublicKeyBytes(allocator, pkey);
     defer allocator.free(raw_pubkey);
 

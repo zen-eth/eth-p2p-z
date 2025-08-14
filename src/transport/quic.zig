@@ -5,12 +5,12 @@ const lsquic = @cImport({
 });
 const std = @import("std");
 const libp2p = @import("../root.zig");
-const p2p_conn = @import("../conn.zig");
+const p2p_conn = libp2p.conn;
 const xev = @import("xev");
-const io_loop = @import("../thread_event_loop.zig");
+const io_loop = libp2p.thread_event_loop;
 const ssl = @import("ssl");
-const keys_proto = @import("../proto/keys.proto.zig");
-const tls = @import("../security/tls.zig");
+const keys_proto = libp2p.protobuf.keys;
+const tls = libp2p.security.tls;
 const Allocator = std.mem.Allocator;
 const UDP = xev.UDP;
 const posix = std.posix;

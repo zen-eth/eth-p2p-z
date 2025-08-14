@@ -62,7 +62,7 @@ pub const Switch = struct {
     }
 
     const ListenCallbackCtx = struct {
-        @"switch": *Switch,
+        network_switch: *Switch,
         // user-defined context for the callback
         callback_ctx: ?*anyopaque,
         // user-defined callback function
@@ -78,11 +78,11 @@ pub const Switch = struct {
             conn.onStream(self, newStreamCallback);
             conn.close_ctx = .{
                 .callback = Switch.onIncomingConnectionClose,
-                .callback_ctx = self.@"switch",
+                .callback_ctx = self.network_switch,
                 .active_callback_ctx = null,
                 .active_callback = null,
             };
-            self.@"switch".incoming_connections.append(conn) catch unreachable;
+            self.network_switch.incoming_connections.append(conn) catch unreachable;
         }
 
         fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
@@ -92,7 +92,7 @@ pub const Switch = struct {
                 return;
             };
 
-            self.@"switch".mss_handler.onResponderStart(stream, self.callback_ctx, self.callback) catch |err| {
+            self.network_switch.mss_handler.onResponderStart(stream, self.callback_ctx, self.callback) catch |err| {
                 std.log.warn("Failed to start responder: {}", .{err});
                 self.callback(self.callback_ctx, err);
 
@@ -131,14 +131,14 @@ pub const Switch = struct {
     };
 
     const StreamCallbackCtx = struct {
-        @"switch": *Switch,
+        network_switch: *Switch,
         proposed_protocols: []const []const u8,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
         fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
             const self: *StreamCallbackCtx = @ptrCast(@alignCast(ctx.?));
-            defer self.@"switch".allocator.destroy(self);
+            defer self.network_switch.allocator.destroy(self);
 
             const stream = res catch |err| {
                 self.callback(self.callback_ctx, err);
@@ -147,7 +147,7 @@ pub const Switch = struct {
 
             stream.proposed_protocols = self.proposed_protocols;
 
-            self.@"switch".mss_handler.onInitiatorStart(stream, self.callback_ctx, self.callback) catch |err| {
+            self.network_switch.mss_handler.onInitiatorStart(stream, self.callback_ctx, self.callback) catch |err| {
                 std.log.warn("Failed to start initiator: {}", .{err});
                 self.callback(self.callback_ctx, err);
 
@@ -182,7 +182,7 @@ pub const Switch = struct {
     };
 
     const ConnectCallbackCtx = struct {
-        @"switch": *Switch,
+        network_switch: *Switch,
         address: std.net.Address,
         proposed_protocols: []const []const u8,
         user_callback_ctx: ?*anyopaque,
@@ -190,7 +190,7 @@ pub const Switch = struct {
 
         fn connectCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
             const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
-            defer self.@"switch".allocator.destroy(self);
+            defer self.network_switch.allocator.destroy(self);
 
             const conn = res catch |err| {
                 std.log.warn("Connection failed: {}", .{err});
@@ -200,19 +200,19 @@ pub const Switch = struct {
 
             conn.close_ctx = .{
                 .callback = Switch.onOutgoingConnectionClose,
-                .callback_ctx = self.@"switch",
+                .callback_ctx = self.network_switch,
                 .active_callback = null,
                 .active_callback_ctx = null,
             };
 
-            const address_str = std.fmt.allocPrint(self.@"switch".allocator, "{}", .{self.address}) catch unreachable;
-            self.@"switch".outgoing_connections.put(address_str, conn) catch unreachable;
+            const address_str = std.fmt.allocPrint(self.network_switch.allocator, "{}", .{self.address}) catch unreachable;
+            self.network_switch.outgoing_connections.put(address_str, conn) catch unreachable;
 
             std.log.debug("Connection established to {}", .{self.address});
 
-            const stream_ctx = self.@"switch".allocator.create(StreamCallbackCtx) catch unreachable;
+            const stream_ctx = self.network_switch.allocator.create(StreamCallbackCtx) catch unreachable;
             stream_ctx.* = StreamCallbackCtx{
-                .@"switch" = self.@"switch",
+                .network_switch = self.network_switch,
                 .callback_ctx = self.user_callback_ctx,
                 .callback = self.user_callback,
                 .proposed_protocols = self.proposed_protocols,
@@ -241,7 +241,7 @@ pub const Switch = struct {
             // If the connection already exists, we can just create a new stream on it.
             const stream_ctx = self.allocator.create(StreamCallbackCtx) catch unreachable;
             stream_ctx.* = StreamCallbackCtx{
-                .@"switch" = self,
+                .network_switch = self,
                 .callback_ctx = callback_ctx,
                 .callback = callback,
                 .proposed_protocols = proposed_protocols,
@@ -251,7 +251,7 @@ pub const Switch = struct {
         } else {
             const connect_ctx = self.allocator.create(ConnectCallbackCtx) catch unreachable;
             connect_ctx.* = ConnectCallbackCtx{
-                .@"switch" = self,
+                .network_switch = self,
                 .address = address,
                 .proposed_protocols = proposed_protocols,
                 .user_callback_ctx = callback_ctx,
@@ -281,7 +281,7 @@ pub const Switch = struct {
         } else {
             const accept_callback_ctx = self.allocator.create(ListenCallbackCtx) catch unreachable;
             accept_callback_ctx.* = ListenCallbackCtx{
-                .@"switch" = self,
+                .network_switch = self,
                 .callback_ctx = callback_ctx,
                 .callback = callback,
             };
