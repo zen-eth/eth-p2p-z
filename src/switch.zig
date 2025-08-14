@@ -61,7 +61,7 @@ pub const Switch = struct {
     }
 
     const ListenCallbackCtx = struct {
-        @"switch": *Switch,
+        network_switch: *Switch,
         // user-defined context for the callback
         callback_ctx: ?*anyopaque,
         // user-defined callback function
@@ -77,11 +77,11 @@ pub const Switch = struct {
             conn.onStream(self, newStreamCallback);
             conn.close_ctx = .{
                 .callback = Switch.onIncomingConnectionClose,
-                .callback_ctx = self.@"switch",
+                .callback_ctx = self.network_switch,
                 .active_callback_ctx = null,
                 .active_callback = null,
             };
-            self.@"switch".incoming_connections.append(conn) catch unreachable;
+            self.network_switch.incoming_connections.append(conn) catch unreachable;
         }
 
         fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
@@ -93,7 +93,7 @@ pub const Switch = struct {
 
             // TODO: To use multistreams, we need to find the protocol handler for the stream.
             // For now, we just use the first protocol handler.
-            self.@"switch".proto_handlers.items[0].onResponderStart(stream, self.callback_ctx, self.callback);
+            self.network_switch.proto_handlers.items[0].onResponderStart(stream, self.callback_ctx, self.callback);
 
             // `onResponderStart` should set the stream's protocol message handler.
             stream.proto_msg_handler.onActivated(stream) catch |err| {
@@ -110,13 +110,13 @@ pub const Switch = struct {
     };
 
     const StreamCallbackCtx = struct {
-        @"switch": *Switch,
+        network_switch: *Switch,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
         fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
             const self: *StreamCallbackCtx = @ptrCast(@alignCast(ctx.?));
-            defer self.@"switch".allocator.destroy(self);
+            defer self.network_switch.allocator.destroy(self);
 
             const stream = res catch |err| {
                 self.callback(self.callback_ctx, err);
@@ -125,7 +125,7 @@ pub const Switch = struct {
 
             // TODO: To use multistreams, we need to find the protocol handler for the stream.
             // For now, we just use the first protocol handler.
-            self.@"switch".proto_handlers.items[0].onInitiatorStart(stream, self.callback_ctx, self.callback);
+            self.network_switch.proto_handlers.items[0].onInitiatorStart(stream, self.callback_ctx, self.callback);
 
             // `onInitiatorStart` should set the stream's protocol message handler.
             stream.proto_msg_handler.onActivated(stream) catch |err| {
@@ -141,7 +141,7 @@ pub const Switch = struct {
     };
 
     const ConnectCallbackCtx = struct {
-        @"switch": *Switch,
+        network_switch: *Switch,
         address: std.net.Address,
         protos: []const []const u8,
         user_callback_ctx: ?*anyopaque,
@@ -149,7 +149,7 @@ pub const Switch = struct {
 
         fn connectCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
             const self: *ConnectCallbackCtx = @ptrCast(@alignCast(ctx.?));
-            defer self.@"switch".allocator.destroy(self);
+            defer self.network_switch.allocator.destroy(self);
 
             const conn = res catch |err| {
                 std.log.warn("Connection failed: {}", .{err});
@@ -159,19 +159,19 @@ pub const Switch = struct {
 
             conn.close_ctx = .{
                 .callback = Switch.onOutgoingConnectionClose,
-                .callback_ctx = self.@"switch",
+                .callback_ctx = self.network_switch,
                 .active_callback = null,
                 .active_callback_ctx = null,
             };
 
-            const address_str = std.fmt.allocPrint(self.@"switch".allocator, "{}", .{self.address}) catch unreachable;
-            self.@"switch".outgoing_connections.put(address_str, conn) catch unreachable;
+            const address_str = std.fmt.allocPrint(self.network_switch.allocator, "{}", .{self.address}) catch unreachable;
+            self.network_switch.outgoing_connections.put(address_str, conn) catch unreachable;
 
             std.log.debug("Connection established to {}", .{self.address});
 
-            const stream_ctx = self.@"switch".allocator.create(StreamCallbackCtx) catch unreachable;
+            const stream_ctx = self.network_switch.allocator.create(StreamCallbackCtx) catch unreachable;
             stream_ctx.* = StreamCallbackCtx{
-                .@"switch" = self.@"switch",
+                .network_switch = self.network_switch,
                 .callback_ctx = self.user_callback_ctx,
                 .callback = self.user_callback,
             };
@@ -199,7 +199,7 @@ pub const Switch = struct {
             // If the connection already exists, we can just create a new stream on it.
             const stream_ctx = self.allocator.create(StreamCallbackCtx) catch unreachable;
             stream_ctx.* = StreamCallbackCtx{
-                .@"switch" = self,
+                .network_switch = self,
                 .callback_ctx = callback_ctx,
                 .callback = callback,
             };
@@ -208,7 +208,7 @@ pub const Switch = struct {
         } else {
             const connect_ctx = self.allocator.create(ConnectCallbackCtx) catch unreachable;
             connect_ctx.* = ConnectCallbackCtx{
-                .@"switch" = self,
+                .network_switch = self,
                 .address = address,
                 .protos = protos,
                 .user_callback_ctx = callback_ctx,
@@ -238,7 +238,7 @@ pub const Switch = struct {
         } else {
             const accept_callback_ctx = self.allocator.create(ListenCallbackCtx) catch unreachable;
             accept_callback_ctx.* = ListenCallbackCtx{
-                .@"switch" = self,
+                .network_switch = self,
                 .callback_ctx = callback_ctx,
                 .callback = callback,
             };

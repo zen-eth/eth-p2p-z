@@ -2,7 +2,7 @@ const std = @import("std");
 const libp2p = @import("../root.zig");
 const quic = libp2p.transport.quic;
 const protocols = libp2p.protocols;
-const @"switch" = @import("../switch.zig");
+const swarm = @import("../switch.zig");
 const io_loop = @import("../thread_event_loop.zig");
 const ssl = @import("ssl");
 const keys_proto = @import("../proto/keys.proto.zig");
@@ -252,7 +252,7 @@ test "discard protocol using switch" {
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
 
-    var switch1: @"switch".Switch = undefined;
+    var switch1: swarm.Switch = undefined;
     switch1.init(allocator, &transport);
     defer {
         switch1.deinit();
@@ -283,7 +283,7 @@ test "discard protocol using switch" {
     var cl_transport: quic.QuicTransport = undefined;
     try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
 
-    var switch2: @"switch".Switch = undefined;
+    var switch2: swarm.Switch = undefined;
     switch2.init(allocator, &cl_transport);
     defer {
         switch2.deinit();
@@ -375,7 +375,7 @@ test "discard protocol using switch with 1MB data" {
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
 
-    var switch1: @"switch".Switch = undefined;
+    var switch1: swarm.Switch = undefined;
     switch1.init(allocator, &transport);
     defer switch1.deinit();
 
@@ -399,7 +399,7 @@ test "discard protocol using switch with 1MB data" {
     var cl_transport: quic.QuicTransport = undefined;
     try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
 
-    var switch2: @"switch".Switch = undefined;
+    var switch2: swarm.Switch = undefined;
     switch2.init(allocator, &cl_transport);
     defer switch2.deinit();
 
