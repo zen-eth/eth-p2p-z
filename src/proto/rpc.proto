@@ -18,7 +18,7 @@ message Message {
 	optional bytes from = 1;
 	optional bytes data = 2;
 	optional bytes seqno = 3;
-	repeated string topicIDs = 4;
+	required string topic = 4;
 	optional bytes signature = 5;
 	optional bytes key = 6;
 }
@@ -33,6 +33,7 @@ message ControlMessage {
 
 message ControlIHave {
 	optional string topicID = 1;
+
 	repeated bytes messageIDs = 2;
 }
 
@@ -61,28 +62,30 @@ message PeerInfo {
 
 message TopicDescriptor {
 	optional string name = 1;
+	// AuthOpts and EncOpts are unused as of Oct 2018, but
+	// are planned to be used in future.
 	optional AuthOpts auth = 2;
 	optional EncOpts enc = 3;
 
 	message AuthOpts {
 		optional AuthMode mode = 1;
-		repeated bytes keys = 2; // root keys to trust
+		repeated bytes keys = 2;
 
 		enum AuthMode {
-			NONE = 0; // no authentication, anyone can publish
-			KEY = 1; // only messages signed by keys in the topic descriptor are accepted
-			WOT = 2; // web of trust, certificates can allow publisher set to grow
+			NONE = 0;
+			KEY = 1;
+			WOT = 2;
 		}
 	}
 
 	message EncOpts {
 		optional EncMode mode = 1;
-		repeated bytes keyHashes = 2; // the hashes of the shared keys used (salted)
+		repeated bytes keyHashes = 2;
 
 		enum EncMode {
-			NONE = 0; // no encryption, anyone can read
-			SHAREDKEY = 1; // messages are encrypted with shared key
-			WOT = 2; // web of trust, certificates can allow publisher set to grow
+			NONE = 0;
+			SHAREDKEY = 1;
+			WOT = 2;
 		}
 	}
 }
