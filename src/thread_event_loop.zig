@@ -342,6 +342,9 @@ pub const ThreadEventLoop = struct {
     pub fn close(self: *Self) void {
         if (self.inEventLoopThread()) {
             self.loop.stop();
+            while (!self.loop.stopped()) {
+                std.time.sleep(1 * std.time.us_per_s);
+            }
             return;
         }
 
