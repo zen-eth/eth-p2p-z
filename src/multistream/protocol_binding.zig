@@ -1,5 +1,6 @@
 const p2p_conn = @import("../conn.zig");
-const ProtocolId = @import("../misc.zig").ProtocolId;
+const libp2p = @import("../root.zig");
+const ProtocolId = libp2p.protocols.ProtocolId;
 const ProtocolDescriptor = @import("./protocol_descriptor.zig").ProtocolDescriptor;
 const std = @import("std");
 

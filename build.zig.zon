@@ -38,8 +38,8 @@
             .hash = "gremlin-0.0.0-E2s91bN4DgDYbb4QNxl4ZT5nEEhNBkk5ngfVasDbsnNF",
         },
         .lsquic = .{
-            .url = "git+https://github.com/zen-eth/lsquic.git#2440030f9f636c00304fa09c064b829eae3376e0",
-            .hash = "lsquic-0.0.0-jO7gdhAXAAAcMreeC2FoU9XUSvzKsnoZeJIryvnTfk62",
+            .url = "git+https://github.com/zen-eth/lsquic.git#585b456f165acd02a68b64c56cf126a596718fac",
+            .hash = "lsquic-0.0.0-jO7gdp8dAADM0lQxub9u0psWph_fUuNTbYWMvpNE_VtY",
         },
     },
     .paths = .{

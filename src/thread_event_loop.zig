@@ -1,10 +1,12 @@
 const std = @import("std");
+const libp2p = @import("root.zig");
 const Allocator = std.mem.Allocator;
 const xev = @import("xev");
 const Intrusive = @import("concurrent/mpsc_queue.zig").Intrusive;
 const Future = @import("concurrent/future.zig").Future;
 const conn = @import("conn.zig");
-const xev_tcp = @import("transport/tcp/xev.zig");
+const xev_tcp = libp2p.transport.tcp;
+const quic = libp2p.transport.quic;
 
 /// Memory pool for managing completion objects in the event loop.
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
@@ -79,6 +81,31 @@ pub const IOAction = union(enum) {
         callback_instance: ?*anyopaque = null,
         /// The timeout for the close operation in milliseconds.
         timeout_ms: u64,
+    },
+    quic_engine_start: struct {
+        engine: *quic.QuicEngine,
+    },
+    quic_connect: struct { engine: *quic.QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void },
+    quic_close_connection: struct {
+        conn: *quic.QuicConnection,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void,
+    },
+    quic_new_stream: struct {
+        conn: *quic.QuicConnection,
+        new_stream_ctx: ?*anyopaque,
+        new_stream_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void,
+    },
+    quic_write_stream: struct {
+        stream: *quic.QuicStream,
+        data: []const u8,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void,
+    },
+    quic_close_stream: struct {
+        stream: *quic.QuicStream,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void,
     },
 };
 
@@ -313,6 +340,11 @@ pub const ThreadEventLoop = struct {
 
     /// Stops the event loop and joins the thread.
     pub fn close(self: *Self) void {
+        if (self.inEventLoopThread()) {
+            self.loop.stop();
+            return;
+        }
+
         self.stop_notifier.notify() catch |err| {
             std.log.warn("Error notifying stop: {}\n", .{err});
         };
@@ -424,6 +456,30 @@ pub const ThreadEventLoop = struct {
                         .callback = action_data.callback,
                     };
                     channel.socket.shutdown(loop, c, CloseCtx, close_ctx, xev_tcp.XevSocketChannel.shutdownCB);
+                },
+                .quic_engine_start => |action_data| {
+                    const engine = action_data.engine;
+                    engine.doStart();
+                },
+                .quic_connect => |action_data| {
+                    const engine = action_data.engine;
+                    engine.doConnect(action_data.peer_address, action_data.callback_ctx, action_data.callback);
+                },
+                .quic_close_connection => |action_data| {
+                    const quic_conn = action_data.conn;
+                    quic_conn.doClose(action_data.callback_ctx, action_data.callback);
+                },
+                .quic_new_stream => |action_data| {
+                    const quic_conn = action_data.conn;
+                    quic_conn.doNewStream(action_data.new_stream_ctx, action_data.new_stream_callback);
+                },
+                .quic_write_stream => |action_data| {
+                    const stream = action_data.stream;
+                    stream.doWrite(action_data.data, action_data.callback_ctx, action_data.callback);
+                },
+                .quic_close_stream => |action_data| {
+                    const stream = action_data.stream;
+                    stream.doClose(action_data.callback_ctx, action_data.callback);
                 },
             }
             self.allocator.destroy(m);
