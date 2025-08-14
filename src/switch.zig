@@ -57,7 +57,8 @@ pub const Switch = struct {
         self.outgoingConnectionCloseAndClean();
         // If there are no connections,`outgoingConnectionCloseAndClean` will be called in current thread so that no need wait.
         if (total_connections > 0) {
-            std.time.sleep(2000 * std.time.ns_per_ms);
+            // TODO: Use wait group to wait for all connections to be closed.
+            std.time.sleep(3000 * std.time.ns_per_ms);
         }
     }
 

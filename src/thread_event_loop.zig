@@ -352,6 +352,9 @@ pub const ThreadEventLoop = struct {
             std.log.warn("Error notifying stop: {}\n", .{err});
         };
 
+        while (!self.loop.stopped()) {
+            std.time.sleep(1 * std.time.us_per_s);
+        }
         self.loop_thread.join();
     }
 
