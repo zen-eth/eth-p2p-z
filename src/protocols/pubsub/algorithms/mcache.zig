@@ -109,6 +109,13 @@ pub const MessageCache = struct {
 
     msg_id_fn: *const fn (ctx: ?*anyopaque, allocator: Allocator, msg: *rpc.Message) anyerror![]const u8,
 
+    const Error = error{
+        DuplicateMessage,
+        MissingTopic,
+        HistoryLengthExceeded,
+        BothFromAndSeqNoNull,
+    };
+
     const PeerTransmissionMap = std.StringHashMap(i32);
 
     const CacheEntry = struct {
@@ -120,7 +127,7 @@ pub const MessageCache = struct {
 
     pub fn init(allocator: Allocator, gossip: usize, history_size: usize, msg_id_ctx: ?*anyopaque, msg_id_fn: fn (ctx: ?*anyopaque, allocator: Allocator, msg: *rpc.Message) anyerror![]const u8) !Self {
         if (gossip > history_size) {
-            return error.InvalidParameters;
+            return error.HistoryLengthExceeded;
         }
 
         var cache = Self{
@@ -271,7 +278,7 @@ pub const MessageCache = struct {
         _ = ctx;
 
         if (msg.from == null and msg.seqno == null) {
-            return error.InvalidParameters;
+            return error.BothFromAndSeqNoNull;
         }
 
         return std.mem.concat(allocator, u8, &.{ msg.from orelse "", msg.seqno orelse "" });
@@ -353,7 +360,7 @@ test "MessageCache.init invalid parameters" {
         5, // history_size
         null, MessageCache.defaultMsgId);
 
-    try testing.expectError(error.InvalidParameters, result);
+    try testing.expectError(error.HistoryLengthExceeded, result);
 }
 
 test "MessageCache.defaultMsgId" {
@@ -387,7 +394,7 @@ test "MessageCache.defaultMsgId invalid parameters" {
 
     const result = MessageCache.defaultMsgId(null, allocator, msg);
 
-    try testing.expectError(error.InvalidParameters, result);
+    try testing.expectError(error.BothFromAndSeqNoNull, result);
 }
 
 test "MessageCache.put and get" {
