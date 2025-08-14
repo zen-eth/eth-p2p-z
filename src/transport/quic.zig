@@ -505,7 +505,9 @@ pub const QuicStream = struct {
 
     active_write: ?WriteRequest,
 
-    proto_msg_handler: protoMsgHandler,
+    proto_msg_handler: ?protoMsgHandler,
+
+    proposed_protocols: ?[]const []const u8,
 
     pub fn init(self: *QuicStream, stream: *lsquic.lsquic_stream_t, conn: *QuicConnection) void {
         self.* = .{
@@ -513,7 +515,8 @@ pub const QuicStream = struct {
             .conn = conn,
             .pending_writes = std.ArrayList(WriteRequest).init(conn.engine.allocator),
             .active_write = null,
-            .proto_msg_handler = undefined,
+            .proto_msg_handler = null,
+            .proposed_protocols = null,
         };
     }
 
@@ -934,7 +937,7 @@ fn onStreamRead(
     while (true) {
         const n_read = lsquic.lsquic_stream_read(s, &buf, buf.len);
         if (n_read > 0) {
-            self.proto_msg_handler.onMessage(self, buf[0..@intCast(n_read)]) catch |err| {
+            self.proto_msg_handler.?.onMessage(self, buf[0..@intCast(n_read)]) catch |err| {
                 std.log.warn("Protocol message handler failed with error: {}. ", .{err});
                 _ = lsquic.lsquic_stream_close(s);
                 return;
@@ -1030,10 +1033,17 @@ fn onStreamClose(
     _: ?*lsquic.lsquic_stream_t,
     stream_ctx: ?*lsquic.lsquic_stream_ctx_t,
 ) callconv(.c) void {
+    if (stream_ctx == null) return;
     const self: *QuicStream = @ptrCast(@alignCast(stream_ctx.?));
-    self.proto_msg_handler.onClose(self) catch |err| {
-        std.log.warn("Protocol message handler failed with error: {}.", .{err});
-    };
+    // When protocol message handler function return error in the `onNewStream` callback,
+    // we want to close the stream immediately, but there is an error thrown by lsquic in the server mode.
+    // In this case, the stream will be closed until the connection closed.
+    // TODO: Can we found a good approach?
+    if (self.proto_msg_handler) |*proto_msg_handler| {
+        proto_msg_handler.onClose(self) catch |err| {
+            std.log.warn("Protocol message handler failed with error: {}.", .{err});
+        };
+    }
     self.deinit();
     self.conn.engine.allocator.destroy(self);
 }
