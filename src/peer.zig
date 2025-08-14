@@ -68,7 +68,7 @@ pub const PeerId = struct {
     /// Parses a PeerId from bytes
     pub fn fromBytes(bytes: []const u8) !Self {
         const mh = try Multihash(64).readBytes(bytes);
-        return fromMultihash(mh);
+        return Self.fromMultihash(mh);
     }
 
     /// Creates a PeerId from a multihash
@@ -157,10 +157,6 @@ pub const PeerId = struct {
     }
 
     pub fn fromString(allocator: Allocator, s: []const u8) !Self {
-        if (s.len == 0) {
-            return ParseError.InputTooShort;
-        }
-
         // Check if it's a bare base58btc encoded multihash
         if (std.mem.startsWith(u8, s, "Qm") or std.mem.startsWith(u8, s, "1")) {
             return try Self.fromBase58(allocator, s);
