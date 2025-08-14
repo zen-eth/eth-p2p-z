@@ -2,11 +2,11 @@ const std = @import("std");
 const libp2p = @import("../root.zig");
 const quic = libp2p.transport.quic;
 const protocols = libp2p.protocols;
-const swarm = @import("../switch.zig");
-const io_loop = @import("../thread_event_loop.zig");
+const swarm = libp2p.swarm;
+const io_loop = libp2p.thread_event_loop;
 const ssl = @import("ssl");
-const keys_proto = @import("../proto/keys.proto.zig");
-const tls = @import("../security/tls.zig");
+const keys_proto = libp2p.protobuf.keys;
+const tls = libp2p.security.tls;
 
 pub const DiscardProtocolHandler = struct {
     allocator: std.mem.Allocator,
