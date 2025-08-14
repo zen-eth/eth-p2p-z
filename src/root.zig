@@ -14,6 +14,7 @@ pub const security = @import("security.zig");
 pub const @"switch" = @import("switch.zig");
 pub const protobuf = @import("protobuf.zig");
 pub const protocols = @import("protocols.zig");
+pub const peer = @import("peer.zig");
 
 test {
     std.testing.refAllDeclsRecursive(@This());

@@ -187,7 +187,7 @@ pub fn buildCert(
 
 /// Encodes a public key into the libp2p PublicKey protobuf format.
 /// The caller owns the returned slice.
-fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
+pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
     const raw_pubkey = try getRawPublicKeyBytes(allocator, pkey);
     defer allocator.free(raw_pubkey);
 
