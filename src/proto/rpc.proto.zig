@@ -266,7 +266,7 @@ const MessageWire = struct {
     const FROM_WIRE: gremlin.ProtoWireNumber = 1;
     const DATA_WIRE: gremlin.ProtoWireNumber = 2;
     const SEQNO_WIRE: gremlin.ProtoWireNumber = 3;
-    const TOPIC_IDS_WIRE: gremlin.ProtoWireNumber = 4;
+    const TOPIC_WIRE: gremlin.ProtoWireNumber = 4;
     const SIGNATURE_WIRE: gremlin.ProtoWireNumber = 5;
     const KEY_WIRE: gremlin.ProtoWireNumber = 6;
 };
@@ -276,7 +276,7 @@ pub const Message = struct {
     from: ?[]const u8 = null,
     data: ?[]const u8 = null,
     seqno: ?[]const u8 = null,
-    topic_i_ds: ?[]const ?[]const u8 = null,
+    topic: ?[]const u8 = null,
     signature: ?[]const u8 = null,
     key: ?[]const u8 = null,
 
@@ -297,14 +297,9 @@ pub const Message = struct {
                 res += gremlin.sizes.sizeWireNumber(MessageWire.SEQNO_WIRE) + gremlin.sizes.sizeUsize(v.len) + v.len;
             }
         }
-        if (self.topic_i_ds) |arr| {
-            for (arr) |maybe_v| {
-                res += gremlin.sizes.sizeWireNumber(MessageWire.TOPIC_IDS_WIRE);
-                if (maybe_v) |v| {
-                    res += gremlin.sizes.sizeUsize(v.len) + v.len;
-                } else {
-                    res += gremlin.sizes.sizeUsize(0);
-                }
+        if (self.topic) |v| {
+            if (v.len > 0) {
+                res += gremlin.sizes.sizeWireNumber(MessageWire.TOPIC_WIRE) + gremlin.sizes.sizeUsize(v.len) + v.len;
             }
         }
         if (self.signature) |v| {
@@ -347,13 +342,9 @@ pub const Message = struct {
                 target.appendBytes(MessageWire.SEQNO_WIRE, v);
             }
         }
-        if (self.topic_i_ds) |arr| {
-            for (arr) |maybe_v| {
-                if (maybe_v) |v| {
-                    target.appendBytes(MessageWire.TOPIC_IDS_WIRE, v);
-                } else {
-                    target.appendBytesTag(MessageWire.TOPIC_IDS_WIRE, 0);
-                }
+        if (self.topic) |v| {
+            if (v.len > 0) {
+                target.appendBytes(MessageWire.TOPIC_WIRE, v);
             }
         }
         if (self.signature) |v| {
@@ -370,18 +361,16 @@ pub const Message = struct {
 };
 
 pub const MessageReader = struct {
-    allocator: std.mem.Allocator,
-    buf: gremlin.Reader,
     _from: ?[]const u8 = null,
     _data: ?[]const u8 = null,
     _seqno: ?[]const u8 = null,
-    _topic_i_ds: ?std.ArrayList([]const u8) = null,
+    _topic: ?[]const u8 = null,
     _signature: ?[]const u8 = null,
     _key: ?[]const u8 = null,
 
-    pub fn init(allocator: std.mem.Allocator, src: []const u8) gremlin.Error!MessageReader {
+    pub fn init(_: std.mem.Allocator, src: []const u8) gremlin.Error!MessageReader {
         var buf = gremlin.Reader.init(src);
-        var res = MessageReader{ .allocator = allocator, .buf = buf };
+        var res = MessageReader{};
         if (buf.buf.len == 0) {
             return res;
         }
@@ -405,13 +394,10 @@ pub const MessageReader = struct {
                     offset += result.size;
                     res._seqno = result.value;
                 },
-                MessageWire.TOPIC_IDS_WIRE => {
+                MessageWire.TOPIC_WIRE => {
                     const result = try buf.readBytes(offset);
                     offset += result.size;
-                    if (res._topic_i_ds == null) {
-                        res._topic_i_ds = std.ArrayList([]const u8).init(allocator);
-                    }
-                    try res._topic_i_ds.?.append(result.value);
+                    res._topic = result.value;
                 },
                 MessageWire.SIGNATURE_WIRE => {
                     const result = try buf.readBytes(offset);
@@ -430,11 +416,8 @@ pub const MessageReader = struct {
         }
         return res;
     }
-    pub fn deinit(self: *const MessageReader) void {
-        if (self._topic_i_ds) |arr| {
-            arr.deinit();
-        }
-    }
+    pub fn deinit(_: *const MessageReader) void {}
+
     pub inline fn getFrom(self: *const MessageReader) []const u8 {
         return self._from orelse &[_]u8{};
     }
@@ -444,11 +427,8 @@ pub const MessageReader = struct {
     pub inline fn getSeqno(self: *const MessageReader) []const u8 {
         return self._seqno orelse &[_]u8{};
     }
-    pub fn getTopicIDs(self: *const MessageReader) []const []const u8 {
-        if (self._topic_i_ds) |arr| {
-            return arr.items;
-        }
-        return &[_][]u8{};
+    pub inline fn getTopic(self: *const MessageReader) []const u8 {
+        return self._topic orelse &[_]u8{};
     }
     pub inline fn getSignature(self: *const MessageReader) []const u8 {
         return self._signature orelse &[_]u8{};
