@@ -188,7 +188,7 @@ pub const MessageCache = struct {
         // Add to history[0] (current window)
         const entry: CacheEntry = .{
             .mid = mid,
-            .topic = cloned_msg.topic.?, // topic should not be null follow the spec
+            .topic = cloned_msg.topic orelse return error.MissingTopic,
         };
         try self.history.items[0].?.append(entry);
     }
@@ -257,10 +257,9 @@ pub const MessageCache = struct {
             last_window.deinit();
         }
 
-        var i: usize = history_len - 1;
-        while (i > 0) {
-            i -= 1;
-            self.history.items[i + 1] = self.history.items[i];
+        // Shift history windows right
+        if (history_len > 1) {
+            std.mem.copyBackwards(?std.ArrayList(CacheEntry), self.history.items[1..], self.history.items[0 .. history_len - 1]);
         }
 
         self.history.items[0] = std.ArrayList(CacheEntry).init(self.allocator);
