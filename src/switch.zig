@@ -273,7 +273,7 @@ pub const Switch = struct {
 
     pub fn listen(
         self: *Switch,
-        address: std.net.Address,
+        address: Multiaddr,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {

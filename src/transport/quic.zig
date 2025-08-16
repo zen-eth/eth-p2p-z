@@ -656,9 +656,10 @@ pub const QuicListener = struct {
     /// Starts listening for incoming QUIC connections on the specified address.
     /// It initializes a UDP socket, binds it to the address, and starts the QUIC engine.
     /// If the listener is already started, it returns an error.
-    pub fn listen(self: *QuicListener, address: std.net.Address) ListenError!void {
-        const socket = try UDP.init(address);
-        try socket.bind(address);
+    pub fn listen(self: *QuicListener, address: Multiaddr) ListenError!void {
+        const addrAndPeerId = try maToStdAddrAndPeerId(address);
+        const socket = try UDP.init(addrAndPeerId.address);
+        try socket.bind(addrAndPeerId.address);
 
         self.engine = undefined;
         const engine_ptr = &self.engine.?;
@@ -1195,8 +1196,8 @@ test "lsquic transport dialing and listening" {
     }.callback);
     defer listener.deinit();
 
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 9997);
-
+    var addr = try Multiaddr.fromString(std.testing.allocator, "/ip4/0.0.0.0/udp/9997");
+    defer addr.deinit();
     try listener.listen(addr);
 
     var loop: io_loop.ThreadEventLoop = undefined;

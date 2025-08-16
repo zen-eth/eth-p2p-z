@@ -240,7 +240,8 @@ pub const DiscardSender = struct {
 
 test "discard protocol using switch" {
     const allocator = std.testing.allocator;
-    const switch1_listen_address = try std.net.Address.parseIp4("127.0.0.1", 8767);
+    const switch1_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/8767");
+    defer switch1_listen_address.deinit();
 
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
@@ -372,7 +373,8 @@ test "discard protocol using switch" {
 
 test "discard protocol using switch with 1MB data" {
     const allocator = std.testing.allocator;
-    const switch1_listen_address = try std.net.Address.parseIp4("127.0.0.1", 8777);
+    const switch1_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/8777");
+    defer switch1_listen_address.deinit();
 
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
@@ -495,7 +497,8 @@ test "discard protocol using switch with 1MB data" {
 
 test "no supported protocols error" {
     const allocator = std.testing.allocator;
-    const switch1_listen_address = try std.net.Address.parseIp4("127.0.0.1", 8867);
+    const switch1_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/8867");
+    defer switch1_listen_address.deinit();
 
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
@@ -521,7 +524,6 @@ test "no supported protocols error" {
 
     var discard_handler = DiscardProtocolHandler.init(allocator);
     defer discard_handler.deinit();
-    // try switch1.addProtocolHandler("discard", discard_handler.any());
 
     try switch1.listen(switch1_listen_address, null, struct {
         pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {
