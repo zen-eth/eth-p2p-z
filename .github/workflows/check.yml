@@ -1,4 +1,4 @@
-name: Zig Test and Benchmark
+name: Zig-libp2p CI
 
 on:
   push:
@@ -14,10 +14,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Cache Zig
-        uses: actions/cache@v3
+        id: cache
+        uses: actions/cache@v4
         with:
           path: ~/zig
           key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}
@@ -33,7 +34,7 @@ jobs:
         run: echo "${HOME}/zig" >> $GITHUB_PATH
 
       - name: Cache Zig build artifacts
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             zig-cache
@@ -48,4 +49,4 @@ jobs:
         run: zig build test --summary all
 
       - name: Building
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseSafe

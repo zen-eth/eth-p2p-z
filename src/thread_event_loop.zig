@@ -7,6 +7,7 @@ const Future = @import("concurrent/future.zig").Future;
 const conn = @import("conn.zig");
 const xev_tcp = libp2p.transport.tcp;
 const quic = libp2p.transport.quic;
+const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 
 /// Memory pool for managing completion objects in the event loop.
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
@@ -85,7 +86,7 @@ pub const IOAction = union(enum) {
     quic_engine_start: struct {
         engine: *quic.QuicEngine,
     },
-    quic_connect: struct { engine: *quic.QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void },
+    quic_connect: struct { engine: *quic.QuicEngine, peer_address: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void },
     quic_close_connection: struct {
         conn: *quic.QuicConnection,
         callback_ctx: ?*anyopaque,

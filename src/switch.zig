@@ -9,6 +9,7 @@ const quic = libp2p.transport.quic;
 const protocols = libp2p.protocols;
 const Allocator = std.mem.Allocator;
 const mss = protocols.mss;
+const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 
 /// The Switch struct is the main entry point for managing connections and protocol handlers.
 /// It acts as a central hub for handling incoming and outgoing connections,
@@ -184,7 +185,7 @@ pub const Switch = struct {
 
     const ConnectCallbackCtx = struct {
         network_switch: *Switch,
-        address: std.net.Address,
+        address: Multiaddr,
         proposed_protocols: []const []const u8,
         user_callback_ctx: ?*anyopaque,
         user_callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
@@ -206,10 +207,14 @@ pub const Switch = struct {
                 .active_callback_ctx = null,
             };
 
-            const address_str = std.fmt.allocPrint(self.network_switch.allocator, "{}", .{self.address}) catch unreachable;
+            const address_str = self.address.toString(self.network_switch.allocator) catch |err| {
+                std.log.warn("Failed to convert address to string: {}", .{err});
+                self.user_callback(self.user_callback_ctx, err);
+                return;
+            };
             self.network_switch.outgoing_connections.put(address_str, conn) catch unreachable;
 
-            std.log.debug("Connection established to {}", .{self.address});
+            std.log.info("Connection established to {s}", .{address_str});
 
             const stream_ctx = self.network_switch.allocator.create(StreamCallbackCtx) catch unreachable;
             stream_ctx.* = StreamCallbackCtx{
@@ -225,7 +230,7 @@ pub const Switch = struct {
 
     pub fn newStream(
         self: *Switch,
-        address: std.net.Address,
+        address: Multiaddr,
         proposed_protocols: []const []const u8,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
@@ -234,7 +239,11 @@ pub const Switch = struct {
             callback(callback_ctx, error.SwitchStopped);
             return;
         }
-        const address_str = std.fmt.allocPrint(self.allocator, "{}", .{address}) catch unreachable;
+        const address_str = address.toString(self.allocator) catch |err| {
+            std.log.warn("Failed to convert address to string: {}", .{err});
+            callback(callback_ctx, err);
+            return;
+        };
         defer self.allocator.free(address_str);
 
         // Check if the connection already exists.

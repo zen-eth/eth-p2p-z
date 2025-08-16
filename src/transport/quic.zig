@@ -15,6 +15,9 @@ const Allocator = std.mem.Allocator;
 const UDP = xev.UDP;
 const posix = std.posix;
 const protoMsgHandler = libp2p.protocols.AnyProtocolMessageHandler;
+const multiaddr = @import("multiformats").multiaddr;
+const Multiaddr = multiaddr.Multiaddr;
+const PeerId = @import("peer_id").PeerId;
 
 // Maximum stream data for bidirectional streams
 const MaxStreamDataBidiRemote = 64 * 1024 * 1024; // 64 MB
@@ -173,8 +176,20 @@ pub const QuicEngine = struct {
     /// If the connection fails, it invokes the callback with an error.
     /// This function is called from the event loop thread to ensure thread safety.
     /// It should not be called directly from other threads.
-    pub fn doConnect(self: *QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+    pub fn doConnect(self: *QuicEngine, peer_address: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+        const addrAndPeerId = maToStdAddrAndPeerId(peer_address) catch |err| {
+            std.log.warn("Failed to convert Multiaddr to std.net.Address and PeerId: {}", .{err});
+            callback(callback_ctx, err);
+            return;
+        };
+
+        if (addrAndPeerId.peer_id == null) {
+            callback(callback_ctx, error.NoPeerIdFound);
+            return;
+        }
+
         self.connect_ctx = .{
+            .peer_id = addrAndPeerId.peer_id.?,
             .address = peer_address,
             .callback_ctx = callback_ctx,
             .callback = callback,
@@ -186,7 +201,7 @@ pub const QuicEngine = struct {
             self.engine,
             lsquic.N_LSQVER,
             @ptrCast(&self.local_address.any),
-            @ptrCast(&peer_address.any),
+            @ptrCast(&addrAndPeerId.address.any),
             self,
             null,
             null,
@@ -206,7 +221,7 @@ pub const QuicEngine = struct {
     /// If the connection fails, it invokes the callback with an error.
     /// This function is not thread-safe and should not be called from multiple threads concurrently.
     /// Queueuing this operation is recommended.
-    pub fn connect(self: *QuicEngine, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+    pub fn connect(self: *QuicEngine, peer_address: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         if (self.connect_ctx != null) {
             callback(callback_ctx, error.AlreadyConnecting);
             return;
@@ -376,7 +391,8 @@ pub const QuicConnection = struct {
     };
 
     pub const ConnectCtx = struct {
-        address: std.net.Address,
+        peer_id: PeerId,
+        address: Multiaddr,
         callback_ctx: ?*anyopaque,
         callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
     };
@@ -723,7 +739,7 @@ pub const QuicTransport = struct {
     /// If the connection fails, it invokes the callback with an error.
     /// This is not thread-safe and should not be called from multiple threads concurrently.
     /// Queueuing this operation is recommended.
-    pub fn dial(self: *QuicTransport, peer_address: std.net.Address, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+    pub fn dial(self: *QuicTransport, peer_address: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
         var dialer = self.getOrCreateDialer(peer_address) catch |err| {
             callback(callback_ctx, err);
             return;
@@ -741,36 +757,40 @@ pub const QuicTransport = struct {
         return listener;
     }
 
-    fn getOrCreateDialer(self: *QuicTransport, peer_address: std.net.Address) !*QuicEngine {
-        switch (peer_address.any.family) {
-            posix.AF.INET => {
-                if (self.dialer_v4) |*dialer| {
-                    return dialer;
-                }
-                const bind_addr = try std.net.Address.parseIp4("0.0.0.0", 0);
-                const socket = try UDP.init(bind_addr);
-                try socket.bind(bind_addr);
+    fn getOrCreateDialer(self: *QuicTransport, peer_address: Multiaddr) !*QuicEngine {
+        var iter = peer_address.iterator();
+        while (try iter.next()) |p| {
+            switch (p) {
+                .Ip4 => {
+                    if (self.dialer_v4) |*dialer| {
+                        return dialer;
+                    }
+                    const bind_addr = try std.net.Address.parseIp4("0.0.0.0", 0);
+                    const socket = try UDP.init(bind_addr);
+                    try socket.bind(bind_addr);
 
-                self.dialer_v4 = undefined;
-                const engine_ptr = &self.dialer_v4.?;
-                try engine_ptr.init(self.allocator, socket, self, true);
-                return engine_ptr;
-            },
-            posix.AF.INET6 => {
-                if (self.dialer_v6) |*dialer| {
-                    return dialer;
-                }
-                const bind_addr = try std.net.Address.parseIp6("::", 0);
-                const socket = try UDP.init(bind_addr);
-                try socket.bind(bind_addr);
+                    self.dialer_v4 = undefined;
+                    const engine_ptr = &self.dialer_v4.?;
+                    try engine_ptr.init(self.allocator, socket, self, true);
+                    return engine_ptr;
+                },
+                .Ip6 => {
+                    if (self.dialer_v6) |*dialer| {
+                        return dialer;
+                    }
+                    const bind_addr = try std.net.Address.parseIp6("::", 0);
+                    const socket = try UDP.init(bind_addr);
+                    try socket.bind(bind_addr);
 
-                self.dialer_v6 = undefined;
-                const engine_ptr = &self.dialer_v6.?;
-                try engine_ptr.init(self.allocator, socket, self, true);
-                return engine_ptr;
-            },
-            else => return error.UnsupportedAddressFamily,
+                    self.dialer_v6 = undefined;
+                    const engine_ptr = &self.dialer_v6.?;
+                    try engine_ptr.init(self.allocator, socket, self, true);
+                    return engine_ptr;
+                },
+                else => continue,
+            }
         }
+        return error.UnsupportedAddressFamily;
     }
 
     fn initSslContext(subject_key: *ssl.EVP_PKEY, cert: *ssl.X509) !*ssl.SSL_CTX {
@@ -1048,6 +1068,43 @@ fn onStreamClose(
     self.conn.engine.allocator.destroy(self);
 }
 
+fn maToStdAddrAndPeerId(ma: Multiaddr) !struct { address: std.net.Address, peer_id: ?PeerId } {
+    var iter = ma.iterator();
+    var ip_addr: ?std.net.Address = null;
+    var port: ?u16 = null;
+    var peer_id: ?PeerId = null;
+
+    while (try iter.next()) |protocol| {
+        switch (protocol) {
+            .Ip4 => |ip4| {
+                ip_addr = .{ .in = ip4 };
+            },
+            .Ip6 => |ip6| {
+                ip_addr = .{ .in6 = ip6 };
+            },
+            .Udp => |udp_port| {
+                port = udp_port;
+            },
+            .P2P => |p2p_id| {
+                peer_id = p2p_id;
+            },
+            else => continue,
+        }
+    }
+
+    if (ip_addr == null) {
+        return error.NoIPAddressFound;
+    }
+
+    if (port == null) {
+        return error.NoPortFound;
+    }
+
+    var result = ip_addr.?;
+    result.setPort(port.?);
+    return .{ .address = result, .peer_id = peer_id };
+}
+
 test "lsquic transport initialization" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
@@ -1116,6 +1173,10 @@ test "lsquic transport dialing and listening" {
 
     defer ssl.EVP_PKEY_free(server_key);
 
+    var pubkey = try tls.createProtobufEncodedPublicKey1(std.testing.allocator, server_key);
+    defer std.testing.allocator.free(pubkey.data.?);
+    const server_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &pubkey);
+
     var server: QuicTransport = undefined;
     try server.init(&server_loop, server_key, keys_proto.KeyType.ECDSA, std.testing.allocator);
 
@@ -1182,7 +1243,10 @@ test "lsquic transport dialing and listening" {
         .conn = undefined,
         .notify = .{},
     };
-    transport.dial(addr, &dial_ctx, DialCtx.callback);
+    var dial_ma = try Multiaddr.fromString(std.testing.allocator, "/ip4/127.0.0.1/udp/9997");
+    try dial_ma.push(.{ .P2P = server_peer_id });
+    defer dial_ma.deinit();
+    transport.dial(dial_ma, &dial_ctx, DialCtx.callback);
     dial_ctx.notify.wait();
 
     dial_ctx.conn.close(null, struct {

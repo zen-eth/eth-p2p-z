@@ -7,6 +7,8 @@ const io_loop = libp2p.thread_event_loop;
 const ssl = @import("ssl");
 const keys_proto = libp2p.protobuf.keys;
 const tls = libp2p.security.tls;
+const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const PeerId = @import("peer_id").PeerId;
 
 pub const DiscardProtocolHandler = struct {
     allocator: std.mem.Allocator,
@@ -252,6 +254,10 @@ test "discard protocol using switch" {
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
 
+    var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
+    defer allocator.free(pubkey.data.?);
+    const server_peer_id = try PeerId.fromPublicKey(allocator, &pubkey);
+
     var switch1: swarm.Switch = undefined;
     switch1.init(allocator, &transport);
     defer {
@@ -314,8 +320,12 @@ test "discard protocol using switch" {
         .mutex = .{},
         .sender = undefined,
     };
+
+    var dial_ma = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/8767");
+    try dial_ma.push(.{ .P2P = server_peer_id });
+    defer dial_ma.deinit();
     switch2.newStream(
-        switch1_listen_address,
+        dial_ma,
         &.{"discard"},
         &callback,
         TestNewStreamCallback.callback,
@@ -338,7 +348,7 @@ test "discard protocol using switch" {
         .sender = undefined,
     };
     switch2.newStream(
-        switch1_listen_address,
+        dial_ma,
         &.{"discard"},
         &callback1,
         TestNewStreamCallback.callback,
@@ -370,6 +380,10 @@ test "discard protocol using switch with 1MB data" {
 
     const host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
+
+    var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
+    defer allocator.free(pubkey.data.?);
+    const server_peer_id = try PeerId.fromPublicKey(allocator, &pubkey);
 
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
@@ -424,7 +438,10 @@ test "discard protocol using switch with 1MB data" {
     };
 
     var callback: TestNewStreamCallback = .{ .mutex = .{}, .sender = undefined };
-    switch2.newStream(switch1_listen_address, &.{"discard"}, &callback, TestNewStreamCallback.callback);
+    var dial_ma = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/8777");
+    try dial_ma.push(.{ .P2P = server_peer_id });
+    defer dial_ma.deinit();
+    switch2.newStream(dial_ma, &.{"discard"}, &callback, TestNewStreamCallback.callback);
     callback.mutex.wait();
     const sender = callback.sender;
 
@@ -488,6 +505,10 @@ test "no supported protocols error" {
 
     const host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
+
+    var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
+    defer allocator.free(pubkey.data.?);
+    const server_peer_id = try PeerId.fromPublicKey(allocator, &pubkey);
 
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
@@ -555,8 +576,12 @@ test "no supported protocols error" {
         .mutex = .{},
         .sender = undefined,
     };
+    var dial_ma = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/8867");
+    try dial_ma.push(.{ .P2P = server_peer_id });
+    defer dial_ma.deinit();
+
     switch2.newStream(
-        switch1_listen_address,
+        dial_ma,
         &.{"discard"},
         &callback,
         TestNewStreamCallback.callback,
