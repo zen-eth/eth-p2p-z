@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v3
 
       - name: Cache Zig
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/zig
           key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}
@@ -33,7 +33,7 @@ jobs:
         run: echo "${HOME}/zig" >> $GITHUB_PATH
 
       - name: Cache Zig build artifacts
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             zig-cache
