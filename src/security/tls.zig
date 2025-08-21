@@ -203,6 +203,7 @@ pub fn createProtobufEncodedPublicKeyBuf(allocator: Allocator, pkey: *ssl.EVP_PK
 /// It returns a `keys_proto.PublicKey` struct instead of a raw byte slice.
 pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) !keys_proto.PublicKey {
     const raw_pubkey = try getRawPublicKeyBytes(allocator, pkey);
+    errdefer allocator.free(raw_pubkey);
 
     const key_type_enum: u8 = blk: {
         const base_id = ssl.EVP_PKEY_base_id(pkey);
@@ -246,6 +247,7 @@ pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY)
 // TODO: peer-id migrated to a separate module, will need to update this function
 pub fn createProtobufEncodedPublicKey1(allocator: Allocator, pkey: *ssl.EVP_PKEY) !keys.PublicKey {
     const raw_pubkey = try getRawPublicKeyBytes(allocator, pkey);
+    errdefer allocator.free(raw_pubkey);
 
     const key_type_enum: u8 = blk: {
         const base_id = ssl.EVP_PKEY_base_id(pkey);

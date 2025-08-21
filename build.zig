@@ -135,13 +135,6 @@ pub fn build(b: *std.Build) void {
         .filters = filters orelse &.{},
     });
 
-    libp2p_lib_unit_tests.root_module.addIncludePath(lsquic_dep.path("include"));
-    libp2p_lib_unit_tests.root_module.addImport("xev", libxev_module);
-    libp2p_lib_unit_tests.root_module.addImport("multiformats", zmultiformats_module);
-    libp2p_lib_unit_tests.root_module.addImport("ssl", ssl_module);
-    libp2p_lib_unit_tests.root_module.addImport("gremlin", gremlin_module);
-    libp2p_lib_unit_tests.root_module.addImport("peer_id", peer_id_module);
-
     libp2p_lib_unit_tests.linkLibrary(lsquic_artifact);
     libp2p_lib_unit_tests.linkSystemLibrary("zlib");
 
@@ -162,7 +155,6 @@ pub fn build(b: *std.Build) void {
     libp2p_exe_unit_tests.root_module.addImport("ssl", ssl_module);
     libp2p_exe_unit_tests.step.dependOn(&protobuf.step);
 
-    libp2p_exe_unit_tests.root_module.addImport("ssl", ssl_module);
     libp2p_exe_unit_tests.linkLibrary(lsquic_artifact);
     libp2p_exe_unit_tests.linkSystemLibrary("zlib");
     // // for exe, lib, tests, etc.
