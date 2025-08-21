@@ -1,13 +1,14 @@
 const proto_binding = @import("../multistream/protocol_binding.zig");
 const ProtocolDescriptor = @import("../multistream/protocol_descriptor.zig").ProtocolDescriptor;
 const ProtocolMatcher = @import("../multistream/protocol_matcher.zig").ProtocolMatcher;
-const ProtocolId = @import("../misc.zig").ProtocolId;
 const Allocator = @import("std").mem.Allocator;
 const p2p_conn = @import("../conn.zig");
 const std = @import("std");
-const security = @import("../security/lib.zig");
+const libp2p = @import("../root.zig");
+const security = libp2p.security;
 const io_loop = @import("../thread_event_loop.zig");
-const xev_tcp = @import("../transport/tcp/lib.zig");
+const xev_tcp = libp2p.transport.tcp;
+const ProtocolId = libp2p.protocols.ProtocolId;
 
 pub const InsecureChannel = struct {
     protocol_descriptor: ProtocolDescriptor,
@@ -140,7 +141,7 @@ pub const InsecureHandler = struct {
         if (self.buffer_pos >= Self.mock_handshake_msg.len) {
             if (std.mem.eql(u8, self.buffer[0..Self.mock_handshake_msg.len], Self.mock_handshake_msg)) {
                 self.handshake_state = .Successful;
-                const session = ctx.pipeline.allocator.create(security.session.Session) catch unreachable;
+                const session = ctx.pipeline.allocator.create(security.Session) catch unreachable;
                 session.* = .{
                     .local_id = "mock_local_id",
                     .remote_id = "mock_remote_id",
@@ -148,11 +149,11 @@ pub const InsecureHandler = struct {
                 };
                 self.on_handshake_callback(self.on_handshake_context, session);
                 if (ctx.conn.direction() == .INBOUND) {
-                    const server_handler = xev_tcp.xev_transport.ServerEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
+                    const server_handler = xev_tcp.ServerEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
                     const server_handler_any = server_handler.any();
                     ctx.pipeline.addLast("server_echo_handler", server_handler_any) catch unreachable;
                 } else {
-                    const client_handler = xev_tcp.xev_transport.ClientEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
+                    const client_handler = xev_tcp.ClientEchoHandler.create(ctx.pipeline.allocator) catch unreachable;
                     const client_handler_any = client_handler.any();
                     ctx.pipeline.addLast("client_echo_handler", client_handler_any) catch unreachable;
                 }

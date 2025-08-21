@@ -30,16 +30,20 @@
             .hash = "libxev-0.0.0-86vtcx8dEwDfl6p4tGVxCygft8oOsggfba9JO-k28J2x",
         },
         .zmultiformats = .{
-            .url = "https://github.com/zen-eth/multiformats-zig/archive/main.tar.gz",
-            .hash = "zmultiformats-0.1.0-6A8pca4MBQAOeUuxppEgwy_j0U_FVNK6h7swLzzDrCZ0",
+            .url = "git+https://github.com/zen-eth/multiformats-zig#acb3945e7f1b2fed18f92f05d321cd1a0a4e32e1",
+            .hash = "zmultiformats-0.1.0-6A8pcdwUBQAgUTaQC5RhH3XBZUgo6-3zQQRO953yVyMA",
         },
         .gremlin = .{
             .url = "git+https://github.com/octopus-foundation/gremlin.zig#fccfe2659f24497199d86404e0ef7dbc79e033d2",
             .hash = "gremlin-0.0.0-E2s91bN4DgDYbb4QNxl4ZT5nEEhNBkk5ngfVasDbsnNF",
         },
         .lsquic = .{
-            .url = "git+https://github.com/zen-eth/lsquic.git#2440030f9f636c00304fa09c064b829eae3376e0",
-            .hash = "lsquic-0.0.0-jO7gdhAXAAAcMreeC2FoU9XUSvzKsnoZeJIryvnTfk62",
+            .url = "git+https://github.com/zen-eth/lsquic.git#585b456f165acd02a68b64c56cf126a596718fac",
+            .hash = "lsquic-0.0.0-jO7gdp8dAADM0lQxub9u0psWph_fUuNTbYWMvpNE_VtY",
+        },
+        .peer_id = .{
+            .url = "git+https://github.com/zen-eth/peer-id#3f9be40ec19f5a85298102dde7c0259f064fb3d8",
+            .hash = "peer_id-0.0.0-jlAlYI9cAACWW0w-GZaf3xAuwXNZhOOGKQtm3CvqcdiK",
         },
     },
     .paths = .{

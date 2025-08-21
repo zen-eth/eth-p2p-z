@@ -4,9 +4,9 @@ const TCP = xev.TCP;
 const Allocator = std.mem.Allocator;
 const ThreadPool = xev.ThreadPool;
 const ResetEvent = std.Thread.ResetEvent;
-const p2p_conn = @import("../../conn.zig");
-const p2p_transport = @import("../../transport.zig");
-const io_loop = @import("../../thread_event_loop.zig");
+const p2p_conn = @import("../conn.zig");
+const p2p_transport = @import("../transport.zig");
+const io_loop = @import("../thread_event_loop.zig");
 
 /// SocketChannel represents a socket channel. It is used to send and receive messages.
 pub const XevSocketChannel = struct {
