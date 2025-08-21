@@ -380,6 +380,8 @@ pub const QuicConnection = struct {
     // Callback context for when a new stream is created in the server mode.
     on_stream_ctx: ?NewStreamCtx,
 
+    security_session: ?libp2p.security.Session1,
+
     pub const Error = error{
         NewStreamNotFinished,
         AlreadyAccepting,
@@ -513,6 +515,17 @@ pub const QuicStream = struct {
         callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void,
     };
 
+    pub const CloseCtx = struct {
+        callback_ctx: ?*anyopaque,
+        // This callback is registered at the time of connection connected,
+        // it is used that the connection is closed not by the user, but by the engine.
+        callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicStream) void,
+        active_callback_ctx: ?*anyopaque,
+        // This callback is passed by the user when closing the connection,
+        // it is called when the connection is closed by the user.
+        active_callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicStream) void,
+    };
+
     stream: *lsquic.lsquic_stream_t,
 
     conn: *QuicConnection,
@@ -525,6 +538,8 @@ pub const QuicStream = struct {
 
     proposed_protocols: ?[]const []const u8,
 
+    close_ctx: ?CloseCtx,
+
     pub fn init(self: *QuicStream, stream: *lsquic.lsquic_stream_t, conn: *QuicConnection) void {
         self.* = .{
             .stream = stream,
@@ -533,6 +548,7 @@ pub const QuicStream = struct {
             .active_write = null,
             .proto_msg_handler = null,
             .proposed_protocols = null,
+            .close_ctx = null,
         };
     }
 
@@ -574,7 +590,20 @@ pub const QuicStream = struct {
         }
     }
 
-    pub fn doClose(self: *QuicStream, _: ?*anyopaque, _: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicStream) void) void {
+    pub fn doClose(self: *QuicStream, callback_ctx: ?*anyopaque, callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicStream) void) void {
+        if (self.close_ctx) |*close_ctx| {
+            // In general we should set the passive close callback in the new stream callback to handle the case io exceptional closed not by application.
+            close_ctx.active_callback_ctx = callback_ctx;
+            close_ctx.active_callback = callback;
+        } else {
+            self.close_ctx = .{
+                .callback_ctx = null,
+                .callback = null,
+                .active_callback_ctx = callback_ctx,
+                .active_callback = callback,
+            };
+        }
+
         _ = lsquic.lsquic_stream_close(self.stream);
         self.conn.engine.processConns();
     }
@@ -879,6 +908,7 @@ fn onNewConn(ctx: ?*anyopaque, conn: ?*lsquic.lsquic_conn_t) callconv(.c) ?*lsqu
     const lsquic_conn: *QuicConnection = engine.allocator.create(QuicConnection) catch unreachable;
     lsquic_conn.* = .{
         .connect_ctx = engine.connect_ctx,
+        .security_session = null,
         .close_ctx = null,
         .new_stream_ctx = null,
         .on_stream_ctx = null,
@@ -1065,11 +1095,22 @@ fn onStreamClose(
             std.log.warn("Protocol message handler failed with error: {}.", .{err});
         };
     }
+    if (self.close_ctx) |close_ctx| {
+        if (close_ctx.callback) |callback| {
+            callback(close_ctx.callback_ctx, self);
+        }
+        if (close_ctx.active_callback) |active_callback| {
+            active_callback(close_ctx.active_callback_ctx, self);
+        }
+    }
     self.deinit();
     self.conn.engine.allocator.destroy(self);
 }
 
-fn maToStdAddrAndPeerId(ma: Multiaddr) !struct { address: std.net.Address, peer_id: ?PeerId } {
+/// Converts a Multiaddr to a standard address and an optional PeerId.
+/// It extracts the IP address, port, and PeerId from the Multiaddr.
+/// TODO: Implement the function to support different transport protocols.
+pub fn maToStdAddrAndPeerId(ma: Multiaddr) !struct { address: std.net.Address, peer_id: ?PeerId } {
     var iter = ma.iterator();
     var ip_addr: ?std.net.Address = null;
     var port: ?u16 = null;

@@ -8,6 +8,8 @@ const conn = @import("conn.zig");
 const xev_tcp = libp2p.transport.tcp;
 const quic = libp2p.transport.quic;
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const PeerId = @import("peer_id").PeerId;
+// const pubsub = libp2p.pubsub;
 
 /// Memory pool for managing completion objects in the event loop.
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
@@ -108,6 +110,18 @@ pub const IOAction = union(enum) {
         callback_ctx: ?*anyopaque,
         callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void,
     },
+    // pubsub_add_peer: struct {
+    //     pubsub: *pubsub.PubSub,
+    //     peer: Multiaddr,
+    //     callback_ctx: ?*anyopaque,
+    //     callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void,
+    // },
+    // pubsub_remove_peer: struct {
+    //     pubsub: *pubsub.PubSub,
+    //     peer: PeerId,
+    //     callback_ctx: ?*anyopaque,
+    //     callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void,
+    // },
 };
 
 /// Represents a queued message for I/O operations in the event loop.
@@ -488,6 +502,14 @@ pub const ThreadEventLoop = struct {
                     const stream = action_data.stream;
                     stream.doClose(action_data.callback_ctx, action_data.callback);
                 },
+                // .pubsub_add_peer => |action_data| {
+                //     const ps = action_data.pubsub;
+                //     ps.doAddPeer(action_data.peer, action_data.callback_ctx, action_data.callback);
+                // },
+                // .pubsub_remove_peer => |action_data| {
+                //     const ps = action_data.pubsub;
+                //     ps.doRemovePeer(action_data.peer, action_data.callback_ctx, action_data.callback);
+                // },
             }
             self.allocator.destroy(m);
         }

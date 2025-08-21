@@ -6,7 +6,6 @@ const testing = std.testing;
 
 pub const concurrent = @import("concurrent.zig");
 pub const conn = @import("conn.zig");
-pub const p2p_transport = @import("transport.zig");
 pub const thread_event_loop = @import("thread_event_loop.zig");
 pub const transport = @import("transport.zig");
 pub const multistream = @import("multistream/lib.zig");
@@ -16,6 +15,12 @@ pub const protobuf = @import("protobuf.zig");
 pub const protocols = @import("protocols.zig");
 pub const peer = @import("peer.zig");
 pub const mcache = @import("protocols/pubsub/algorithms/mcache.zig");
+// pub const pubsub = @import("protocols/pubsub/pubsub.zig");
+
+pub const QuicStream = transport.QuicStream;
+pub const QuicTransport = transport.QuicTransport;
+
+pub const PubSubMessage = protobuf.rpc.Message;
 
 test {
     std.testing.refAllDeclsRecursive(@This());
