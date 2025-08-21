@@ -45,11 +45,11 @@ pub const PeerId = struct {
 
     const Self = @This();
 
-    /// Creates a PeerId from a public key
+    /// Creates a PeerId from a key pair
     /// For keys <= 42 bytes, uses identity multihash
     /// For larger keys, uses SHA2-256 hash
-    pub fn fromPublicKey(allocator: Allocator, public_key: *ssl.EVP_PKEY) !Self {
-        const protobuf_public_key = try tls.createProtobufEncodedPublicKey(allocator, public_key);
+    pub fn fromKeyPair(allocator: Allocator, public_key: *ssl.EVP_PKEY) !Self {
+        const protobuf_public_key = try tls.createProtobufEncodedPublicKeyBuf(allocator, public_key);
         defer allocator.free(protobuf_public_key);
         if (protobuf_public_key.len <= MAX_INLINE_KEY_LENGTH) {
             // Use identity multihash for small keys
@@ -114,6 +114,7 @@ pub const PeerId = struct {
         return try self.multihash.toBytes(dest);
     }
 
+    /// Returns the length of the base58-encoded representation of this PeerId
     pub fn toBase58Len(self: *const Self) usize {
         return multibase.MultiBaseCodec.Base58Btc.encodedLenBySize(self.toBytesLen());
     }
@@ -156,6 +157,7 @@ pub const PeerId = struct {
         return &self.multihash;
     }
 
+    /// Parses a PeerId from a string
     pub fn fromString(allocator: Allocator, s: []const u8) !Self {
         // Check if it's a bare base58btc encoded multihash
         if (std.mem.startsWith(u8, s, "Qm") or std.mem.startsWith(u8, s, "1")) {
@@ -170,7 +172,7 @@ pub const PeerId = struct {
     }
 };
 
-test "PeerId fromPublicKey with identity multihash" {
+test "PeerId fromKeyPair with identity multihash" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
@@ -188,7 +190,7 @@ test "PeerId fromPublicKey with identity multihash" {
     const key = maybe_key orelse return error.OpenSSLFailed;
     defer ssl.EVP_PKEY_free(key);
 
-    const peer_id = try PeerId.fromPublicKey(allocator, key);
+    const peer_id = try PeerId.fromKeyPair(allocator, key);
 
     try testing.expectEqual(MULTIHASH_IDENTITY_CODE, peer_id.multihash.getCode());
 }
@@ -301,7 +303,7 @@ test "PeerId from public key to CID complete flow" {
     const key = maybe_key orelse return error.OpenSSLFailed;
     defer ssl.EVP_PKEY_free(key);
 
-    const peer_id = try PeerId.fromPublicKey(allocator, key);
+    const peer_id = try PeerId.fromKeyPair(allocator, key);
 
     const peer_cid = try peer_id.toCid();
 

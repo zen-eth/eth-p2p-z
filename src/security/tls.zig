@@ -2,6 +2,7 @@ const std = @import("std");
 const ssl = @import("ssl");
 const Allocator = std.mem.Allocator;
 const keys_proto = @import("../proto/keys.proto.zig");
+const keys = @import("peer_id").keys;
 
 pub const ALPN = "libp2p";
 
@@ -162,7 +163,7 @@ pub fn buildCert(
     const signature = try signData(allocator, hostKey, data_to_sign);
     defer allocator.free(signature);
 
-    const host_pubkey_proto = try createProtobufEncodedPublicKey(allocator, hostKey);
+    const host_pubkey_proto = try createProtobufEncodedPublicKeyBuf(allocator, hostKey);
     defer allocator.free(host_pubkey_proto);
 
     var ext_value_der: [*c]u8 = null;
@@ -188,9 +189,21 @@ pub fn buildCert(
 
 /// Encodes a public key into the libp2p PublicKey protobuf format.
 /// The caller owns the returned slice.
-pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
+pub fn createProtobufEncodedPublicKeyBuf(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
+    var public_key_proto = try createProtobufEncodedPublicKey(allocator, pkey);
+    defer allocator.free(public_key_proto.data.?);
+
+    const proto_bytes = try public_key_proto.encode(allocator);
+    return proto_bytes;
+}
+
+/// Encodes a public key into the libp2p PublicKey protobuf format.
+/// The caller owns the returned PublicKey struct.
+/// This function is a convenience wrapper around `createProtobufEncodedPublicKeyBuf`.
+/// It returns a `keys_proto.PublicKey` struct instead of a raw byte slice.
+pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) !keys_proto.PublicKey {
     const raw_pubkey = try getRawPublicKeyBytes(allocator, pkey);
-    defer allocator.free(raw_pubkey);
+    errdefer allocator.free(raw_pubkey);
 
     const key_type_enum: u8 = blk: {
         const base_id = ssl.EVP_PKEY_base_id(pkey);
@@ -218,13 +231,56 @@ pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY)
         return error.UnsupportedKeyType;
     };
 
-    var public_key_proto = keys_proto.PublicKey{
+    const public_key_proto = keys_proto.PublicKey{
         .type = @enumFromInt(key_type_enum),
         .data = raw_pubkey,
     };
 
-    const proto_bytes = try public_key_proto.encode(allocator);
-    return proto_bytes;
+    return public_key_proto;
+}
+
+/// Encodes a public key into the libp2p PublicKey protobuf format.
+/// The caller owns the returned PublicKey struct.
+/// This function is a convenience wrapper around `createProtobufEncodedPublicKeyBuf`.
+/// It returns a `keys.PublicKey` struct instead of a raw byte slice.
+/// This is useful for compatibility with the `keys` module.
+// TODO: peer-id migrated to a separate module, will need to update this function
+pub fn createProtobufEncodedPublicKey1(allocator: Allocator, pkey: *ssl.EVP_PKEY) !keys.PublicKey {
+    const raw_pubkey = try getRawPublicKeyBytes(allocator, pkey);
+    errdefer allocator.free(raw_pubkey);
+
+    const key_type_enum: u8 = blk: {
+        const base_id = ssl.EVP_PKEY_base_id(pkey);
+
+        if (base_id == ssl.EVP_PKEY_RSA) {
+            break :blk 0;
+        }
+        if (base_id == ssl.EVP_PKEY_ED25519) {
+            break :blk 1;
+        }
+        if (base_id == ssl.EVP_PKEY_EC) {
+            const ec_key = ssl.EVP_PKEY_get0_EC_KEY(pkey);
+            if (ec_key == null) return error.OpenSSLFailed;
+            const group = ssl.EC_KEY_get0_group(ec_key);
+            if (group == null) return error.OpenSSLFailed;
+
+            const curve_nid = ssl.EC_GROUP_get_curve_name(group);
+            switch (curve_nid) {
+                // TODO: BoringSSL does not support SECP256K1
+                ssl.NID_secp256k1 => return error.UnsupportedKeyType,
+                ssl.NID_X9_62_prime256v1 => break :blk 3,
+                else => return error.UnsupportedKeyType,
+            }
+        }
+        return error.UnsupportedKeyType;
+    };
+
+    const public_key_proto = keys.PublicKey{
+        .type = @enumFromInt(key_type_enum),
+        .data = raw_pubkey,
+    };
+
+    return public_key_proto;
 }
 
 /// Gets the raw public key bytes from an EVP_PKEY.

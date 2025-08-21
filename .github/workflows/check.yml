@@ -1,4 +1,4 @@
-name: Zig Test and Benchmark
+name: Zig-libp2p CI
 
 on:
   push:
@@ -48,4 +48,4 @@ jobs:
         run: zig build test --summary all
 
       - name: Building
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseSafe
