@@ -1,12 +1,13 @@
 const std = @import("std");
+const libp2p = @import("../root.zig");
 const p2p_conn = @import("../conn.zig");
 const multistream = @import("../multistream/lib.zig").multistream;
 const proto_binding = @import("../multistream/protocol_binding.zig");
 const Multistream = multistream.Multistream;
 const Allocator = std.mem.Allocator;
 const AnyProtocolBinding = proto_binding.AnyProtocolBinding;
-const security = @import("../security/lib.zig");
-const SecuritySession = security.session.Session;
+const security = libp2p.security;
+const SecuritySession = security.Session;
 const io_loop = @import("../thread_event_loop.zig");
 
 /// ConnUpgrader is a struct that manages the security upgrade process for P2P connections.

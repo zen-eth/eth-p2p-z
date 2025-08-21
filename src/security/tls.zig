@@ -2,6 +2,11 @@ const std = @import("std");
 const ssl = @import("ssl");
 const Allocator = std.mem.Allocator;
 const keys_proto = @import("../proto/keys.proto.zig");
+const keys = @import("peer_id").keys;
+
+pub const ALPN = "libp2p";
+
+pub const ALPN_PROTOS = @as([1]u8, .{@intCast(ALPN.len)}) ++ ALPN;
 
 /// This is the prefix libp2p uses for signing the certificate extension.
 const CertificatePrefix = "libp2p-tls-handshake:";
@@ -33,6 +38,74 @@ pub const Error = error{
     SignCertFailed,
     UnsupportedKeyType,
 };
+
+/// Generates a new key pair based on the specified key type.
+/// This is a helper function to encapsulate the complexity of key generation using OpenSSL.
+/// Note: SECP256K1 is not supported and will result in an `Error.UnsupportedKeyType`.
+pub fn generateKeyPair(cert_key_type: keys_proto.KeyType) !*ssl.EVP_PKEY {
+    var maybe_subject_keypair: ?*ssl.EVP_PKEY = null;
+
+    if (cert_key_type == .ECDSA or cert_key_type == .SECP256K1) {
+        const curve_nid = switch (cert_key_type) {
+            .ECDSA => ssl.NID_X9_62_prime256v1,
+            // SECP256K1 is not supported in BoringSSL
+            .SECP256K1 => return error.UnsupportedKeyType,
+            else => unreachable,
+        };
+
+        var maybe_params: ?*ssl.EVP_PKEY = null;
+        {
+            const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_EC, null) orelse return error.OpenSSLFailed;
+            defer ssl.EVP_PKEY_CTX_free(pctx);
+
+            if (ssl.EVP_PKEY_paramgen_init(pctx) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, curve_nid) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_paramgen(pctx, &maybe_params) <= 0) {
+                return error.OpenSSLFailed;
+            }
+        }
+        const params = maybe_params orelse return error.OpenSSLFailed;
+        defer ssl.EVP_PKEY_free(params);
+
+        {
+            const kctx = ssl.EVP_PKEY_CTX_new(params, null) orelse return error.OpenSSLFailed;
+            defer ssl.EVP_PKEY_CTX_free(kctx);
+
+            if (ssl.EVP_PKEY_keygen_init(kctx) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_keygen(kctx, &maybe_subject_keypair) <= 0) {
+                return error.OpenSSLFailed;
+            }
+        }
+    } else {
+        const key_alg_id = switch (cert_key_type) {
+            .ED25519 => ssl.EVP_PKEY_ED25519,
+            .RSA => ssl.EVP_PKEY_RSA,
+            else => unreachable,
+        };
+
+        const pctx = ssl.EVP_PKEY_CTX_new_id(key_alg_id, null) orelse return error.OpenSSLFailed;
+        defer ssl.EVP_PKEY_CTX_free(pctx);
+
+        if (ssl.EVP_PKEY_keygen_init(pctx) <= 0) {
+            return error.OpenSSLFailed;
+        }
+
+        if (ssl.EVP_PKEY_keygen(pctx, &maybe_subject_keypair) <= 0) {
+            return error.OpenSSLFailed;
+        }
+    }
+
+    return maybe_subject_keypair orelse return error.OpenSSLFailed;
+}
 
 /// Builds a self-signed X.509 certificate suitable for libp2p's TLS handshake,
 /// The caller owns the returned certificate and must free it with ssl.X509.free().
@@ -90,7 +163,7 @@ pub fn buildCert(
     const signature = try signData(allocator, hostKey, data_to_sign);
     defer allocator.free(signature);
 
-    const host_pubkey_proto = try createProtobufEncodedPublicKey(allocator, hostKey);
+    const host_pubkey_proto = try createProtobufEncodedPublicKeyBuf(allocator, hostKey);
     defer allocator.free(host_pubkey_proto);
 
     var ext_value_der: [*c]u8 = null;
@@ -99,7 +172,15 @@ pub fn buildCert(
 
     try addExtension(cert, Libp2pExtensionOid, true, ext_value_der[0..@intCast(ext_value_der_len)]);
 
-    if (ssl.X509_sign(cert, subjectKey, null) <= 0) {
+    const message_digest: ?*const ssl.EVP_MD = switch (ssl.EVP_PKEY_base_id(subjectKey)) {
+        ssl.EVP_PKEY_ED25519 => null,
+
+        ssl.EVP_PKEY_EC, ssl.EVP_PKEY_RSA => ssl.EVP_sha256(),
+
+        else => return error.UnsupportedKeyType,
+    };
+
+    if (ssl.X509_sign(cert, subjectKey, message_digest) <= 0) {
         return error.SignCertFailed;
     }
 
@@ -108,9 +189,21 @@ pub fn buildCert(
 
 /// Encodes a public key into the libp2p PublicKey protobuf format.
 /// The caller owns the returned slice.
-fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
+pub fn createProtobufEncodedPublicKeyBuf(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
+    var public_key_proto = try createProtobufEncodedPublicKey(allocator, pkey);
+    defer allocator.free(public_key_proto.data.?);
+
+    const proto_bytes = try public_key_proto.encode(allocator);
+    return proto_bytes;
+}
+
+/// Encodes a public key into the libp2p PublicKey protobuf format.
+/// The caller owns the returned PublicKey struct.
+/// This function is a convenience wrapper around `createProtobufEncodedPublicKeyBuf`.
+/// It returns a `keys_proto.PublicKey` struct instead of a raw byte slice.
+pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) !keys_proto.PublicKey {
     const raw_pubkey = try getRawPublicKeyBytes(allocator, pkey);
-    defer allocator.free(raw_pubkey);
+    errdefer allocator.free(raw_pubkey);
 
     const key_type_enum: u8 = blk: {
         const base_id = ssl.EVP_PKEY_base_id(pkey);
@@ -129,7 +222,8 @@ fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]
 
             const curve_nid = ssl.EC_GROUP_get_curve_name(group);
             switch (curve_nid) {
-                ssl.NID_secp256k1 => break :blk 2,
+                // TODO: BoringSSL does not support SECP256K1
+                ssl.NID_secp256k1 => return error.UnsupportedKeyType,
                 ssl.NID_X9_62_prime256v1 => break :blk 3,
                 else => return error.UnsupportedKeyType,
             }
@@ -137,13 +231,56 @@ fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]
         return error.UnsupportedKeyType;
     };
 
-    var public_key_proto = keys_proto.PublicKey{
+    const public_key_proto = keys_proto.PublicKey{
         .type = @enumFromInt(key_type_enum),
         .data = raw_pubkey,
     };
 
-    const proto_bytes = try public_key_proto.encode(allocator);
-    return proto_bytes;
+    return public_key_proto;
+}
+
+/// Encodes a public key into the libp2p PublicKey protobuf format.
+/// The caller owns the returned PublicKey struct.
+/// This function is a convenience wrapper around `createProtobufEncodedPublicKeyBuf`.
+/// It returns a `keys.PublicKey` struct instead of a raw byte slice.
+/// This is useful for compatibility with the `keys` module.
+// TODO: peer-id migrated to a separate module, will need to update this function
+pub fn createProtobufEncodedPublicKey1(allocator: Allocator, pkey: *ssl.EVP_PKEY) !keys.PublicKey {
+    const raw_pubkey = try getRawPublicKeyBytes(allocator, pkey);
+    errdefer allocator.free(raw_pubkey);
+
+    const key_type_enum: u8 = blk: {
+        const base_id = ssl.EVP_PKEY_base_id(pkey);
+
+        if (base_id == ssl.EVP_PKEY_RSA) {
+            break :blk 0;
+        }
+        if (base_id == ssl.EVP_PKEY_ED25519) {
+            break :blk 1;
+        }
+        if (base_id == ssl.EVP_PKEY_EC) {
+            const ec_key = ssl.EVP_PKEY_get0_EC_KEY(pkey);
+            if (ec_key == null) return error.OpenSSLFailed;
+            const group = ssl.EC_KEY_get0_group(ec_key);
+            if (group == null) return error.OpenSSLFailed;
+
+            const curve_nid = ssl.EC_GROUP_get_curve_name(group);
+            switch (curve_nid) {
+                // TODO: BoringSSL does not support SECP256K1
+                ssl.NID_secp256k1 => return error.UnsupportedKeyType,
+                ssl.NID_X9_62_prime256v1 => break :blk 3,
+                else => return error.UnsupportedKeyType,
+            }
+        }
+        return error.UnsupportedKeyType;
+    };
+
+    const public_key_proto = keys.PublicKey{
+        .type = @enumFromInt(key_type_enum),
+        .data = raw_pubkey,
+    };
+
+    return public_key_proto;
 }
 
 /// Gets the raw public key bytes from an EVP_PKEY.
@@ -271,6 +408,34 @@ fn x509ToPem(allocator: Allocator, cert: *ssl.X509) ![]u8 {
     }
 
     return allocator.dupe(u8, data_ptr[0..@intCast(len)]);
+}
+
+pub fn alpnSelectCallbackfn(ssl_handle: ?*ssl.SSL, out: [*c][*c]const u8, out_len: [*c]u8, in_protos: [*c]const u8, in_len: c_uint, _: ?*anyopaque) callconv(.c) c_int {
+    _ = ssl_handle;
+
+    const mutable_out: [*c][*c]u8 = @ptrCast(out);
+
+    const result: c_int = ssl.SSL_select_next_proto(
+        mutable_out,
+        out_len,
+        ALPN_PROTOS.ptr,
+        @intCast(ALPN_PROTOS.len),
+        in_protos,
+        in_len,
+    );
+
+    if (result == ssl.OPENSSL_NPN_NEGOTIATED) {
+        return ssl.SSL_TLSEXT_ERR_OK;
+    } else {
+        return ssl.SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+}
+
+pub fn libp2pVerifyCallback(cert_ctx: ?*ssl.X509_STORE_CTX, ctx: ?*anyopaque) callconv(.c) c_int {
+    _ = cert_ctx;
+    _ = ctx;
+    // TODO: Implement certificate verification logic if needed.
+    return 1;
 }
 
 test "Build certificate using Ed25519 keys" {

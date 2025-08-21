@@ -1,10 +1,11 @@
 const std = @import("std");
+const libp2p = @import("../root.zig");
 const proto_binding = @import("protocol_binding.zig");
 const AnyProtocolBinding = proto_binding.AnyProtocolBinding;
 const ArrayList = std.ArrayList;
 const p2p_conn = @import("../conn.zig");
 const AnyRxConn = p2p_conn.AnyConn;
-const ProtocolId = @import("../misc.zig").ProtocolId;
+const ProtocolId = libp2p.protocols.ProtocolId;
 const ProtoMatcher = @import("protocol_matcher.zig").ProtocolMatcher;
 const multiformats = @import("multiformats");
 const uvarint = multiformats.uvarint;
@@ -13,7 +14,7 @@ const LinearFifo = std.fifo.LinearFifo;
 const io_loop = @import("../thread_event_loop.zig");
 const Upgrader = @import("../transport/upgrader.zig").ConnUpgrader;
 const insecure = @import("../security/insecure.zig");
-const xev_tcp = @import("../transport/tcp/xev.zig");
+const xev_tcp = libp2p.transport.tcp;
 const p2p_transport = @import("../transport.zig");
 
 pub const Multistream = struct {
