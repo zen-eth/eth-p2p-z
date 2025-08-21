@@ -13,7 +13,7 @@ pub const Semiduplex = struct {
 
     close_ctx: ?*anyopaque,
 
-    close_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*Semiduplex) void,
+    close_callback: ?*const fn (ctx: ?*anyopaque, res: anyerror!*Semiduplex) void,
 
     const Self = @This();
 
@@ -27,7 +27,7 @@ pub const Semiduplex = struct {
             if (self.responder) |resp| {
                 resp.stream.close(self, onIncomingStreamClose);
             } else {
-                std.log.warn("Both initiator and responder are null");
+                std.log.warn("Both initiator and responder are null", .{});
             }
         }
     }
@@ -39,7 +39,7 @@ pub const Semiduplex = struct {
         if (self.responder) |resp| {
             resp.stream.close(self, onIncomingStreamClose);
         } else {
-            self.close_callback(self.close_ctx, self);
+            self.close_callback.?(self.close_ctx, self);
         }
     }
 
@@ -47,7 +47,7 @@ pub const Semiduplex = struct {
         const self: *Semiduplex = @ptrCast(@alignCast(ctx.?));
         _ = res catch unreachable;
 
-        self.close_callback(self.close_ctx, self);
+        self.close_callback.?(self.close_ctx, self);
     }
 };
 

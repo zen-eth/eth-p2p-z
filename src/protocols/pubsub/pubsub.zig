@@ -8,6 +8,7 @@ const PeerId = @import("peer_id").PeerId;
 const Allocator = std.mem.Allocator;
 const io_loop = @import("../../thread_event_loop.zig");
 
+pub const gossipsub = @import("algorithms/gossipsub.zig");
 pub const semiduplex = @import("semiduplex.zig");
 pub const Semiduplex = semiduplex.Semiduplex;
 pub const PubSubPeerInitiator = semiduplex.PubSubPeerInitiator;
@@ -41,10 +42,12 @@ pub const PubSub = struct {
             const stream_initiator: *PubSubPeerInitiator = @ptrCast(@alignCast(initiator.?));
 
             if (self.pubsub) |pubsub| {
-                pubsub.peers.putNoClobber(stream_initiator.stream.conn.security_session.remote_id, Semiduplex{
+                pubsub.peers.putNoClobber(stream_initiator.stream.conn.security_session.?.remote_id, Semiduplex{
                     .initiator = stream_initiator,
                     .responder = null,
                     .allocator = pubsub.allocator,
+                    .close_ctx = null,
+                    .close_callback = null,
                 }) catch |err| {
                     self.callback(self.callback_ctx, err);
                 };
@@ -64,10 +67,7 @@ pub const PubSub = struct {
 
         fn onCloseSemiduplex(ctx: ?*anyopaque, _: anyerror!*Semiduplex) void {
             const self: *RemovePeerCtx = @ptrCast(@alignCast(ctx.?));
-            self.pubsub.peers.remove(self.peer) catch |err| {
-                self.callback(self.callback_ctx, err);
-                return;
-            };
+            _ = self.pubsub.peers.remove(self.peer);
             self.callback(self.callback_ctx, {});
         }
     };
@@ -80,7 +80,7 @@ pub const PubSub = struct {
             .peer = peer,
             .peer_id = peer_id,
             .swarm = swarm,
-            .peers = std.StringHashMap(Semiduplex).init(allocator),
+            .peers = std.AutoHashMap(PeerId, Semiduplex).init(allocator),
         };
     }
 
@@ -187,6 +187,11 @@ pub const PubSub = struct {
                 .peer_id = peer_id,
             };
         }
+
+        responder.stream.close_ctx = .{
+            .callback_ctx = self,
+            .callback = Self.onStreamClose,
+        };
     }
 
     fn onStreamClose(ctx: ?*anyopaque, stream: anyerror!*libp2p.QuicStream) void {
