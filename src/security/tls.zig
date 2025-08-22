@@ -1,8 +1,9 @@
 const std = @import("std");
 const ssl = @import("ssl");
 const Allocator = std.mem.Allocator;
-const keys_proto = @import("../proto/keys.proto.zig");
 const keys = @import("peer_id").keys;
+const keys_proto = @import("../proto/keys.proto.zig");
+const PeerId = @import("peer_id").PeerId;
 
 pub const ALPN = "libp2p";
 
@@ -45,10 +46,79 @@ pub const ExtensionData = struct {
     signature: []u8,
 };
 
+/// TODO: Deprecated when peer-id migrated to blockblaz
 /// Generates a new key pair based on the specified key type.
 /// This is a helper function to encapsulate the complexity of key generation using OpenSSL.
 /// Note: SECP256K1 is not supported and will result in an `Error.UnsupportedKeyType`.
 pub fn generateKeyPair(cert_key_type: keys_proto.KeyType) !*ssl.EVP_PKEY {
+    var maybe_subject_keypair: ?*ssl.EVP_PKEY = null;
+
+    if (cert_key_type == .ECDSA or cert_key_type == .SECP256K1) {
+        const curve_nid = switch (cert_key_type) {
+            .ECDSA => ssl.NID_X9_62_prime256v1,
+            // SECP256K1 is not supported in BoringSSL
+            .SECP256K1 => return error.UnsupportedKeyType,
+            else => unreachable,
+        };
+
+        var maybe_params: ?*ssl.EVP_PKEY = null;
+        {
+            const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_EC, null) orelse return error.OpenSSLFailed;
+            defer ssl.EVP_PKEY_CTX_free(pctx);
+
+            if (ssl.EVP_PKEY_paramgen_init(pctx) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, curve_nid) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_paramgen(pctx, &maybe_params) <= 0) {
+                return error.OpenSSLFailed;
+            }
+        }
+        const params = maybe_params orelse return error.OpenSSLFailed;
+        defer ssl.EVP_PKEY_free(params);
+
+        {
+            const kctx = ssl.EVP_PKEY_CTX_new(params, null) orelse return error.OpenSSLFailed;
+            defer ssl.EVP_PKEY_CTX_free(kctx);
+
+            if (ssl.EVP_PKEY_keygen_init(kctx) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_keygen(kctx, &maybe_subject_keypair) <= 0) {
+                return error.OpenSSLFailed;
+            }
+        }
+    } else {
+        const key_alg_id = switch (cert_key_type) {
+            .ED25519 => ssl.EVP_PKEY_ED25519,
+            .RSA => ssl.EVP_PKEY_RSA,
+            else => unreachable,
+        };
+
+        const pctx = ssl.EVP_PKEY_CTX_new_id(key_alg_id, null) orelse return error.OpenSSLFailed;
+        defer ssl.EVP_PKEY_CTX_free(pctx);
+
+        if (ssl.EVP_PKEY_keygen_init(pctx) <= 0) {
+            return error.OpenSSLFailed;
+        }
+
+        if (ssl.EVP_PKEY_keygen(pctx, &maybe_subject_keypair) <= 0) {
+            return error.OpenSSLFailed;
+        }
+    }
+
+    return maybe_subject_keypair orelse return error.OpenSSLFailed;
+}
+
+/// Generates a new key pair based on the specified key type.
+/// This is a helper function to encapsulate the complexity of key generation using OpenSSL.
+/// Note: SECP256K1 is not supported and will result in an `Error.UnsupportedKeyType`.
+pub fn generateKeyPair1(cert_key_type: keys.KeyType) !*ssl.EVP_PKEY {
     var maybe_subject_keypair: ?*ssl.EVP_PKEY = null;
 
     if (cert_key_type == .ECDSA or cert_key_type == .SECP256K1) {
@@ -334,17 +404,71 @@ fn signData(allocator: Allocator, pkey: *ssl.EVP_PKEY, data: []const u8) ![]u8 {
     return sig_buf;
 }
 
-// fn extractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !struct {host_pubkey: keys.PublicKey,peer_id:PeerId,signature:[]u8} {
-//     const subject = ssl.X509_get_subject_name(cert);
-//     if (subject == null) return error.OpenSSLFailed;
+fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !struct { is_valid: bool, host_pubkey: keys.PublicKey, peer_id: PeerId } {
+    const ext_data = try extractExtensionFields(allocator, cert);
+    defer {
+        allocator.free(ext_data.host_pubkey);
+        allocator.free(ext_data.signature);
+    }
 
-//     const common_name = ssl.X509_NAME_get_text_by_NID(subject, ssl.NID_commonName);
-//     if (common_name == null) return error.OpenSSLFailed;
+    const host_pubkey_reader = try keys.PublicKeyReader.init(allocator, ext_data.host_pubkey);
 
-//     return PeerInfo{
-//         .common_name = try allocator.dupe(u8, common_name),
-//     };
-// }
+    var host_pubkey = keys.PublicKey{
+        .type = host_pubkey_reader.getType(),
+        .data = try allocator.dupe(u8, host_pubkey_reader.getData()),
+    };
+
+    const evp_key = try reconstructEvpKeyFromPublicKey(&host_pubkey);
+    defer ssl.EVP_PKEY_free(evp_key);
+
+    const peer_id = try PeerId.fromPublicKey(allocator, &host_pubkey);
+
+    const cert_pkey = ssl.X509_get_pubkey(cert);
+    if (cert_pkey == null) return error.InvalidCertificate;
+    defer ssl.EVP_PKEY_free(cert_pkey);
+
+    var cert_pubkey_ptr: [*c]u8 = null;
+    const cert_pubkey_len = ssl.i2d_PUBKEY(cert_pkey, &cert_pubkey_ptr);
+    if (cert_pubkey_len <= 0) return error.InvalidCertificate;
+    defer ssl.OPENSSL_free(cert_pubkey_ptr);
+    const cert_pubkey_der = cert_pubkey_ptr[0..@intCast(cert_pubkey_len)];
+
+    const data_to_verify = try allocator.alloc(u8, CertificatePrefix.len + cert_pubkey_der.len);
+    defer allocator.free(data_to_verify);
+    @memcpy(data_to_verify[0..CertificatePrefix.len], CertificatePrefix);
+    @memcpy(data_to_verify[CertificatePrefix.len..], cert_pubkey_der);
+
+    const is_valid = verifySignature(evp_key, data_to_verify, ext_data.signature);
+    return .{ .is_valid = is_valid, .host_pubkey = host_pubkey, .peer_id = peer_id };
+}
+
+fn reconstructEvpKeyFromPublicKey(public_key: *const keys.PublicKey) !*ssl.EVP_PKEY {
+    switch (public_key.type) {
+        .ED25519 => {
+            if (public_key.data.?.len != 32) {
+                return error.InvalidKeyLength;
+            }
+            return ssl.EVP_PKEY_new_raw_public_key(ssl.EVP_PKEY_ED25519, null, // engine parameter (not used)
+                public_key.data.?.ptr, public_key.data.?.len) orelse error.OpenSSLFailed;
+        },
+
+        .RSA => {
+            var key_ptr: [*c]const u8 = public_key.data.?.ptr;
+            return ssl.d2i_PUBKEY(null, &key_ptr, @intCast(public_key.data.?.len)) orelse error.OpenSSLFailed;
+        },
+
+        .ECDSA => {
+            var key_ptr: [*c]const u8 = public_key.data.?.ptr;
+            return ssl.d2i_PUBKEY(null, &key_ptr, @intCast(public_key.data.?.len)) orelse error.OpenSSLFailed;
+        },
+
+        .SECP256K1 => {
+            return error.UnsupportedKeyType; // BoringSSL not supported
+        },
+
+        else => return error.UnsupportedKeyType,
+    }
+}
 
 fn extractExtensionFields(allocator: Allocator, cert: *const ssl.X509) !ExtensionData {
     const obj = ssl.OBJ_txt2obj(Libp2pExtensionOid, 1) orelse return error.InvalidOID;
@@ -416,36 +540,6 @@ fn parseExtensionSequence(allocator: Allocator, der_data: []const u8) !Extension
     const signature = try allocator.dupe(u8, sig_data[0..@intCast(sig_len)]);
 
     return .{ .host_pubkey = host_pubkey, .signature = signature };
-}
-
-/// Verifies the libp2p extension signature against the certificate's public key.
-/// This validates that the signature in the extension was created by the host key.
-pub fn verifyExtensionSignature(allocator: Allocator, cert: *const ssl.X509, host_pkey: *ssl.EVP_PKEY) !bool {
-    // Extract the extension data
-    const ext_data = extractExtensionFields(allocator, cert) catch |err| {
-        std.log.warn("Failed to extract extension data: {}", .{err});
-        return false;
-    };
-    defer allocator.free(ext_data.host_pubkey);
-    defer allocator.free(ext_data.signature);
-
-    const cert_pkey = ssl.X509_get_pubkey(cert);
-    if (cert_pkey == null) return false;
-    defer ssl.EVP_PKEY_free(cert_pkey);
-
-    var cert_pubkey_ptr: [*c]u8 = null;
-    const cert_pubkey_len = ssl.i2d_PUBKEY(cert_pkey, &cert_pubkey_ptr);
-    if (cert_pubkey_len <= 0) return false;
-    defer ssl.OPENSSL_free(cert_pubkey_ptr);
-    const cert_pubkey_der = cert_pubkey_ptr[0..@intCast(cert_pubkey_len)];
-
-    const data_to_verify = try allocator.alloc(u8, CertificatePrefix.len + cert_pubkey_der.len);
-    defer allocator.free(data_to_verify);
-    @memcpy(data_to_verify[0..CertificatePrefix.len], CertificatePrefix);
-    @memcpy(data_to_verify[CertificatePrefix.len..], cert_pubkey_der);
-
-    // Verify the signature
-    return verifySignature(host_pkey, data_to_verify, ext_data.signature);
 }
 
 /// Verifies a signature using the provided public key.
@@ -621,4 +715,40 @@ test "Build certificate using Ed25519 keys" {
     const pem_buf = try x509ToPem(std.testing.allocator, cert);
     defer std.testing.allocator.free(pem_buf);
     try file.writeAll(pem_buf);
+}
+
+test "Verify certificate with Ed25519 keys" {
+    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_host_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
+
+    defer ssl.EVP_PKEY_free(host_key);
+
+    const sctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+
+    if (ssl.EVP_PKEY_keygen_init(sctx) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_subject_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(sctx, &maybe_subject_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const subject_key = maybe_subject_key orelse return error.OpenSSLFailed;
+
+    defer ssl.EVP_PKEY_free(subject_key);
+
+    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    defer ssl.X509_free(cert);
+
+    const peer_info = try verifyAndExtractPeerInfo(std.testing.allocator, cert);
+    std.testing.allocator.free(peer_info.host_pubkey.data.?);
+
+    try std.testing.expect(peer_info.is_valid);
+    try std.testing.expect(peer_info.host_pubkey.type == .ED25519);
 }
