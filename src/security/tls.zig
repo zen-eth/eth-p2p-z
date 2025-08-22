@@ -37,6 +37,12 @@ pub const Error = error{
     SignDataFailed,
     SignCertFailed,
     UnsupportedKeyType,
+    IncompatibleCertificateExtension,
+};
+
+pub const ExtensionData = struct {
+    host_pubkey: []u8,
+    signature: []u8,
 };
 
 /// Generates a new key pair based on the specified key type.
@@ -326,6 +332,139 @@ fn signData(allocator: Allocator, pkey: *ssl.EVP_PKEY, data: []const u8) ![]u8 {
         return error.CertSignCreationFailed;
     }
     return sig_buf;
+}
+
+// fn extractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !struct {host_pubkey: keys.PublicKey,peer_id:PeerId,signature:[]u8} {
+//     const subject = ssl.X509_get_subject_name(cert);
+//     if (subject == null) return error.OpenSSLFailed;
+
+//     const common_name = ssl.X509_NAME_get_text_by_NID(subject, ssl.NID_commonName);
+//     if (common_name == null) return error.OpenSSLFailed;
+
+//     return PeerInfo{
+//         .common_name = try allocator.dupe(u8, common_name),
+//     };
+// }
+
+fn extractExtensionFields(allocator: Allocator, cert: *const ssl.X509) !ExtensionData {
+    const obj = ssl.OBJ_txt2obj(Libp2pExtensionOid, 1) orelse return error.InvalidOID;
+    defer ssl.ASN1_OBJECT_free(obj);
+    const index = ssl.X509_get_ext_by_OBJ(cert, obj, -1);
+    if (index < 0) {
+        std.log.warn("Certificate does not contain the required extension", .{});
+        return error.IncompatibleCertificateExtension;
+    }
+
+    const ext = ssl.X509_get_ext(cert, index);
+
+    const os = ssl.X509_EXTENSION_get_data(ext);
+
+    const raw_len = ssl.ASN1_STRING_length(@ptrCast(os));
+    const raw_data = ssl.ASN1_STRING_get0_data(@ptrCast(os));
+
+    if (raw_data == null or raw_len <= 0) {
+        return error.IncompatibleCertificateExtension;
+    }
+
+    return parseExtensionSequence(allocator, raw_data[0..@intCast(raw_len)]);
+}
+
+/// Parses the ASN.1 SEQUENCE from the extension data.
+/// The sequence contains two OCTET STRINGs: host public key and signature.
+fn parseExtensionSequence(allocator: Allocator, der_data: []const u8) !ExtensionData {
+    var data_ptr: [*c]const u8 = der_data.ptr;
+    const seq_stack = ssl.d2i_ASN1_SEQUENCE_ANY(null, &data_ptr, @intCast(der_data.len));
+    if (seq_stack == null) {
+        return error.IncompatibleCertificateExtension;
+    }
+    defer ssl.sk_ASN1_TYPE_free(seq_stack);
+
+    const num_items = ssl.sk_ASN1_TYPE_num(seq_stack);
+    if (num_items != 2) {
+        std.log.warn("Extension sequence should contain exactly 2 items, found {}", .{num_items});
+        return error.IncompatibleCertificateExtension;
+    }
+
+    // Extract first OCTET STRING (host public key)
+    const host_key_type = ssl.sk_ASN1_TYPE_value(seq_stack, 0);
+    if (host_key_type == null or ssl.ASN1_TYPE_get(host_key_type) != ssl.V_ASN1_OCTET_STRING) {
+        return error.IncompatibleCertificateExtension;
+    }
+
+    const host_key_os = host_key_type.*.value.octet_string;
+    if (host_key_os == null) {
+        return error.IncompatibleCertificateExtension;
+    }
+
+    const host_key_len = ssl.ASN1_STRING_length(@ptrCast(host_key_os));
+    const host_key_data = ssl.ASN1_STRING_get0_data(@ptrCast(host_key_os));
+    const host_pubkey = try allocator.dupe(u8, host_key_data[0..@intCast(host_key_len)]);
+    errdefer allocator.free(host_pubkey);
+
+    const sig_type = ssl.sk_ASN1_TYPE_value(seq_stack, 1);
+    if (sig_type == null or ssl.ASN1_TYPE_get(sig_type) != ssl.V_ASN1_OCTET_STRING) {
+        return error.IncompatibleCertificateExtension;
+    }
+
+    const sig_os = sig_type.*.value.octet_string;
+    if (sig_os == null) {
+        return error.IncompatibleCertificateExtension;
+    }
+
+    const sig_len = ssl.ASN1_STRING_length(@ptrCast(sig_os));
+    const sig_data = ssl.ASN1_STRING_get0_data(@ptrCast(sig_os));
+    const signature = try allocator.dupe(u8, sig_data[0..@intCast(sig_len)]);
+
+    return .{ .host_pubkey = host_pubkey, .signature = signature };
+}
+
+/// Verifies the libp2p extension signature against the certificate's public key.
+/// This validates that the signature in the extension was created by the host key.
+pub fn verifyExtensionSignature(allocator: Allocator, cert: *const ssl.X509, host_pkey: *ssl.EVP_PKEY) !bool {
+    // Extract the extension data
+    const ext_data = extractExtensionFields(allocator, cert) catch |err| {
+        std.log.warn("Failed to extract extension data: {}", .{err});
+        return false;
+    };
+    defer allocator.free(ext_data.host_pubkey);
+    defer allocator.free(ext_data.signature);
+
+    const cert_pkey = ssl.X509_get_pubkey(cert);
+    if (cert_pkey == null) return false;
+    defer ssl.EVP_PKEY_free(cert_pkey);
+
+    var cert_pubkey_ptr: [*c]u8 = null;
+    const cert_pubkey_len = ssl.i2d_PUBKEY(cert_pkey, &cert_pubkey_ptr);
+    if (cert_pubkey_len <= 0) return false;
+    defer ssl.OPENSSL_free(cert_pubkey_ptr);
+    const cert_pubkey_der = cert_pubkey_ptr[0..@intCast(cert_pubkey_len)];
+
+    const data_to_verify = try allocator.alloc(u8, CertificatePrefix.len + cert_pubkey_der.len);
+    defer allocator.free(data_to_verify);
+    @memcpy(data_to_verify[0..CertificatePrefix.len], CertificatePrefix);
+    @memcpy(data_to_verify[CertificatePrefix.len..], cert_pubkey_der);
+
+    // Verify the signature
+    return verifySignature(host_pkey, data_to_verify, ext_data.signature);
+}
+
+/// Verifies a signature using the provided public key.
+fn verifySignature(pkey: *ssl.EVP_PKEY, data: []const u8, signature: []const u8) bool {
+    const ctx = ssl.EVP_MD_CTX_new() orelse return false;
+    defer ssl.EVP_MD_CTX_free(ctx);
+
+    const message_digest: ?*const ssl.EVP_MD = switch (ssl.EVP_PKEY_base_id(pkey)) {
+        ssl.EVP_PKEY_ED25519 => null,
+        ssl.EVP_PKEY_EC, ssl.EVP_PKEY_RSA => ssl.EVP_sha256(),
+        else => return false,
+    };
+
+    if (ssl.EVP_DigestVerifyInit(ctx, null, message_digest, null, pkey) <= 0) {
+        return false;
+    }
+
+    const result = ssl.EVP_DigestVerify(ctx, signature.ptr, signature.len, data.ptr, data.len);
+    return result == 1;
 }
 
 /// Creates the DER-encoded value for the libp2p extension.
