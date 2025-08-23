@@ -813,8 +813,7 @@ pub const QuicTransport = struct {
         // This callback is used to verify the peer's certificate.
         // It is set to verify the peer's certificate and fail if no peer certificate is provided.
         // It also sets the callback for certificate verification.
-        ssl.SSL_CTX_set_verify(ssl_ctx, ssl.SSL_VERIFY_PEER | ssl.SSL_VERIFY_FAIL_IF_NO_PEER_CERT | ssl.SSL_VERIFY_CLIENT_ONCE, null);
-        ssl.SSL_CTX_set_cert_verify_callback(ssl_ctx, tls.libp2pVerifyCallback, null);
+        ssl.SSL_CTX_set_verify(ssl_ctx, ssl.SSL_VERIFY_PEER | ssl.SSL_VERIFY_FAIL_IF_NO_PEER_CERT | ssl.SSL_VERIFY_CLIENT_ONCE, tls.libp2pVerifyCallback);
 
         // Set the certificate algorithm preferences for the SSL context.
         if (ssl.SSL_CTX_set_verify_algorithm_prefs(ssl_ctx, SignatureAlgs.ptr, @intCast(SignatureAlgs.len)) == 0)

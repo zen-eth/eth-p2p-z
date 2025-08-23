@@ -664,11 +664,172 @@ pub fn alpnSelectCallbackfn(ssl_handle: ?*ssl.SSL, out: [*c][*c]const u8, out_le
     }
 }
 
-pub fn libp2pVerifyCallback(cert_ctx: ?*ssl.X509_STORE_CTX, ctx: ?*anyopaque) callconv(.c) c_int {
-    _ = cert_ctx;
-    _ = ctx;
-    // TODO: Implement certificate verification logic if needed.
-    return 1;
+pub fn libp2pVerifyCallback(_: c_int, cert_ctx: ?*ssl.X509_STORE_CTX) callconv(.c) c_int {
+    std.debug.assert(cert_ctx != null);
+
+    const err = ssl.X509_STORE_CTX_get_error(cert_ctx);
+    const err_depth = ssl.X509_STORE_CTX_get_error_depth(cert_ctx);
+
+    const cert = ssl.X509_STORE_CTX_get_current_cert(cert_ctx);
+    if (cert == null) {
+        std.log.warn("No certificate found in verification context", .{});
+        return 0;
+    }
+
+    var subject_name: [256]u8 = std.mem.zeroes([256]u8);
+    const subject_name_ptr = ssl.X509_get_subject_name(cert);
+    if (subject_name_ptr != null) {
+        _ = ssl.X509_NAME_oneline(subject_name_ptr, &subject_name, subject_name.len);
+    }
+
+    var res: c_int = 0;
+    if (err == ssl.X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN or
+        err == ssl.X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT)
+    {
+        res = 1;
+        std.log.debug("Certificate verify callback: subject={s}, error={s} ({}), depth={}, status=ACCEPTED (self-signed)", .{
+            std.mem.sliceTo(&subject_name, 0),
+            x509ErrorToStr(err),
+            err,
+            err_depth,
+        });
+    } else if (err == ssl.X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION) {
+        const is_valid = checkCriticalExtensions(cert.?) catch false;
+        res = if (is_valid) 1 else 0;
+
+        const status_str = if (is_valid) "ACCEPTED (libp2p extension)" else "REJECTED (unknown critical extension)";
+
+        if (is_valid) {
+            std.log.debug("Certificate verify callback: subject={s}, error={s} ({}), depth={}, status={s}", .{
+                std.mem.sliceTo(&subject_name, 0),
+                x509ErrorToStr(err),
+                err,
+                err_depth,
+                status_str,
+            });
+        } else {
+            std.log.warn("Certificate verify callback: subject={s}, error={s} ({}), depth={}, status={s}", .{
+                std.mem.sliceTo(&subject_name, 0),
+                x509ErrorToStr(err),
+                err,
+                err_depth,
+                status_str,
+            });
+        }
+    } else {
+        res = 0;
+        std.log.warn("Certificate verify callback: subject={s}, error={s} ({}), depth={}, status=REJECTED", .{
+            std.mem.sliceTo(&subject_name, 0),
+            x509ErrorToStr(err),
+            err,
+            err_depth,
+        });
+    }
+
+    return res;
+}
+
+fn x509ErrorToStr(error_code: c_int) []const u8 {
+    return switch (error_code) {
+        ssl.X509_V_OK => "ok",
+        ssl.X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT => "unable to get issuer certificate",
+        ssl.X509_V_ERR_UNABLE_TO_GET_CRL => "unable to get certificate CRL",
+        ssl.X509_V_ERR_UNABLE_TO_DECRYPT_CERT_SIGNATURE => "unable to decrypt certificate's signature",
+        ssl.X509_V_ERR_UNABLE_TO_DECRYPT_CRL_SIGNATURE => "unable to decrypt CRL's signature",
+        ssl.X509_V_ERR_UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY => "unable to decode issuer public key",
+        ssl.X509_V_ERR_CERT_SIGNATURE_FAILURE => "certificate signature failure",
+        ssl.X509_V_ERR_CRL_SIGNATURE_FAILURE => "CRL signature failure",
+        ssl.X509_V_ERR_CERT_NOT_YET_VALID => "certificate is not yet valid",
+        ssl.X509_V_ERR_CERT_HAS_EXPIRED => "certificate has expired",
+        ssl.X509_V_ERR_CRL_NOT_YET_VALID => "CRL is not yet valid",
+        ssl.X509_V_ERR_CRL_HAS_EXPIRED => "CRL has expired",
+        ssl.X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD => "format error in certificate's notBefore field",
+        ssl.X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD => "format error in certificate's notAfter field",
+        ssl.X509_V_ERR_ERROR_IN_CRL_LAST_UPDATE_FIELD => "format error in CRL's lastUpdate field",
+        ssl.X509_V_ERR_ERROR_IN_CRL_NEXT_UPDATE_FIELD => "format error in CRL's nextUpdate field",
+        ssl.X509_V_ERR_OUT_OF_MEM => "out of memory",
+        ssl.X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT => "self signed certificate",
+        ssl.X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN => "self signed certificate in certificate chain",
+        ssl.X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY => "unable to get local issuer certificate",
+        ssl.X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE => "unable to verify the first certificate",
+        ssl.X509_V_ERR_CERT_CHAIN_TOO_LONG => "certificate chain too long",
+        ssl.X509_V_ERR_CERT_REVOKED => "certificate revoked",
+        ssl.X509_V_ERR_INVALID_CA => "invalid CA certificate",
+        ssl.X509_V_ERR_PATH_LENGTH_EXCEEDED => "path length constraint exceeded",
+        ssl.X509_V_ERR_INVALID_PURPOSE => "unsupported certificate purpose",
+        ssl.X509_V_ERR_CERT_UNTRUSTED => "certificate not trusted",
+        ssl.X509_V_ERR_CERT_REJECTED => "certificate rejected",
+        ssl.X509_V_ERR_SUBJECT_ISSUER_MISMATCH => "subject issuer mismatch",
+        ssl.X509_V_ERR_AKID_SKID_MISMATCH => "authority and subject key identifier mismatch",
+        ssl.X509_V_ERR_AKID_ISSUER_SERIAL_MISMATCH => "authority and issuer serial number mismatch",
+        ssl.X509_V_ERR_KEYUSAGE_NO_CERTSIGN => "key usage does not include certificate signing",
+        ssl.X509_V_ERR_UNABLE_TO_GET_CRL_ISSUER => "unable to get CRL issuer certificate",
+        ssl.X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION => "unhandled critical extension",
+        ssl.X509_V_ERR_KEYUSAGE_NO_CRL_SIGN => "key usage does not include CRL signing",
+        ssl.X509_V_ERR_UNHANDLED_CRITICAL_CRL_EXTENSION => "unhandled critical CRL extension",
+        ssl.X509_V_ERR_INVALID_NON_CA => "invalid non-CA certificate (has CA markings)",
+        ssl.X509_V_ERR_PROXY_PATH_LENGTH_EXCEEDED => "proxy path length constraint exceeded",
+        ssl.X509_V_ERR_KEYUSAGE_NO_DIGITAL_SIGNATURE => "key usage does not include digital signature",
+        ssl.X509_V_ERR_PROXY_CERTIFICATES_NOT_ALLOWED => "proxy certificates not allowed, please set the appropriate flag",
+        ssl.X509_V_ERR_INVALID_EXTENSION => "invalid or inconsistent certificate extension",
+        ssl.X509_V_ERR_INVALID_POLICY_EXTENSION => "invalid or inconsistent certificate policy extension",
+        ssl.X509_V_ERR_NO_EXPLICIT_POLICY => "no explicit policy",
+        ssl.X509_V_ERR_DIFFERENT_CRL_SCOPE => "different CRL scope",
+        ssl.X509_V_ERR_UNSUPPORTED_EXTENSION_FEATURE => "unsupported extension feature",
+        ssl.X509_V_ERR_UNNESTED_RESOURCE => "RFC 3779 resource not subset of parent's resources",
+        ssl.X509_V_ERR_PERMITTED_VIOLATION => "permitted subtree violation",
+        ssl.X509_V_ERR_EXCLUDED_VIOLATION => "excluded subtree violation",
+        ssl.X509_V_ERR_SUBTREE_MINMAX => "name constraints minimum and maximum not supported",
+        ssl.X509_V_ERR_APPLICATION_VERIFICATION => "application verification failure",
+        ssl.X509_V_ERR_UNSUPPORTED_CONSTRAINT_TYPE => "unsupported name constraint type",
+        ssl.X509_V_ERR_UNSUPPORTED_CONSTRAINT_SYNTAX => "unsupported or invalid name constraint syntax",
+        ssl.X509_V_ERR_UNSUPPORTED_NAME_SYNTAX => "unsupported or invalid name syntax",
+        ssl.X509_V_ERR_CRL_PATH_VALIDATION_ERROR => "CRL path validation error",
+        else => "unknown error",
+    };
+}
+
+fn checkCriticalExtensions(cert: *ssl.X509) !bool {
+    var seen_libp2p_ext = false;
+    const ext_count = ssl.X509_get_ext_count(cert);
+
+    var i: c_int = 0;
+    while (i < ext_count) : (i += 1) {
+        const ext = ssl.X509_get_ext(cert, i) orelse continue;
+
+        if (ssl.X509_EXTENSION_get_critical(ext) == 0) {
+            continue;
+        }
+
+        if (ssl.X509_supported_extension(ext) != 0) {
+            continue;
+        }
+
+        if (seen_libp2p_ext) {
+            std.log.warn("Found unknown critical extension after libp2p extension", .{});
+            return false;
+        }
+
+        const ext_obj = ssl.X509_EXTENSION_get_object(ext) orelse {
+            std.log.warn("Failed to get extension object", .{});
+            return false;
+        };
+
+        const libp2p_oid = ssl.OBJ_txt2obj(Libp2pExtensionOid, 1) orelse {
+            return error.InvalidOID;
+        };
+        defer ssl.ASN1_OBJECT_free(libp2p_oid);
+
+        if (ssl.OBJ_cmp(ext_obj, libp2p_oid) == 0) {
+            seen_libp2p_ext = true;
+            continue;
+        }
+
+        std.log.warn("Found unsupported critical extension", .{});
+        return false;
+    }
+
+    return true;
 }
 
 test "Build certificate using Ed25519 keys" {
