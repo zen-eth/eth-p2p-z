@@ -438,7 +438,7 @@ fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !struct
     @memcpy(data_to_verify[0..CertificatePrefix.len], CertificatePrefix);
     @memcpy(data_to_verify[CertificatePrefix.len..], cert_pubkey_der);
 
-    const is_valid = verifySignature(evp_key, data_to_verify, ext_data.signature);
+    const is_valid = try verifySignature(evp_key, data_to_verify, ext_data.signature);
     return .{ .is_valid = is_valid, .host_pubkey = host_pubkey, .peer_id = peer_id };
 }
 
@@ -452,12 +452,7 @@ fn reconstructEvpKeyFromPublicKey(public_key: *const keys.PublicKey) !*ssl.EVP_P
                 public_key.data.?.ptr, public_key.data.?.len) orelse error.OpenSSLFailed;
         },
 
-        .RSA => {
-            var key_ptr: [*c]const u8 = public_key.data.?.ptr;
-            return ssl.d2i_PUBKEY(null, &key_ptr, @intCast(public_key.data.?.len)) orelse error.OpenSSLFailed;
-        },
-
-        .ECDSA => {
+        .RSA, .ECDSA => {
             var key_ptr: [*c]const u8 = public_key.data.?.ptr;
             return ssl.d2i_PUBKEY(null, &key_ptr, @intCast(public_key.data.?.len)) orelse error.OpenSSLFailed;
         },
@@ -543,22 +538,28 @@ fn parseExtensionSequence(allocator: Allocator, der_data: []const u8) !Extension
 }
 
 /// Verifies a signature using the provided public key.
-fn verifySignature(pkey: *ssl.EVP_PKEY, data: []const u8, signature: []const u8) bool {
-    const ctx = ssl.EVP_MD_CTX_new() orelse return false;
+fn verifySignature(pkey: *ssl.EVP_PKEY, data: []const u8, signature: []const u8) !bool {
+    const ctx = ssl.EVP_MD_CTX_new() orelse return error.OpenSSLFailed;
     defer ssl.EVP_MD_CTX_free(ctx);
 
     const message_digest: ?*const ssl.EVP_MD = switch (ssl.EVP_PKEY_base_id(pkey)) {
         ssl.EVP_PKEY_ED25519 => null,
         ssl.EVP_PKEY_EC, ssl.EVP_PKEY_RSA => ssl.EVP_sha256(),
-        else => return false,
+        else => return error.UnsupportedKeyType,
     };
 
     if (ssl.EVP_DigestVerifyInit(ctx, null, message_digest, null, pkey) <= 0) {
-        return false;
+        return error.OpenSSLFailed;
     }
 
     const result = ssl.EVP_DigestVerify(ctx, signature.ptr, signature.len, data.ptr, data.len);
-    return result == 1;
+    if (result == 1) {
+        return true;
+    } else if (result == 0) {
+        return false;
+    } else {
+        return error.OpenSSLFailed;
+    }
 }
 
 /// Creates the DER-encoded value for the libp2p extension.
@@ -842,29 +843,10 @@ test "Build certificate using Ed25519 keys" {
         }
     };
 
-    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
-        return error.OpenSSLFailed;
-    }
-    var maybe_host_key: ?*ssl.EVP_PKEY = null;
-    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
-        return error.OpenSSLFailed;
-    }
-    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
-
+    const host_key = try generateKeyPair1(.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
 
-    const sctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-
-    if (ssl.EVP_PKEY_keygen_init(sctx) == 0) {
-        return error.OpenSSLFailed;
-    }
-    var maybe_subject_key: ?*ssl.EVP_PKEY = null;
-    if (ssl.EVP_PKEY_keygen(sctx, &maybe_subject_key) == 0) {
-        return error.OpenSSLFailed;
-    }
-    const subject_key = maybe_subject_key orelse return error.OpenSSLFailed;
-
+    const subject_key = try generateKeyPair1(.ED25519);
     defer ssl.EVP_PKEY_free(subject_key);
 
     const cert = try buildCert(std.testing.allocator, host_key, subject_key);
@@ -879,29 +861,10 @@ test "Build certificate using Ed25519 keys" {
 }
 
 test "Verify certificate with Ed25519 keys" {
-    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
-        return error.OpenSSLFailed;
-    }
-    var maybe_host_key: ?*ssl.EVP_PKEY = null;
-    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
-        return error.OpenSSLFailed;
-    }
-    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
-
+    const host_key = try generateKeyPair1(.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
 
-    const sctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-
-    if (ssl.EVP_PKEY_keygen_init(sctx) == 0) {
-        return error.OpenSSLFailed;
-    }
-    var maybe_subject_key: ?*ssl.EVP_PKEY = null;
-    if (ssl.EVP_PKEY_keygen(sctx, &maybe_subject_key) == 0) {
-        return error.OpenSSLFailed;
-    }
-    const subject_key = maybe_subject_key orelse return error.OpenSSLFailed;
-
+    const subject_key = try generateKeyPair1(.ED25519);
     defer ssl.EVP_PKEY_free(subject_key);
 
     const cert = try buildCert(std.testing.allocator, host_key, subject_key);
