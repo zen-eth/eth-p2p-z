@@ -18,6 +18,8 @@ const CertNotBeforeOffsetSeconds = -3600; // 1 hour before current time
 /// The offset to apply to the certificate's notAfter field.
 const CertNotAfterOffsetSeconds = 365 * 24 * 3600; // 1 year after current time
 
+var g_peer_cert: ?*ssl.X509 = null;
+
 pub const Error = error{
     CertCreationFailed,
     CertNameCreationFailed,
@@ -405,7 +407,7 @@ fn signData(allocator: Allocator, pkey: *ssl.EVP_PKEY, data: []const u8) ![]u8 {
     return sig_buf;
 }
 
-fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !struct { is_valid: bool, host_pubkey: keys.PublicKey, peer_id: PeerId } {
+pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !struct { is_valid: bool, host_pubkey: keys.PublicKey, peer_id: PeerId } {
     const ext_data = try extractExtensionFields(allocator, cert);
     defer {
         allocator.free(ext_data.host_pubkey);
@@ -680,6 +682,12 @@ pub fn libp2pVerifyCallback(_: c_int, cert_ctx: ?*ssl.X509_STORE_CTX) callconv(.
         return 0;
     }
 
+    // if (g_peer_cert) |old_cert| {
+    //     ssl.X509_free(old_cert);
+    // }
+    // g_peer_cert = ssl.X509_dup(cert.?);
+    // std.log.debug("Saved certificate to global variable: {*}", .{g_peer_cert});
+
     var subject_name: [256]u8 = std.mem.zeroes([256]u8);
     const subject_name_ptr = ssl.X509_get_subject_name(cert);
     if (subject_name_ptr != null) {
@@ -731,6 +739,19 @@ pub fn libp2pVerifyCallback(_: c_int, cert_ctx: ?*ssl.X509_STORE_CTX) callconv(.
     }
 
     return res;
+}
+
+pub fn takeSavedPeerCertificate() ?*ssl.X509 {
+    const cert = g_peer_cert;
+    g_peer_cert = null;
+    return cert;
+}
+
+pub fn clearSavedPeerCertificate() void {
+    if (g_peer_cert) |cert| {
+        ssl.X509_free(cert);
+        g_peer_cert = null;
+    }
 }
 
 fn x509ErrorToStr(error_code: c_int) []const u8 {

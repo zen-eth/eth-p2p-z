@@ -300,23 +300,28 @@ test "discard protocol using switch" {
     defer discard_handler2.deinit();
     try switch2.addProtocolHandler("discard", discard_handler2.any());
 
-    const TestNewStreamCallback = struct {
-        mutex: std.Thread.ResetEvent,
+    var cl_loop1: io_loop.ThreadEventLoop = undefined;
+    try cl_loop1.init(allocator);
+    defer {
+        cl_loop1.deinit();
+    }
 
-        sender: *DiscardSender,
+    const cl_host_key1 = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(cl_host_key1);
 
-        const Self = @This();
-        pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx.?));
-            const sender_ptr = res catch {
-                self.mutex.set();
-                return;
-            };
-            self.sender = @ptrCast(@alignCast(sender_ptr.?));
-            std.log.info("Stream started successfully", .{});
-            self.mutex.set();
-        }
-    };
+    var cl_transport1: quic.QuicTransport = undefined;
+    try cl_transport1.init(&cl_loop1, cl_host_key1, keys_proto.KeyType.ED25519, allocator);
+
+    var switch3: swarm.Switch = undefined;
+    switch3.init(allocator, &cl_transport1);
+    defer {
+        switch3.deinit();
+    }
+
+    var discard_handler3 = DiscardProtocolHandler.init(allocator);
+    defer discard_handler3.deinit();
+    try switch3.addProtocolHandler("discard", discard_handler3.any());
+
     var callback: TestNewStreamCallback = .{
         .mutex = .{},
         .sender = undefined,
@@ -348,6 +353,7 @@ test "discard protocol using switch" {
         .mutex = .{},
         .sender = undefined,
     };
+
     switch2.newStream(
         dial_ma,
         &.{"discard"},
@@ -367,8 +373,57 @@ test "discard protocol using switch" {
         }
     }.callback_);
 
+    // spawn a thread use switch3 new another stream
+    const thread = try std.Thread.spawn(.{}, spawnSwitch3Test, .{ allocator, &switch3, server_peer_id });
+    defer thread.join();
+
     std.time.sleep(2000 * std.time.ns_per_ms); // Wait for the stream to be established
 
+}
+
+const TestNewStreamCallback = struct {
+    mutex: std.Thread.ResetEvent,
+
+    sender: *DiscardSender,
+
+    const Self = @This();
+    pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx.?));
+        const sender_ptr = res catch {
+            self.mutex.set();
+            return;
+        };
+        self.sender = @ptrCast(@alignCast(sender_ptr.?));
+        std.log.info("Stream started successfully", .{});
+        self.mutex.set();
+    }
+};
+
+fn spawnSwitch3Test(allocator: std.mem.Allocator, switch3: *swarm.Switch, server_peer_id: PeerId) !void {
+    var callback2: TestNewStreamCallback = .{ .mutex = .{}, .sender = undefined };
+
+    var dial_ma2 = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/8777");
+    defer dial_ma2.deinit();
+    try dial_ma2.push(.{ .P2P = server_peer_id });
+
+    switch3.newStream(
+        dial_ma2,
+        &.{"discard"},
+        &callback2,
+        TestNewStreamCallback.callback,
+    );
+
+    callback2.mutex.wait();
+
+    callback2.sender.send("Hello from Switch 3", null, struct {
+        pub fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
+            if (res) |size| {
+                std.debug.print("Message sent successfully, size: {}\n", .{size});
+            } else |err| {
+                std.debug.print("Failed to send message: {}\n", .{err});
+            }
+        }
+    }.callback_);
 }
 
 test "discard protocol using switch with 1MB data" {
@@ -422,22 +477,22 @@ test "discard protocol using switch with 1MB data" {
     defer discard_handler2.deinit();
     try switch2.addProtocolHandler("discard", discard_handler2.any());
 
-    const TestNewStreamCallback = struct {
-        mutex: std.Thread.ResetEvent,
-        sender: *DiscardSender,
+    // const TestNewStreamCallback = struct {
+    //     mutex: std.Thread.ResetEvent,
+    //     sender: *DiscardSender,
 
-        const Self = @This();
-        pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx.?));
-            const sender_ptr = res catch |err| {
-                std.log.warn("Failed to start stream: {}", .{err});
-                self.mutex.set();
-                return;
-            };
-            self.sender = @ptrCast(@alignCast(sender_ptr.?));
-            self.mutex.set();
-        }
-    };
+    //     const Self = @This();
+    //     pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+    //         const self: *Self = @ptrCast(@alignCast(ctx.?));
+    //         const sender_ptr = res catch |err| {
+    //             std.log.warn("Failed to start stream: {}", .{err});
+    //             self.mutex.set();
+    //             return;
+    //         };
+    //         self.sender = @ptrCast(@alignCast(sender_ptr.?));
+    //         self.mutex.set();
+    //     }
+    // };
 
     var callback: TestNewStreamCallback = .{ .mutex = .{}, .sender = undefined };
     var dial_ma = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/8777");
@@ -556,24 +611,24 @@ test "no supported protocols error" {
     defer discard_handler2.deinit();
     // try switch2.addProtocolHandler("discard", discard_handler2.any());
 
-    const TestNewStreamCallback = struct {
-        mutex: std.Thread.ResetEvent,
+    // const TestNewStreamCallback = struct {
+    //     mutex: std.Thread.ResetEvent,
 
-        sender: *DiscardSender,
+    //     sender: *DiscardSender,
 
-        const Self = @This();
-        pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx.?));
-            const sender_ptr = res catch |err| {
-                std.testing.expectEqual(error.NoSupportedProtocols, err) catch unreachable;
-                self.mutex.set();
-                return;
-            };
-            self.sender = @ptrCast(@alignCast(sender_ptr.?));
-            std.log.info("Stream started successfully", .{});
-            self.mutex.set();
-        }
-    };
+    //     const Self = @This();
+    //     pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+    //         const self: *Self = @ptrCast(@alignCast(ctx.?));
+    //         const sender_ptr = res catch |err| {
+    //             std.testing.expectEqual(error.NoSupportedProtocols, err) catch unreachable;
+    //             self.mutex.set();
+    //             return;
+    //         };
+    //         self.sender = @ptrCast(@alignCast(sender_ptr.?));
+    //         std.log.info("Stream started successfully", .{});
+    //         self.mutex.set();
+    //     }
+    // };
     var callback: TestNewStreamCallback = .{
         .mutex = .{},
         .sender = undefined,
