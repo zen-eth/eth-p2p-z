@@ -39,6 +39,7 @@ pub const Error = error{
     SignCertFailed,
     UnsupportedKeyType,
     IncompatibleCertificateExtension,
+    InvalidKeyLength,
 };
 
 pub const ExtensionData = struct {
@@ -443,18 +444,20 @@ fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !struct
 }
 
 fn reconstructEvpKeyFromPublicKey(public_key: *const keys.PublicKey) !*ssl.EVP_PKEY {
+    const key_data = public_key.data orelse return error.RawPubKeyGetFailed;
+
     switch (public_key.type) {
         .ED25519 => {
-            if (public_key.data.?.len != 32) {
+            if (key_data.len != 32) {
                 return error.InvalidKeyLength;
             }
             return ssl.EVP_PKEY_new_raw_public_key(ssl.EVP_PKEY_ED25519, null, // engine parameter (not used)
-                public_key.data.?.ptr, public_key.data.?.len) orelse error.OpenSSLFailed;
+                key_data.ptr, key_data.len) orelse error.OpenSSLFailed;
         },
 
         .RSA, .ECDSA => {
-            var key_ptr: [*c]const u8 = public_key.data.?.ptr;
-            return ssl.d2i_PUBKEY(null, &key_ptr, @intCast(public_key.data.?.len)) orelse error.OpenSSLFailed;
+            var key_ptr: [*c]const u8 = key_data.ptr;
+            return ssl.d2i_PUBKEY(null, &key_ptr, @intCast(key_data.len)) orelse error.OpenSSLFailed;
         },
 
         .SECP256K1 => {
@@ -794,6 +797,11 @@ fn checkCriticalExtensions(cert: *ssl.X509) !bool {
     var seen_libp2p_ext = false;
     const ext_count = ssl.X509_get_ext_count(cert);
 
+    const libp2p_oid = ssl.OBJ_txt2obj(Libp2pExtensionOid, 1) orelse {
+        return error.InvalidOID;
+    };
+    defer ssl.ASN1_OBJECT_free(libp2p_oid);
+
     var i: c_int = 0;
     while (i < ext_count) : (i += 1) {
         const ext = ssl.X509_get_ext(cert, i) orelse continue;
@@ -815,11 +823,6 @@ fn checkCriticalExtensions(cert: *ssl.X509) !bool {
             std.log.warn("Failed to get extension object", .{});
             return false;
         };
-
-        const libp2p_oid = ssl.OBJ_txt2obj(Libp2pExtensionOid, 1) orelse {
-            return error.InvalidOID;
-        };
-        defer ssl.ASN1_OBJECT_free(libp2p_oid);
 
         if (ssl.OBJ_cmp(ext_obj, libp2p_oid) == 0) {
             seen_libp2p_ext = true;
