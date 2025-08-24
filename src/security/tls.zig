@@ -18,6 +18,12 @@ const CertNotBeforeOffsetSeconds = -3600; // 1 hour before current time
 /// The offset to apply to the certificate's notAfter field.
 const CertNotAfterOffsetSeconds = 365 * 24 * 3600; // 1 year after current time
 
+// There is no approach to get cert in the lsquic `onHskDone` callback, but we need it to verify the peer's identity.
+// So we store it in a thread-local variable. It assumes that the callback will be called in the same thread for each engine,
+// and that multiple connections will not be handled concurrently in the same thread.
+// cpp-libp2p fork the lsquic library and add a function to retrieve the peer certificate.
+// https://github.com/libp2p/cpp-libp2p/blob/c386b481410af1910c23f96aec81789410204dbd/vcpkg-overlay/liblsquic/lsquic_conn_ssl.patch .
+// TODO: If thread-local storage is not suitable, consider apply that patch.
 threadlocal var g_peer_cert: ?*ssl.X509 = null;
 
 pub const Error = error{
