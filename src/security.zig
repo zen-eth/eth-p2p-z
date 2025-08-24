@@ -1,6 +1,6 @@
 const std = @import("std");
-const libp2p = @import("root.zig");
 const PeerId = @import("peer_id").PeerId;
+const PublicKey = @import("peer_id").PublicKey;
 
 pub const plain = @import("security/plain.zig");
 pub const insecure = @import("security/insecure.zig");
@@ -15,5 +15,5 @@ pub const Session = struct {
 pub const Session1 = struct {
     local_id: PeerId,
     remote_id: PeerId,
-    remote_public_key: libp2p.protobuf.keys.PublicKey,
+    remote_public_key: PublicKey,
 };
