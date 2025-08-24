@@ -908,40 +908,38 @@ fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_status
     } else {
         const lsquic_conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(conn.?)));
 
-        // const cert = tls.takeSavedPeerCertificate();
-        // if (cert == null) {
-        //     std.log.warn("No peer certificate available from verify callback, closing connection.\n", .{});
-        //     _ = lsquic.lsquic_conn_close(conn);
-        //     return;
-        // }
-        // defer ssl.X509_free(cert);
+        const cert = tls.takeSavedPeerCertificate();
+        if (cert == null) {
+            std.log.warn("No peer certificate available from verify callback, closing connection.\n", .{});
+            _ = lsquic.lsquic_conn_close(conn);
+            return;
+        }
+        defer ssl.X509_free(cert);
 
-        // std.log.debug("Retrieved saved certificate: {*}", .{cert});
-
-        // const peer_info = tls.verifyAndExtractPeerInfo(lsquic_conn.engine.allocator, cert.?) catch |err| {
-        //     std.log.warn("Failed to verify and extract peer info: {}", .{err});
-        //     _ = lsquic.lsquic_conn_close(conn);
-        //     return;
-        // };
-        // if (!peer_info.is_valid) {
-        //     std.log.warn("Invalid peer certificate, closing connection.\n", .{});
-        //     _ = lsquic.lsquic_conn_close(conn);
-        //     return;
-        // }
-        // lsquic_conn.security_session = SecuritySession{
-        //     // TODO: need add local id later
-        //     .local_id = undefined,
-        //     .remote_id = peer_info.peer_id,
-        //     .remote_public_key = peer_info.host_pubkey,
-        // };
+        const peer_info = tls.verifyAndExtractPeerInfo(lsquic_conn.engine.allocator, cert.?) catch |err| {
+            std.log.warn("Failed to verify and extract peer info: {}", .{err});
+            _ = lsquic.lsquic_conn_close(conn);
+            return;
+        };
+        if (!peer_info.is_valid) {
+            std.log.warn("Invalid peer certificate, closing connection.\n", .{});
+            _ = lsquic.lsquic_conn_close(conn);
+            return;
+        }
+        lsquic_conn.security_session = SecuritySession{
+            // TODO: need add local id later
+            .local_id = undefined,
+            .remote_id = peer_info.peer_id,
+            .remote_public_key = peer_info.host_pubkey,
+        };
         if (lsquic_conn.direction == p2p_conn.Direction.INBOUND) {
             lsquic_conn.engine.listen_ctx.?.callback(lsquic_conn.engine.listen_ctx.?.callback_ctx, lsquic_conn);
         } else {
-            // if (!peer_info.peer_id.eql(&lsquic_conn.connect_ctx.?.peer_id)) {
-            //     std.log.warn("Peer ID mismatch, closing connection.\n", .{});
-            //     _ = lsquic.lsquic_conn_close(conn);
-            //     return;
-            // }
+            if (!peer_info.peer_id.eql(&lsquic_conn.connect_ctx.?.peer_id)) {
+                std.log.warn("Peer ID mismatch, closing connection.\n", .{});
+                _ = lsquic.lsquic_conn_close(conn);
+                return;
+            }
             lsquic_conn.connect_ctx.?.callback(lsquic_conn.connect_ctx.?.callback_ctx, lsquic_conn);
         }
     }
@@ -950,13 +948,13 @@ fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_status
 pub fn onConnClosed(conn: ?*lsquic.lsquic_conn_t) callconv(.c) void {
     const lsquic_conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(conn.?)));
 
-    // tls.clearSavedPeerCertificate();
+    tls.clearSavedPeerCertificate();
 
-    // if (lsquic_conn.security_session) |*session| {
-    //     if (session.remote_public_key.data) |data| {
-    //         lsquic_conn.engine.allocator.free(data);
-    //     }
-    // }
+    if (lsquic_conn.security_session) |*session| {
+        if (session.remote_public_key.data) |data| {
+            lsquic_conn.engine.allocator.free(data);
+        }
+    }
 
     if (lsquic_conn.close_ctx) |close_ctx| {
         if (close_ctx.callback) |callback| {

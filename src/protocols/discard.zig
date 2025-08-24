@@ -9,6 +9,7 @@ const keys_proto = libp2p.protobuf.keys;
 const tls = libp2p.security.tls;
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
+const keys = @import("peer_id").keys;
 
 pub const DiscardProtocolHandler = struct {
     allocator: std.mem.Allocator,
@@ -238,22 +239,132 @@ pub const DiscardSender = struct {
     }
 };
 
+const TestNewStreamCallback = struct {
+    mutex: std.Thread.ResetEvent,
+
+    sender: *DiscardSender,
+
+    const Self = @This();
+    pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx.?));
+        const sender_ptr = res catch {
+            self.mutex.set();
+            return;
+        };
+        self.sender = @ptrCast(@alignCast(sender_ptr.?));
+        self.mutex.set();
+    }
+};
+
+fn spawnSwitch3Test(allocator: std.mem.Allocator, switch3: *swarm.Switch, server_peer_id: PeerId) !void {
+    var callback2: TestNewStreamCallback = .{ .mutex = .{}, .sender = undefined };
+
+    var dial_ma2 = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/8767");
+    defer dial_ma2.deinit();
+    try dial_ma2.push(.{ .P2P = server_peer_id });
+
+    switch3.newStream(
+        dial_ma2,
+        &.{"discard"},
+        &callback2,
+        TestNewStreamCallback.callback,
+    );
+
+    callback2.mutex.wait();
+
+    callback2.sender.send("Hello from Switch 3", null, struct {
+        pub fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
+            if (res) |size| {
+                std.debug.print("Message from Switch 3 sent successfully, size: {}\n", .{size});
+            } else |err| {
+                std.debug.print("Failed to send message from Switch 3: {}\n", .{err});
+            }
+        }
+    }.callback_);
+
+    std.time.sleep(3000 * std.time.ns_per_ms);
+}
+
+fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId, client_id: u32) !void {
+    var cl_loop: io_loop.ThreadEventLoop = undefined;
+    try cl_loop.init(allocator);
+    defer cl_loop.deinit();
+
+    const cl_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(cl_host_key);
+
+    var cl_transport: quic.QuicTransport = undefined;
+    try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
+
+    var client_switch: swarm.Switch = undefined;
+    client_switch.init(allocator, &cl_transport);
+    defer client_switch.deinit();
+
+    var discard_handler = DiscardProtocolHandler.init(allocator);
+    defer discard_handler.deinit();
+    try client_switch.addProtocolHandler("discard", discard_handler.any());
+
+    std.time.sleep(100 * std.time.ns_per_ms * client_id);
+
+    var callback: TestNewStreamCallback = .{ .mutex = .{}, .sender = undefined };
+
+    var dial_ma = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9000");
+    defer dial_ma.deinit();
+    try dial_ma.push(.{ .P2P = server_peer_id });
+
+    client_switch.newStream(
+        dial_ma,
+        &.{"discard"},
+        &callback,
+        TestNewStreamCallback.callback,
+    );
+
+    callback.mutex.wait();
+
+    for (0..5) |msg_id| {
+        const message = try std.fmt.allocPrint(allocator, "Hello from Client {} - Message {}", .{ client_id, msg_id });
+        defer allocator.free(message);
+
+        callback.sender.send(message, null, struct {
+            fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
+                if (res) |size| {
+                    std.debug.print("Client message sent successfully, size: {}\n", .{size});
+                } else |err| {
+                    std.debug.print("Failed to send client message: {}\n", .{err});
+                }
+            }
+        }.callback_);
+
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+
+    std.time.sleep(3000 * std.time.ns_per_ms);
+}
+
 test "discard protocol using switch" {
-    const allocator = std.testing.allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked == .leak) {
+            std.log.warn("Memory leak detected in test!", .{});
+        }
+    }
+    const allocator = gpa.allocator();
+
     const switch1_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/8767");
     defer switch1_listen_address.deinit();
 
     var loop: io_loop.ThreadEventLoop = undefined;
-    try loop.init(std.testing.allocator);
+    try loop.init(allocator);
     defer {
         loop.deinit();
     }
 
-    const host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
+    const host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: quic.QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
+    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, allocator); // ✅ 使用统一分配器
 
     var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
     defer allocator.free(pubkey.data.?);
@@ -284,7 +395,7 @@ test "discard protocol using switch" {
         cl_loop.deinit();
     }
 
-    const cl_host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
+    const cl_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(cl_host_key);
 
     var cl_transport: quic.QuicTransport = undefined;
@@ -306,7 +417,7 @@ test "discard protocol using switch" {
         cl_loop1.deinit();
     }
 
-    const cl_host_key1 = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
+    const cl_host_key1 = try tls.generateKeyPair1(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(cl_host_key1);
 
     var cl_transport1: quic.QuicTransport = undefined;
@@ -330,6 +441,7 @@ test "discard protocol using switch" {
     var dial_ma = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/8767");
     try dial_ma.push(.{ .P2P = server_peer_id });
     defer dial_ma.deinit();
+
     switch2.newStream(
         dial_ma,
         &.{"discard"},
@@ -373,57 +485,12 @@ test "discard protocol using switch" {
         }
     }.callback_);
 
-    // spawn a thread use switch3 new another stream
+    std.time.sleep(500 * std.time.ns_per_ms);
+
     const thread = try std.Thread.spawn(.{}, spawnSwitch3Test, .{ allocator, &switch3, server_peer_id });
     defer thread.join();
 
-    std.time.sleep(2000 * std.time.ns_per_ms); // Wait for the stream to be established
-
-}
-
-const TestNewStreamCallback = struct {
-    mutex: std.Thread.ResetEvent,
-
-    sender: *DiscardSender,
-
-    const Self = @This();
-    pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
-        const self: *Self = @ptrCast(@alignCast(ctx.?));
-        const sender_ptr = res catch {
-            self.mutex.set();
-            return;
-        };
-        self.sender = @ptrCast(@alignCast(sender_ptr.?));
-        std.log.info("Stream started successfully", .{});
-        self.mutex.set();
-    }
-};
-
-fn spawnSwitch3Test(allocator: std.mem.Allocator, switch3: *swarm.Switch, server_peer_id: PeerId) !void {
-    var callback2: TestNewStreamCallback = .{ .mutex = .{}, .sender = undefined };
-
-    var dial_ma2 = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/8777");
-    defer dial_ma2.deinit();
-    try dial_ma2.push(.{ .P2P = server_peer_id });
-
-    switch3.newStream(
-        dial_ma2,
-        &.{"discard"},
-        &callback2,
-        TestNewStreamCallback.callback,
-    );
-
-    callback2.mutex.wait();
-
-    callback2.sender.send("Hello from Switch 3", null, struct {
-        pub fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
-            if (res) |size| {
-                std.debug.print("Message sent successfully, size: {}\n", .{size});
-            } else |err| {
-                std.debug.print("Failed to send message: {}\n", .{err});
-            }
-        }
-    }.callback_);
+    std.time.sleep(2000 * std.time.ns_per_ms);
 }
 
 test "discard protocol using switch with 1MB data" {
@@ -476,23 +543,6 @@ test "discard protocol using switch with 1MB data" {
     var discard_handler2 = DiscardProtocolHandler.init(allocator);
     defer discard_handler2.deinit();
     try switch2.addProtocolHandler("discard", discard_handler2.any());
-
-    // const TestNewStreamCallback = struct {
-    //     mutex: std.Thread.ResetEvent,
-    //     sender: *DiscardSender,
-
-    //     const Self = @This();
-    //     pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
-    //         const self: *Self = @ptrCast(@alignCast(ctx.?));
-    //         const sender_ptr = res catch |err| {
-    //             std.log.warn("Failed to start stream: {}", .{err});
-    //             self.mutex.set();
-    //             return;
-    //         };
-    //         self.sender = @ptrCast(@alignCast(sender_ptr.?));
-    //         self.mutex.set();
-    //     }
-    // };
 
     var callback: TestNewStreamCallback = .{ .mutex = .{}, .sender = undefined };
     var dial_ma = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/8777");
@@ -609,26 +659,7 @@ test "no supported protocols error" {
 
     var discard_handler2 = DiscardProtocolHandler.init(allocator);
     defer discard_handler2.deinit();
-    // try switch2.addProtocolHandler("discard", discard_handler2.any());
 
-    // const TestNewStreamCallback = struct {
-    //     mutex: std.Thread.ResetEvent,
-
-    //     sender: *DiscardSender,
-
-    //     const Self = @This();
-    //     pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
-    //         const self: *Self = @ptrCast(@alignCast(ctx.?));
-    //         const sender_ptr = res catch |err| {
-    //             std.testing.expectEqual(error.NoSupportedProtocols, err) catch unreachable;
-    //             self.mutex.set();
-    //             return;
-    //         };
-    //         self.sender = @ptrCast(@alignCast(sender_ptr.?));
-    //         std.log.info("Stream started successfully", .{});
-    //         self.mutex.set();
-    //     }
-    // };
     var callback: TestNewStreamCallback = .{
         .mutex = .{},
         .sender = undefined,
@@ -648,4 +679,59 @@ test "no supported protocols error" {
 
     std.time.sleep(2000 * std.time.ns_per_ms); // Wait for the stream to be established
 
+}
+
+test "discard protocol with 5 concurrent clients" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked == .leak) {
+            std.log.warn("Memory leak detected in test!", .{});
+        }
+    }
+    const allocator = gpa.allocator();
+
+    const switch1_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9000");
+    defer switch1_listen_address.deinit();
+
+    var loop: io_loop.ThreadEventLoop = undefined;
+    try loop.init(allocator);
+    defer loop.deinit();
+
+    const host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(host_key);
+
+    var transport: quic.QuicTransport = undefined;
+    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, allocator);
+
+    var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
+    defer allocator.free(pubkey.data.?);
+    const server_peer_id = try PeerId.fromPublicKey(allocator, &pubkey);
+
+    var switch1: swarm.Switch = undefined;
+    switch1.init(allocator, &transport);
+    defer switch1.deinit();
+
+    var discard_handler = DiscardProtocolHandler.init(allocator);
+    defer discard_handler.deinit();
+    try switch1.addProtocolHandler("discard", discard_handler.any());
+
+    try switch1.listen(switch1_listen_address, null, struct {
+        pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {}
+    }.callback);
+
+    std.time.sleep(500 * std.time.ns_per_ms);
+
+    const NUM_CLIENTS = 5;
+    var threads: [NUM_CLIENTS]std.Thread = undefined;
+
+    for (0..NUM_CLIENTS) |i| {
+        threads[i] = try std.Thread.spawn(.{}, spawnMultipleClientsTest, .{ allocator, server_peer_id, @as(u32, @intCast(i)) });
+    }
+
+    for (0..NUM_CLIENTS) |i| {
+        threads[i].join();
+    }
+
+    std.time.sleep(2000 * std.time.ns_per_ms);
 }
