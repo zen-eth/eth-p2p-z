@@ -364,7 +364,7 @@ test "discard protocol using switch" {
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: quic.QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, allocator); // ✅ 使用统一分配器
+    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, allocator);
 
     var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
     defer allocator.free(pubkey.data.?);
@@ -450,6 +450,7 @@ test "discard protocol using switch" {
     );
 
     callback.mutex.wait();
+    try std.testing.expect(callback.sender.stream.conn.security_session.?.remote_id.eql(&server_peer_id));
 
     callback.sender.send("Hello from Switch 2", null, struct {
         pub fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
@@ -475,6 +476,7 @@ test "discard protocol using switch" {
 
     callback1.mutex.wait();
 
+    try std.testing.expect(callback1.sender.stream.conn.security_session.?.remote_id.eql(&server_peer_id));
     callback1.sender.send("Hello from Switch 2 (second message)", null, struct {
         pub fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
             if (res) |size| {
