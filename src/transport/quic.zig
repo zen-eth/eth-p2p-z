@@ -727,6 +727,8 @@ pub const QuicTransport = struct {
 
     cert_key_type: keys_proto.KeyType,
 
+    local_peer_id: PeerId,
+
     pub fn init(self: *QuicTransport, loop: *io_loop.ThreadEventLoop, host_keypair: *ssl.EVP_PKEY, cert_key_type: keys_proto.KeyType, allocator: Allocator) !void {
         const result = lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT | lsquic.LSQUIC_GLOBAL_SERVER);
         if (result != 0) {
@@ -736,6 +738,9 @@ pub const QuicTransport = struct {
         const subject_keypair = try tls.generateKeyPair(cert_key_type);
 
         const subject_cert = try tls.buildCert(allocator, host_keypair, subject_keypair);
+
+        var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_keypair);
+        defer allocator.free(pubkey.data.?);
 
         self.* = .{
             .ssl_context = try initSslContext(subject_keypair, subject_cert),
@@ -747,6 +752,7 @@ pub const QuicTransport = struct {
             .cert_key_type = cert_key_type,
             .subject_keypair = subject_keypair,
             .subject_cert = subject_cert,
+            .local_peer_id = try PeerId.fromPublicKey(allocator, &pubkey),
         };
     }
 
@@ -954,8 +960,7 @@ fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_status
             return;
         }
         lsquic_conn.security_session = SecuritySession{
-            // TODO: need add local id later
-            .local_id = undefined,
+            .local_id = lsquic_conn.engine.transport.local_peer_id,
             .remote_id = peer_info.peer_id,
             .remote_public_key = peer_info.host_pubkey,
         };
