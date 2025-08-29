@@ -259,7 +259,6 @@ test "pubsub" {
 
     var switch1: swarm.Switch = undefined;
     switch1.init(allocator, &transport1);
-    defer switch1.deinit();
 
     var pubsub_peer_handler1 = PubSubPeerProtocolHandler.init(allocator);
     defer pubsub_peer_handler1.deinit();
@@ -268,7 +267,6 @@ test "pubsub" {
 
     var pubsub1: PubSub = undefined;
     pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1);
-    defer pubsub1.deinit();
 
     try switch1.listen(switch1_listen_address, &pubsub1, PubSub.onIncomingNewStream);
     std.debug.print("Switch1 is listening on: {}\n", .{switch1_listen_address});
@@ -290,7 +288,6 @@ test "pubsub" {
 
     var switch2: swarm.Switch = undefined;
     switch2.init(allocator, &transport2);
-    defer switch2.deinit();
 
     var pubsub_peer_handler2 = PubSubPeerProtocolHandler.init(allocator);
     defer pubsub_peer_handler2.deinit();
@@ -299,17 +296,14 @@ test "pubsub" {
 
     var pubsub2: PubSub = undefined;
     pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2);
-    defer pubsub2.deinit();
 
     try switch2.listen(switch2_listen_address, &pubsub2, PubSub.onIncomingNewStream);
-    std.debug.print("Switch2 is listening on: {}\n", .{switch2_listen_address});
-    std.debug.print("Switch2 Peer ID: {}\n", .{transport2.local_peer_id});
 
     std.time.sleep(300 * std.time.us_per_ms);
 
     var dial_ma_switch2 = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9768");
     try dial_ma_switch2.push(.{ .P2P = transport2.local_peer_id });
-    // defer dial_ma_switch2.deinit();
+
     pubsub1.addPeer(dial_ma_switch2, null, struct {
         fn callback(_: ?*anyopaque, res: anyerror!void) void {
             res catch |err| {
@@ -321,4 +315,16 @@ test "pubsub" {
     }.callback);
 
     std.time.sleep(4 * std.time.ns_per_s);
+
+    defer {
+        pubsub1.peers.clearAndFree();
+        pubsub1.deinit();
+        switch1.deinit();
+
+        pubsub2.peers.clearAndFree();
+        pubsub2.deinit();
+        switch2.deinit();
+
+        dial_ma_switch2.deinit();
+    }
 }

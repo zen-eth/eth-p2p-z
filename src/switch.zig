@@ -213,10 +213,7 @@ pub const Switch = struct {
                 return;
             };
 
-            std.debug.print("New QUIC connection established: {*}\n", .{&self.network_switch.outgoing_connections});
             self.network_switch.outgoing_connections.put(address_str, conn) catch unreachable;
-
-            std.debug.print("New QUIC connection established: {*}\n", .{&self.network_switch.outgoing_connections});
 
             const stream_ctx = self.network_switch.allocator.create(StreamCallbackCtx) catch unreachable;
             stream_ctx.* = StreamCallbackCtx{
