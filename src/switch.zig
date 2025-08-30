@@ -71,7 +71,6 @@ pub const Switch = struct {
 
         self.stopped_notify.wait();
 
-        // 在这里进行最终的资源清理
         self.finalCleanup();
     }
 
@@ -458,8 +457,5 @@ pub const Switch = struct {
 
     fn finalCleanup(_: *Switch) void {
         lsquic.lsquic_global_cleanup();
-        // 在事件循环停止后进行最终清理
-        // self.transport.deinit(); // 现在安全地释放 transport
-
     }
 };
