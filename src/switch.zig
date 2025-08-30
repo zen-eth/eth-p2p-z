@@ -228,9 +228,8 @@ pub const Switch = struct {
                 self.user_callback(self.user_callback_ctx, err);
                 return;
             };
-            self.network_switch.outgoing_connections.put(address_str, conn) catch unreachable;
 
-            std.log.info("Connection established to {s}", .{address_str});
+            self.network_switch.outgoing_connections.put(address_str, conn) catch unreachable;
 
             const stream_ctx = self.network_switch.allocator.create(StreamCallbackCtx) catch unreachable;
             stream_ctx.* = StreamCallbackCtx{

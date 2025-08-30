@@ -30,8 +30,8 @@
             .hash = "libxev-0.0.0-86vtcx8dEwDfl6p4tGVxCygft8oOsggfba9JO-k28J2x",
         },
         .zmultiformats = .{
-            .url = "git+https://github.com/zen-eth/multiformats-zig#acb3945e7f1b2fed18f92f05d321cd1a0a4e32e1",
-            .hash = "zmultiformats-0.1.0-6A8pcdwUBQAgUTaQC5RhH3XBZUgo6-3zQQRO953yVyMA",
+            .url = "git+https://github.com/zen-eth/multiformats-zig#b2e94f46f23dc4e24c7e1b2406339c23e66f4f91",
+            .hash = "zmultiformats-0.1.0-6A8pcUIVBQD3NV-GivnYPZtYUxErb2dB5ReR98T_snoa",
         },
         .gremlin = .{
             .url = "git+https://github.com/octopus-foundation/gremlin.zig#fccfe2659f24497199d86404e0ef7dbc79e033d2",

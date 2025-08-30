@@ -5,7 +5,6 @@ const protocols = libp2p.protocols;
 const swarm = libp2p.swarm;
 const io_loop = libp2p.thread_event_loop;
 const ssl = @import("ssl");
-const keys_proto = libp2p.protobuf.keys;
 const tls = libp2p.security.tls;
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
@@ -294,7 +293,7 @@ fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId
     defer ssl.EVP_PKEY_free(cl_host_key);
 
     var cl_transport: quic.QuicTransport = undefined;
-    try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
+    try cl_transport.init(&cl_loop, cl_host_key, keys.KeyType.ED25519, allocator);
     defer cl_transport.deinit();
     var client_switch: swarm.Switch = undefined;
     client_switch.init(allocator, &cl_transport);
@@ -365,7 +364,7 @@ test "discard protocol using switch" {
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: quic.QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, allocator);
+    try transport.init(&loop, host_key, keys.KeyType.ED25519, allocator);
     defer transport.deinit();
 
     var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
@@ -402,7 +401,7 @@ test "discard protocol using switch" {
     defer ssl.EVP_PKEY_free(cl_host_key);
 
     var cl_transport: quic.QuicTransport = undefined;
-    try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
+    try cl_transport.init(&cl_loop, cl_host_key, keys.KeyType.ED25519, allocator);
     defer cl_transport.deinit();
     var switch2: swarm.Switch = undefined;
     switch2.init(allocator, &cl_transport);
@@ -425,7 +424,7 @@ test "discard protocol using switch" {
     defer ssl.EVP_PKEY_free(cl_host_key1);
 
     var cl_transport1: quic.QuicTransport = undefined;
-    try cl_transport1.init(&cl_loop1, cl_host_key1, keys_proto.KeyType.ED25519, allocator);
+    try cl_transport1.init(&cl_loop1, cl_host_key1, keys.KeyType.ED25519, allocator);
     defer cl_transport1.deinit();
     var switch3: swarm.Switch = undefined;
     switch3.init(allocator, &cl_transport1);
@@ -510,7 +509,7 @@ test "discard protocol using switch with 1MB data" {
     try loop.init(std.testing.allocator);
     defer loop.deinit();
 
-    const host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
+    const host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
 
     var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
@@ -518,7 +517,7 @@ test "discard protocol using switch with 1MB data" {
     const server_peer_id = try PeerId.fromPublicKey(allocator, &pubkey);
 
     var transport: quic.QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
+    try transport.init(&loop, host_key, keys.KeyType.ED25519, std.testing.allocator);
     defer transport.deinit();
     var switch1: swarm.Switch = undefined;
     switch1.init(allocator, &transport);
@@ -538,11 +537,11 @@ test "discard protocol using switch with 1MB data" {
     try cl_loop.init(allocator);
     defer cl_loop.deinit();
 
-    const cl_host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
+    const cl_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(cl_host_key);
 
     var cl_transport: quic.QuicTransport = undefined;
-    try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
+    try cl_transport.init(&cl_loop, cl_host_key, keys.KeyType.ED25519, allocator);
     defer cl_transport.deinit();
     var switch2: swarm.Switch = undefined;
     switch2.init(allocator, &cl_transport);
@@ -619,7 +618,7 @@ test "discard protocol using switch with 1MB data" {
 //         loop.deinit();
 //     }
 
-//     const host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
+//     const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
 //     defer ssl.EVP_PKEY_free(host_key);
 
 //     var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
@@ -627,7 +626,7 @@ test "discard protocol using switch with 1MB data" {
 //     const server_peer_id = try PeerId.fromPublicKey(allocator, &pubkey);
 
 //     var transport: quic.QuicTransport = undefined;
-//     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
+//     try transport.init(&loop, host_key, keys.KeyType.ED25519, std.testing.allocator);
 //     defer transport.deinit();
 //     var switch1: swarm.Switch = undefined;
 //     switch1.init(allocator, &transport);
@@ -653,11 +652,11 @@ test "discard protocol using switch with 1MB data" {
 //         cl_loop.deinit();
 //     }
 
-//     const cl_host_key = try tls.generateKeyPair(keys_proto.KeyType.ED25519);
+//     const cl_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
 //     defer ssl.EVP_PKEY_free(cl_host_key);
 
 //     var cl_transport: quic.QuicTransport = undefined;
-//     try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
+//     try cl_transport.init(&cl_loop, cl_host_key, keys.KeyType.ED25519, allocator);
 //     defer cl_transport.deinit();
 //     var switch2: swarm.Switch = undefined;
 //     switch2.init(allocator, &cl_transport);
@@ -710,7 +709,7 @@ test "discard protocol with 5 concurrent clients" {
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: quic.QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, allocator);
+    try transport.init(&loop, host_key, keys.KeyType.ED25519, allocator);
     defer transport.deinit();
     var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
     defer allocator.free(pubkey.data.?);
