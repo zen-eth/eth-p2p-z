@@ -295,7 +295,7 @@ fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId
 
     var cl_transport: quic.QuicTransport = undefined;
     try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
-
+    defer cl_transport.deinit();
     var client_switch: swarm.Switch = undefined;
     client_switch.init(allocator, &cl_transport);
     defer client_switch.deinit();
@@ -357,6 +357,7 @@ test "discard protocol using switch" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(allocator);
     defer {
+        // loop.close();
         loop.deinit();
     }
 
@@ -365,6 +366,7 @@ test "discard protocol using switch" {
 
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, allocator);
+    defer transport.deinit();
 
     var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
     defer allocator.free(pubkey.data.?);
@@ -392,6 +394,7 @@ test "discard protocol using switch" {
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
     defer {
+        // cl_loop.close();
         cl_loop.deinit();
     }
 
@@ -400,7 +403,7 @@ test "discard protocol using switch" {
 
     var cl_transport: quic.QuicTransport = undefined;
     try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
-
+    defer cl_transport.deinit();
     var switch2: swarm.Switch = undefined;
     switch2.init(allocator, &cl_transport);
     defer {
@@ -414,6 +417,7 @@ test "discard protocol using switch" {
     var cl_loop1: io_loop.ThreadEventLoop = undefined;
     try cl_loop1.init(allocator);
     defer {
+        // cl_loop1.close();
         cl_loop1.deinit();
     }
 
@@ -422,7 +426,7 @@ test "discard protocol using switch" {
 
     var cl_transport1: quic.QuicTransport = undefined;
     try cl_transport1.init(&cl_loop1, cl_host_key1, keys_proto.KeyType.ED25519, allocator);
-
+    defer cl_transport1.deinit();
     var switch3: swarm.Switch = undefined;
     switch3.init(allocator, &cl_transport1);
     defer {
@@ -493,6 +497,8 @@ test "discard protocol using switch" {
     defer thread.join();
 
     std.time.sleep(2000 * std.time.ns_per_ms);
+
+    std.debug.print("Switch 3 test completed\n", .{});
 }
 
 test "discard protocol using switch with 1MB data" {
@@ -513,7 +519,7 @@ test "discard protocol using switch with 1MB data" {
 
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
-
+    defer transport.deinit();
     var switch1: swarm.Switch = undefined;
     switch1.init(allocator, &transport);
     defer switch1.deinit();
@@ -537,7 +543,7 @@ test "discard protocol using switch with 1MB data" {
 
     var cl_transport: quic.QuicTransport = undefined;
     try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
-
+    defer cl_transport.deinit();
     var switch2: swarm.Switch = undefined;
     switch2.init(allocator, &cl_transport);
     defer switch2.deinit();
@@ -622,7 +628,7 @@ test "no supported protocols error" {
 
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, std.testing.allocator);
-
+    defer transport.deinit();
     var switch1: swarm.Switch = undefined;
     switch1.init(allocator, &transport);
     defer {
@@ -652,7 +658,7 @@ test "no supported protocols error" {
 
     var cl_transport: quic.QuicTransport = undefined;
     try cl_transport.init(&cl_loop, cl_host_key, keys_proto.KeyType.ED25519, allocator);
-
+    defer cl_transport.deinit();
     var switch2: swarm.Switch = undefined;
     switch2.init(allocator, &cl_transport);
     defer {
@@ -705,7 +711,7 @@ test "discard protocol with 5 concurrent clients" {
 
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys_proto.KeyType.ED25519, allocator);
-
+    defer transport.deinit();
     var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
     defer allocator.free(pubkey.data.?);
     const server_peer_id = try PeerId.fromPublicKey(allocator, &pubkey);

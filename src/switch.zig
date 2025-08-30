@@ -69,13 +69,15 @@ pub const Switch = struct {
             self.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
 
-        self.stopped_notify.timedWait(5 * std.time.ns_per_s) catch {};
+        self.stopped_notify.wait();
+
+        // 在这里进行最终的资源清理
+        self.finalCleanup();
     }
 
     pub fn doClose(self: *Switch) void {
         self.is_stopping = true;
         self.outgoingConnectionCloseAndClean();
-        self.stopped_notify.set();
     }
 
     const ListenCallbackCtx = struct {
@@ -117,11 +119,11 @@ pub const Switch = struct {
                 // So that right now the stream will be closed when the connection close function called.
                 // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
                 // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
-                stream.close(null, struct {
-                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-                }.callback);
-                stream.deinit();
-                stream.conn.engine.allocator.destroy(stream);
+                // stream.close(null, struct {
+                //     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                // }.callback);
+                // stream.deinit();
+                // stream.conn.engine.allocator.destroy(stream);
                 return;
             };
 
@@ -134,14 +136,14 @@ pub const Switch = struct {
                 // So that right now the stream will be closed when the connection close function called.
                 // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
                 // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
-                stream.close(null, struct {
-                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-                }.callback);
-                stream.proto_msg_handler.?.onClose(stream) catch |e| {
-                    std.log.warn("Protocol message handler failed with error: {}.", .{e});
-                };
-                stream.deinit();
-                stream.conn.engine.allocator.destroy(stream);
+                // stream.close(null, struct {
+                //     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                // }.callback);
+                // stream.proto_msg_handler.?.onClose(stream) catch |e| {
+                //     std.log.warn("Protocol message handler failed with error: {}.", .{e});
+                // };
+                // stream.deinit();
+                // stream.conn.engine.allocator.destroy(stream);
                 return;
             };
         }
@@ -405,7 +407,7 @@ pub const Switch = struct {
         const outgoing_entry = self.outgoing_connections.pop();
         if (outgoing_entry) |e| {
             self.allocator.free(e.key);
-            e.value.close(self, outgoingConnectionCloseAndCleanCallback);
+            e.value.doClose(self, outgoingConnectionCloseAndCleanCallback);
         } else {
             self.incomingConnectionCloseAndClean(); // Clean up resources if no outgoing connections are left.
         }
@@ -422,7 +424,7 @@ pub const Switch = struct {
     fn incomingConnectionCloseAndClean(self: *Switch) void {
         const incoming_entry = self.incoming_connections.pop();
         if (incoming_entry) |conn| {
-            conn.close(self, incomingConnectionCloseAndCleanCallback);
+            conn.doClose(self, incomingConnectionCloseAndCleanCallback);
         } else {
             self.cleanResources(); // Clean up resources if no incoming connections are left.
         }
@@ -432,7 +434,7 @@ pub const Switch = struct {
         self.outgoing_connections.deinit();
         self.incoming_connections.deinit();
 
-        self.transport.deinit();
+        // self.transport.deinit();
         var listener_iter = self.listeners.iterator();
         while (listener_iter.next()) |entry| {
             var listener = entry.value_ptr.*;
@@ -447,9 +449,17 @@ pub const Switch = struct {
         // Call it here because the listeners and transports all used quic engine,
         // so we need to clean up the global state.
         // TODO: Can we not expose lsquic to switch?
-        lsquic.lsquic_global_cleanup();
+        // lsquic.lsquic_global_cleanup();
         self.listeners.deinit();
 
         self.mss_handler.deinit();
+        self.stopped_notify.set();
+    }
+
+    fn finalCleanup(_: *Switch) void {
+        lsquic.lsquic_global_cleanup();
+        // 在事件循环停止后进行最终清理
+        // self.transport.deinit(); // 现在安全地释放 transport
+
     }
 };

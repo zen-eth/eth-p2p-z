@@ -1048,7 +1048,7 @@ fn onStreamRead(
             // On Windows, error codes may differ and additional handling may be required here.
             const err = posix.errno(n_read);
             if (err == posix.E.AGAIN) {
-                std.log.warn("lsquic_stream_read returned E.AGAIN, waiting for more data.\n", .{});
+                std.log.debug("lsquic_stream_read returned E.AGAIN, waiting for more data.\n", .{});
                 _ = lsquic.lsquic_stream_wantread(s, 1);
                 return;
             }
