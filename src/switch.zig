@@ -10,6 +10,7 @@ const protocols = libp2p.protocols;
 const Allocator = std.mem.Allocator;
 const mss = protocols.mss;
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const io_loop = libp2p.thread_event_loop;
 
 /// The Switch struct is the main entry point for managing connections and protocol handlers.
 /// It acts as a central hub for handling incoming and outgoing connections,
@@ -39,6 +40,8 @@ pub const Switch = struct {
 
     is_stopped: std.atomic.Value(bool),
 
+    stopped_notify: std.Thread.ResetEvent,
+
     pub fn init(self: *Switch, allocator: Allocator, transport: *quic.QuicTransport) void {
         self.* = Switch{
             .transport = transport,
@@ -49,18 +52,30 @@ pub const Switch = struct {
             .is_stopping = false,
             .is_stopped = std.atomic.Value(bool).init(false),
             .mss_handler = mss.MultistreamSelectHandler.init(allocator),
+            .stopped_notify = .{},
         };
     }
 
     pub fn deinit(self: *Switch) void {
-        self.is_stopping = true;
-        const total_connections = self.outgoing_connections.count() + self.incoming_connections.items.len;
-        self.outgoingConnectionCloseAndClean();
-        // If there are no connections,`outgoingConnectionCloseAndClean` will be called in current thread so that no need wait.
-        if (total_connections > 0) {
-            // TODO: Use wait group to wait for all connections to be closed.
-            std.time.sleep(3000 * std.time.ns_per_ms);
+        if (self.transport.io_event_loop.inEventLoopThread()) {
+            self.doClose();
+        } else {
+            const message = io_loop.IOMessage{
+                .action = .{ .switch_close = .{
+                    .network_switch = self,
+                } },
+            };
+
+            self.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
+
+        self.stopped_notify.timedWait(5 * std.time.ns_per_s) catch {};
+    }
+
+    pub fn doClose(self: *Switch) void {
+        self.is_stopping = true;
+        self.outgoingConnectionCloseAndClean();
+        self.stopped_notify.set();
     }
 
     const ListenCallbackCtx = struct {
@@ -102,11 +117,11 @@ pub const Switch = struct {
                 // So that right now the stream will be closed when the connection close function called.
                 // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
                 // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
-                // stream.close(null, struct {
-                //     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-                // }.callback);
-                // stream.deinit();
-                // stream.conn.engine.allocator.destroy(stream);
+                stream.close(null, struct {
+                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                }.callback);
+                stream.deinit();
+                stream.conn.engine.allocator.destroy(stream);
                 return;
             };
 
@@ -119,14 +134,14 @@ pub const Switch = struct {
                 // So that right now the stream will be closed when the connection close function called.
                 // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
                 // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
-                // stream.close(null, struct {
-                //     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-                // }.callback);
-                // stream.proto_msg_handler.onClose(stream) catch |e| {
-                //     std.log.warn("Protocol message handler failed with error: {}.", .{e});
-                // };
-                // stream.deinit();
-                // stream.conn.engine.allocator.destroy(stream);
+                stream.close(null, struct {
+                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                }.callback);
+                stream.proto_msg_handler.?.onClose(stream) catch |e| {
+                    std.log.warn("Protocol message handler failed with error: {}.", .{e});
+                };
+                stream.deinit();
+                stream.conn.engine.allocator.destroy(stream);
                 return;
             };
         }

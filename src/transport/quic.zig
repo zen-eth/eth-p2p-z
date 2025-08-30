@@ -178,6 +178,11 @@ pub const QuicEngine = struct {
     /// This function is called from the event loop thread to ensure thread safety.
     /// It should not be called directly from other threads.
     pub fn doConnect(self: *QuicEngine, peer_address: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+        if (self.connect_ctx != null) {
+            callback(callback_ctx, error.AlreadyConnecting);
+            return;
+        }
+
         const addrAndPeerId = maToStdAddrAndPeerId(peer_address) catch |err| {
             std.log.warn("Failed to convert Multiaddr to std.net.Address and PeerId: {}", .{err});
             callback(callback_ctx, err);
@@ -223,11 +228,6 @@ pub const QuicEngine = struct {
     /// This function is not thread-safe and should not be called from multiple threads concurrently.
     /// Queueuing this operation is recommended.
     pub fn connect(self: *QuicEngine, peer_address: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
-        if (self.connect_ctx != null) {
-            callback(callback_ctx, error.AlreadyConnecting);
-            return;
-        }
-
         if (self.transport.io_event_loop.inEventLoopThread()) {
             self.doConnect(peer_address, callback_ctx, callback);
         } else {
@@ -249,7 +249,7 @@ pub const QuicEngine = struct {
     /// It processes the connections in the lsquic engine and schedules the next processing based on the earliest advertised tick.
     /// It is called from the event loop thread to ensure thread safety.
     /// It should not be called directly from other threads.
-    pub fn processConns(self: *QuicEngine) void {
+    fn processConns(self: *QuicEngine) void {
         lsquic.lsquic_engine_process_conns(self.engine);
 
         var diff_us: c_int = 0;
@@ -298,7 +298,7 @@ pub const QuicEngine = struct {
             return .rearm;
         }
 
-        _ = lsquic.lsquic_engine_packet_in(
+        const result = lsquic.lsquic_engine_packet_in(
             self.engine,
             b.slice.ptr,
             n,
@@ -309,10 +309,10 @@ pub const QuicEngine = struct {
         );
 
         // If the packet processing failed, we log the error and rearm the read operation.
-        // if (result < 0) {
-        //     std.log.warn("QUIC engine packet in failed {}\n", .{result});
-        //     return .rearm;
-        // }
+        if (result < 0) {
+            std.log.warn("QUIC engine packet in failed {}\n", .{result});
+            return .rearm;
+        }
 
         self.processConns();
 
@@ -478,6 +478,7 @@ pub const QuicConnection = struct {
             close_ctx.active_callback_ctx = callback_ctx;
             close_ctx.active_callback = callback;
         } else {
+            std.log.warn("In general it should have the close context when dialing and listening", .{});
             self.close_ctx = .{
                 .callback_ctx = null,
                 .callback = null,
@@ -597,6 +598,7 @@ pub const QuicStream = struct {
             close_ctx.active_callback_ctx = callback_ctx;
             close_ctx.active_callback = callback;
         } else {
+            std.log.warn("In general it should have the stream close context when dialing and listening", .{});
             self.close_ctx = .{
                 .callback_ctx = null,
                 .callback = null,
@@ -1130,6 +1132,16 @@ fn onStreamClose(
 ) callconv(.c) void {
     if (stream_ctx == null) return;
     const self: *QuicStream = @ptrCast(@alignCast(stream_ctx.?));
+
+    if (self.close_ctx) |close_ctx| {
+        if (close_ctx.callback) |callback| {
+            callback(close_ctx.callback_ctx, self);
+        }
+        if (close_ctx.active_callback) |active_callback| {
+            active_callback(close_ctx.active_callback_ctx, self);
+        }
+    }
+
     // When protocol message handler function return error in the `onNewStream` callback,
     // we want to close the stream immediately, but there is an error thrown by lsquic in the server mode.
     // In this case, the stream will be closed until the connection closed.
@@ -1139,14 +1151,7 @@ fn onStreamClose(
             std.log.warn("Protocol message handler failed with error: {}.", .{err});
         };
     }
-    if (self.close_ctx) |close_ctx| {
-        if (close_ctx.callback) |callback| {
-            callback(close_ctx.callback_ctx, self);
-        }
-        if (close_ctx.active_callback) |active_callback| {
-            active_callback(close_ctx.active_callback_ctx, self);
-        }
-    }
+
     self.deinit();
     self.conn.engine.allocator.destroy(self);
 }

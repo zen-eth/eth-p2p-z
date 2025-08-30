@@ -10,6 +10,7 @@ const quic = libp2p.transport.quic;
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 const pubsub = libp2p.protocols.pubsub;
+const Switch = libp2p.swarm.Switch;
 
 /// Memory pool for managing completion objects in the event loop.
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
@@ -109,6 +110,9 @@ pub const IOAction = union(enum) {
         stream: *quic.QuicStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void,
+    },
+    switch_close: struct {
+        network_switch: *Switch,
     },
     pubsub_add_peer: struct {
         pubsub: *pubsub.PubSub,
@@ -501,6 +505,10 @@ pub const ThreadEventLoop = struct {
                 .quic_close_stream => |action_data| {
                     const stream = action_data.stream;
                     stream.doClose(action_data.callback_ctx, action_data.callback);
+                },
+                .switch_close => |action_data| {
+                    const sw = action_data.network_switch;
+                    sw.doClose();
                 },
                 .pubsub_add_peer => |action_data| {
                     const ps = action_data.pubsub;
