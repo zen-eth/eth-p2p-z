@@ -298,7 +298,7 @@ pub const QuicEngine = struct {
             return .rearm;
         }
 
-        const result = lsquic.lsquic_engine_packet_in(
+        _ = lsquic.lsquic_engine_packet_in(
             self.engine,
             b.slice.ptr,
             n,
@@ -307,12 +307,6 @@ pub const QuicEngine = struct {
             self,
             0,
         );
-
-        // If the packet processing failed, we log the error and rearm the read operation.
-        if (result < 0) {
-            std.log.warn("QUIC engine packet in failed {}\n", .{result});
-            return .rearm;
-        }
 
         self.processConns();
 

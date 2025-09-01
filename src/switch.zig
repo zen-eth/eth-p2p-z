@@ -70,13 +70,25 @@ pub const Switch = struct {
         }
 
         self.stopped_notify.wait();
-
-        self.finalCleanup();
+        std.time.sleep(1000 * std.time.ns_per_ms);
     }
 
     pub fn doClose(self: *Switch) void {
         self.is_stopping = true;
-        self.outgoingConnectionCloseAndClean();
+        var out_iter = self.outgoing_connections.iterator();
+        while (out_iter.next()) |entry| {
+            entry.value_ptr.*.close(null, struct {
+                fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {}
+            }.callback); // Close the connection, which will trigger the close callback.
+        }
+
+        for (self.incoming_connections.items) |conn| {
+            conn.close(null, struct {
+                fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {}
+            }.callback); // Close the connection, which will trigger the close callback.
+        }
+
+        self.cleanResources();
     }
 
     const ListenCallbackCtx = struct {
@@ -334,15 +346,15 @@ pub const Switch = struct {
     fn onOutgoingConnectionClose(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
         const self: *Switch = @ptrCast(@alignCast(ctx.?));
 
-        if (self.is_stopping) {
-            // If the switch is stopping, we do not need to handle the connection close.
-            return;
-        }
-
         const conn = res catch |err| {
             std.log.warn("Connection close callback failed with error: {any}", .{err});
             return;
         };
+
+        if (conn.connect_ctx == null) {
+            std.log.err("Cannot remove outgoing connection: connect_ctx is null.", .{});
+            return;
+        }
 
         const address_str = std.fmt.allocPrint(self.allocator, "{}", .{conn.connect_ctx.?.address}) catch unreachable;
         defer self.allocator.free(address_str);
@@ -366,11 +378,6 @@ pub const Switch = struct {
 
     fn onIncomingConnectionClose(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
         const self: *Switch = @ptrCast(@alignCast(ctx.?));
-
-        if (self.is_stopping) {
-            // If the switch is stopping, we do not need to handle the connection close.
-            return;
-        }
 
         const conn = res catch |err| {
             std.log.warn("Connection close callback failed with error: {any}", .{err});
@@ -429,10 +436,7 @@ pub const Switch = struct {
     }
 
     fn cleanResources(self: *Switch) void {
-        self.outgoing_connections.deinit();
-        self.incoming_connections.deinit();
-
-        // self.transport.deinit();
+        self.transport.deinit();
         var listener_iter = self.listeners.iterator();
         while (listener_iter.next()) |entry| {
             var listener = entry.value_ptr.*;
@@ -451,6 +455,17 @@ pub const Switch = struct {
         self.listeners.deinit();
 
         self.mss_handler.deinit();
+        self.finalCleanup();
+
+        // Iterate through any remaining outgoing connections and free their keys
+        // before deinitializing the HashMap. This prevents memory leaks if connections
+        // were not gracefully removed during the shutdown process.
+        var out_iter = self.outgoing_connections.iterator();
+        while (out_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.outgoing_connections.deinit();
+        self.incoming_connections.deinit();
         self.stopped_notify.set();
     }
 
