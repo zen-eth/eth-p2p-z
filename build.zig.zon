@@ -12,7 +12,7 @@
     // In a future version of Zig it will be used for package deduplication.
     .version = "0.1.0",
 
-    .fingerprint = 0x227d092bf27e01fe,
+    .fingerprint = 0x227d092b70f440a7,
 
     // This field is optional.
     // This is currently advisory only; Zig does not yet do anything
