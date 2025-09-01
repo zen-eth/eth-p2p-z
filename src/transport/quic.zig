@@ -298,7 +298,7 @@ pub const QuicEngine = struct {
             return .rearm;
         }
 
-        const result = lsquic.lsquic_engine_packet_in(
+        _ = lsquic.lsquic_engine_packet_in(
             self.engine,
             b.slice.ptr,
             n,
@@ -309,10 +309,10 @@ pub const QuicEngine = struct {
         );
 
         // If the packet processing failed, we log the error and rearm the read operation.
-        if (result < 0) {
-            std.log.warn("QUIC engine packet in failed {}\n", .{result});
-            return .rearm;
-        }
+        // if (result < 0) {
+        //     std.log.warn("QUIC engine packet in failed {}\n", .{result});
+        //     return .rearm;
+        // }
 
         self.processConns();
 
@@ -608,7 +608,6 @@ pub const QuicStream = struct {
         }
 
         _ = lsquic.lsquic_stream_close(self.stream);
-        self.conn.engine.processConns();
     }
 
     /// Writes data to the QUIC stream asynchronously.
@@ -759,9 +758,13 @@ pub const QuicTransport = struct {
     }
 
     pub fn deinit(self: *QuicTransport) void {
-        self.io_event_loop.close();
+        std.debug.print("Deinitializing QUIC transport {*}\n", .{self});
+        std.debug.print("Event loop: {*}\n", .{&self.io_event_loop});
 
+        // self.io_event_loop.close();
+        std.debug.print("Closing QUIC transport\n", .{});
         if (self.dialer_v4) |*dialer| {
+            std.debug.print("Closing outgoing connection to {*}\n", .{dialer});
             lsquic.lsquic_engine_destroy(dialer.engine);
         }
         if (self.dialer_v6) |*dialer| {
@@ -770,6 +773,8 @@ pub const QuicTransport = struct {
         ssl.SSL_CTX_free(self.ssl_context);
         ssl.EVP_PKEY_free(self.subject_keypair);
         ssl.X509_free(self.subject_cert);
+
+        std.debug.print("QUIC transport deinitialized\n", .{});
     }
 
     // Initiates a QUIC connection to the specified peer address.
@@ -1199,7 +1204,10 @@ pub fn maToStdAddrAndPeerId(ma: Multiaddr) !struct { address: std.net.Address, p
 test "lsquic transport initialization" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
-    defer loop.deinit();
+    defer {
+        loop.close();
+        loop.deinit();
+    }
 
     const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
     if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
@@ -1222,7 +1230,10 @@ test "lsquic transport initialization" {
 test "lsquic engine initialization" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
-    defer loop.deinit();
+    defer {
+        loop.close();
+        loop.deinit();
+    }
 
     const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
     if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {

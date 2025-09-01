@@ -118,11 +118,12 @@ pub const Switch = struct {
                 // So that right now the stream will be closed when the connection close function called.
                 // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
                 // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
-                // stream.close(null, struct {
-                //     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-                // }.callback);
+                stream.close(null, struct {
+                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                }.callback);
                 // stream.deinit();
                 // stream.conn.engine.allocator.destroy(stream);
+                std.debug.print("Failed to start responder111: {}\n", .{err});
                 return;
             };
 
@@ -135,9 +136,9 @@ pub const Switch = struct {
                 // So that right now the stream will be closed when the connection close function called.
                 // When call `stream.close` here, because this function is called in `onNewStream`, the `stream_ctx` hasn't been returned yet,
                 // the `stream_ctx` will be null passed to `onStreamClose` function, so that we need to call `stream.deinit` and destroy it manually.
-                // stream.close(null, struct {
-                //     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-                // }.callback);
+                stream.close(null, struct {
+                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                }.callback);
                 // stream.proto_msg_handler.?.onClose(stream) catch |e| {
                 //     std.log.warn("Protocol message handler failed with error: {}.", .{e});
                 // };
@@ -174,8 +175,8 @@ pub const Switch = struct {
                 stream.close(null, struct {
                     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
                 }.callback);
-                stream.deinit();
-                stream.conn.engine.allocator.destroy(stream);
+                // stream.deinit();
+                // stream.conn.engine.allocator.destroy(stream);
                 return;
             };
 
@@ -189,11 +190,11 @@ pub const Switch = struct {
                 stream.close(null, struct {
                     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
                 }.callback);
-                stream.proto_msg_handler.?.onClose(stream) catch |e| {
-                    std.log.warn("Protocol message handler failed with error: {}.", .{e});
-                };
-                stream.deinit();
-                stream.conn.engine.allocator.destroy(stream);
+                // stream.proto_msg_handler.?.onClose(stream) catch |e| {
+                //     std.log.warn("Protocol message handler failed with error: {}.", .{e});
+                // };
+                // stream.deinit();
+                // stream.conn.engine.allocator.destroy(stream);
                 return;
             };
         }
@@ -404,6 +405,7 @@ pub const Switch = struct {
     fn outgoingConnectionCloseAndClean(self: *Switch) void {
         const outgoing_entry = self.outgoing_connections.pop();
         if (outgoing_entry) |e| {
+            std.debug.print("Closing outgoing connection to {s}\n", .{e.key});
             self.allocator.free(e.key);
             e.value.doClose(self, outgoingConnectionCloseAndCleanCallback);
         } else {
@@ -422,6 +424,7 @@ pub const Switch = struct {
     fn incomingConnectionCloseAndClean(self: *Switch) void {
         const incoming_entry = self.incoming_connections.pop();
         if (incoming_entry) |conn| {
+            std.debug.print("Closing incoming connection\n", .{});
             conn.doClose(self, incomingConnectionCloseAndCleanCallback);
         } else {
             self.cleanResources(); // Clean up resources if no incoming connections are left.
@@ -450,8 +453,10 @@ pub const Switch = struct {
         // lsquic.lsquic_global_cleanup();
         self.listeners.deinit();
 
+        std.debug.print("Closing mss handler\n", .{});
         self.mss_handler.deinit();
         self.stopped_notify.set();
+        std.debug.print("Switch stopped\n", .{});
     }
 
     fn finalCleanup(_: *Switch) void {

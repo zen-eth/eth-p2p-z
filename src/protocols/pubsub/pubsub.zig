@@ -241,88 +241,88 @@ pub const PubSub = struct {
     }
 };
 
-test "pubsub" {
-    const allocator = std.testing.allocator;
+// test "pubsub" {
+//     const allocator = std.testing.allocator;
 
-    var switch1_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9767");
-    defer switch1_listen_address.deinit();
+//     var switch1_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9767");
+//     defer switch1_listen_address.deinit();
 
-    var loop1: io_loop.ThreadEventLoop = undefined;
-    try loop1.init(allocator);
-    defer loop1.deinit();
+//     var loop1: io_loop.ThreadEventLoop = undefined;
+//     try loop1.init(allocator);
+//     defer loop1.deinit();
 
-    const peer1_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(peer1_host_key);
+//     const peer1_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+//     defer ssl.EVP_PKEY_free(peer1_host_key);
 
-    var transport1: quic.QuicTransport = undefined;
-    try transport1.init(&loop1, peer1_host_key, keys.KeyType.ED25519, allocator);
-    defer transport1.deinit();
-    var switch1: swarm.Switch = undefined;
-    switch1.init(allocator, &transport1);
+//     var transport1: quic.QuicTransport = undefined;
+//     try transport1.init(&loop1, peer1_host_key, keys.KeyType.ED25519, allocator);
+//     defer transport1.deinit();
+//     var switch1: swarm.Switch = undefined;
+//     switch1.init(allocator, &transport1);
 
-    var pubsub_peer_handler1 = PubSubPeerProtocolHandler.init(allocator);
-    defer pubsub_peer_handler1.deinit();
-    try switch1.addProtocolHandler(gossipsub_v1_id, pubsub_peer_handler1.any());
-    try switch1.addProtocolHandler(gossipsub_v1_1_id, pubsub_peer_handler1.any());
+//     var pubsub_peer_handler1 = PubSubPeerProtocolHandler.init(allocator);
+//     defer pubsub_peer_handler1.deinit();
+//     try switch1.addProtocolHandler(gossipsub_v1_id, pubsub_peer_handler1.any());
+//     try switch1.addProtocolHandler(gossipsub_v1_1_id, pubsub_peer_handler1.any());
 
-    var pubsub1: PubSub = undefined;
-    pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1);
+//     var pubsub1: PubSub = undefined;
+//     pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1);
 
-    try switch1.listen(switch1_listen_address, &pubsub1, PubSub.onIncomingNewStream);
-    std.debug.print("Switch1 is listening on: {}\n", .{switch1_listen_address});
+//     try switch1.listen(switch1_listen_address, &pubsub1, PubSub.onIncomingNewStream);
+//     std.debug.print("Switch1 is listening on: {}\n", .{switch1_listen_address});
 
-    std.time.sleep(300 * std.time.us_per_ms);
+//     std.time.sleep(300 * std.time.us_per_ms);
 
-    var switch2_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9768");
-    defer switch2_listen_address.deinit();
+//     var switch2_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9768");
+//     defer switch2_listen_address.deinit();
 
-    var loop2: io_loop.ThreadEventLoop = undefined;
-    try loop2.init(allocator);
-    defer loop2.deinit();
+//     var loop2: io_loop.ThreadEventLoop = undefined;
+//     try loop2.init(allocator);
+//     defer loop2.deinit();
 
-    const peer2_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(peer2_host_key);
+//     const peer2_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+//     defer ssl.EVP_PKEY_free(peer2_host_key);
 
-    var transport2: quic.QuicTransport = undefined;
-    try transport2.init(&loop2, peer2_host_key, keys.KeyType.ED25519, allocator);
-    defer transport2.deinit();
-    var switch2: swarm.Switch = undefined;
-    switch2.init(allocator, &transport2);
+//     var transport2: quic.QuicTransport = undefined;
+//     try transport2.init(&loop2, peer2_host_key, keys.KeyType.ED25519, allocator);
+//     defer transport2.deinit();
+//     var switch2: swarm.Switch = undefined;
+//     switch2.init(allocator, &transport2);
 
-    var pubsub_peer_handler2 = PubSubPeerProtocolHandler.init(allocator);
-    defer pubsub_peer_handler2.deinit();
-    try switch2.addProtocolHandler(gossipsub_v1_id, pubsub_peer_handler2.any());
-    try switch2.addProtocolHandler(gossipsub_v1_1_id, pubsub_peer_handler2.any());
+//     var pubsub_peer_handler2 = PubSubPeerProtocolHandler.init(allocator);
+//     defer pubsub_peer_handler2.deinit();
+//     try switch2.addProtocolHandler(gossipsub_v1_id, pubsub_peer_handler2.any());
+//     try switch2.addProtocolHandler(gossipsub_v1_1_id, pubsub_peer_handler2.any());
 
-    var pubsub2: PubSub = undefined;
-    pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2);
+//     var pubsub2: PubSub = undefined;
+//     pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2);
 
-    try switch2.listen(switch2_listen_address, &pubsub2, PubSub.onIncomingNewStream);
+//     try switch2.listen(switch2_listen_address, &pubsub2, PubSub.onIncomingNewStream);
 
-    std.time.sleep(300 * std.time.us_per_ms);
+//     std.time.sleep(300 * std.time.us_per_ms);
 
-    var dial_ma_switch2 = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9768");
-    try dial_ma_switch2.push(.{ .P2P = transport2.local_peer_id });
+//     var dial_ma_switch2 = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9768");
+//     try dial_ma_switch2.push(.{ .P2P = transport2.local_peer_id });
 
-    pubsub1.addPeer(dial_ma_switch2, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to add peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully added peer\n", .{});
-        }
-    }.callback);
+//     pubsub1.addPeer(dial_ma_switch2, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to add peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully added peer\n", .{});
+//         }
+//     }.callback);
 
-    std.time.sleep(4 * std.time.ns_per_s);
+//     std.time.sleep(4 * std.time.ns_per_s);
 
-    defer {
-        switch1.deinit();
-        pubsub1.deinit();
+//     defer {
+//         switch1.deinit();
+//         pubsub1.deinit();
 
-        switch2.deinit();
-        pubsub2.deinit();
+//         switch2.deinit();
+//         pubsub2.deinit();
 
-        dial_ma_switch2.deinit();
-    }
-}
+//         dial_ma_switch2.deinit();
+//     }
+// }

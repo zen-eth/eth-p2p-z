@@ -359,6 +359,7 @@ pub const ThreadEventLoop = struct {
 
     /// Stops the event loop and joins the thread.
     pub fn close(self: *Self) void {
+        std.debug.print("Closing event loop: {*}\n", .{&self.loop});
         if (self.inEventLoopThread()) {
             self.loop.stop();
             while (!self.loop.stopped()) {
@@ -367,14 +368,18 @@ pub const ThreadEventLoop = struct {
             return;
         }
 
+        std.debug.print("Notifying stop for event loop: {*}\n", .{&self.loop});
         self.stop_notifier.notify() catch |err| {
             std.log.warn("Error notifying stop: {}\n", .{err});
         };
 
-        while (!self.loop.stopped()) {
-            std.time.sleep(1 * std.time.us_per_s);
-        }
+        std.debug.print("Waiting for event loop to stop: {*}\n", .{&self.loop});
+        // while (!self.loop.stopped()) {
+        //     std.debug.print("Event loop state - running\n", .{});
+        // }
+        std.debug.print("Event loop state after close - running, done\n", .{});
         self.loop_thread.join();
+        std.debug.print("Event loop thread joined\n", .{});
     }
 
     /// Queues a message for processing in the event loop.
@@ -407,6 +412,7 @@ pub const ThreadEventLoop = struct {
         };
 
         loop.stop();
+        std.debug.print("Event loop stopped: {*}\n", .{loop});
 
         return .disarm;
     }
