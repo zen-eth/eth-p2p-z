@@ -279,7 +279,7 @@ pub const QuicEngine = struct {
     /// This function is not thread-safe and should not be called from multiple threads concurrently.
     fn readCallback(
         ctx: ?*QuicEngine,
-        _: *xev.Loop,
+        loop: *xev.Loop,
         _: *xev.Completion,
         _: *xev.UDP.State,
         address: std.net.Address,
@@ -292,9 +292,15 @@ pub const QuicEngine = struct {
         // For UDP read errors, we log the error and continue to listen.
         const n = r catch |err| {
             std.log.warn("UDP read failed with error: {any}. Continuing to listen.", .{err});
+            if (loop.stopped()) {
+                return .disarm;
+            }
             return .rearm;
         };
         if (n == 0) {
+            if (loop.stopped()) {
+                return .disarm;
+            }
             return .rearm;
         }
 
@@ -310,6 +316,9 @@ pub const QuicEngine = struct {
 
         self.processConns();
 
+        if (loop.stopped()) {
+            return .disarm;
+        }
         return .rearm;
     }
 

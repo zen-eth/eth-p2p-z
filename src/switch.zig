@@ -70,7 +70,6 @@ pub const Switch = struct {
         }
 
         self.stopped_notify.wait();
-        std.time.sleep(1000 * std.time.ns_per_ms);
     }
 
     pub fn doClose(self: *Switch) void {
@@ -398,41 +397,6 @@ pub const Switch = struct {
         // This code is reached if the connection was not found in the list, which might
         // indicate a logic error elsewhere, but is safe to ignore for now.
         std.log.warn("Incoming connection close callback invoked, but connection not found in the list.", .{});
-    }
-
-    fn outgoingConnectionCloseAndCleanCallback(ctx: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {
-        const self: *Switch = @ptrCast(@alignCast(ctx.?));
-
-        // This callback is called when an outgoing connection is closed.
-        // We will remove it from the list and clean up resources.
-        self.outgoingConnectionCloseAndClean();
-    }
-
-    fn outgoingConnectionCloseAndClean(self: *Switch) void {
-        const outgoing_entry = self.outgoing_connections.pop();
-        if (outgoing_entry) |e| {
-            self.allocator.free(e.key);
-            e.value.doClose(self, outgoingConnectionCloseAndCleanCallback);
-        } else {
-            self.incomingConnectionCloseAndClean(); // Clean up resources if no outgoing connections are left.
-        }
-    }
-
-    fn incomingConnectionCloseAndCleanCallback(ctx: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {
-        const self: *Switch = @ptrCast(@alignCast(ctx.?));
-
-        // This callback is called when an incoming connection is closed.
-        // We will remove it from the list and clean up resources.
-        self.incomingConnectionCloseAndClean();
-    }
-
-    fn incomingConnectionCloseAndClean(self: *Switch) void {
-        const incoming_entry = self.incoming_connections.pop();
-        if (incoming_entry) |conn| {
-            conn.doClose(self, incomingConnectionCloseAndCleanCallback);
-        } else {
-            self.cleanResources(); // Clean up resources if no incoming connections are left.
-        }
     }
 
     fn cleanResources(self: *Switch) void {

@@ -516,6 +516,9 @@ pub const ThreadEventLoop = struct {
             self.allocator.destroy(m);
         }
 
+        if (loop.stopped()) {
+            return .disarm;
+        }
         return .rearm;
     }
 };
