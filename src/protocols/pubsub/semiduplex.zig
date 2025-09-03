@@ -2,6 +2,7 @@ const std = @import("std");
 const libp2p = @import("../../root.zig");
 const protocols = libp2p.protocols;
 const PeerId = @import("peer-id").PeerId;
+const quic = libp2p.transport.quic;
 
 pub const Semiduplex = struct {
     /// The read half of the semiduplex stream.
@@ -11,43 +12,22 @@ pub const Semiduplex = struct {
 
     allocator: std.mem.Allocator,
 
-    close_ctx: ?*anyopaque,
-
-    close_callback: ?*const fn (ctx: ?*anyopaque, res: anyerror!*Semiduplex) void,
-
     const Self = @This();
 
-    pub fn close(self: *Self, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*Semiduplex) void) void {
-        self.close_ctx = callback_ctx;
-        self.close_callback = callback;
-
+    pub fn close(self: *Self, s_callback_ctx: ?*anyopaque, s_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*Semiduplex) void) void {
         if (self.initiator) |init| {
-            init.stream.close(self, onOutgoingStreamClose);
-        } else {
-            if (self.responder) |resp| {
-                resp.stream.close(self, onIncomingStreamClose);
-            } else {
-                std.log.warn("Both initiator and responder are null", .{});
-            }
+            init.stream.close(null, struct {
+                fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+            }.callback);
         }
-    }
-
-    fn onOutgoingStreamClose(ctx: ?*anyopaque, res: anyerror!*libp2p.QuicStream) void {
-        const self: *Semiduplex = @ptrCast(@alignCast(ctx.?));
-        _ = res catch unreachable;
-
         if (self.responder) |resp| {
-            resp.stream.close(self, onIncomingStreamClose);
-        } else {
-            self.close_callback.?(self.close_ctx, self);
+            resp.stream.close(null, struct {
+                fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+            }.callback);
         }
-    }
-
-    fn onIncomingStreamClose(ctx: ?*anyopaque, res: anyerror!*libp2p.QuicStream) void {
-        const self: *Semiduplex = @ptrCast(@alignCast(ctx.?));
-        _ = res catch unreachable;
-
-        self.close_callback.?(self.close_ctx, self);
+        std.debug.print("Closing semiduplex stream\n", .{});
+        s_callback(s_callback_ctx, self);
+        std.debug.print("Semiduplex stream closed\n", .{});
     }
 };
 

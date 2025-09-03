@@ -327,11 +327,15 @@ pub const QuicEngine = struct {
     /// It processes the connections in the lsquic engine and schedules the next processing based on the earliest advertised tick.
     fn processConnsCallback(
         ctx: ?*QuicEngine,
-        _: *xev.Loop,
+        loop: *xev.Loop,
         _: *xev.Completion,
         r: xev.Timer.RunError!void,
     ) xev.CallbackAction {
         const engine = ctx.?;
+
+        if (loop.stopped()) {
+            return .disarm;
+        }
 
         _ = r catch |err| {
             std.log.warn("QUIC engine process conns timer failed with error: {}", .{err});

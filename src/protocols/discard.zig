@@ -658,7 +658,6 @@ test "no supported protocols error" {
     switch1.init(allocator, &transport);
     defer {
         switch1.deinit();
-        std.time.sleep(100 * std.time.ns_per_ms);
     }
 
     var discard_handler = DiscardProtocolHandler.init(allocator);
@@ -688,7 +687,6 @@ test "no supported protocols error" {
     switch2.init(allocator, &cl_transport);
     defer {
         switch2.deinit();
-        std.time.sleep(100 * std.time.ns_per_ms);
     }
 
     var discard_handler2 = DiscardProtocolHandler.init(allocator);
