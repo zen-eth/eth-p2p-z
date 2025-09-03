@@ -740,11 +740,11 @@ pub const QuicTransport = struct {
             return error.InitializationFailed;
         }
 
-        const subject_keypair = try tls.generateKeyPair1(cert_key_type);
+        const subject_keypair = try tls.generateKeyPair(cert_key_type);
 
         const subject_cert = try tls.buildCert(allocator, host_keypair, subject_keypair);
 
-        var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_keypair);
+        var pubkey = try tls.createProtobufEncodedPublicKey(allocator, host_keypair);
         defer allocator.free(pubkey.data.?);
 
         self.* = .{
@@ -1267,7 +1267,7 @@ test "lsquic engine initialization" {
 
 //     defer ssl.EVP_PKEY_free(server_key);
 
-//     var pubkey = try tls.createProtobufEncodedPublicKey1(std.testing.allocator, server_key);
+//     var pubkey = try tls.createProtobufEncodedPublicKey(std.testing.allocator, server_key);
 //     defer std.testing.allocator.free(pubkey.data.?);
 //     const server_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &pubkey);
 //     std.debug.print("Server Peer ID: {}\n", .{server_peer_id});

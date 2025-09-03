@@ -289,7 +289,7 @@ fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId
     try cl_loop.init(allocator);
     defer cl_loop.deinit();
 
-    const cl_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+    const cl_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(cl_host_key);
 
     var cl_transport: quic.QuicTransport = undefined;
@@ -359,13 +359,13 @@ test "discard protocol using switch" {
         loop.deinit();
     }
 
-    const host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+    const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys.KeyType.ED25519, allocator);
 
-    var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
+    var pubkey = try tls.createProtobufEncodedPublicKey(allocator, host_key);
     defer allocator.free(pubkey.data.?);
     const server_peer_id = try PeerId.fromPublicKey(allocator, &pubkey);
 
@@ -398,13 +398,13 @@ test "discard protocol using switch" {
         cl_loop.deinit();
     }
 
-    const cl_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+    const cl_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(cl_host_key);
 
     var cl_transport: quic.QuicTransport = undefined;
     try cl_transport.init(&cl_loop, cl_host_key, keys.KeyType.ED25519, allocator);
 
-    var pubkey1 = try tls.createProtobufEncodedPublicKey1(allocator, cl_host_key);
+    var pubkey1 = try tls.createProtobufEncodedPublicKey(allocator, cl_host_key);
     defer allocator.free(pubkey1.data.?);
     const server_peer_id1 = try PeerId.fromPublicKey(allocator, &pubkey1);
 
@@ -431,7 +431,7 @@ test "discard protocol using switch" {
         cl_loop1.deinit();
     }
 
-    const cl_host_key1 = try tls.generateKeyPair1(keys.KeyType.ED25519);
+    const cl_host_key1 = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(cl_host_key1);
 
     var cl_transport1: quic.QuicTransport = undefined;
@@ -538,10 +538,10 @@ test "discard protocol using switch with 1MB data" {
     try loop.init(std.testing.allocator);
     defer loop.deinit();
 
-    const host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+    const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
 
-    var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
+    var pubkey = try tls.createProtobufEncodedPublicKey(allocator, host_key);
     defer allocator.free(pubkey.data.?);
     const server_peer_id = try PeerId.fromPublicKey(allocator, &pubkey);
 
@@ -565,7 +565,7 @@ test "discard protocol using switch with 1MB data" {
     try cl_loop.init(allocator);
     defer cl_loop.deinit();
 
-    const cl_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+    const cl_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(cl_host_key);
 
     var cl_transport: quic.QuicTransport = undefined;
@@ -645,10 +645,10 @@ test "no supported protocols error" {
         loop.deinit();
     }
 
-    const host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+    const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
 
-    var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
+    var pubkey = try tls.createProtobufEncodedPublicKey(allocator, host_key);
     defer allocator.free(pubkey.data.?);
     const server_peer_id = try PeerId.fromPublicKey(allocator, &pubkey);
 
@@ -679,7 +679,7 @@ test "no supported protocols error" {
         cl_loop.deinit();
     }
 
-    const cl_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+    const cl_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(cl_host_key);
 
     var cl_transport: quic.QuicTransport = undefined;
@@ -732,12 +732,12 @@ test "discard protocol with 5 concurrent clients" {
     try loop.init(allocator);
     defer loop.deinit();
 
-    const host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+    const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: quic.QuicTransport = undefined;
     try transport.init(&loop, host_key, keys.KeyType.ED25519, allocator);
-    var pubkey = try tls.createProtobufEncodedPublicKey1(allocator, host_key);
+    var pubkey = try tls.createProtobufEncodedPublicKey(allocator, host_key);
     defer allocator.free(pubkey.data.?);
     const server_peer_id = try PeerId.fromPublicKey(allocator, &pubkey);
 

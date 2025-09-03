@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
         },
     );
 
-    const peer_id_dep = b.dependency("peer_id", .{
+    const peer_id_dep = zmultiformats_dep.builder.dependency("peer_id", .{
         .target = target,
         .optimize = optimize,
     });

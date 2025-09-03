@@ -251,7 +251,7 @@ pub const PubSub = struct {
 //     try loop1.init(allocator);
 //     defer loop1.deinit();
 
-//     const peer1_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+//     const peer1_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
 //     defer ssl.EVP_PKEY_free(peer1_host_key);
 
 //     var transport1: quic.QuicTransport = undefined;
@@ -280,7 +280,7 @@ pub const PubSub = struct {
 //     try loop2.init(allocator);
 //     defer loop2.deinit();
 
-//     const peer2_host_key = try tls.generateKeyPair1(keys.KeyType.ED25519);
+//     const peer2_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
 //     defer ssl.EVP_PKEY_free(peer2_host_key);
 
 //     var transport2: quic.QuicTransport = undefined;
