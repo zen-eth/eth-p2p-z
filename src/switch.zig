@@ -70,6 +70,7 @@ pub const Switch = struct {
         }
 
         self.stopped_notify.wait();
+        std.time.sleep(1 * std.time.ns_per_s);
     }
 
     pub fn doClose(self: *Switch) void {
