@@ -225,6 +225,7 @@ pub const PubSub = struct {
         };
     }
 
+    // This function is called when a stream is closed. It is set when the stream is created.
     fn onStreamClose(ctx: ?*anyopaque, stream: anyerror!*libp2p.QuicStream) void {
         const self: *Self = @ptrCast(@alignCast(ctx.?));
         const s = stream catch unreachable;
@@ -248,6 +249,10 @@ pub const PubSub = struct {
             }
         }
 
+        // If the close operation is not initiated by the application layer, we will try to close the other direction stream as well.
+        // If both directions are closed, we will remove the peer from the peer list.
+        // If the close operation is initiated by the application layer, we will not do anything here.
+        // Because the application layer will handle the removal of the peer.
         if (!semi_duplex.active_close) {
             if (semi_duplex.initiator == null and semi_duplex.responder == null) {
                 _ = self.peers.remove(remote_peer_id);
