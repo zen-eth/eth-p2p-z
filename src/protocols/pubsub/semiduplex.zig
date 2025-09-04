@@ -12,22 +12,33 @@ pub const Semiduplex = struct {
 
     allocator: std.mem.Allocator,
 
+    active_close: bool = false,
+
     const Self = @This();
 
     pub fn close(self: *Self, s_callback_ctx: ?*anyopaque, s_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*Semiduplex) void) void {
-        if (self.initiator) |init| {
+        if (self.active_close) {
+            s_callback(s_callback_ctx, self);
+            return;
+        }
+
+        self.active_close = true;
+
+        const current_initiator = self.initiator;
+        const current_responder = self.responder;
+
+        if (current_initiator) |init| {
             init.stream.close(null, struct {
                 fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
             }.callback);
         }
-        if (self.responder) |resp| {
+
+        if (current_responder) |resp| {
             resp.stream.close(null, struct {
                 fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
             }.callback);
         }
-        std.debug.print("Closing semiduplex stream\n", .{});
         s_callback(s_callback_ctx, self);
-        std.debug.print("Semiduplex stream closed\n", .{});
     }
 };
 
