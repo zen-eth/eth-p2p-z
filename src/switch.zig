@@ -70,6 +70,10 @@ pub const Switch = struct {
         }
 
         self.stopped_notify.wait();
+        // **NOTE**: The async close operation may take some time to complete,
+        // so we wait here to ensure all resources are cleaned up before returning.
+        // This is an important fix for the https://github.com/zen-eth/zig-libp2p/issues/69.
+        // We should improve this in the future by finding a way to not block the caller thread.
         std.time.sleep(1 * std.time.ns_per_s);
     }
 

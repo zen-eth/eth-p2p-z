@@ -485,7 +485,7 @@ pub const QuicConnection = struct {
             close_ctx.active_callback_ctx = callback_ctx;
             close_ctx.active_callback = callback;
         } else {
-            std.log.warn("In general it should have the close context when dialing and listening", .{});
+            std.log.warn("In general it should have the close context which is set when dialing and listening", .{});
             self.close_ctx = .{
                 .callback_ctx = null,
                 .callback = null,
@@ -605,7 +605,7 @@ pub const QuicStream = struct {
             close_ctx.active_callback_ctx = callback_ctx;
             close_ctx.active_callback = callback;
         } else {
-            std.log.warn("In general it should have the stream close context when dialing and listening", .{});
+            std.log.warn("In general it should have the stream close context which is set when dialing and listening", .{});
             self.close_ctx = .{
                 .callback_ctx = null,
                 .callback = null,

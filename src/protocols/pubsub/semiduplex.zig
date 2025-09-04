@@ -4,6 +4,12 @@ const protocols = libp2p.protocols;
 const PeerId = @import("peer-id").PeerId;
 const quic = libp2p.transport.quic;
 
+/// The Semiduplex struct represents a bidirectional communication channel
+/// between two peers in a PubSub network. It consists of two halves:
+/// the initiator (read half) and the responder (write half). Each half is
+/// represented by a PubSubPeerInitiator and PubSubPeerResponder respectively.
+/// The Semiduplex struct manages the lifecycle of these two halves and provides
+/// methods to close the connection gracefully.
 pub const Semiduplex = struct {
     /// The read half of the semiduplex stream.
     initiator: ?*PubSubPeerInitiator,
@@ -11,7 +17,7 @@ pub const Semiduplex = struct {
     responder: ?*PubSubPeerResponder,
 
     allocator: std.mem.Allocator,
-
+    /// Indicates whether the close operation is initiated by the application layer.
     active_close: bool = false,
 
     const Self = @This();

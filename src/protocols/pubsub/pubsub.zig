@@ -21,6 +21,11 @@ pub const PubSubPeerProtocolHandler = semiduplex.PubSubPeerProtocolHandler;
 pub const gossipsub_v1_id: ProtocolId = gossipsub.v1_id;
 pub const gossipsub_v1_1_id: ProtocolId = gossipsub.v1_1_id;
 
+/// This is an implementation of the generic PubSub system which defined by the libp2p specification.
+/// It manages the peers and their connections, and provides methods to add and remove peers.
+/// It uses the Semiduplex struct to manage the bidirectional communication with each peer.
+/// It also handles incoming and outgoing streams for the PubSub protocol.
+/// It could use different PubSub routing algorithms, such as Gossipsub, Floodsub, etc.
 pub const PubSub = struct {
     peers: std.AutoHashMap(PeerId, Semiduplex),
 
