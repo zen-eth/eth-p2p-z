@@ -20,6 +20,8 @@ pub const Semiduplex = struct {
     /// Indicates whether the close operation is initiated by the application layer.
     active_close: bool = false,
 
+    replace_stream: bool = false,
+
     const Self = @This();
 
     pub fn close(self: *Self, s_callback_ctx: ?*anyopaque, s_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*Semiduplex) void) void {

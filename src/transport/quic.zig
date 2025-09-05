@@ -615,7 +615,6 @@ pub const QuicStream = struct {
         }
 
         _ = lsquic.lsquic_stream_close(self.stream);
-        self.conn.engine.processConns();
     }
 
     /// Writes data to the QUIC stream asynchronously.
