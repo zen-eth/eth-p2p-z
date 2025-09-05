@@ -1,8 +1,9 @@
 const std = @import("std");
 const ssl = @import("ssl");
 const Allocator = std.mem.Allocator;
-const keys_proto = @import("../proto/keys.proto.zig");
 const keys = @import("peer_id").keys;
+const keys_proto = @import("../proto/keys.proto.zig");
+const PeerId = @import("peer_id").PeerId;
 
 pub const ALPN = "libp2p";
 
@@ -16,6 +17,14 @@ const Libp2pExtensionOid = "1.3.6.1.4.1.53594.1.1";
 const CertNotBeforeOffsetSeconds = -3600; // 1 hour before current time
 /// The offset to apply to the certificate's notAfter field.
 const CertNotAfterOffsetSeconds = 365 * 24 * 3600; // 1 year after current time
+
+// There is no approach to get cert in the lsquic `onHskDone` callback, but we need it to verify the peer's identity.
+// So we store it in a thread-local variable. It assumes that the callback will be called in the same thread for each engine,
+// and that multiple connections will not be handled concurrently in the same thread.
+// cpp-libp2p fork the lsquic library and add a function to retrieve the peer certificate.
+// https://github.com/libp2p/cpp-libp2p/blob/c386b481410af1910c23f96aec81789410204dbd/vcpkg-overlay/liblsquic/lsquic_conn_ssl.patch .
+// TODO: If thread-local storage is not suitable, consider apply that patch.
+threadlocal var g_peer_cert: ?*ssl.X509 = null;
 
 pub const Error = error{
     CertCreationFailed,
@@ -37,12 +46,88 @@ pub const Error = error{
     SignDataFailed,
     SignCertFailed,
     UnsupportedKeyType,
+    IncompatibleCertificateExtension,
+    InvalidKeyLength,
 };
 
+pub const ExtensionData = struct {
+    host_pubkey: []u8,
+    signature: []u8,
+};
+
+/// TODO: Deprecated when peer-id migrated to blockblaz
 /// Generates a new key pair based on the specified key type.
 /// This is a helper function to encapsulate the complexity of key generation using OpenSSL.
 /// Note: SECP256K1 is not supported and will result in an `Error.UnsupportedKeyType`.
 pub fn generateKeyPair(cert_key_type: keys_proto.KeyType) !*ssl.EVP_PKEY {
+    var maybe_subject_keypair: ?*ssl.EVP_PKEY = null;
+
+    if (cert_key_type == .ECDSA or cert_key_type == .SECP256K1) {
+        const curve_nid = switch (cert_key_type) {
+            .ECDSA => ssl.NID_X9_62_prime256v1,
+            // SECP256K1 is not supported in BoringSSL
+            .SECP256K1 => return error.UnsupportedKeyType,
+            else => unreachable,
+        };
+
+        var maybe_params: ?*ssl.EVP_PKEY = null;
+        {
+            const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_EC, null) orelse return error.OpenSSLFailed;
+            defer ssl.EVP_PKEY_CTX_free(pctx);
+
+            if (ssl.EVP_PKEY_paramgen_init(pctx) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, curve_nid) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_paramgen(pctx, &maybe_params) <= 0) {
+                return error.OpenSSLFailed;
+            }
+        }
+        const params = maybe_params orelse return error.OpenSSLFailed;
+        defer ssl.EVP_PKEY_free(params);
+
+        {
+            const kctx = ssl.EVP_PKEY_CTX_new(params, null) orelse return error.OpenSSLFailed;
+            defer ssl.EVP_PKEY_CTX_free(kctx);
+
+            if (ssl.EVP_PKEY_keygen_init(kctx) <= 0) {
+                return error.OpenSSLFailed;
+            }
+
+            if (ssl.EVP_PKEY_keygen(kctx, &maybe_subject_keypair) <= 0) {
+                return error.OpenSSLFailed;
+            }
+        }
+    } else {
+        const key_alg_id = switch (cert_key_type) {
+            .ED25519 => ssl.EVP_PKEY_ED25519,
+            .RSA => ssl.EVP_PKEY_RSA,
+            else => unreachable,
+        };
+
+        const pctx = ssl.EVP_PKEY_CTX_new_id(key_alg_id, null) orelse return error.OpenSSLFailed;
+        defer ssl.EVP_PKEY_CTX_free(pctx);
+
+        if (ssl.EVP_PKEY_keygen_init(pctx) <= 0) {
+            return error.OpenSSLFailed;
+        }
+
+        if (ssl.EVP_PKEY_keygen(pctx, &maybe_subject_keypair) <= 0) {
+            return error.OpenSSLFailed;
+        }
+    }
+
+    return maybe_subject_keypair orelse return error.OpenSSLFailed;
+}
+
+/// Generates a new key pair based on the specified key type.
+/// This is a helper function to encapsulate the complexity of key generation using OpenSSL.
+/// Note: SECP256K1 is not supported and will result in an `Error.UnsupportedKeyType`.
+pub fn generateKeyPair1(cert_key_type: keys.KeyType) !*ssl.EVP_PKEY {
     var maybe_subject_keypair: ?*ssl.EVP_PKEY = null;
 
     if (cert_key_type == .ECDSA or cert_key_type == .SECP256K1) {
@@ -328,6 +413,166 @@ fn signData(allocator: Allocator, pkey: *ssl.EVP_PKEY, data: []const u8) ![]u8 {
     return sig_buf;
 }
 
+pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !struct { is_valid: bool, host_pubkey: keys.PublicKey, peer_id: PeerId } {
+    const ext_data = try extractExtensionFields(allocator, cert);
+    defer {
+        allocator.free(ext_data.host_pubkey);
+        allocator.free(ext_data.signature);
+    }
+
+    const host_pubkey_reader = try keys.PublicKeyReader.init(allocator, ext_data.host_pubkey);
+
+    var host_pubkey = keys.PublicKey{
+        .type = host_pubkey_reader.getType(),
+        .data = try allocator.dupe(u8, host_pubkey_reader.getData()),
+    };
+
+    const evp_key = try reconstructEvpKeyFromPublicKey(&host_pubkey);
+    defer ssl.EVP_PKEY_free(evp_key);
+
+    const peer_id = try PeerId.fromPublicKey(allocator, &host_pubkey);
+
+    const cert_pkey = ssl.X509_get_pubkey(cert);
+    if (cert_pkey == null) return error.InvalidCertificate;
+    defer ssl.EVP_PKEY_free(cert_pkey);
+
+    var cert_pubkey_ptr: [*c]u8 = null;
+    const cert_pubkey_len = ssl.i2d_PUBKEY(cert_pkey, &cert_pubkey_ptr);
+    if (cert_pubkey_len <= 0) return error.InvalidCertificate;
+    defer ssl.OPENSSL_free(cert_pubkey_ptr);
+    const cert_pubkey_der = cert_pubkey_ptr[0..@intCast(cert_pubkey_len)];
+
+    const data_to_verify = try allocator.alloc(u8, CertificatePrefix.len + cert_pubkey_der.len);
+    defer allocator.free(data_to_verify);
+    @memcpy(data_to_verify[0..CertificatePrefix.len], CertificatePrefix);
+    @memcpy(data_to_verify[CertificatePrefix.len..], cert_pubkey_der);
+
+    const is_valid = try verifySignature(evp_key, data_to_verify, ext_data.signature);
+    return .{ .is_valid = is_valid, .host_pubkey = host_pubkey, .peer_id = peer_id };
+}
+
+fn reconstructEvpKeyFromPublicKey(public_key: *const keys.PublicKey) !*ssl.EVP_PKEY {
+    const key_data = public_key.data orelse return error.RawPubKeyGetFailed;
+
+    switch (public_key.type) {
+        .ED25519 => {
+            if (key_data.len != 32) {
+                return error.InvalidKeyLength;
+            }
+            return ssl.EVP_PKEY_new_raw_public_key(ssl.EVP_PKEY_ED25519, null, // engine parameter (not used)
+                key_data.ptr, key_data.len) orelse error.OpenSSLFailed;
+        },
+
+        .RSA, .ECDSA => {
+            var key_ptr: [*c]const u8 = key_data.ptr;
+            return ssl.d2i_PUBKEY(null, &key_ptr, @intCast(key_data.len)) orelse error.OpenSSLFailed;
+        },
+
+        .SECP256K1 => {
+            return error.UnsupportedKeyType; // BoringSSL not supported
+        },
+
+        else => return error.UnsupportedKeyType,
+    }
+}
+
+fn extractExtensionFields(allocator: Allocator, cert: *const ssl.X509) !ExtensionData {
+    const obj = ssl.OBJ_txt2obj(Libp2pExtensionOid, 1) orelse return error.InvalidOID;
+    defer ssl.ASN1_OBJECT_free(obj);
+    const index = ssl.X509_get_ext_by_OBJ(cert, obj, -1);
+    if (index < 0) {
+        std.log.warn("Certificate does not contain the required extension", .{});
+        return error.IncompatibleCertificateExtension;
+    }
+
+    const ext = ssl.X509_get_ext(cert, index);
+
+    const os = ssl.X509_EXTENSION_get_data(ext);
+
+    const raw_len = ssl.ASN1_STRING_length(@ptrCast(os));
+    const raw_data = ssl.ASN1_STRING_get0_data(@ptrCast(os));
+
+    if (raw_data == null or raw_len <= 0) {
+        return error.IncompatibleCertificateExtension;
+    }
+
+    return parseExtensionSequence(allocator, raw_data[0..@intCast(raw_len)]);
+}
+
+/// Parses the ASN.1 SEQUENCE from the extension data.
+/// The sequence contains two OCTET STRINGs: host public key and signature.
+fn parseExtensionSequence(allocator: Allocator, der_data: []const u8) !ExtensionData {
+    var data_ptr: [*c]const u8 = der_data.ptr;
+    const seq_stack = ssl.d2i_ASN1_SEQUENCE_ANY(null, &data_ptr, @intCast(der_data.len));
+    if (seq_stack == null) {
+        return error.IncompatibleCertificateExtension;
+    }
+    defer ssl.sk_ASN1_TYPE_free(seq_stack);
+
+    const num_items = ssl.sk_ASN1_TYPE_num(seq_stack);
+    if (num_items != 2) {
+        std.log.warn("Extension sequence should contain exactly 2 items, found {}", .{num_items});
+        return error.IncompatibleCertificateExtension;
+    }
+
+    // Extract first OCTET STRING (host public key)
+    const host_key_type = ssl.sk_ASN1_TYPE_value(seq_stack, 0);
+    if (host_key_type == null or ssl.ASN1_TYPE_get(host_key_type) != ssl.V_ASN1_OCTET_STRING) {
+        return error.IncompatibleCertificateExtension;
+    }
+
+    const host_key_os = host_key_type.*.value.octet_string;
+    if (host_key_os == null) {
+        return error.IncompatibleCertificateExtension;
+    }
+
+    const host_key_len = ssl.ASN1_STRING_length(@ptrCast(host_key_os));
+    const host_key_data = ssl.ASN1_STRING_get0_data(@ptrCast(host_key_os));
+    const host_pubkey = try allocator.dupe(u8, host_key_data[0..@intCast(host_key_len)]);
+    errdefer allocator.free(host_pubkey);
+
+    const sig_type = ssl.sk_ASN1_TYPE_value(seq_stack, 1);
+    if (sig_type == null or ssl.ASN1_TYPE_get(sig_type) != ssl.V_ASN1_OCTET_STRING) {
+        return error.IncompatibleCertificateExtension;
+    }
+
+    const sig_os = sig_type.*.value.octet_string;
+    if (sig_os == null) {
+        return error.IncompatibleCertificateExtension;
+    }
+
+    const sig_len = ssl.ASN1_STRING_length(@ptrCast(sig_os));
+    const sig_data = ssl.ASN1_STRING_get0_data(@ptrCast(sig_os));
+    const signature = try allocator.dupe(u8, sig_data[0..@intCast(sig_len)]);
+
+    return .{ .host_pubkey = host_pubkey, .signature = signature };
+}
+
+/// Verifies a signature using the provided public key.
+fn verifySignature(pkey: *ssl.EVP_PKEY, data: []const u8, signature: []const u8) !bool {
+    const ctx = ssl.EVP_MD_CTX_new() orelse return error.OpenSSLFailed;
+    defer ssl.EVP_MD_CTX_free(ctx);
+
+    const message_digest: ?*const ssl.EVP_MD = switch (ssl.EVP_PKEY_base_id(pkey)) {
+        ssl.EVP_PKEY_ED25519 => null,
+        ssl.EVP_PKEY_EC, ssl.EVP_PKEY_RSA => ssl.EVP_sha256(),
+        else => return error.UnsupportedKeyType,
+    };
+
+    if (ssl.EVP_DigestVerifyInit(ctx, null, message_digest, null, pkey) <= 0) {
+        return error.OpenSSLFailed;
+    }
+
+    const result = ssl.EVP_DigestVerify(ctx, signature.ptr, signature.len, data.ptr, data.len);
+    if (result == 1) {
+        return true;
+    } else if (result == 0) {
+        return false;
+    } else {
+        return error.OpenSSLFailed;
+    }
+}
+
 /// Creates the DER-encoded value for the libp2p extension.
 /// The value is a SEQUENCE of two OCTET STRINGs. The caller is responsible for
 /// freeing the memory pointed to by `out` using `ssl.OPENSSL_free()`.
@@ -431,11 +676,190 @@ pub fn alpnSelectCallbackfn(ssl_handle: ?*ssl.SSL, out: [*c][*c]const u8, out_le
     }
 }
 
-pub fn libp2pVerifyCallback(cert_ctx: ?*ssl.X509_STORE_CTX, ctx: ?*anyopaque) callconv(.c) c_int {
-    _ = cert_ctx;
-    _ = ctx;
-    // TODO: Implement certificate verification logic if needed.
-    return 1;
+pub fn libp2pVerifyCallback(_: c_int, cert_ctx: ?*ssl.X509_STORE_CTX) callconv(.c) c_int {
+    std.debug.assert(cert_ctx != null);
+
+    const err = ssl.X509_STORE_CTX_get_error(cert_ctx);
+    const err_depth = ssl.X509_STORE_CTX_get_error_depth(cert_ctx);
+
+    const cert = ssl.X509_STORE_CTX_get_current_cert(cert_ctx);
+    if (cert == null) {
+        std.log.warn("No certificate found in verification context", .{});
+        return 0;
+    }
+
+    if (g_peer_cert) |old_cert| {
+        ssl.X509_free(old_cert);
+    }
+    g_peer_cert = ssl.X509_dup(cert.?);
+
+    var subject_name: [256]u8 = std.mem.zeroes([256]u8);
+    const subject_name_ptr = ssl.X509_get_subject_name(cert);
+    if (subject_name_ptr != null) {
+        _ = ssl.X509_NAME_oneline(subject_name_ptr, &subject_name, subject_name.len);
+    }
+
+    var res: c_int = 0;
+    if (err == ssl.X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN or
+        err == ssl.X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT)
+    {
+        res = 1;
+        std.log.debug("Certificate verify callback: subject={s}, error={s} ({}), depth={}, status=ACCEPTED (self-signed)", .{
+            std.mem.sliceTo(&subject_name, 0),
+            x509ErrorToStr(err),
+            err,
+            err_depth,
+        });
+    } else if (err == ssl.X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION) {
+        const is_valid = checkCriticalExtensions(cert.?) catch false;
+        res = if (is_valid) 1 else 0;
+
+        const status_str = if (is_valid) "ACCEPTED (libp2p extension)" else "REJECTED (unknown critical extension)";
+
+        if (is_valid) {
+            std.log.debug("Certificate verify callback: subject={s}, error={s} ({}), depth={}, status={s}", .{
+                std.mem.sliceTo(&subject_name, 0),
+                x509ErrorToStr(err),
+                err,
+                err_depth,
+                status_str,
+            });
+        } else {
+            std.log.warn("Certificate verify callback: subject={s}, error={s} ({}), depth={}, status={s}", .{
+                std.mem.sliceTo(&subject_name, 0),
+                x509ErrorToStr(err),
+                err,
+                err_depth,
+                status_str,
+            });
+        }
+    } else {
+        res = 0;
+        std.log.warn("Certificate verify callback: subject={s}, error={s} ({}), depth={}, status=REJECTED", .{
+            std.mem.sliceTo(&subject_name, 0),
+            x509ErrorToStr(err),
+            err,
+            err_depth,
+        });
+    }
+
+    return res;
+}
+
+pub fn takeSavedPeerCertificate() ?*ssl.X509 {
+    const cert = g_peer_cert;
+    g_peer_cert = null;
+    return cert;
+}
+
+pub fn clearSavedPeerCertificate() void {
+    if (g_peer_cert) |cert| {
+        ssl.X509_free(cert);
+        g_peer_cert = null;
+    }
+}
+
+fn x509ErrorToStr(error_code: c_int) []const u8 {
+    return switch (error_code) {
+        ssl.X509_V_OK => "ok",
+        ssl.X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT => "unable to get issuer certificate",
+        ssl.X509_V_ERR_UNABLE_TO_GET_CRL => "unable to get certificate CRL",
+        ssl.X509_V_ERR_UNABLE_TO_DECRYPT_CERT_SIGNATURE => "unable to decrypt certificate's signature",
+        ssl.X509_V_ERR_UNABLE_TO_DECRYPT_CRL_SIGNATURE => "unable to decrypt CRL's signature",
+        ssl.X509_V_ERR_UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY => "unable to decode issuer public key",
+        ssl.X509_V_ERR_CERT_SIGNATURE_FAILURE => "certificate signature failure",
+        ssl.X509_V_ERR_CRL_SIGNATURE_FAILURE => "CRL signature failure",
+        ssl.X509_V_ERR_CERT_NOT_YET_VALID => "certificate is not yet valid",
+        ssl.X509_V_ERR_CERT_HAS_EXPIRED => "certificate has expired",
+        ssl.X509_V_ERR_CRL_NOT_YET_VALID => "CRL is not yet valid",
+        ssl.X509_V_ERR_CRL_HAS_EXPIRED => "CRL has expired",
+        ssl.X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD => "format error in certificate's notBefore field",
+        ssl.X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD => "format error in certificate's notAfter field",
+        ssl.X509_V_ERR_ERROR_IN_CRL_LAST_UPDATE_FIELD => "format error in CRL's lastUpdate field",
+        ssl.X509_V_ERR_ERROR_IN_CRL_NEXT_UPDATE_FIELD => "format error in CRL's nextUpdate field",
+        ssl.X509_V_ERR_OUT_OF_MEM => "out of memory",
+        ssl.X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT => "self signed certificate",
+        ssl.X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN => "self signed certificate in certificate chain",
+        ssl.X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY => "unable to get local issuer certificate",
+        ssl.X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE => "unable to verify the first certificate",
+        ssl.X509_V_ERR_CERT_CHAIN_TOO_LONG => "certificate chain too long",
+        ssl.X509_V_ERR_CERT_REVOKED => "certificate revoked",
+        ssl.X509_V_ERR_INVALID_CA => "invalid CA certificate",
+        ssl.X509_V_ERR_PATH_LENGTH_EXCEEDED => "path length constraint exceeded",
+        ssl.X509_V_ERR_INVALID_PURPOSE => "unsupported certificate purpose",
+        ssl.X509_V_ERR_CERT_UNTRUSTED => "certificate not trusted",
+        ssl.X509_V_ERR_CERT_REJECTED => "certificate rejected",
+        ssl.X509_V_ERR_SUBJECT_ISSUER_MISMATCH => "subject issuer mismatch",
+        ssl.X509_V_ERR_AKID_SKID_MISMATCH => "authority and subject key identifier mismatch",
+        ssl.X509_V_ERR_AKID_ISSUER_SERIAL_MISMATCH => "authority and issuer serial number mismatch",
+        ssl.X509_V_ERR_KEYUSAGE_NO_CERTSIGN => "key usage does not include certificate signing",
+        ssl.X509_V_ERR_UNABLE_TO_GET_CRL_ISSUER => "unable to get CRL issuer certificate",
+        ssl.X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION => "unhandled critical extension",
+        ssl.X509_V_ERR_KEYUSAGE_NO_CRL_SIGN => "key usage does not include CRL signing",
+        ssl.X509_V_ERR_UNHANDLED_CRITICAL_CRL_EXTENSION => "unhandled critical CRL extension",
+        ssl.X509_V_ERR_INVALID_NON_CA => "invalid non-CA certificate (has CA markings)",
+        ssl.X509_V_ERR_PROXY_PATH_LENGTH_EXCEEDED => "proxy path length constraint exceeded",
+        ssl.X509_V_ERR_KEYUSAGE_NO_DIGITAL_SIGNATURE => "key usage does not include digital signature",
+        ssl.X509_V_ERR_PROXY_CERTIFICATES_NOT_ALLOWED => "proxy certificates not allowed, please set the appropriate flag",
+        ssl.X509_V_ERR_INVALID_EXTENSION => "invalid or inconsistent certificate extension",
+        ssl.X509_V_ERR_INVALID_POLICY_EXTENSION => "invalid or inconsistent certificate policy extension",
+        ssl.X509_V_ERR_NO_EXPLICIT_POLICY => "no explicit policy",
+        ssl.X509_V_ERR_DIFFERENT_CRL_SCOPE => "different CRL scope",
+        ssl.X509_V_ERR_UNSUPPORTED_EXTENSION_FEATURE => "unsupported extension feature",
+        ssl.X509_V_ERR_UNNESTED_RESOURCE => "RFC 3779 resource not subset of parent's resources",
+        ssl.X509_V_ERR_PERMITTED_VIOLATION => "permitted subtree violation",
+        ssl.X509_V_ERR_EXCLUDED_VIOLATION => "excluded subtree violation",
+        ssl.X509_V_ERR_SUBTREE_MINMAX => "name constraints minimum and maximum not supported",
+        ssl.X509_V_ERR_APPLICATION_VERIFICATION => "application verification failure",
+        ssl.X509_V_ERR_UNSUPPORTED_CONSTRAINT_TYPE => "unsupported name constraint type",
+        ssl.X509_V_ERR_UNSUPPORTED_CONSTRAINT_SYNTAX => "unsupported or invalid name constraint syntax",
+        ssl.X509_V_ERR_UNSUPPORTED_NAME_SYNTAX => "unsupported or invalid name syntax",
+        ssl.X509_V_ERR_CRL_PATH_VALIDATION_ERROR => "CRL path validation error",
+        else => "unknown error",
+    };
+}
+
+fn checkCriticalExtensions(cert: *ssl.X509) !bool {
+    var seen_libp2p_ext = false;
+    const ext_count = ssl.X509_get_ext_count(cert);
+
+    const libp2p_oid = ssl.OBJ_txt2obj(Libp2pExtensionOid, 1) orelse {
+        return error.InvalidOID;
+    };
+    defer ssl.ASN1_OBJECT_free(libp2p_oid);
+
+    var i: c_int = 0;
+    while (i < ext_count) : (i += 1) {
+        const ext = ssl.X509_get_ext(cert, i) orelse continue;
+
+        if (ssl.X509_EXTENSION_get_critical(ext) == 0) {
+            continue;
+        }
+
+        if (ssl.X509_supported_extension(ext) != 0) {
+            continue;
+        }
+
+        if (seen_libp2p_ext) {
+            std.log.warn("Found unknown critical extension after libp2p extension", .{});
+            return false;
+        }
+
+        const ext_obj = ssl.X509_EXTENSION_get_object(ext) orelse {
+            std.log.warn("Failed to get extension object", .{});
+            return false;
+        };
+
+        if (ssl.OBJ_cmp(ext_obj, libp2p_oid) == 0) {
+            seen_libp2p_ext = true;
+            continue;
+        }
+
+        std.log.warn("Found unsupported critical extension", .{});
+        return false;
+    }
+
+    return true;
 }
 
 test "Build certificate using Ed25519 keys" {
@@ -448,29 +872,10 @@ test "Build certificate using Ed25519 keys" {
         }
     };
 
-    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
-        return error.OpenSSLFailed;
-    }
-    var maybe_host_key: ?*ssl.EVP_PKEY = null;
-    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
-        return error.OpenSSLFailed;
-    }
-    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
-
+    const host_key = try generateKeyPair1(.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
 
-    const sctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-
-    if (ssl.EVP_PKEY_keygen_init(sctx) == 0) {
-        return error.OpenSSLFailed;
-    }
-    var maybe_subject_key: ?*ssl.EVP_PKEY = null;
-    if (ssl.EVP_PKEY_keygen(sctx, &maybe_subject_key) == 0) {
-        return error.OpenSSLFailed;
-    }
-    const subject_key = maybe_subject_key orelse return error.OpenSSLFailed;
-
+    const subject_key = try generateKeyPair1(.ED25519);
     defer ssl.EVP_PKEY_free(subject_key);
 
     const cert = try buildCert(std.testing.allocator, host_key, subject_key);
@@ -482,4 +887,21 @@ test "Build certificate using Ed25519 keys" {
     const pem_buf = try x509ToPem(std.testing.allocator, cert);
     defer std.testing.allocator.free(pem_buf);
     try file.writeAll(pem_buf);
+}
+
+test "Verify certificate with Ed25519 keys" {
+    const host_key = try generateKeyPair1(.ED25519);
+    defer ssl.EVP_PKEY_free(host_key);
+
+    const subject_key = try generateKeyPair1(.ED25519);
+    defer ssl.EVP_PKEY_free(subject_key);
+
+    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    defer ssl.X509_free(cert);
+
+    const peer_info = try verifyAndExtractPeerInfo(std.testing.allocator, cert);
+    std.testing.allocator.free(peer_info.host_pubkey.data.?);
+
+    try std.testing.expect(peer_info.is_valid);
+    try std.testing.expect(peer_info.host_pubkey.type == .ED25519);
 }

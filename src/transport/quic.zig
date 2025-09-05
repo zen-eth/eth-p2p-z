@@ -18,6 +18,7 @@ const protoMsgHandler = libp2p.protocols.AnyProtocolMessageHandler;
 const multiaddr = @import("multiformats").multiaddr;
 const Multiaddr = multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
+const SecuritySession = libp2p.security.Session1;
 
 // Maximum stream data for bidirectional streams
 const MaxStreamDataBidiRemote = 64 * 1024 * 1024; // 64 MB
@@ -379,6 +380,8 @@ pub const QuicConnection = struct {
     close_ctx: ?CloseCtx,
     // Callback context for when a new stream is created in the server mode.
     on_stream_ctx: ?NewStreamCtx,
+
+    security_session: ?SecuritySession,
 
     pub const Error = error{
         NewStreamNotFinished,
@@ -813,8 +816,7 @@ pub const QuicTransport = struct {
         // This callback is used to verify the peer's certificate.
         // It is set to verify the peer's certificate and fail if no peer certificate is provided.
         // It also sets the callback for certificate verification.
-        ssl.SSL_CTX_set_verify(ssl_ctx, ssl.SSL_VERIFY_PEER | ssl.SSL_VERIFY_FAIL_IF_NO_PEER_CERT | ssl.SSL_VERIFY_CLIENT_ONCE, null);
-        ssl.SSL_CTX_set_cert_verify_callback(ssl_ctx, tls.libp2pVerifyCallback, null);
+        ssl.SSL_CTX_set_verify(ssl_ctx, ssl.SSL_VERIFY_PEER | ssl.SSL_VERIFY_FAIL_IF_NO_PEER_CERT | ssl.SSL_VERIFY_CLIENT_ONCE, tls.libp2pVerifyCallback);
 
         // Set the certificate algorithm preferences for the SSL context.
         if (ssl.SSL_CTX_set_verify_algorithm_prefs(ssl_ctx, SignatureAlgs.ptr, @intCast(SignatureAlgs.len)) == 0)
@@ -878,6 +880,7 @@ fn onNewConn(ctx: ?*anyopaque, conn: ?*lsquic.lsquic_conn_t) callconv(.c) ?*lsqu
     // TODO: Can it use a pool for connections?
     const lsquic_conn: *QuicConnection = engine.allocator.create(QuicConnection) catch unreachable;
     lsquic_conn.* = .{
+        .security_session = null,
         .connect_ctx = engine.connect_ctx,
         .close_ctx = null,
         .new_stream_ctx = null,
@@ -904,9 +907,39 @@ fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_status
         return;
     } else {
         const lsquic_conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(conn.?)));
+
+        const cert = tls.takeSavedPeerCertificate();
+        if (cert == null) {
+            std.log.warn("No peer certificate available from verify callback, closing connection.\n", .{});
+            _ = lsquic.lsquic_conn_close(conn);
+            return;
+        }
+        defer ssl.X509_free(cert);
+
+        const peer_info = tls.verifyAndExtractPeerInfo(lsquic_conn.engine.allocator, cert.?) catch |err| {
+            std.log.warn("Failed to verify and extract peer info: {}", .{err});
+            _ = lsquic.lsquic_conn_close(conn);
+            return;
+        };
+        if (!peer_info.is_valid) {
+            std.log.warn("Invalid peer certificate, closing connection.\n", .{});
+            _ = lsquic.lsquic_conn_close(conn);
+            return;
+        }
+        lsquic_conn.security_session = SecuritySession{
+            // TODO: need add local id later
+            .local_id = undefined,
+            .remote_id = peer_info.peer_id,
+            .remote_public_key = peer_info.host_pubkey,
+        };
         if (lsquic_conn.direction == p2p_conn.Direction.INBOUND) {
             lsquic_conn.engine.listen_ctx.?.callback(lsquic_conn.engine.listen_ctx.?.callback_ctx, lsquic_conn);
         } else {
+            if (!peer_info.peer_id.eql(&lsquic_conn.connect_ctx.?.peer_id)) {
+                std.log.warn("Peer ID mismatch, closing connection.\n", .{});
+                _ = lsquic.lsquic_conn_close(conn);
+                return;
+            }
             lsquic_conn.connect_ctx.?.callback(lsquic_conn.connect_ctx.?.callback_ctx, lsquic_conn);
         }
     }
@@ -914,6 +947,15 @@ fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_status
 
 pub fn onConnClosed(conn: ?*lsquic.lsquic_conn_t) callconv(.c) void {
     const lsquic_conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(conn.?)));
+
+    tls.clearSavedPeerCertificate();
+
+    if (lsquic_conn.security_session) |*session| {
+        if (session.remote_public_key.data) |data| {
+            lsquic_conn.engine.allocator.free(data);
+        }
+    }
+
     if (lsquic_conn.close_ctx) |close_ctx| {
         if (close_ctx.callback) |callback| {
             callback(close_ctx.callback_ctx, lsquic_conn);
