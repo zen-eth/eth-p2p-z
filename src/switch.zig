@@ -10,6 +10,7 @@ const protocols = libp2p.protocols;
 const Allocator = std.mem.Allocator;
 const mss = protocols.mss;
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const io_loop = libp2p.thread_event_loop;
 
 /// The Switch struct is the main entry point for managing connections and protocol handlers.
 /// It acts as a central hub for handling incoming and outgoing connections,
@@ -39,6 +40,8 @@ pub const Switch = struct {
 
     is_stopped: std.atomic.Value(bool),
 
+    stopped_notify: std.Thread.ResetEvent,
+
     pub fn init(self: *Switch, allocator: Allocator, transport: *quic.QuicTransport) void {
         self.* = Switch{
             .transport = transport,
@@ -49,18 +52,47 @@ pub const Switch = struct {
             .is_stopping = false,
             .is_stopped = std.atomic.Value(bool).init(false),
             .mss_handler = mss.MultistreamSelectHandler.init(allocator),
+            .stopped_notify = .{},
         };
     }
 
     pub fn deinit(self: *Switch) void {
-        self.is_stopping = true;
-        const total_connections = self.outgoing_connections.count() + self.incoming_connections.items.len;
-        self.outgoingConnectionCloseAndClean();
-        // If there are no connections,`outgoingConnectionCloseAndClean` will be called in current thread so that no need wait.
-        if (total_connections > 0) {
-            // TODO: Use wait group to wait for all connections to be closed.
-            std.time.sleep(3000 * std.time.ns_per_ms);
+        if (self.transport.io_event_loop.inEventLoopThread()) {
+            self.doClose();
+        } else {
+            const message = io_loop.IOMessage{
+                .action = .{ .switch_close = .{
+                    .network_switch = self,
+                } },
+            };
+
+            self.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
+
+        self.stopped_notify.wait();
+        // **NOTE**: The async close operation may take some time to complete,
+        // so we wait here to ensure all resources are cleaned up before returning.
+        // This is an important fix for the https://github.com/zen-eth/zig-libp2p/issues/69.
+        // We should improve this in the future by finding a way to not block the caller thread.
+        std.time.sleep(1 * std.time.ns_per_s);
+    }
+
+    pub fn doClose(self: *Switch) void {
+        self.is_stopping = true;
+        var out_iter = self.outgoing_connections.iterator();
+        while (out_iter.next()) |entry| {
+            entry.value_ptr.*.close(null, struct {
+                fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {}
+            }.callback); // Close the connection, which will trigger the close callback.
+        }
+
+        for (self.incoming_connections.items) |conn| {
+            conn.close(null, struct {
+                fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {}
+            }.callback); // Close the connection, which will trigger the close callback.
+        }
+
+        self.cleanResources();
     }
 
     const ListenCallbackCtx = struct {
@@ -122,7 +154,7 @@ pub const Switch = struct {
                 // stream.close(null, struct {
                 //     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
                 // }.callback);
-                // stream.proto_msg_handler.onClose(stream) catch |e| {
+                // stream.proto_msg_handler.?.onClose(stream) catch |e| {
                 //     std.log.warn("Protocol message handler failed with error: {}.", .{e});
                 // };
                 // stream.deinit();
@@ -212,9 +244,8 @@ pub const Switch = struct {
                 self.user_callback(self.user_callback_ctx, err);
                 return;
             };
-            self.network_switch.outgoing_connections.put(address_str, conn) catch unreachable;
 
-            std.log.info("Connection established to {s}", .{address_str});
+            self.network_switch.outgoing_connections.put(address_str, conn) catch unreachable;
 
             const stream_ctx = self.network_switch.allocator.create(StreamCallbackCtx) catch unreachable;
             stream_ctx.* = StreamCallbackCtx{
@@ -319,15 +350,15 @@ pub const Switch = struct {
     fn onOutgoingConnectionClose(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
         const self: *Switch = @ptrCast(@alignCast(ctx.?));
 
-        if (self.is_stopping) {
-            // If the switch is stopping, we do not need to handle the connection close.
-            return;
-        }
-
         const conn = res catch |err| {
             std.log.warn("Connection close callback failed with error: {any}", .{err});
             return;
         };
+
+        if (conn.connect_ctx == null) {
+            std.log.err("Cannot remove outgoing connection: connect_ctx is null.", .{});
+            return;
+        }
 
         const address_str = std.fmt.allocPrint(self.allocator, "{}", .{conn.connect_ctx.?.address}) catch unreachable;
         defer self.allocator.free(address_str);
@@ -352,11 +383,6 @@ pub const Switch = struct {
     fn onIncomingConnectionClose(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {
         const self: *Switch = @ptrCast(@alignCast(ctx.?));
 
-        if (self.is_stopping) {
-            // If the switch is stopping, we do not need to handle the connection close.
-            return;
-        }
-
         const conn = res catch |err| {
             std.log.warn("Connection close callback failed with error: {any}", .{err});
             return;
@@ -378,45 +404,7 @@ pub const Switch = struct {
         std.log.warn("Incoming connection close callback invoked, but connection not found in the list.", .{});
     }
 
-    fn outgoingConnectionCloseAndCleanCallback(ctx: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {
-        const self: *Switch = @ptrCast(@alignCast(ctx.?));
-
-        // This callback is called when an outgoing connection is closed.
-        // We will remove it from the list and clean up resources.
-        self.outgoingConnectionCloseAndClean();
-    }
-
-    fn outgoingConnectionCloseAndClean(self: *Switch) void {
-        const outgoing_entry = self.outgoing_connections.pop();
-        if (outgoing_entry) |e| {
-            self.allocator.free(e.key);
-            e.value.close(self, outgoingConnectionCloseAndCleanCallback);
-        } else {
-            self.incomingConnectionCloseAndClean(); // Clean up resources if no outgoing connections are left.
-        }
-    }
-
-    fn incomingConnectionCloseAndCleanCallback(ctx: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {
-        const self: *Switch = @ptrCast(@alignCast(ctx.?));
-
-        // This callback is called when an incoming connection is closed.
-        // We will remove it from the list and clean up resources.
-        self.incomingConnectionCloseAndClean();
-    }
-
-    fn incomingConnectionCloseAndClean(self: *Switch) void {
-        const incoming_entry = self.incoming_connections.pop();
-        if (incoming_entry) |conn| {
-            conn.close(self, incomingConnectionCloseAndCleanCallback);
-        } else {
-            self.cleanResources(); // Clean up resources if no incoming connections are left.
-        }
-    }
-
     fn cleanResources(self: *Switch) void {
-        self.outgoing_connections.deinit();
-        self.incoming_connections.deinit();
-
         self.transport.deinit();
         var listener_iter = self.listeners.iterator();
         while (listener_iter.next()) |entry| {
@@ -432,9 +420,25 @@ pub const Switch = struct {
         // Call it here because the listeners and transports all used quic engine,
         // so we need to clean up the global state.
         // TODO: Can we not expose lsquic to switch?
-        lsquic.lsquic_global_cleanup();
+        // lsquic.lsquic_global_cleanup();
         self.listeners.deinit();
 
         self.mss_handler.deinit();
+        self.finalCleanup();
+
+        // Iterate through any remaining outgoing connections and free their keys
+        // before deinitializing the HashMap. This prevents memory leaks if connections
+        // were not gracefully removed during the shutdown process.
+        var out_iter = self.outgoing_connections.iterator();
+        while (out_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.outgoing_connections.deinit();
+        self.incoming_connections.deinit();
+        self.stopped_notify.set();
+    }
+
+    fn finalCleanup(_: *Switch) void {
+        lsquic.lsquic_global_cleanup();
     }
 };

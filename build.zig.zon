@@ -12,7 +12,7 @@
     // In a future version of Zig it will be used for package deduplication.
     .version = "0.1.0",
 
-    .fingerprint = 0x227d092bf27e01fe,
+    .fingerprint = 0x227d092b6f65f2d1,
 
     // This field is optional.
     // This is currently advisory only; Zig does not yet do anything
@@ -30,8 +30,8 @@
             .hash = "libxev-0.0.0-86vtcx8dEwDfl6p4tGVxCygft8oOsggfba9JO-k28J2x",
         },
         .zmultiformats = .{
-            .url = "git+https://github.com/zen-eth/multiformats-zig#acb3945e7f1b2fed18f92f05d321cd1a0a4e32e1",
-            .hash = "zmultiformats-0.1.0-6A8pcdwUBQAgUTaQC5RhH3XBZUgo6-3zQQRO953yVyMA",
+            .url = "git+https://github.com/zen-eth/multiformats-zig#92c90226ee8b14052718df724a1bc753996a6e07",
+            .hash = "zmultiformats-0.1.0-U2uyh94UBQCwBOXy5xZ9SZQJkQXZSiYCudWPWxNqjuE0",
         },
         .gremlin = .{
             .url = "git+https://github.com/octopus-foundation/gremlin.zig#fccfe2659f24497199d86404e0ef7dbc79e033d2",
@@ -40,10 +40,6 @@
         .lsquic = .{
             .url = "git+https://github.com/zen-eth/lsquic.git#585b456f165acd02a68b64c56cf126a596718fac",
             .hash = "lsquic-0.0.0-jO7gdp8dAADM0lQxub9u0psWph_fUuNTbYWMvpNE_VtY",
-        },
-        .peer_id = .{
-            .url = "git+https://github.com/zen-eth/peer-id#3f9be40ec19f5a85298102dde7c0259f064fb3d8",
-            .hash = "peer_id-0.0.0-jlAlYI9cAACWW0w-GZaf3xAuwXNZhOOGKQtm3CvqcdiK",
         },
     },
     .paths = .{

@@ -186,7 +186,7 @@ pub const XevSocketChannel = struct {
 
     pub fn readCB(
         instance: ?*XevSocketChannel,
-        _: *xev.Loop,
+        loop: *xev.Loop,
         c: *xev.Completion,
         _: xev.TCP,
         rb: xev.ReadBuffer,
@@ -233,6 +233,9 @@ pub const XevSocketChannel = struct {
             };
         }
 
+        if (loop.stopped()) {
+            return .disarm;
+        }
         return .rearm;
     }
 
