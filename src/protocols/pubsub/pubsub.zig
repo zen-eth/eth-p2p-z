@@ -11,6 +11,7 @@ const tls = libp2p.security.tls;
 const keys = @import("peer_id").keys;
 const ssl = @import("ssl");
 const swarm = libp2p.swarm;
+const rpc = libp2p.protobuf.rpc;
 
 pub const gossipsub = @import("algorithms/gossipsub.zig");
 pub const semiduplex = @import("semiduplex.zig");
@@ -36,6 +37,8 @@ pub const PubSub = struct {
     peer_id: PeerId,
 
     allocator: Allocator,
+
+    incoming_rpc: std.ArrayListUnmanaged(rpc.RPCReader),
 
     // TODO: Not hardcode protocol IDs
     protocols: []const ProtocolId = &.{ gossipsub_v1_id, gossipsub_v1_1_id },
@@ -111,6 +114,7 @@ pub const PubSub = struct {
             .peer_id = peer_id,
             .swarm = network_swarm,
             .peers = std.AutoHashMap(PeerId, Semiduplex).init(allocator),
+            .incoming_rpc = std.ArrayListUnmanaged(rpc.RPCReader).empty,
         };
     }
 
@@ -202,7 +206,7 @@ pub const PubSub = struct {
         const self: *Self = @ptrCast(@alignCast(ctx.?));
         const resp = controller catch unreachable;
         const responder: *PubSubPeerResponder = @ptrCast(@alignCast(resp.?));
-
+        responder.pubsub = self;
         const peer_id = responder.stream.conn.security_session.?.remote_id;
 
         const result = self.peers.getOrPut(peer_id) catch unreachable;
@@ -783,4 +787,7 @@ test "pubsub add peer single direction with replace stream" {
     std.time.sleep(1 * std.time.ns_per_s);
     try std.testing.expect(pubsub2.peers.get(transport1.local_peer_id).?.responder != null);
     std.debug.print("new responder {?*}\n", .{pubsub2.peers.get(transport1.local_peer_id).?.responder});
+
+    // The old stream be closed by switch2, so that the pubsub1's outgoing stream is closed
+    try std.testing.expectEqual(0, pubsub1.peers.count());
 }

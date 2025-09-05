@@ -3,6 +3,12 @@ const libp2p = @import("../../root.zig");
 const protocols = libp2p.protocols;
 const PeerId = @import("peer-id").PeerId;
 const quic = libp2p.transport.quic;
+const rpc = libp2p.protobuf.rpc;
+const PubSub = @import("pubsub.zig").PubSub;
+const uvarint = @import("multiformats").uvarint;
+
+const max_message_size = 1024 * 1024;
+const u64_max_uvarint_bytes = 10;
 
 /// The Semiduplex struct represents a bidirectional communication channel
 /// between two peers in a PubSub network. It consists of two halves:
@@ -89,11 +95,13 @@ pub const PubSubPeerProtocolHandler = struct {
     ) !void {
         const handler = self.allocator.create(PubSubPeerResponder) catch unreachable;
         handler.* = .{
+            .pubsub = undefined,
             .callback_ctx = callback_ctx,
             .callback = callback,
             .allocator = self.allocator,
             .stream = stream,
             .received = std.ArrayList(libp2p.PubSubMessage).init(self.allocator),
+            .received_buffer = std.fifo.LinearFifo(u8, .Dynamic).init(self.allocator),
         };
         stream.setProtoMsgHandler(handler.any());
     }
@@ -202,6 +210,10 @@ pub const PubSubPeerResponder = struct {
 
     stream: *libp2p.QuicStream,
 
+    pubsub: *PubSub,
+
+    received_buffer: std.fifo.LinearFifo(u8, .Dynamic),
+
     const Self = @This();
 
     pub fn onActivated(self: *Self, stream: *libp2p.QuicStream) anyerror!void {
@@ -209,8 +221,36 @@ pub const PubSubPeerResponder = struct {
         self.callback(self.callback_ctx, self);
     }
 
-    pub fn onMessage(_: *Self, _: *libp2p.QuicStream, _: []const u8) anyerror!void {
-        // Decode the message and add to received
+    pub fn onMessage(self: *Self, _: *libp2p.QuicStream, message: []const u8) anyerror!void {
+        try self.received_buffer.write(message);
+
+        while (true) {
+            if (self.received_buffer.readableLength() < u64_max_uvarint_bytes) {
+                return;
+            }
+
+            const result = try uvarint.decode(usize, self.received_buffer.readableSliceOfLen(u64_max_uvarint_bytes));
+            const msg_len = result.value;
+            const remaining = result.remaining;
+
+            if (msg_len > max_message_size) {
+                return error.MessageTooLarge;
+            }
+
+            const msg_len_len = u64_max_uvarint_bytes - remaining.len;
+            const total_need = msg_len_len + msg_len;
+
+            if (self.received_buffer.readableLength() < total_need) {
+                return;
+            }
+
+            const copied_message = try self.pubsub.allocator.alloc(u8, total_need);
+            const bytes_read = self.received_buffer.read(copied_message);
+            std.debug.assert(bytes_read == total_need);
+
+            const rpc_reader = try rpc.RPCReader.init(self.pubsub.allocator, copied_message);
+            try self.pubsub.incoming_rpc.append(self.pubsub.allocator, rpc_reader);
+        }
     }
 
     pub fn onClose(self: *Self, _: *libp2p.QuicStream) anyerror!void {
@@ -255,3 +295,5 @@ pub const PubSubPeerResponder = struct {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 };
+
+test "simulate onMessage" {}
