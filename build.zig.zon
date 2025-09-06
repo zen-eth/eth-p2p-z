@@ -12,7 +12,7 @@
     // In a future version of Zig it will be used for package deduplication.
     .version = "0.1.0",
 
-    .fingerprint = 0x227d092b6f65f2d1,
+    .fingerprint = 0x227d092bfeb97df1,
 
     // This field is optional.
     // This is currently advisory only; Zig does not yet do anything
@@ -38,8 +38,8 @@
             .hash = "gremlin-0.0.0-E2s91bN4DgDYbb4QNxl4ZT5nEEhNBkk5ngfVasDbsnNF",
         },
         .lsquic = .{
-            .url = "git+https://github.com/zen-eth/lsquic.git#585b456f165acd02a68b64c56cf126a596718fac",
-            .hash = "lsquic-0.0.0-jO7gdp8dAADM0lQxub9u0psWph_fUuNTbYWMvpNE_VtY",
+            .url = "git+https://github.com/zen-eth/lsquic.git#59bee4ce57e35dab8c28415d4a5dfb2c26089c84",
+            .hash = "lsquic-0.0.0-jO7gdhAfAABVzSIdOXi13ePKeV-C6EMJ7KVosCgbTmOk",
         },
     },
     .paths = .{
