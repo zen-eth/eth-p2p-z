@@ -225,11 +225,13 @@ pub const PubSubPeerResponder = struct {
         try self.received_buffer.write(message);
 
         while (true) {
-            if (self.received_buffer.readableLength() < u64_max_uvarint_bytes) {
-                return;
-            }
-
-            const result = try uvarint.decode(usize, self.received_buffer.readableSliceOfLen(u64_max_uvarint_bytes));
+            const readable_bytes = self.received_buffer.readableSlice(0);
+            const result = uvarint.decode(usize, readable_bytes) catch |err| {
+                switch (err) {
+                    uvarint.VarintParseError.Insufficient => return,
+                    else => return err,
+                }
+            };
             const msg_len = result.value;
             const remaining = result.remaining;
 
@@ -237,16 +239,18 @@ pub const PubSubPeerResponder = struct {
                 return error.MessageTooLarge;
             }
 
-            const msg_len_len = u64_max_uvarint_bytes - remaining.len;
-            const total_need = msg_len_len + msg_len;
+            const msg_len_size = readable_bytes.len - remaining.len;
+            const total_need = msg_len_size + msg_len;
 
             if (self.received_buffer.readableLength() < total_need) {
                 return;
             }
 
-            const copied_message = try self.pubsub.allocator.alloc(u8, total_need);
+            const copied_message = try self.pubsub.allocator.alloc(u8, msg_len);
+            defer self.pubsub.allocator.free(copied_message);
+            self.received_buffer.discard(msg_len_size);
             const bytes_read = self.received_buffer.read(copied_message);
-            std.debug.assert(bytes_read == total_need);
+            std.debug.assert(bytes_read == msg_len);
 
             const rpc_reader = try rpc.RPCReader.init(self.pubsub.allocator, copied_message);
             try self.pubsub.incoming_rpc.append(self.pubsub.allocator, rpc_reader);
@@ -256,6 +260,7 @@ pub const PubSubPeerResponder = struct {
     pub fn onClose(self: *Self, _: *libp2p.QuicStream) anyerror!void {
         const allocator = self.allocator;
         self.received.deinit();
+        self.received_buffer.deinit();
         allocator.destroy(self);
     }
 
@@ -295,5 +300,3 @@ pub const PubSubPeerResponder = struct {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 };
-
-test "simulate onMessage" {}

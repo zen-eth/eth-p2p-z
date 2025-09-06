@@ -1,6 +1,7 @@
 const std = @import("std");
 const libp2p = @import("../../root.zig");
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const multiformats = @import("multiformats");
+const Multiaddr = multiformats.multiaddr.Multiaddr;
 const Switch = libp2p.swarm.Switch;
 const quic = libp2p.transport.quic;
 const ProtocolId = libp2p.protocols.ProtocolId;
@@ -12,6 +13,7 @@ const keys = @import("peer_id").keys;
 const ssl = @import("ssl");
 const swarm = libp2p.swarm;
 const rpc = libp2p.protobuf.rpc;
+const uvarint = multiformats.uvarint;
 
 pub const gossipsub = @import("algorithms/gossipsub.zig");
 pub const semiduplex = @import("semiduplex.zig");
@@ -120,6 +122,10 @@ pub const PubSub = struct {
 
     pub fn deinit(self: *Self) void {
         self.peers.deinit();
+        for (self.incoming_rpc.items) |*item| {
+            item.deinit();
+        }
+        self.incoming_rpc.deinit(self.allocator);
     }
 
     pub fn removePeer(self: *Self, peer: PeerId, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
@@ -790,4 +796,118 @@ test "pubsub add peer single direction with replace stream" {
 
     // The old stream be closed by switch2, so that the pubsub1's outgoing stream is closed
     try std.testing.expectEqual(0, pubsub1.peers.count());
+}
+
+test "simulate onMessage" {
+    const allocator = std.testing.allocator;
+
+    var switch1_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9567");
+    defer switch1_listen_address.deinit();
+
+    var loop1: io_loop.ThreadEventLoop = undefined;
+    try loop1.init(allocator);
+    defer loop1.deinit();
+
+    const peer1_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(peer1_host_key);
+
+    var transport1: quic.QuicTransport = undefined;
+    try transport1.init(&loop1, peer1_host_key, keys.KeyType.ED25519, allocator);
+
+    var dial_ma_switch1 = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9567");
+    try dial_ma_switch1.push(.{ .P2P = transport1.local_peer_id });
+    defer dial_ma_switch1.deinit();
+
+    var switch1: swarm.Switch = undefined;
+    switch1.init(allocator, &transport1);
+
+    var pubsub_peer_handler1 = PubSubPeerProtocolHandler.init(allocator);
+    defer pubsub_peer_handler1.deinit();
+    try switch1.addProtocolHandler(gossipsub_v1_id, pubsub_peer_handler1.any());
+    try switch1.addProtocolHandler(gossipsub_v1_1_id, pubsub_peer_handler1.any());
+
+    var pubsub1: PubSub = undefined;
+    pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1);
+    defer pubsub1.deinit();
+    try switch1.listen(switch1_listen_address, &pubsub1, PubSub.onIncomingNewStream);
+    defer switch1.deinit();
+    std.time.sleep(300 * std.time.us_per_ms);
+
+    var switch2_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9568");
+    defer switch2_listen_address.deinit();
+
+    var loop2: io_loop.ThreadEventLoop = undefined;
+    try loop2.init(allocator);
+    defer loop2.deinit();
+
+    const peer2_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(peer2_host_key);
+
+    var transport2: quic.QuicTransport = undefined;
+    try transport2.init(&loop2, peer2_host_key, keys.KeyType.ED25519, allocator);
+
+    var dial_ma_switch2 = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9568");
+    try dial_ma_switch2.push(.{ .P2P = transport2.local_peer_id });
+    defer dial_ma_switch2.deinit();
+
+    var switch2: swarm.Switch = undefined;
+    switch2.init(allocator, &transport2);
+
+    var pubsub_peer_handler2 = PubSubPeerProtocolHandler.init(allocator);
+    defer pubsub_peer_handler2.deinit();
+    try switch2.addProtocolHandler(gossipsub_v1_id, pubsub_peer_handler2.any());
+    try switch2.addProtocolHandler(gossipsub_v1_1_id, pubsub_peer_handler2.any());
+
+    var pubsub2: PubSub = undefined;
+    pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2);
+    defer pubsub2.deinit();
+    try switch2.listen(switch2_listen_address, &pubsub2, PubSub.onIncomingNewStream);
+    defer switch2.deinit();
+    std.time.sleep(300 * std.time.us_per_ms);
+
+    pubsub1.addPeer(dial_ma_switch2, null, struct {
+        fn callback(_: ?*anyopaque, res: anyerror!void) void {
+            res catch |err| {
+                std.debug.print("Failed to add peer: {}\n", .{err});
+                return;
+            };
+            std.debug.print("Successfully added peer\n", .{});
+        }
+    }.callback);
+
+    std.time.sleep(1 * std.time.ns_per_s);
+
+    try std.testing.expectEqual(1, pubsub1.peers.count());
+    try std.testing.expectEqual(1, pubsub2.peers.count());
+
+    try std.testing.expect(pubsub1.peers.get(transport2.local_peer_id).?.initiator != null);
+    try std.testing.expect(pubsub1.peers.get(transport2.local_peer_id).?.responder == null);
+
+    const rpc_message = rpc.RPC{
+        .publish = &[_]?rpc.Message{ .{
+            .from = "test_from",
+            .topic = "test_topic",
+            .data = "test_data",
+            .seqno = "1",
+        }, rpc.Message{
+            .from = "test_from1",
+            .topic = "test_topic1",
+            .data = "test_data1",
+            .seqno = "2",
+        } },
+    };
+
+    const encoded_size = rpc_message.calcProtobufSize();
+    var size_buffer: [200]u8 = undefined;
+    const size_bytes = uvarint.encode(usize, encoded_size, &size_buffer);
+    const encoded_message = try rpc_message.encode(std.testing.allocator);
+    defer std.testing.allocator.free(encoded_message);
+
+    const encoded_rpc_message = try std.mem.concat(std.testing.allocator, u8, &[_][]const u8{ size_bytes, encoded_message });
+    defer std.testing.allocator.free(encoded_rpc_message);
+
+    const responder = pubsub2.peers.get(transport1.local_peer_id).?.responder.?;
+    try responder.onMessage(responder.stream, encoded_rpc_message);
+
+    try std.testing.expectEqual(1, responder.pubsub.incoming_rpc.items.len);
 }
