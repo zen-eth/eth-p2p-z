@@ -1,4 +1,6 @@
 name: Zig-libp2p CI
+permissions:
+  contents: read
 
 on:
   push:
