@@ -897,17 +897,37 @@ test "simulate onMessage" {
         } },
     };
 
+    const rpc_message1 = rpc.RPC{
+        .publish = &[_]?rpc.Message{ .{
+            .from = "test_from2",
+            .topic = "test_topic2",
+            .data = "test_data2",
+            .seqno = "3",
+        }, rpc.Message{
+            .from = "test_from3",
+            .topic = "test_topic3",
+            .data = "test_data3",
+            .seqno = "4",
+        } },
+    };
+
     const encoded_size = rpc_message.calcProtobufSize();
     var size_buffer: [200]u8 = undefined;
     const size_bytes = uvarint.encode(usize, encoded_size, &size_buffer);
     const encoded_message = try rpc_message.encode(std.testing.allocator);
     defer std.testing.allocator.free(encoded_message);
 
-    const encoded_rpc_message = try std.mem.concat(std.testing.allocator, u8, &[_][]const u8{ size_bytes, encoded_message });
+    const encoded_size1 = rpc_message1.calcProtobufSize();
+    var size_buffer1: [200]u8 = undefined;
+    const size_bytes1 = uvarint.encode(usize, encoded_size1, &size_buffer1);
+    const encoded_message1 = try rpc_message1.encode(std.testing.allocator);
+    defer std.testing.allocator.free(encoded_message1);
+
+    const encoded_rpc_message = try std.mem.concat(std.testing.allocator, u8, &[_][]const u8{ size_bytes, encoded_message, size_bytes1, encoded_message1 });
     defer std.testing.allocator.free(encoded_rpc_message);
 
     const responder = pubsub2.peers.get(transport1.local_peer_id).?.responder.?;
     try responder.onMessage(responder.stream, encoded_rpc_message);
 
-    try std.testing.expectEqual(1, responder.pubsub.incoming_rpc.items.len);
+    try std.testing.expectEqual(2, responder.pubsub.incoming_rpc.items.len);
 }
