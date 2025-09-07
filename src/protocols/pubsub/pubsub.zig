@@ -15,7 +15,7 @@ const swarm = libp2p.swarm;
 const rpc = libp2p.protobuf.rpc;
 const uvarint = multiformats.uvarint;
 
-pub const gossipsub = @import("algorithms/gossipsub.zig");
+pub const gossipsub = @import("routers/gossipsub.zig");
 pub const semiduplex = @import("semiduplex.zig");
 pub const Semiduplex = semiduplex.Semiduplex;
 pub const PubSubPeerInitiator = semiduplex.PubSubPeerInitiator;
