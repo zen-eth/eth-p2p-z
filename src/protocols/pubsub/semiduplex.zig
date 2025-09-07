@@ -4,7 +4,8 @@ const protocols = libp2p.protocols;
 const PeerId = @import("peer-id").PeerId;
 const quic = libp2p.transport.quic;
 const rpc = libp2p.protobuf.rpc;
-const PubSub = @import("pubsub.zig").PubSub;
+const pubsub = @import("pubsub.zig");
+const PubSub = pubsub.PubSub;
 const uvarint = @import("multiformats").uvarint;
 
 const max_message_size = 1024 * 1024;
@@ -218,7 +219,7 @@ pub const PubSubPeerResponder = struct {
         self.callback(self.callback_ctx, self);
     }
 
-    pub fn onMessage(self: *Self, _: *libp2p.QuicStream, message: []const u8) anyerror!void {
+    pub fn onMessage(self: *Self, stream: *libp2p.QuicStream, message: []const u8) anyerror!void {
         try self.received_buffer.write(message);
 
         while (true) {
@@ -250,7 +251,11 @@ pub const PubSubPeerResponder = struct {
             std.debug.assert(bytes_read == msg_len);
 
             const rpc_reader = try rpc.RPCReader.init(self.pubsub.allocator, copied_message);
-            try self.pubsub.incoming_rpc.append(self.pubsub.allocator, rpc_reader);
+            const rpc_message: pubsub.RPC = .{
+                .rpc_reader = rpc_reader,
+                .peer = stream.conn.security_session.?.remote_id,
+            };
+            try self.pubsub.incoming_rpc.append(self.pubsub.allocator, rpc_message);
         }
     }
 

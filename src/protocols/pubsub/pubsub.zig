@@ -24,6 +24,14 @@ pub const PubSubPeerProtocolHandler = semiduplex.PubSubPeerProtocolHandler;
 pub const gossipsub_v1_id: ProtocolId = gossipsub.v1_id;
 pub const gossipsub_v1_1_id: ProtocolId = gossipsub.v1_1_id;
 
+pub const RPC = struct {
+    rpc_reader: rpc.RPCReader,
+    peer: PeerId,
+
+    pub fn deinit(self: *RPC) void {
+        self.rpc_reader.deinit();
+    }
+};
 /// This is an implementation of the generic PubSub system which defined by the libp2p specification.
 /// It manages the peers and their connections, and provides methods to add and remove peers.
 /// It uses the Semiduplex struct to manage the bidirectional communication with each peer.
@@ -40,7 +48,7 @@ pub const PubSub = struct {
 
     allocator: Allocator,
 
-    incoming_rpc: std.ArrayListUnmanaged(rpc.RPCReader),
+    incoming_rpc: std.ArrayListUnmanaged(RPC),
 
     // TODO: Not hardcode protocol IDs
     protocols: []const ProtocolId = &.{ gossipsub_v1_id, gossipsub_v1_1_id },
@@ -116,7 +124,7 @@ pub const PubSub = struct {
             .peer_id = peer_id,
             .swarm = network_swarm,
             .peers = std.AutoHashMap(PeerId, Semiduplex).init(allocator),
-            .incoming_rpc = std.ArrayListUnmanaged(rpc.RPCReader).empty,
+            .incoming_rpc = std.ArrayListUnmanaged(RPC).empty,
         };
     }
 
