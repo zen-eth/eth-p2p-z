@@ -100,7 +100,6 @@ pub const PubSubPeerProtocolHandler = struct {
             .callback = callback,
             .allocator = self.allocator,
             .stream = stream,
-            .received = std.ArrayList(libp2p.PubSubMessage).init(self.allocator),
             .received_buffer = std.fifo.LinearFifo(u8, .Dynamic).init(self.allocator),
         };
         stream.setProtoMsgHandler(handler.any());
@@ -206,8 +205,6 @@ pub const PubSubPeerResponder = struct {
 
     allocator: std.mem.Allocator,
 
-    received: std.ArrayList(libp2p.PubSubMessage),
-
     stream: *libp2p.QuicStream,
 
     pubsub: *PubSub,
@@ -259,7 +256,6 @@ pub const PubSubPeerResponder = struct {
 
     pub fn onClose(self: *Self, _: *libp2p.QuicStream) anyerror!void {
         const allocator = self.allocator;
-        self.received.deinit();
         self.received_buffer.deinit();
         allocator.destroy(self);
     }
