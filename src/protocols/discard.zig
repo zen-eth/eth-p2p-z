@@ -302,7 +302,7 @@ fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId
     defer discard_handler.deinit();
     try client_switch.addProtocolHandler("discard", discard_handler.any());
 
-    std.time.sleep(100 * std.time.ns_per_ms * client_id);
+    std.time.sleep(200 * std.time.ns_per_ms);
 
     var callback: TestNewStreamCallback = .{ .mutex = .{}, .sender = undefined };
 
@@ -333,7 +333,7 @@ fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId
             }
         }.callback_);
 
-        std.time.sleep(50 * std.time.ns_per_ms);
+        std.time.sleep(200 * std.time.ns_per_ms);
     }
 
     std.time.sleep(3000 * std.time.ns_per_ms);
@@ -519,14 +519,12 @@ test "discard protocol using switch" {
     callback2.mutex.wait();
     try std.testing.expect(callback2.sender.stream.conn.security_session.?.remote_id.eql(&server_peer_id1));
 
-    std.time.sleep(500 * std.time.ns_per_ms);
+    std.time.sleep(200 * std.time.ns_per_ms);
 
     const thread = try std.Thread.spawn(.{}, spawnSwitch3Test, .{ allocator, &switch3, server_peer_id });
     defer thread.join();
 
     std.time.sleep(2000 * std.time.ns_per_ms);
-
-    std.debug.print("Switch 3 test completed\n", .{});
 }
 
 test "discard protocol using switch with 1MB data" {
@@ -709,8 +707,7 @@ test "no supported protocols error" {
 
     callback.mutex.wait();
 
-    std.time.sleep(2000 * std.time.ns_per_ms); // Wait for the stream to be established
-
+    std.time.sleep(2000 * std.time.ns_per_ms);
 }
 
 test "discard protocol with 5 concurrent clients" {
@@ -751,7 +748,7 @@ test "discard protocol with 5 concurrent clients" {
         pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {}
     }.callback);
 
-    std.time.sleep(500 * std.time.ns_per_ms);
+    std.time.sleep(200 * std.time.ns_per_ms);
 
     const NUM_CLIENTS = 5;
     var threads: [NUM_CLIENTS]std.Thread = undefined;
