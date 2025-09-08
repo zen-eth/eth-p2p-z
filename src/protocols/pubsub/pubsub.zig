@@ -42,7 +42,7 @@ pub const Event = union(enum) {
 
         switch (self) {
             .subscription_changed => |sub_change| {
-                var peer_buf: [128]u8 = undefined;
+                var peer_buf: [128]u8 = undefined; // this is enough space for a PeerId
                 const peer_bytes = sub_change.peer.toBytes(&peer_buf) catch unreachable;
                 hasher.update(peer_bytes);
 
@@ -113,8 +113,6 @@ pub const PubSub = struct {
     peer_id: PeerId,
 
     allocator: Allocator,
-
-    incoming_rpc: std.ArrayListUnmanaged(RPC),
 
     topics: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)),
 
@@ -196,7 +194,6 @@ pub const PubSub = struct {
             .peer_id = peer_id,
             .swarm = network_swarm,
             .peers = std.AutoHashMap(PeerId, Semiduplex).init(allocator),
-            .incoming_rpc = std.ArrayListUnmanaged(RPC).empty,
             .topics = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
             .my_topics = std.StringHashMapUnmanaged(void).empty,
             .event_emitter = event.EventEmitter(Event).init(allocator),
@@ -205,10 +202,6 @@ pub const PubSub = struct {
 
     pub fn deinit(self: *Self) void {
         self.peers.deinit();
-        for (self.incoming_rpc.items) |*item| {
-            item.deinit();
-        }
-        self.incoming_rpc.deinit(self.allocator);
 
         var topic_iter = self.topics.iterator();
         while (topic_iter.next()) |entry| {
