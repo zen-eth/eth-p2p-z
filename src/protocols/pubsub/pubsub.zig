@@ -14,6 +14,7 @@ const ssl = @import("ssl");
 const swarm = libp2p.swarm;
 const rpc = libp2p.protobuf.rpc;
 const uvarint = multiformats.uvarint;
+const event = libp2p.event;
 
 pub const gossipsub = @import("routers/gossipsub.zig");
 pub const semiduplex = @import("semiduplex.zig");
@@ -24,9 +25,74 @@ pub const PubSubPeerProtocolHandler = semiduplex.PubSubPeerProtocolHandler;
 pub const gossipsub_v1_id: ProtocolId = gossipsub.v1_id;
 pub const gossipsub_v1_1_id: ProtocolId = gossipsub.v1_1_id;
 
+pub const Subscription = struct {
+    topic: []const u8,
+    subscribe: bool,
+};
+
+pub const Event = union(enum) {
+    subscription_changed: struct {
+        peer: PeerId,
+        subscriptions: []Subscription,
+    },
+
+    pub fn hash(self: Event, hasher: anytype) void {
+        const tag = std.meta.activeTag(self);
+        hasher.update(std.mem.asBytes(&tag));
+
+        switch (self) {
+            .subscription_changed => |sub_change| {
+                var peer_buf: [128]u8 = undefined;
+                const peer_bytes = sub_change.peer.toBytes(&peer_buf) catch unreachable;
+                hasher.update(peer_bytes);
+
+                hasher.update(std.mem.asBytes(&sub_change.subscriptions.len));
+
+                for (sub_change.subscriptions) |subscription| {
+                    hasher.update(std.mem.asBytes(&subscription.topic.len));
+                    hasher.update(subscription.topic);
+
+                    hasher.update(std.mem.asBytes(&subscription.subscribe));
+                }
+            },
+        }
+    }
+
+    pub fn eql(self: Event, other: Event) bool {
+        const self_tag = std.meta.activeTag(self);
+        const other_tag = std.meta.activeTag(other);
+
+        if (self_tag != other_tag) return false;
+
+        switch (self) {
+            .subscription_changed => |self_sub| {
+                const other_sub = other.subscription_changed;
+
+                if (!self_sub.peer.eql(&other_sub.peer)) {
+                    return false;
+                }
+
+                if (self_sub.subscriptions.len != other_sub.subscriptions.len) {
+                    return false;
+                }
+
+                for (self_sub.subscriptions, other_sub.subscriptions) |self_subscription, other_subscription| {
+                    if (!std.mem.eql(u8, self_subscription.topic, other_subscription.topic) or
+                        self_subscription.subscribe != other_subscription.subscribe)
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            },
+        }
+    }
+};
+
 pub const RPC = struct {
     rpc_reader: rpc.RPCReader,
-    peer: PeerId,
+    from: PeerId,
 
     pub fn deinit(self: *RPC) void {
         self.rpc_reader.deinit();
@@ -49,6 +115,12 @@ pub const PubSub = struct {
     allocator: Allocator,
 
     incoming_rpc: std.ArrayListUnmanaged(RPC),
+
+    topics: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)),
+
+    my_topics: std.StringHashMapUnmanaged(void),
+
+    event_emitter: event.EventEmitter(Event),
 
     // TODO: Not hardcode protocol IDs
     protocols: []const ProtocolId = &.{ gossipsub_v1_id, gossipsub_v1_1_id },
@@ -125,6 +197,9 @@ pub const PubSub = struct {
             .swarm = network_swarm,
             .peers = std.AutoHashMap(PeerId, Semiduplex).init(allocator),
             .incoming_rpc = std.ArrayListUnmanaged(RPC).empty,
+            .topics = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
+            .my_topics = std.StringHashMapUnmanaged(void).empty,
+            .event_emitter = event.EventEmitter(Event).init(allocator),
         };
     }
 
@@ -134,6 +209,69 @@ pub const PubSub = struct {
             item.deinit();
         }
         self.incoming_rpc.deinit(self.allocator);
+
+        var topic_iter = self.topics.iterator();
+        while (topic_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.topics.deinit(self.allocator);
+
+        var my_topic_iter = self.my_topics.iterator();
+        while (my_topic_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.my_topics.deinit(self.allocator);
+        self.event_emitter.deinit();
+    }
+
+    pub fn handleIncomingRPC(self: *Self, rpc_message: *const RPC) !void {
+        const subs = try rpc_message.rpc_reader.getSubscriptions(self.allocator);
+        defer self.allocator.free(subs);
+        //TODO:Implement subscription filtering
+
+        var subscriptions = std.ArrayListUnmanaged(Subscription).empty;
+        defer {
+            for (subscriptions.items) |subscription| {
+                self.allocator.free(subscription.topic);
+            }
+            subscriptions.deinit(self.allocator);
+        }
+        for (subs) |sub| {
+            const topic_id = sub.getTopicid();
+            if (sub.getSubscribe()) {
+                if (!self.topics.contains(topic_id)) {
+                    const copied_topic_id = try self.allocator.dupe(u8, topic_id);
+                    errdefer self.allocator.free(copied_topic_id);
+                    const tmap = std.AutoHashMapUnmanaged(PeerId, void).empty;
+                    try self.topics.put(self.allocator, copied_topic_id, tmap);
+                }
+
+                const pgop = try self.topics.getPtr(topic_id).?.getOrPut(self.allocator, rpc_message.from);
+                if (!pgop.found_existing) {
+                    pgop.value_ptr.* = {};
+                }
+            } else {
+                if (!self.topics.contains(topic_id)) {
+                    continue;
+                }
+
+                if (self.topics.getPtr(topic_id).?.contains(rpc_message.from)) {
+                    _ = self.topics.getPtr(topic_id).?.remove(rpc_message.from);
+                }
+            }
+
+            const sub_copied = try self.allocator.dupe(u8, topic_id);
+            errdefer self.allocator.free(sub_copied);
+            try subscriptions.append(self.allocator, .{ .topic = sub_copied, .subscribe = sub.getSubscribe() });
+        }
+
+        if (self.event_emitter.getListenerCount(.subscription_changed) > 0) {
+            self.event_emitter.emit(.{ .subscription_changed = .{
+                .peer = rpc_message.from,
+                .subscriptions = try subscriptions.toOwnedSlice(self.allocator),
+            } });
+        }
     }
 
     pub fn removePeer(self: *Self, peer: PeerId, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
@@ -809,6 +947,40 @@ test "pubsub add peer single direction with replace stream" {
 test "simulate onMessage" {
     const allocator = std.testing.allocator;
 
+    const SubscriptionChangedListener = struct {
+        allocator: std.mem.Allocator,
+
+        const Self = @This();
+
+        pub fn handle(self: *Self, e: Event) void {
+            switch (e) {
+                .subscription_changed => |sc| {
+                    std.debug.print("Subscription changed event received\n", .{});
+                    for (sc.subscriptions) |subscription| {
+                        self.allocator.free(subscription.topic);
+                    }
+                    self.allocator.free(sc.subscriptions);
+                },
+            }
+        }
+
+        pub fn vtableHandleFn(instance: *anyopaque, e: Event) void {
+            const self: *Self = @ptrCast(@alignCast(instance));
+            return self.handle(e);
+        }
+
+        pub const vtable = event.EventListenerVTable(Event){
+            .handleFn = vtableHandleFn,
+        };
+
+        pub fn any(self: *Self) event.AnyEventListener(Event) {
+            return event.AnyEventListener(Event){
+                .instance = @ptrCast(self),
+                .vtable = &Self.vtable,
+            };
+        }
+    };
+
     var switch1_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9567");
     defer switch1_listen_address.deinit();
 
@@ -892,30 +1064,22 @@ test "simulate onMessage" {
     try std.testing.expect(pubsub1.peers.get(transport2.local_peer_id).?.responder == null);
 
     const rpc_message = rpc.RPC{
-        .publish = &[_]?rpc.Message{ .{
-            .from = "test_from",
-            .topic = "test_topic",
-            .data = "test_data",
-            .seqno = "1",
-        }, rpc.Message{
-            .from = "test_from1",
-            .topic = "test_topic1",
-            .data = "test_data1",
-            .seqno = "2",
+        .subscriptions = &[_]?rpc.RPC.SubOpts{ .{
+            .topicid = "test_topic",
+            .subscribe = true,
+        }, rpc.RPC.SubOpts{
+            .topicid = "test_topic1",
+            .subscribe = true,
         } },
     };
 
     const rpc_message1 = rpc.RPC{
-        .publish = &[_]?rpc.Message{ .{
-            .from = "test_from2",
-            .topic = "test_topic2",
-            .data = "test_data2",
-            .seqno = "3",
-        }, rpc.Message{
-            .from = "test_from3",
-            .topic = "test_topic3",
-            .data = "test_data3",
-            .seqno = "4",
+        .subscriptions = &[_]?rpc.RPC.SubOpts{ .{
+            .topicid = "test_topic2",
+            .subscribe = true,
+        }, rpc.RPC.SubOpts{
+            .topicid = "test_topic1",
+            .subscribe = false,
         } },
     };
 
@@ -935,7 +1099,14 @@ test "simulate onMessage" {
     defer std.testing.allocator.free(encoded_rpc_message);
 
     const responder = pubsub2.peers.get(transport1.local_peer_id).?.responder.?;
+    var listener: SubscriptionChangedListener = .{
+        .allocator = allocator,
+    };
+    try pubsub2.event_emitter.addListener(.subscription_changed, listener.any());
     try responder.onMessage(responder.stream, encoded_rpc_message);
 
-    try std.testing.expectEqual(2, responder.pubsub.incoming_rpc.items.len);
+    try std.testing.expectEqual(3, pubsub2.topics.count());
+    try std.testing.expectEqual(0, pubsub2.topics.get("test_topic1").?.count());
+    try std.testing.expectEqual(1, pubsub2.topics.get("test_topic").?.count());
+    try std.testing.expectEqual(1, pubsub2.topics.get("test_topic2").?.count());
 }

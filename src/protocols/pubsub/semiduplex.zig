@@ -251,11 +251,12 @@ pub const PubSubPeerResponder = struct {
             std.debug.assert(bytes_read == msg_len);
 
             const rpc_reader = try rpc.RPCReader.init(self.pubsub.allocator, copied_message);
-            const rpc_message: pubsub.RPC = .{
+            var rpc_message: pubsub.RPC = .{
                 .rpc_reader = rpc_reader,
-                .peer = stream.conn.security_session.?.remote_id,
+                .from = stream.conn.security_session.?.remote_id,
             };
-            try self.pubsub.incoming_rpc.append(self.pubsub.allocator, rpc_message);
+            defer rpc_message.deinit();
+            try self.pubsub.handleIncomingRPC(&rpc_message);
         }
     }
 

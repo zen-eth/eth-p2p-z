@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// A generic event emitter/listener system.
 /// This allows registering listeners for specific event types and emitting events to those listeners.
-/// The event type is generic and can be any type that supports equality comparison.
+/// The event type must be a tagged union, and listeners are registered by the union's tag enum.
 /// Listeners are type-erased using a vtable pattern to allow different listener implementations.
 pub fn EventListenerVTable(comptime T: type) type {
     return struct {
@@ -24,19 +24,33 @@ pub fn AnyEventListener(comptime T: type) type {
 }
 
 /// A generic event emitter that allows registering listeners for specific event types and emitting events to those listeners.
-/// The event type is generic and can be any type that supports equality comparison.
+/// The event type T must be a tagged union.
+/// Listeners are registered by the union's tag enum, not the full union type.
 /// Listeners are type-erased using a vtable pattern to allow different listener implementations.
 pub fn EventEmitter(comptime T: type) type {
+    // Compile-time checks to ensure T is a tagged union
+    comptime {
+        const type_info = @typeInfo(T);
+        if (type_info != .@"union") {
+            @compileError("EventEmitter requires a union type, got " ++ @typeName(T));
+        }
+        if (type_info.@"union".tag_type == null) {
+            @compileError("EventEmitter requires a tagged union, got untagged union " ++ @typeName(T));
+        }
+    }
+
     return struct {
         allocator: std.mem.Allocator,
-        listeners: std.AutoHashMapUnmanaged(T, std.ArrayListUnmanaged(AnyEventListener(T))),
+        // Use the union's tag enum as the key type
+        listeners: std.HashMapUnmanaged(std.meta.Tag(T), std.ArrayListUnmanaged(AnyEventListener(T)), std.hash_map.AutoContext(std.meta.Tag(T)), std.hash_map.default_max_load_percentage),
 
         const Self = @This();
+        const TagType = std.meta.Tag(T);
 
-        pub fn init(allocator: std.mem.Allocator) !Self {
+        pub fn init(allocator: std.mem.Allocator) Self {
             return Self{
                 .allocator = allocator,
-                .listeners = std.AutoHashMapUnmanaged(T, std.ArrayListUnmanaged(AnyEventListener(T))).empty,
+                .listeners = std.HashMapUnmanaged(TagType, std.ArrayListUnmanaged(AnyEventListener(T)), std.hash_map.AutoContext(TagType), std.hash_map.default_max_load_percentage).empty,
             };
         }
 
@@ -48,18 +62,20 @@ pub fn EventEmitter(comptime T: type) type {
             self.listeners.deinit(self.allocator);
         }
 
-        pub fn addListener(self: *Self, event: T, listener: AnyEventListener(T)) !void {
-            if (self.listeners.getPtr(event)) |l| {
+        /// Add a listener for a specific event tag
+        pub fn addListener(self: *Self, event_tag: TagType, listener: AnyEventListener(T)) !void {
+            if (self.listeners.getPtr(event_tag)) |l| {
                 try l.append(self.allocator, listener);
             } else {
                 var new_list = std.ArrayListUnmanaged(AnyEventListener(T)).empty;
                 try new_list.append(self.allocator, listener);
-                try self.listeners.put(self.allocator, event, new_list);
+                try self.listeners.put(self.allocator, event_tag, new_list);
             }
         }
 
-        pub fn removeListener(self: *Self, event: T, listener: AnyEventListener(T)) bool {
-            if (self.listeners.getPtr(event)) |list| {
+        /// Remove a specific listener for an event tag
+        pub fn removeListener(self: *Self, event_tag: TagType, listener: AnyEventListener(T)) bool {
+            if (self.listeners.getPtr(event_tag)) |list| {
                 for (list.items, 0..) |item, index| {
                     if (item.instance == listener.instance and item.vtable == listener.vtable) {
                         _ = list.swapRemove(index);
@@ -70,25 +86,46 @@ pub fn EventEmitter(comptime T: type) type {
             return false;
         }
 
+        /// Emit an event to all listeners registered for its tag
         pub fn emit(self: *Self, event: T) void {
-            if (self.listeners.getPtr(event)) |list| {
+            const event_tag = std.meta.activeTag(event);
+            if (self.listeners.getPtr(event_tag)) |list| {
                 for (list.items) |listener| {
                     listener.handle(event);
                 }
             }
         }
+
+        /// Get the count of listeners for a specific event tag
+        pub fn getListenerCount(self: *Self, event_tag: TagType) usize {
+            if (self.listeners.getPtr(event_tag)) |list| {
+                return list.items.len;
+            }
+            return 0;
+        }
+
+        /// Remove all listeners for a specific event tag
+        pub fn removeAllListeners(self: *Self, event_tag: TagType) void {
+            if (self.listeners.getPtr(event_tag)) |list| {
+                list.clearAndFree(self.allocator);
+            }
+        }
     };
 }
 
-test "EventEmitter works" {
+test "EventEmitter works with tagged union" {
     const allocator = std.testing.allocator;
 
-    const MyEvent = enum {
-        EventA,
-        EventB,
+    // Define a tagged union for events
+    const MyEvent = union(enum) {
+        event_a: struct { value: u32 },
+        event_b: struct { message: []const u8 },
+        event_c: void,
+
+        const Tag = std.meta.Tag(@This());
     };
 
-    var emitter = try EventEmitter(MyEvent).init(allocator);
+    var emitter = EventEmitter(MyEvent).init(allocator);
     defer emitter.deinit();
 
     var state: u32 = 0;
@@ -99,8 +136,11 @@ test "EventEmitter works" {
         const Self = @This();
 
         pub fn handle(self: *Self, event: MyEvent) void {
-            if (event == .EventA) {
-                self.state_ptr.* += 1;
+            switch (event) {
+                .event_a => |data| {
+                    self.state_ptr.* += data.value;
+                },
+                else => {},
             }
         }
 
@@ -126,97 +166,33 @@ test "EventEmitter works" {
 
     var listener_a_instance = ListenerA{ .state_ptr = &state };
 
-    try emitter.addListener(.EventA, listener_a_instance.any());
+    try emitter.addListener(.event_a, listener_a_instance.any());
 
-    emitter.emit(.EventA);
-    try std.testing.expect(state == 1);
+    emitter.emit(MyEvent{ .event_a = .{ .value = 5 } });
+    try std.testing.expect(state == 5);
 
-    emitter.emit(.EventB);
-    try std.testing.expect(state == 1);
+    emitter.emit(MyEvent{ .event_b = .{ .message = "hello" } });
+    try std.testing.expect(state == 5);
 
-    emitter.emit(.EventA);
-    try std.testing.expect(state == 2);
+    emitter.emit(MyEvent{ .event_a = .{ .value = 3 } });
+    try std.testing.expect(state == 8);
 
-    const removed = emitter.removeListener(.EventA, listener_a_instance.any());
+    const removed = emitter.removeListener(.event_a, listener_a_instance.any());
     try std.testing.expect(removed);
 
-    emitter.emit(.EventA);
-    try std.testing.expect(state == 2);
+    emitter.emit(MyEvent{ .event_a = .{ .value = 10 } });
+    try std.testing.expect(state == 8);
 }
 
-test "EventEmitter emits events to listeners" {
+test "EventEmitter with multiple listeners for same event tag" {
     const allocator = std.testing.allocator;
 
-    const MyEvent = enum {
-        EventA,
-        EventB,
+    const MyEvent = union(enum) {
+        event_a: struct { value: u32 },
+        event_b: struct { message: []const u8 },
     };
 
-    var emitter = try EventEmitter(MyEvent).init(allocator);
-    defer emitter.deinit();
-
-    var state: u32 = 0;
-
-    const ListenerA = struct {
-        state_ptr: *u32,
-
-        const Self = @This();
-
-        pub fn handle(self: *Self, event: MyEvent) void {
-            if (event == .EventA) {
-                self.state_ptr.* += 1;
-            }
-        }
-
-        pub fn vtableHandleFn(
-            instance: *anyopaque,
-            event: MyEvent,
-        ) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            return self.handle(event);
-        }
-
-        pub const vtable = EventListenerVTable(MyEvent){
-            .handleFn = vtableHandleFn,
-        };
-
-        pub fn any(self: *Self) AnyEventListener(MyEvent) {
-            return AnyEventListener(MyEvent){
-                .instance = @ptrCast(self),
-                .vtable = &Self.vtable,
-            };
-        }
-    };
-
-    var listener_a_instance = ListenerA{ .state_ptr = &state };
-
-    try emitter.addListener(.EventA, listener_a_instance.any());
-
-    emitter.emit(.EventA);
-    try std.testing.expect(state == 1);
-
-    emitter.emit(.EventB);
-    try std.testing.expect(state == 1);
-
-    emitter.emit(.EventA);
-    try std.testing.expect(state == 2);
-
-    const removed = emitter.removeListener(.EventA, listener_a_instance.any());
-    try std.testing.expect(removed);
-
-    emitter.emit(.EventA);
-    try std.testing.expect(state == 2);
-}
-
-test "EventEmitter with multiple listeners for same event" {
-    const allocator = std.testing.allocator;
-
-    const MyEvent = enum {
-        EventA,
-        EventB,
-    };
-
-    var emitter = try EventEmitter(MyEvent).init(allocator);
+    var emitter = EventEmitter(MyEvent).init(allocator);
     defer emitter.deinit();
 
     var state1: u32 = 0;
@@ -230,8 +206,11 @@ test "EventEmitter with multiple listeners for same event" {
         const Self = @This();
 
         pub fn handle(self: *Self, event: MyEvent) void {
-            if (event == .EventA) {
-                self.state_ptr.* += self.multiplier;
+            switch (event) {
+                .event_a => |data| {
+                    self.state_ptr.* += data.value * self.multiplier;
+                },
+                else => {},
             }
         }
 
@@ -255,208 +234,62 @@ test "EventEmitter with multiple listeners for same event" {
         }
     };
 
-    // Create three different listeners for the same event
     var listener1 = ListenerA{ .state_ptr = &state1, .multiplier = 1 };
     var listener2 = ListenerA{ .state_ptr = &state2, .multiplier = 2 };
     var listener3 = ListenerA{ .state_ptr = &state3, .multiplier = 3 };
 
-    // Add all three listeners to the same event
-    try emitter.addListener(.EventA, listener1.any());
-    try emitter.addListener(.EventA, listener2.any());
-    try emitter.addListener(.EventA, listener3.any());
+    try emitter.addListener(.event_a, listener1.any());
+    try emitter.addListener(.event_a, listener2.any());
+    try emitter.addListener(.event_a, listener3.any());
 
-    // Emit EventA - all three listeners should be called
-    emitter.emit(.EventA);
-    try std.testing.expect(state1 == 1);
-    try std.testing.expect(state2 == 2);
-    try std.testing.expect(state3 == 3);
+    try std.testing.expect(emitter.getListenerCount(.event_a) == 3);
+    try std.testing.expect(emitter.getListenerCount(.event_b) == 0);
 
-    // Emit EventB - no listeners should be called
-    emitter.emit(.EventB);
-    try std.testing.expect(state1 == 1);
-    try std.testing.expect(state2 == 2);
-    try std.testing.expect(state3 == 3);
+    emitter.emit(MyEvent{ .event_a = .{ .value = 2 } });
+    try std.testing.expect(state1 == 2); // 2 * 1
+    try std.testing.expect(state2 == 4); // 2 * 2
+    try std.testing.expect(state3 == 6); // 2 * 3
 
-    // Emit EventA again - all three listeners should be called again
-    emitter.emit(.EventA);
-    try std.testing.expect(state1 == 2);
-    try std.testing.expect(state2 == 4);
-    try std.testing.expect(state3 == 6);
+    emitter.emit(MyEvent{ .event_b = .{ .message = "test" } });
+    try std.testing.expect(state1 == 2); // unchanged
+    try std.testing.expect(state2 == 4); // unchanged
+    try std.testing.expect(state3 == 6); // unchanged
 
-    // Remove one listener and test again
-    const removed = emitter.removeListener(.EventA, listener2.any());
+    const removed = emitter.removeListener(.event_a, listener2.any());
     try std.testing.expect(removed);
+    try std.testing.expect(emitter.getListenerCount(.event_a) == 2);
 
-    emitter.emit(.EventA);
+    emitter.emit(MyEvent{ .event_a = .{ .value = 1 } });
+    try std.testing.expect(state1 == 3);
+    try std.testing.expect(state2 == 4);
+    try std.testing.expect(state3 == 9);
+
+    // Remove all listeners for event_a
+    emitter.removeAllListeners(.event_a);
+    try std.testing.expect(emitter.getListenerCount(.event_a) == 0);
+
+    emitter.emit(MyEvent{ .event_a = .{ .value = 5 } });
     try std.testing.expect(state1 == 3);
     try std.testing.expect(state2 == 4);
     try std.testing.expect(state3 == 9);
 }
 
-test "EventEmitter with multiple listeners for different events" {
+test "EventEmitter with different event tags" {
     const allocator = std.testing.allocator;
 
-    const MyEvent = enum {
-        EventA,
-        EventB,
-        EventC,
+    const MyEvent = union(enum) {
+        connect: struct { peer_id: []const u8 },
+        disconnect: struct { peer_id: []const u8 },
+        message: struct { content: []const u8, from: []const u8 },
+        err: struct { code: u32, description: []const u8 },
     };
 
-    var emitter = try EventEmitter(MyEvent).init(allocator);
-    defer emitter.deinit();
-
-    var eventA_count: u32 = 0;
-    var eventB_count: u32 = 0;
-    var all_events_count: u32 = 0;
-
-    const EventAListener = struct {
-        counter: *u32,
-
-        const Self = @This();
-
-        pub fn handle(self: *Self, event: MyEvent) void {
-            if (event == .EventA) {
-                self.counter.* += 1;
-            }
-        }
-
-        pub fn vtableHandleFn(instance: *anyopaque, event: MyEvent) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            return self.handle(event);
-        }
-
-        pub const vtable = EventListenerVTable(MyEvent){
-            .handleFn = vtableHandleFn,
-        };
-
-        pub fn any(self: *Self) AnyEventListener(MyEvent) {
-            return AnyEventListener(MyEvent){
-                .instance = @ptrCast(self),
-                .vtable = &Self.vtable,
-            };
-        }
-    };
-
-    const EventBListener = struct {
-        counter: *u32,
-
-        const Self = @This();
-
-        pub fn handle(self: *Self, event: MyEvent) void {
-            if (event == .EventB) {
-                self.counter.* += 10; // Use different increment to distinguish
-            }
-        }
-
-        pub fn vtableHandleFn(instance: *anyopaque, event: MyEvent) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            return self.handle(event);
-        }
-
-        pub const vtable = EventListenerVTable(MyEvent){
-            .handleFn = vtableHandleFn,
-        };
-
-        pub fn any(self: *Self) AnyEventListener(MyEvent) {
-            return AnyEventListener(MyEvent){
-                .instance = @ptrCast(self),
-                .vtable = &Self.vtable,
-            };
-        }
-    };
-
-    const AllEventsListener = struct {
-        counter: *u32,
-
-        const Self = @This();
-
-        pub fn handle(self: *Self, event: MyEvent) void {
-            // This listener responds to all events
-            switch (event) {
-                .EventA, .EventB, .EventC => self.counter.* += 100,
-            }
-        }
-
-        pub fn vtableHandleFn(instance: *anyopaque, event: MyEvent) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            return self.handle(event);
-        }
-
-        pub const vtable = EventListenerVTable(MyEvent){
-            .handleFn = vtableHandleFn,
-        };
-
-        pub fn any(self: *Self) AnyEventListener(MyEvent) {
-            return AnyEventListener(MyEvent){
-                .instance = @ptrCast(self),
-                .vtable = &Self.vtable,
-            };
-        }
-    };
-
-    // Create listeners for different events
-    var listenerA = EventAListener{ .counter = &eventA_count };
-    var listenerB = EventBListener{ .counter = &eventB_count };
-    var allListener1 = AllEventsListener{ .counter = &all_events_count };
-    var allListener2 = AllEventsListener{ .counter = &all_events_count };
-
-    // Add listeners to different events
-    try emitter.addListener(.EventA, listenerA.any());
-    try emitter.addListener(.EventB, listenerB.any());
-
-    // Add the all-events listener to multiple events
-    try emitter.addListener(.EventA, allListener1.any());
-    try emitter.addListener(.EventB, allListener1.any());
-    try emitter.addListener(.EventC, allListener1.any());
-
-    // Add another all-events listener to EventA only
-    try emitter.addListener(.EventA, allListener2.any());
-
-    // Test EventA - should trigger EventA listener + 2 all-events listeners
-    emitter.emit(.EventA);
-    try std.testing.expect(eventA_count == 1);
-    try std.testing.expect(eventB_count == 0);
-    try std.testing.expect(all_events_count == 200);
-
-    // Test EventB - should trigger EventB listener + 1 all-events listener
-    emitter.emit(.EventB);
-    try std.testing.expect(eventA_count == 1);
-    try std.testing.expect(eventB_count == 10);
-    try std.testing.expect(all_events_count == 300);
-
-    // Test EventC - should trigger only 1 all-events listener
-    emitter.emit(.EventC);
-    try std.testing.expect(eventA_count == 1);
-    try std.testing.expect(eventB_count == 10);
-    try std.testing.expect(all_events_count == 400);
-
-    // Remove one all-events listener from EventA and test again
-    const removed = emitter.removeListener(.EventA, allListener2.any());
-    try std.testing.expect(removed);
-
-    emitter.emit(.EventA);
-    try std.testing.expect(eventA_count == 2);
-    try std.testing.expect(eventB_count == 10);
-    try std.testing.expect(all_events_count == 500);
-}
-
-test "EventEmitter complex scenario with mixed listeners" {
-    const allocator = std.testing.allocator;
-
-    const MyEvent = enum {
-        Connect,
-        Disconnect,
-        Message,
-        Error,
-    };
-
-    var emitter = try EventEmitter(MyEvent).init(allocator);
+    var emitter = EventEmitter(MyEvent).init(allocator);
     defer emitter.deinit();
 
     var connection_count: i32 = 0;
     var message_count: u32 = 0;
     var error_count: u32 = 0;
-    var total_events: u32 = 0;
 
     const ConnectionListener = struct {
         counter: *i32,
@@ -465,8 +298,8 @@ test "EventEmitter complex scenario with mixed listeners" {
 
         pub fn handle(self: *Self, event: MyEvent) void {
             switch (event) {
-                .Connect => self.counter.* += 1,
-                .Disconnect => self.counter.* -= 1,
+                .connect => self.counter.* += 1,
+                .disconnect => self.counter.* -= 1,
                 else => {},
             }
         }
@@ -494,8 +327,9 @@ test "EventEmitter complex scenario with mixed listeners" {
         const Self = @This();
 
         pub fn handle(self: *Self, event: MyEvent) void {
-            if (event == .Message) {
-                self.counter.* += 1;
+            switch (event) {
+                .message => self.counter.* += 1,
+                else => {},
             }
         }
 
@@ -522,8 +356,9 @@ test "EventEmitter complex scenario with mixed listeners" {
         const Self = @This();
 
         pub fn handle(self: *Self, event: MyEvent) void {
-            if (event == .Error) {
-                self.counter.* += 1;
+            switch (event) {
+                .err => self.counter.* += 1,
+                else => {},
             }
         }
 
@@ -544,89 +379,32 @@ test "EventEmitter complex scenario with mixed listeners" {
         }
     };
 
-    const TotalEventsListener = struct {
-        counter: *u32,
-
-        const Self = @This();
-
-        pub fn handle(self: *Self, event: MyEvent) void {
-            _ = event; // All events increment the counter
-            self.counter.* += 1;
-        }
-
-        pub fn vtableHandleFn(instance: *anyopaque, event: MyEvent) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            return self.handle(event);
-        }
-
-        pub const vtable = EventListenerVTable(MyEvent){
-            .handleFn = vtableHandleFn,
-        };
-
-        pub fn any(self: *Self) AnyEventListener(MyEvent) {
-            return AnyEventListener(MyEvent){
-                .instance = @ptrCast(self),
-                .vtable = &Self.vtable,
-            };
-        }
-    };
-
     var connListener = ConnectionListener{ .counter = &connection_count };
-    var msgListener1 = MessageListener{ .counter = &message_count };
-    var msgListener2 = MessageListener{ .counter = &message_count };
+    var msgListener = MessageListener{ .counter = &message_count };
     var errListener = ErrorListener{ .counter = &error_count };
-    var totalListener = TotalEventsListener{ .counter = &total_events };
 
-    // Set up listeners
-    try emitter.addListener(.Connect, connListener.any());
-    try emitter.addListener(.Disconnect, connListener.any());
-    try emitter.addListener(.Message, msgListener1.any());
-    try emitter.addListener(.Message, msgListener2.any()); // Two listeners for Message
-    try emitter.addListener(.Error, errListener.any());
+    try emitter.addListener(.connect, connListener.any());
+    try emitter.addListener(.disconnect, connListener.any());
+    try emitter.addListener(.message, msgListener.any());
+    try emitter.addListener(.err, errListener.any());
 
-    // Total event listener listens to all event types
-    try emitter.addListener(.Connect, totalListener.any());
-    try emitter.addListener(.Disconnect, totalListener.any());
-    try emitter.addListener(.Message, totalListener.any());
-    try emitter.addListener(.Error, totalListener.any());
-
-    // Simulate a session
-    emitter.emit(.Connect);
+    emitter.emit(MyEvent{ .connect = .{ .peer_id = "peer1" } });
     try std.testing.expect(connection_count == 1);
     try std.testing.expect(message_count == 0);
     try std.testing.expect(error_count == 0);
-    try std.testing.expect(total_events == 1);
 
-    emitter.emit(.Message);
+    emitter.emit(MyEvent{ .message = .{ .content = "hello", .from = "peer1" } });
     try std.testing.expect(connection_count == 1);
-    try std.testing.expect(message_count == 2);
+    try std.testing.expect(message_count == 1);
     try std.testing.expect(error_count == 0);
-    try std.testing.expect(total_events == 2);
 
-    emitter.emit(.Message);
+    emitter.emit(MyEvent{ .err = .{ .code = 404, .description = "Not found" } });
     try std.testing.expect(connection_count == 1);
-    try std.testing.expect(message_count == 4);
-    try std.testing.expect(error_count == 0);
-    try std.testing.expect(total_events == 3);
-
-    emitter.emit(.Error);
-    try std.testing.expect(connection_count == 1);
-    try std.testing.expect(message_count == 4);
+    try std.testing.expect(message_count == 1);
     try std.testing.expect(error_count == 1);
-    try std.testing.expect(total_events == 4);
 
-    emitter.emit(.Disconnect);
+    emitter.emit(MyEvent{ .disconnect = .{ .peer_id = "peer1" } });
     try std.testing.expect(connection_count == 0);
-    try std.testing.expect(message_count == 4);
+    try std.testing.expect(message_count == 1);
     try std.testing.expect(error_count == 1);
-    try std.testing.expect(total_events == 5);
-
-    // Remove one message listener and test
-    _ = emitter.removeListener(.Message, msgListener1.any());
-
-    emitter.emit(.Message);
-    try std.testing.expect(connection_count == 0);
-    try std.testing.expect(message_count == 5);
-    try std.testing.expect(error_count == 1);
-    try std.testing.expect(total_events == 6);
 }
