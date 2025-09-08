@@ -64,13 +64,11 @@ pub fn EventEmitter(comptime T: type) type {
 
         /// Add a listener for a specific event tag
         pub fn addListener(self: *Self, event_tag: TagType, listener: AnyEventListener(T)) !void {
-            if (self.listeners.getPtr(event_tag)) |l| {
-                try l.append(self.allocator, listener);
-            } else {
-                var new_list = std.ArrayListUnmanaged(AnyEventListener(T)).empty;
-                try new_list.append(self.allocator, listener);
-                try self.listeners.put(self.allocator, event_tag, new_list);
+            const gop = try self.listeners.getOrPut(self.allocator, event_tag);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = std.ArrayListUnmanaged(AnyEventListener(T)).empty;
             }
+            try gop.value_ptr.append(self.allocator, listener);
         }
 
         /// Remove a specific listener for an event tag
@@ -108,6 +106,7 @@ pub fn EventEmitter(comptime T: type) type {
         pub fn removeAllListeners(self: *Self, event_tag: TagType) void {
             if (self.listeners.getPtr(event_tag)) |list| {
                 list.clearAndFree(self.allocator);
+                _ = self.listeners.remove(event_tag);
             }
         }
     };

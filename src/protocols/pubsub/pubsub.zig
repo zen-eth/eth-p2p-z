@@ -224,12 +224,6 @@ pub const PubSub = struct {
         //TODO:Implement subscription filtering
 
         var subscriptions = std.ArrayListUnmanaged(Subscription).empty;
-        defer {
-            for (subscriptions.items) |subscription| {
-                self.allocator.free(subscription.topic);
-            }
-            subscriptions.deinit(self.allocator);
-        }
         for (subs) |sub| {
             const topic_id = sub.getTopicid();
             if (sub.getSubscribe()) {
@@ -247,10 +241,10 @@ pub const PubSub = struct {
             } else {
                 if (!self.topics.contains(topic_id)) {
                     continue;
-                }
-
-                if (self.topics.getPtr(topic_id).?.contains(rpc_message.from)) {
-                    _ = self.topics.getPtr(topic_id).?.remove(rpc_message.from);
+                } else {
+                    if (self.topics.getPtr(topic_id)) |peer_set| {
+                        _ = peer_set.remove(rpc_message.from);
+                    }
                 }
             }
 
@@ -259,12 +253,15 @@ pub const PubSub = struct {
             try subscriptions.append(self.allocator, .{ .topic = sub_copied, .subscribe = sub.getSubscribe() });
         }
 
-        if (self.event_emitter.getListenerCount(.subscription_changed) > 0) {
-            self.event_emitter.emit(.{ .subscription_changed = .{
-                .peer = rpc_message.from,
-                .subscriptions = try subscriptions.toOwnedSlice(self.allocator),
-            } });
+        const owned_subscriptions = try subscriptions.toOwnedSlice(self.allocator);
+        defer {
+            for (owned_subscriptions) |s| self.allocator.free(s.topic);
+            self.allocator.free(owned_subscriptions);
         }
+        self.event_emitter.emit(.{ .subscription_changed = .{
+            .peer = rpc_message.from,
+            .subscriptions = owned_subscriptions,
+        } });
     }
 
     pub fn removePeer(self: *Self, peer: PeerId, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
@@ -358,8 +355,6 @@ pub const PubSub = struct {
 
         if (result.found_existing) {
             if (result.value_ptr.responder != null) {
-                std.debug.print("old responder11 {?*}\n", .{result.value_ptr.responder});
-                std.debug.print("new responder111 {*}\n", .{responder});
                 result.value_ptr.replace_stream = true;
                 const old_responder = result.value_ptr.responder.?;
                 old_responder.stream.close(null, struct {
@@ -945,14 +940,10 @@ test "simulate onMessage" {
 
         const Self = @This();
 
-        pub fn handle(self: *Self, e: Event) void {
+        pub fn handle(_: *Self, e: Event) void {
             switch (e) {
-                .subscription_changed => |sc| {
+                .subscription_changed => {
                     std.debug.print("Subscription changed event received\n", .{});
-                    for (sc.subscriptions) |subscription| {
-                        self.allocator.free(subscription.topic);
-                    }
-                    self.allocator.free(sc.subscriptions);
                 },
             }
         }
