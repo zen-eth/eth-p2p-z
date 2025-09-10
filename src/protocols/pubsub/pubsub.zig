@@ -226,27 +226,9 @@ pub const PubSub = struct {
         var subscriptions = std.ArrayListUnmanaged(Subscription).empty;
         for (subs) |sub| {
             const topic_id = sub.getTopicid();
-            if (sub.getSubscribe()) {
-                if (!self.topics.contains(topic_id)) {
-                    const copied_topic_id = try self.allocator.dupe(u8, topic_id);
-                    errdefer self.allocator.free(copied_topic_id);
-                    const tmap = std.AutoHashMapUnmanaged(PeerId, void).empty;
-                    try self.topics.put(self.allocator, copied_topic_id, tmap);
-                }
+            const subscribe = sub.getSubscribe();
 
-                const pgop = try self.topics.getPtr(topic_id).?.getOrPut(self.allocator, rpc_message.from);
-                if (!pgop.found_existing) {
-                    pgop.value_ptr.* = {};
-                }
-            } else {
-                if (!self.topics.contains(topic_id)) {
-                    continue;
-                } else {
-                    if (self.topics.getPtr(topic_id)) |peer_set| {
-                        _ = peer_set.remove(rpc_message.from);
-                    }
-                }
-            }
+            try self.handleReceivedSubscription(rpc_message.from, topic_id, subscribe);
 
             const sub_copied = try self.allocator.dupe(u8, topic_id);
             errdefer self.allocator.free(sub_copied);
@@ -262,6 +244,8 @@ pub const PubSub = struct {
             .peer = rpc_message.from,
             .subscriptions = owned_subscriptions,
         } });
+
+        // Handle publish
     }
 
     pub fn removePeer(self: *Self, peer: PeerId, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
@@ -418,6 +402,30 @@ pub const PubSub = struct {
                 semi_duplex.close(null, struct {
                     fn callback(_: ?*anyopaque, _: anyerror!*Semiduplex) void {}
                 }.callback);
+            }
+        }
+    }
+
+    fn handleReceivedSubscription(self: *Self, from: PeerId, topic: []const u8, subscribe: bool) !void {
+        if (subscribe) {
+            if (!self.topics.contains(topic)) {
+                const copied_topic_id = try self.allocator.dupe(u8, topic);
+                errdefer self.allocator.free(copied_topic_id);
+                const tmap = std.AutoHashMapUnmanaged(PeerId, void).empty;
+                try self.topics.put(self.allocator, copied_topic_id, tmap);
+            }
+
+            const pgop = try self.topics.getPtr(topic).?.getOrPut(self.allocator, from);
+            if (!pgop.found_existing) {
+                pgop.value_ptr.* = {};
+            }
+        } else {
+            if (!self.topics.contains(topic)) {
+                return;
+            } else {
+                if (self.topics.getPtr(topic)) |peer_set| {
+                    _ = peer_set.remove(from);
+                }
             }
         }
     }
