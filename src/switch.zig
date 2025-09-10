@@ -190,8 +190,6 @@ pub const Switch = struct {
                 stream.close(null, struct {
                     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
                 }.callback);
-                stream.deinit();
-                stream.conn.engine.allocator.destroy(stream);
                 return;
             };
 
@@ -208,8 +206,6 @@ pub const Switch = struct {
                 stream.proto_msg_handler.?.onClose(stream) catch |e| {
                     std.log.warn("Protocol message handler failed with error: {}.", .{e});
                 };
-                stream.deinit();
-                stream.conn.engine.allocator.destroy(stream);
                 return;
             };
         }
