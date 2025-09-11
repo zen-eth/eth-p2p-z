@@ -115,13 +115,13 @@ pub const IOAction = union(enum) {
         network_switch: *Switch,
     },
     pubsub_add_peer: struct {
-        pubsub: *pubsub.PubSub,
+        pubsub: pubsub.PubSub,
         peer: Multiaddr,
         callback_ctx: ?*anyopaque,
         callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void,
     },
     pubsub_remove_peer: struct {
-        pubsub: *pubsub.PubSub,
+        pubsub: pubsub.PubSub,
         peer: PeerId,
         callback_ctx: ?*anyopaque,
         callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void,
@@ -506,11 +506,11 @@ pub const ThreadEventLoop = struct {
                 },
                 .pubsub_add_peer => |action_data| {
                     const ps = action_data.pubsub;
-                    ps.doAddPeer(action_data.peer, action_data.callback_ctx, action_data.callback);
+                    ps.addPeer(action_data.peer, action_data.callback_ctx, action_data.callback);
                 },
                 .pubsub_remove_peer => |action_data| {
                     const ps = action_data.pubsub;
-                    ps.doRemovePeer(action_data.peer, action_data.callback_ctx, action_data.callback);
+                    ps.removePeer(action_data.peer, action_data.callback_ctx, action_data.callback);
                 },
             }
             self.allocator.destroy(m);

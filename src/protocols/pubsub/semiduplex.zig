@@ -208,7 +208,7 @@ pub const PubSubPeerResponder = struct {
 
     stream: *libp2p.QuicStream,
 
-    pubsub: *PubSub,
+    pubsub: PubSub,
 
     received_buffer: std.fifo.LinearFifo(u8, .Dynamic),
 
@@ -244,19 +244,19 @@ pub const PubSubPeerResponder = struct {
                 return;
             }
 
-            const copied_message = try self.pubsub.allocator.alloc(u8, msg_len);
-            defer self.pubsub.allocator.free(copied_message);
+            const copied_message = try self.allocator.alloc(u8, msg_len);
+            defer self.allocator.free(copied_message);
             self.received_buffer.discard(msg_len_size);
             const bytes_read = self.received_buffer.read(copied_message);
             std.debug.assert(bytes_read == msg_len);
 
-            const rpc_reader = try rpc.RPCReader.init(self.pubsub.allocator, copied_message);
+            const rpc_reader = try rpc.RPCReader.init(self.allocator, copied_message);
             var rpc_message: pubsub.RPC = .{
                 .rpc_reader = rpc_reader,
                 .from = stream.conn.security_session.?.remote_id,
             };
             defer rpc_message.deinit();
-            try self.pubsub.handleIncomingRPC(&rpc_message);
+            try self.pubsub.handleRPC(&rpc_message);
         }
     }
 
