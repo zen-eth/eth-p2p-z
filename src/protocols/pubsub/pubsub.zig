@@ -19,6 +19,10 @@ pub const PubSubVTable = struct {
     removePeerFn: *const fn (self: *anyopaque, peer: PeerId, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
 };
 
+/// This is a generic PubSub interface that uses the VTable pattern to provide a type-erased
+/// interface for handling PubSub messages. It contains a pointer to the underlying
+/// PubSub implementation and a pointer to the VTable that defines the interface
+/// for that implementation.
 pub const PubSub = struct {
     instance: *anyopaque,
     vtable: *const PubSubVTable,

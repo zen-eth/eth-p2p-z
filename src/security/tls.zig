@@ -314,6 +314,7 @@ pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !st
         .type = host_pubkey_reader.getType(),
         .data = try allocator.dupe(u8, host_pubkey_reader.getData()),
     };
+    errdefer allocator.free(host_pubkey.data.?);
 
     const evp_key = try reconstructEvpKeyFromPublicKey(&host_pubkey);
     defer ssl.EVP_PKEY_free(evp_key);
@@ -339,7 +340,7 @@ pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !st
     return .{ .is_valid = is_valid, .host_pubkey = host_pubkey, .peer_id = peer_id };
 }
 
-fn reconstructEvpKeyFromPublicKey(public_key: *const keys.PublicKey) !*ssl.EVP_PKEY {
+pub fn reconstructEvpKeyFromPublicKey(public_key: *const keys.PublicKey) !*ssl.EVP_PKEY {
     const key_data = public_key.data orelse return error.RawPubKeyGetFailed;
 
     switch (public_key.type) {
@@ -437,7 +438,7 @@ fn parseExtensionSequence(allocator: Allocator, der_data: []const u8) !Extension
 }
 
 /// Verifies a signature using the provided public key.
-fn verifySignature(pkey: *ssl.EVP_PKEY, data: []const u8, signature: []const u8) !bool {
+pub fn verifySignature(pkey: *ssl.EVP_PKEY, data: []const u8, signature: []const u8) !bool {
     const ctx = ssl.EVP_MD_CTX_new() orelse return error.OpenSSLFailed;
     defer ssl.EVP_MD_CTX_free(ctx);
 

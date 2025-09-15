@@ -16,6 +16,9 @@ const rpc = libp2p.protobuf.rpc;
 const uvarint = multiformats.uvarint;
 const event = libp2p.event;
 const pubsub = @import("../pubsub.zig");
+const cache = @import("cache");
+
+const sign_prefix: []const u8 = "libp2p-pubsub:";
 
 pub const semiduplex = @import("../semiduplex.zig");
 pub const Semiduplex = semiduplex.Semiduplex;
@@ -32,6 +35,33 @@ pub const protocols: []const ProtocolId = &.{ v1_id, v1_1_id };
 pub const Subscription = struct {
     topic: []const u8,
     subscribe: bool,
+};
+
+pub const Message = struct {
+    from: ?PeerId,
+    data: []const u8,
+    seqno: ?u64,
+    topic_hash: []const u8,
+    signature: ?[]const u8,
+    key: ?[]const u8,
+    validated: bool,
+};
+
+pub const ValidateError = error{
+    InvalidSignature,
+    InvalidSeqno,
+    InvalidPeerId,
+    InvalidPubkey,
+    SignaturePresent,
+    SeqnoPresent,
+    FromPresent,
+    KeyPresent,
+    TransformFailed,
+} || Allocator.Error;
+
+pub const SignaturePolicy = enum {
+    StrictSign,
+    StrictNoSign,
 };
 
 pub const Event = union(enum) {
@@ -94,11 +124,11 @@ pub const Event = union(enum) {
     }
 };
 
-/// This is an implementation of the generic PubSub system which defined by the libp2p specification.
-/// It manages the peers and their connections, and provides methods to add and remove peers.
-/// It uses the Semiduplex struct to manage the bidirectional communication with each peer.
-/// It also handles incoming and outgoing streams for the PubSub protocol.
-/// It could use different PubSub routing algorithms, such as Gossipsub, Floodsub, etc.
+/// Gossipsub is a PubSub router implementation that follows the Gossipsub protocol.
+/// It maintains a list of peers and topics, and handles incoming and outgoing messages.
+/// It uses the Semiduplex struct to manage bidirectional communication channels.
+/// It also provides methods to add and remove peers, and to handle incoming RPC messages.
+///
 pub const Gossipsub = struct {
     peers: std.AutoHashMap(PeerId, Semiduplex),
 
@@ -112,11 +142,20 @@ pub const Gossipsub = struct {
 
     topics: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)),
 
-    my_topics: std.StringHashMapUnmanaged(void),
+    subscriptions: std.StringHashMapUnmanaged(void),
 
     event_emitter: event.EventEmitter(Event),
 
+    fast_msg_id_cache: cache.Cache([]const u8),
+
+    opts: Options,
+
     protocols: []const ProtocolId = &.{ v1_id, v1_1_id },
+
+    const Options = struct {
+        seen_ttl_s: u64 = 120,
+        max_messages_per_rpc: ?usize = null,
+    };
 
     const AddPeerCtx = struct {
         pubsub: *Gossipsub,
@@ -182,7 +221,7 @@ pub const Gossipsub = struct {
 
     const Self = @This();
 
-    pub fn init(self: *Self, allocator: Allocator, peer: Multiaddr, peer_id: PeerId, network_swarm: *Switch) void {
+    pub fn init(self: *Self, allocator: Allocator, peer: Multiaddr, peer_id: PeerId, network_swarm: *Switch, opts: Options) !void {
         self.* = .{
             .allocator = allocator,
             .peer = peer,
@@ -190,8 +229,10 @@ pub const Gossipsub = struct {
             .swarm = network_swarm,
             .peers = std.AutoHashMap(PeerId, Semiduplex).init(allocator),
             .topics = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
-            .my_topics = std.StringHashMapUnmanaged(void).empty,
+            .subscriptions = std.StringHashMapUnmanaged(void).empty,
             .event_emitter = event.EventEmitter(Event).init(allocator),
+            .fast_msg_id_cache = try cache.Cache([]const u8).init(allocator, .{}),
+            .opts = opts,
         };
     }
 
@@ -205,15 +246,27 @@ pub const Gossipsub = struct {
         }
         self.topics.deinit(self.allocator);
 
-        var my_topic_iter = self.my_topics.iterator();
+        var my_topic_iter = self.subscriptions.iterator();
         while (my_topic_iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
         }
-        self.my_topics.deinit(self.allocator);
+        self.subscriptions.deinit(self.allocator);
         self.event_emitter.deinit();
+        self.fast_msg_id_cache.deinit();
     }
 
-    pub fn handleIncomingRPC(self: *Self, rpc_message: *const pubsub.RPC) !void {
+    pub fn acceptFrom(self: *Self, peer_id: PeerId) bool {
+        _ = self;
+        _ = peer_id;
+        return true;
+    }
+
+    pub fn handleRPC(self: *Self, rpc_message: *const pubsub.RPC) !void {
+        if (!self.acceptFrom(rpc_message.from)) {
+            std.log.warn("Rejected RPC message from peer: {}", .{rpc_message.from});
+            return;
+        }
+
         const subs = try rpc_message.rpc_reader.getSubscriptions(self.allocator);
         defer self.allocator.free(subs);
         //TODO:Implement subscription filtering
@@ -223,7 +276,7 @@ pub const Gossipsub = struct {
             const topic_id = sub.getTopicid();
             const subscribe = sub.getSubscribe();
 
-            try self.handleReceivedSubscription(rpc_message.from, topic_id, subscribe);
+            try self.handleSubscription(rpc_message.from, topic_id, subscribe);
 
             const sub_copied = try self.allocator.dupe(u8, topic_id);
             errdefer self.allocator.free(sub_copied);
@@ -241,6 +294,15 @@ pub const Gossipsub = struct {
         } });
 
         // Handle publish
+        const msgs = try rpc_message.rpc_reader.getPublish(self.allocator);
+        defer self.allocator.free(msgs);
+        if (self.opts.max_messages_per_rpc) |max| if (msgs.len > max) {
+            std.log.warn("Received {} messages, exceeding limit of {}", .{ msgs.len, max });
+            return;
+        };
+        for (msgs) |*msg| {
+            try self.handleMessages(msg);
+        }
     }
 
     pub fn removePeer(self: *Self, peer: PeerId, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
@@ -401,7 +463,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn handleReceivedSubscription(self: *Self, from: PeerId, topic: []const u8, subscribe: bool) !void {
+    fn handleSubscription(self: *Self, from: PeerId, topic: []const u8, subscribe: bool) !void {
         if (subscribe) {
             if (!self.topics.contains(topic)) {
                 const copied_topic_id = try self.allocator.dupe(u8, topic);
@@ -425,9 +487,14 @@ pub const Gossipsub = struct {
         }
     }
 
+    fn handleMessages(self: *Self, publish: *const rpc.MessageReader) !void {
+        _ = self;
+        _ = publish;
+    }
+
     fn vtableHandleRPCFn(instance: *anyopaque, rpc_msg: *const pubsub.RPC) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.handleIncomingRPC(rpc_msg);
+        return self.handleRPC(rpc_msg);
     }
 
     fn vtableAddPeerFn(instance: *anyopaque, peer: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
@@ -452,6 +519,117 @@ pub const Gossipsub = struct {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 };
+
+pub fn validateMessage(allocator: Allocator, msg: *const rpc.Message, policy: SignaturePolicy, m: *Message) ValidateError!void {
+    switch (policy) {
+        SignaturePolicy.StrictNoSign => {
+            if (msg.signature != null) {
+                return error.SignaturePresent;
+            }
+            if (msg.seqno != null) {
+                return error.SeqnoPresent;
+            }
+            if (msg.from != null) {
+                return error.FromPresent;
+            }
+            if (msg.key != null) {
+                return error.KeyPresent;
+            }
+
+            m.* = .{
+                .from = null,
+                .data = msg.data orelse &.{},
+                .seqno = null,
+                .topic_hash = msg.topic.?,
+                .signature = null,
+                .key = null,
+                .validated = true,
+            };
+
+            return;
+        },
+        SignaturePolicy.StrictSign => {
+            if (msg.seqno == null) {
+                return error.InvalidSeqno;
+            }
+            if (msg.seqno.?.len != 8) {
+                return error.InvalidSeqno;
+            }
+            if (msg.signature == null) {
+                return error.InvalidSignature;
+            }
+            if (msg.from == null) {
+                return error.InvalidPeerId;
+            }
+            const from_peer_id = PeerId.fromBytes(msg.from.?) catch {
+                return error.InvalidPeerId;
+            };
+
+            var pubkey_bytes_buf: [128]u8 = undefined; // this is enough space for a PeerId
+            const pubkey_bytes = if (msg.key) |k| k else (from_peer_id.toBytes(&pubkey_bytes_buf) catch {
+                return error.InvalidPeerId;
+            })[2..];
+            const proto_pubkey_reader = keys.PublicKeyReader.init(allocator, pubkey_bytes) catch {
+                return error.InvalidPeerId;
+            };
+
+            var proto_pubkey = keys.PublicKey{
+                .type = proto_pubkey_reader.getType(),
+                .data = try allocator.dupe(u8, proto_pubkey_reader.getData()),
+            };
+            errdefer allocator.free(proto_pubkey.data.?);
+
+            const evp_key = tls.reconstructEvpKeyFromPublicKey(&proto_pubkey) catch {
+                return error.InvalidPubkey;
+            };
+            defer ssl.EVP_PKEY_free(evp_key);
+
+            if (msg.key != null) {
+                const key_peer_id = PeerId.fromPublicKey(allocator, &proto_pubkey) catch {
+                    return error.InvalidPubkey;
+                };
+
+                if (!from_peer_id.eql(&key_peer_id)) {
+                    return error.InvalidPeerId;
+                }
+            }
+
+            const data_to_sign: rpc.Message = .{
+                .seqno = msg.seqno,
+                .data = msg.data,
+                .from = msg.from,
+                .topic = msg.topic,
+                .signature = null,
+                .key = null,
+            };
+            const encoded_data = data_to_sign.encode(allocator) catch {
+                return error.InvalidSignature;
+            };
+            defer allocator.free(encoded_data);
+            const prefixed_data = std.mem.concat(allocator, u8, &.{ sign_prefix, encoded_data }) catch {
+                return error.InvalidSignature;
+            };
+            defer allocator.free(prefixed_data);
+            const is_valid = tls.verifySignature(evp_key, prefixed_data, msg.signature.?) catch {
+                return error.InvalidSignature;
+            };
+            if (!is_valid) {
+                return error.InvalidSignature;
+            }
+
+            m.* = .{
+                .from = from_peer_id,
+                .data = msg.data orelse &.{},
+                .seqno = std.mem.readInt(u64, msg.seqno.?[0..8], .big),
+                .topic_hash = msg.topic.?,
+                .signature = msg.signature,
+                .key = msg.key,
+                .validated = true,
+            };
+            return;
+        },
+    }
+}
 
 test "pubsub add peer" {
     const allocator = std.testing.allocator;
@@ -482,7 +660,7 @@ test "pubsub add peer" {
     try switch1.addProtocolHandler(v1_1_id, pubsub_peer_handler1.any());
 
     var pubsub1: Gossipsub = undefined;
-    pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1);
+    try pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1, .{});
     defer pubsub1.deinit();
     try switch1.listen(switch1_listen_address, &pubsub1, Gossipsub.onIncomingNewStream);
     defer switch1.deinit();
@@ -514,7 +692,7 @@ test "pubsub add peer" {
     try switch2.addProtocolHandler(v1_1_id, pubsub_peer_handler2.any());
 
     var pubsub2: Gossipsub = undefined;
-    pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2);
+    try pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2, .{});
     defer pubsub2.deinit();
     try switch2.listen(switch2_listen_address, &pubsub2, Gossipsub.onIncomingNewStream);
     defer switch2.deinit();
@@ -581,7 +759,7 @@ test "pubsub add and remove peer" {
     try switch1.addProtocolHandler(v1_1_id, pubsub_peer_handler1.any());
 
     var pubsub1: Gossipsub = undefined;
-    pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1);
+    try pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1, .{});
     defer pubsub1.deinit();
     try switch1.listen(switch1_listen_address, &pubsub1, Gossipsub.onIncomingNewStream);
     defer switch1.deinit();
@@ -613,7 +791,7 @@ test "pubsub add and remove peer" {
     try switch2.addProtocolHandler(v1_1_id, pubsub_peer_handler2.any());
 
     var pubsub2: Gossipsub = undefined;
-    pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2);
+    try pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2, .{});
     defer pubsub2.deinit();
     try switch2.listen(switch2_listen_address, &pubsub2, Gossipsub.onIncomingNewStream);
     defer switch2.deinit();
@@ -705,7 +883,7 @@ test "pubsub add peer single direction" {
     try switch1.addProtocolHandler(v1_1_id, pubsub_peer_handler1.any());
 
     var pubsub1: Gossipsub = undefined;
-    pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1);
+    try pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1, .{});
     defer pubsub1.deinit();
     try switch1.listen(switch1_listen_address, &pubsub1, Gossipsub.onIncomingNewStream);
     defer switch1.deinit();
@@ -737,7 +915,7 @@ test "pubsub add peer single direction" {
     try switch2.addProtocolHandler(v1_1_id, pubsub_peer_handler2.any());
 
     var pubsub2: Gossipsub = undefined;
-    pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2);
+    try pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2, .{});
     defer pubsub2.deinit();
     try switch2.listen(switch2_listen_address, &pubsub2, Gossipsub.onIncomingNewStream);
     defer switch2.deinit();
@@ -791,7 +969,7 @@ test "pubsub add and remove peer single direction" {
     try switch1.addProtocolHandler(v1_1_id, pubsub_peer_handler1.any());
 
     var pubsub1: Gossipsub = undefined;
-    pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1);
+    try pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1, .{});
     defer pubsub1.deinit();
     try switch1.listen(switch1_listen_address, &pubsub1, Gossipsub.onIncomingNewStream);
     defer switch1.deinit();
@@ -823,7 +1001,7 @@ test "pubsub add and remove peer single direction" {
     try switch2.addProtocolHandler(v1_1_id, pubsub_peer_handler2.any());
 
     var pubsub2: Gossipsub = undefined;
-    pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2);
+    try pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2, .{});
     defer pubsub2.deinit();
     try switch2.listen(switch2_listen_address, &pubsub2, Gossipsub.onIncomingNewStream);
     defer switch2.deinit();
@@ -892,7 +1070,7 @@ test "pubsub add peer single direction with replace stream" {
     try switch1.addProtocolHandler(v1_1_id, pubsub_peer_handler1.any());
 
     var pubsub1: Gossipsub = undefined;
-    pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1);
+    try pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1, .{});
     defer pubsub1.deinit();
     try switch1.listen(switch1_listen_address, &pubsub1, Gossipsub.onIncomingNewStream);
     defer switch1.deinit();
@@ -924,7 +1102,7 @@ test "pubsub add peer single direction with replace stream" {
     try switch2.addProtocolHandler(v1_1_id, pubsub_peer_handler2.any());
 
     var pubsub2: Gossipsub = undefined;
-    pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2);
+    try pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2, .{});
     defer pubsub2.deinit();
     try switch2.listen(switch2_listen_address, &pubsub2, Gossipsub.onIncomingNewStream);
     defer switch2.deinit();
@@ -1021,7 +1199,7 @@ test "simulate onMessage" {
     try switch1.addProtocolHandler(v1_1_id, pubsub_peer_handler1.any());
 
     var pubsub1: Gossipsub = undefined;
-    pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1);
+    try pubsub1.init(allocator, switch1_listen_address, transport1.local_peer_id, &switch1, .{});
     defer pubsub1.deinit();
     try switch1.listen(switch1_listen_address, &pubsub1, Gossipsub.onIncomingNewStream);
     defer switch1.deinit();
@@ -1053,7 +1231,7 @@ test "simulate onMessage" {
     try switch2.addProtocolHandler(v1_1_id, pubsub_peer_handler2.any());
 
     var pubsub2: Gossipsub = undefined;
-    pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2);
+    try pubsub2.init(allocator, switch2_listen_address, transport2.local_peer_id, &switch2, .{});
     defer pubsub2.deinit();
     try switch2.listen(switch2_listen_address, &pubsub2, Gossipsub.onIncomingNewStream);
     defer switch2.deinit();

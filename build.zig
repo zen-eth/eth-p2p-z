@@ -45,6 +45,12 @@ pub fn build(b: *std.Build) void {
     });
     const gremlin_module = gremlin_dep.module("gremlin");
 
+    const cache_dep = b.dependency("cache", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const cache_module = cache_dep.module("cache");
+
     const protobuf = ProtoGenStep.create(
         b,
         .{
@@ -70,6 +76,7 @@ pub fn build(b: *std.Build) void {
     root_module.addIncludePath(lsquic_dep.path("include"));
     root_module.addImport("gremlin", gremlin_module);
     root_module.addImport("peer_id", peer_id_module);
+    root_module.addImport("cache", cache_module);
 
     const libp2p_lib = b.addLibrary(.{
         .name = "zig-libp2p",
@@ -95,6 +102,7 @@ pub fn build(b: *std.Build) void {
     libp2p_exe.root_module.addImport("ssl", ssl_module);
     libp2p_exe.root_module.addImport("gremlin", gremlin_module);
     libp2p_exe.root_module.addImport("peer_id", peer_id_module);
+    libp2p_exe.root_module.addImport("cache", cache_module);
     libp2p_exe.step.dependOn(&protobuf.step);
 
     libp2p_exe.linkLibrary(lsquic_artifact);
@@ -153,6 +161,7 @@ pub fn build(b: *std.Build) void {
     libp2p_exe_unit_tests.root_module.addImport("gremlin", gremlin_module);
     libp2p_exe_unit_tests.root_module.addImport("peer_id", peer_id_module);
     libp2p_exe_unit_tests.root_module.addImport("ssl", ssl_module);
+    libp2p_exe_unit_tests.root_module.addImport("cache", cache_module);
     libp2p_exe_unit_tests.step.dependOn(&protobuf.step);
 
     libp2p_exe_unit_tests.linkLibrary(lsquic_artifact);
