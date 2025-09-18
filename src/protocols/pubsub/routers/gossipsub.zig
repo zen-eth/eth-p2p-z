@@ -32,6 +32,29 @@ pub const v1_1_id: ProtocolId = "/meshsub/1.1.0";
 
 pub const protocols: []const ProtocolId = &.{ v1_id, v1_1_id };
 
+/// DataTransformVTable defines the function pointers for transforming message data
+/// before sending and after receiving. This allows for custom processing such as
+/// encryption, compression, or other modifications to the message payload.
+pub const DataTransformVTable = struct {
+    inboundTransformFn: *const fn (instance: *anyopaque, topic: []const u8, data: []const u8) anyerror![]const u8,
+    outboundTransformFn: *const fn (instance: *anyopaque, topic: []const u8, data: []const u8) anyerror![]const u8,
+};
+
+pub const AnyDataTransform = struct {
+    instance: *anyopaque,
+    vtable: *const DataTransformVTable,
+
+    const Self = @This();
+
+    pub fn inboundTransform(self: Self, topic: []const u8, data: []const u8) anyerror![]const u8 {
+        return self.vtable.inboundTransformFn(self.instance, topic, data);
+    }
+
+    pub fn outboundTransform(self: Self, topic: []const u8, data: []const u8) anyerror![]const u8 {
+        return self.vtable.outboundTransformFn(self.instance, topic, data);
+    }
+};
+
 pub const Subscription = struct {
     topic: []const u8,
     subscribe: bool,
@@ -43,8 +66,35 @@ pub const Message = struct {
     seqno: ?u64,
     topic_hash: []const u8,
     signature: ?[]const u8,
-    key: ?[]const u8,
+    key: ?keys.PublicKey,
     validated: bool,
+};
+
+pub const MessageStatus = enum {
+    Valid,
+    Invalid,
+    Duplicate,
+};
+
+pub const MessageValidationResult = union(enum) {
+    valid: struct {
+        message_id: []const u8,
+        message: Message,
+    },
+    invalid: struct {
+        reason: RejectReason,
+        err: ValidateError,
+    },
+    duplicate: struct {
+        message_id: []const u8,
+    },
+};
+
+pub const RejectReason = enum {
+    Error,
+    Ignore,
+    Reject,
+    Blacklisted,
 };
 
 pub const ValidateError = error{
@@ -146,7 +196,7 @@ pub const Gossipsub = struct {
 
     event_emitter: event.EventEmitter(Event),
 
-    fast_msg_id_cache: cache.Cache([]const u8),
+    seen_cache: cache.Cache([]const u8),
 
     opts: Options,
 
@@ -155,6 +205,9 @@ pub const Gossipsub = struct {
     const Options = struct {
         seen_ttl_s: u64 = 120,
         max_messages_per_rpc: ?usize = null,
+        global_signature_policy: SignaturePolicy = .StrictSign,
+        data_transform: ?AnyDataTransform = null,
+        msg_id_fn: pubsub.MessageIdFn = pubsub.defaultMsgId,
     };
 
     const AddPeerCtx = struct {
@@ -231,7 +284,7 @@ pub const Gossipsub = struct {
             .topics = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
             .subscriptions = std.StringHashMapUnmanaged(void).empty,
             .event_emitter = event.EventEmitter(Event).init(allocator),
-            .fast_msg_id_cache = try cache.Cache([]const u8).init(allocator, .{}),
+            .seen_cache = try cache.Cache([]const u8).init(allocator, .{}),
             .opts = opts,
         };
     }
@@ -252,7 +305,7 @@ pub const Gossipsub = struct {
         }
         self.subscriptions.deinit(self.allocator);
         self.event_emitter.deinit();
-        self.fast_msg_id_cache.deinit();
+        self.seen_cache.deinit();
     }
 
     pub fn acceptFrom(self: *Self, peer_id: PeerId) bool {
@@ -487,6 +540,31 @@ pub const Gossipsub = struct {
         }
     }
 
+    fn validateReceivedMessage(self: *Self, msg: *const rpc.Message, propagation_source: PeerId) !MessageValidationResult {
+        var m: Message = undefined;
+        validateMessage(self.allocator, msg, self.opts.global_signature_policy, &m) catch |err| {
+            return MessageValidationResult{
+                .invalid = .{
+                    .reason = RejectReason.Error,
+                    .err = err,
+                },
+            };
+        };
+
+        if (self.data_transform) |dt| {
+            const transformed_data = dt.inboundTransform(m.topic_hash, m.data) catch |err| {
+                std.log.warn("Inbound data transformation failed for message from peer {}: {}", .{ propagation_source, err });
+                return MessageValidationResult{
+                    .invalid = .{
+                        .reason = RejectReason.Error,
+                        .err = error.TransformFailed,
+                    },
+                };
+            };
+            m.data = transformed_data;
+        }
+    }
+
     fn handleMessages(self: *Self, publish: *const rpc.MessageReader) !void {
         _ = self;
         _ = publish;
@@ -623,7 +701,7 @@ pub fn validateMessage(allocator: Allocator, msg: *const rpc.Message, policy: Si
                 .seqno = std.mem.readInt(u64, msg.seqno.?[0..8], .big),
                 .topic_hash = msg.topic.?,
                 .signature = msg.signature,
-                .key = msg.key,
+                .key = proto_pubkey,
                 .validated = true,
             };
             return;

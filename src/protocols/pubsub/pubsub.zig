@@ -1,4 +1,5 @@
 pub const gossipsub = @import("./routers/gossipsub.zig");
+const std = @import("std");
 const libp2p = @import("../../root.zig");
 const rpc = libp2p.protobuf.rpc;
 const PeerId = @import("peer_id").PeerId;
@@ -42,3 +43,15 @@ pub const PubSub = struct {
         self.vtable.removePeerFn(self.instance, peer, callback_ctx, callback);
     }
 };
+
+pub const MessageIdFn = *const fn (allocator: std.mem.Allocator, message: *const rpc.Message) anyerror![]const u8;
+
+/// Computes the default message ID by concatenating `msg.from` and `msg.seqno`.
+/// The caller must ensure that `dest` is allocated with at least `msg.from.len + msg.seqno.len` bytes.
+pub fn defaultMsgId(allocator: std.mem.Allocator, msg: *const rpc.Message) ![]const u8 {
+    if (msg.from == null and msg.seqno == null) {
+        return error.BothFromAndSeqNoNull;
+    }
+
+    return std.mem.concat(allocator, u8, &.{ msg.from orelse "", msg.seqno orelse "" });
+}
