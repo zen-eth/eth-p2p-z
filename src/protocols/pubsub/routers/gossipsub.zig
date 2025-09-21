@@ -226,6 +226,7 @@ pub const Gossipsub = struct {
         max_ihave_len: usize = 5000,
         history_length: usize = 5,
         history_gossip: usize = 3,
+        gossip_retransmission: usize = 3,
     };
 
     const AddPeerCtx = struct {
@@ -682,7 +683,7 @@ pub const Gossipsub = struct {
         while (iter.next()) |peer_id| {
             if (self.shouldSendIDontWant(peer_id.*, source)) {
                 std.log.debug("Sending IDontWant for message ID {any} to peer {}", .{ message_id, peer_id });
-                // Here we would normally send the IDontWant message to the peer.
+                // TODO: Here we would normally send the IDontWant message to the peer.
                 // For brevity, this is omitted.
             }
         }
@@ -733,37 +734,82 @@ pub const Gossipsub = struct {
         } else blk: {
             break :blk &.{};
         };
+        defer {}
+
         std.log.debug("Sending IWANT with {d} message IDs to peer {}", .{ iwant.len, from });
+
+        const iwant_messages = try control.getIwant(self.allocator);
+        defer {
+            // Free only if we allocated, len == 0 returns a static empty slice
+            if (iwant_messages.len > 0) {
+                self.allocator.free(iwant_messages);
+            }
+        }
+
+        const ihave = if (iwant.len > 0) blk: {
+            const result = try self.handleIWant(from, iwant_messages);
+            break :blk result;
+        } else blk: {
+            break :blk &.{};
+        };
+        std.log.debug("Sending {d} messages to peer {}", .{ ihave.len, from });
     }
 
-    // fn handleIWant(self: *Self, from: PeerId, iwant: []const rpc.ControlIWantReader) ![]rpc.Message {
-    //     if (iwant.len == 0) {
-    //         return &.{};
-    //     }
+    fn handleIWant(self: *Self, from: PeerId, iwant: []const rpc.ControlIWantReader) ![]*rpc.Message {
+        if (iwant.len == 0) {
+            return &.{};
+        }
 
-    //     const ihave:std.StringHashMapUnmanaged(rpc.Message) = .empty;
-    //     defer ihave.deinit(self.allocator);
-    //     const iwant_by_topic: std.StringHashMapUnmanaged(usize) = .empty;
-    //     defer iwant_by_topic.deinit(self.allocator);
-    //     var iwant_dont_have: usize = 0;
+        var ihave: std.StringHashMapUnmanaged(*rpc.Message) = .empty;
+        defer ihave.deinit(self.allocator);
+        var iwant_by_topic: std.StringHashMapUnmanaged(usize) = .empty;
+        defer iwant_by_topic.deinit(self.allocator);
+        var iwant_dont_have: usize = 0;
 
-    //     var processed_iwant: usize = 0;
-    //     errdefer {
-    //         for (iwant[processed_iwant..]) |*rem| rem.deinit();
-    //     }
-    //     for (iwant) |*iwant_msg| {
-    //         defer {
-    //             iwant_msg.deinit();
-    //             processed_iwant += 1;
-    //         }
+        var processed_iwant: usize = 0;
+        errdefer {
+            for (iwant[processed_iwant..]) |*rem| rem.deinit();
+        }
+        for (iwant) |*iwant_msg| {
+            defer {
+                iwant_msg.deinit();
+                processed_iwant += 1;
+            }
 
-    //         for (iwant_msg.getMessageIDs()) |msg_id| {
-    //             // Here we would normally check if we have the message and send it to the requesting peer.
-    //             // For brevity, this is omitted.
-    //             _ = msg_id;
-    //         }
-    //     }
-    // }
+            for (iwant_msg.getMessageIDs()) |msg_id| {
+                const cached = try self.mcache.getForPeer(msg_id, from) orelse {
+                    iwant_dont_have += 1;
+                    continue;
+                };
+
+                std.debug.assert(cached.msg.topic != null);
+                try iwant_by_topic.put(self.allocator, cached.msg.topic.?, (iwant_by_topic.get(cached.msg.topic.?) orelse 0) + 1);
+
+                if (cached.count > self.opts.gossip_retransmission) {
+                    std.log.debug("Not sending message ID {any} to peer {} as it has been sent {d} times (limit {d})", .{ msg_id, from, cached.count, self.opts.gossip_retransmission });
+                    continue;
+                }
+
+                try ihave.put(self.allocator, msg_id, cached.msg);
+            }
+        }
+
+        if (ihave.count() == 0) {
+            return &.{};
+        }
+
+        var ihave_list = try std.ArrayListUnmanaged(*rpc.Message).initCapacity(self.allocator, ihave.count());
+        defer ihave_list.deinit(self.allocator);
+
+        var it = ihave.valueIterator();
+        while (it.next()) |msg| {
+            try ihave_list.append(self.allocator, msg.*);
+        }
+
+        std.log.debug("Sending {d} messages to peer {}, {d} IWANT IDs not found", .{ ihave_list.items.len, from, iwant_dont_have });
+
+        return try ihave_list.toOwnedSlice(self.allocator);
+    }
 
     fn handleIHave(self: *Self, from: PeerId, ihave: []const rpc.ControlIHaveReader) ![]const rpc.ControlIWant {
         if (ihave.len == 0) {
