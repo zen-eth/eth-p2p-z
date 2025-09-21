@@ -708,15 +708,50 @@ pub const Gossipsub = struct {
 
     fn handleControl(self: *Self, control: *const rpc.ControlMessageReader, from: PeerId) !void {
         const ihave_messages = try control.getIhave(self.allocator);
-        defer self.allocator.free(ihave_messages);
+        defer {
+            // Free only if we allocated, len == 0 returns a static empty slice
+            if (ihave_messages.len > 0) {
+                self.allocator.free(ihave_messages);
+            }
+        }
 
-        _ = if (ihave_messages.len > 0) blk: {
+        const iwant = if (ihave_messages.len > 0) blk: {
             const result = try self.handleIHave(from, ihave_messages);
             break :blk result;
         } else blk: {
             break :blk &.{};
         };
+        std.log.debug("Sending IWANT with {d} message IDs to peer {}", .{ iwant.len, from });
     }
+
+    // fn handleIWant(self: *Self, from: PeerId, iwant: []const rpc.ControlIWantReader) ![]rpc.Message {
+    //     if (iwant.len == 0) {
+    //         return &.{};
+    //     }
+
+    //     const ihave:std.StringHashMapUnmanaged(rpc.Message) = .empty;
+    //     defer ihave.deinit(self.allocator);
+    //     const iwant_by_topic: std.StringHashMapUnmanaged(usize) = .empty;
+    //     defer iwant_by_topic.deinit(self.allocator);
+    //     var iwant_dont_have: usize = 0;
+
+    //     var processed_iwant: usize = 0;
+    //     errdefer {
+    //         for (iwant[processed_iwant..]) |*rem| rem.deinit();
+    //     }
+    //     for (iwant) |*iwant_msg| {
+    //         defer {
+    //             iwant_msg.deinit();
+    //             processed_iwant += 1;
+    //         }
+
+    //         for (iwant_msg.getMessageIDs()) |msg_id| {
+    //             // Here we would normally check if we have the message and send it to the requesting peer.
+    //             // For brevity, this is omitted.
+    //             _ = msg_id;
+    //         }
+    //     }
+    // }
 
     fn handleIHave(self: *Self, from: PeerId, ihave: []const rpc.ControlIHaveReader) ![]const rpc.ControlIWant {
         if (ihave.len == 0) {

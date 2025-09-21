@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rpc = @import("../../../proto/rpc.proto.zig");
+const PeerId = @import("peer_id").PeerId;
 const testing = std.testing;
 
 /// This is a message cache implementation follow the
@@ -116,7 +117,7 @@ pub const MessageCache = struct {
         BothFromAndSeqNoNull,
     };
 
-    const PeerTransmissionMap = std.StringHashMap(i32);
+    const PeerTransmissionMap = std.AutoHashMap(PeerId, i32);
 
     const CacheEntry = struct {
         mid: []const u8,
@@ -164,10 +165,6 @@ pub const MessageCache = struct {
         while (peertx_iter.next()) |entry| {
             // key is used as same as msgs, so it does not need to be freed
             var peer_map = entry.value_ptr.*;
-            var peer_iter = peer_map.iterator();
-            while (peer_iter.next()) |peer_entry| {
-                self.allocator.free(peer_entry.key_ptr.*); // Free owned peer ID string
-            }
             peer_map.deinit();
         }
         self.peertx.deinit();
@@ -204,7 +201,7 @@ pub const MessageCache = struct {
         return self.msgs.getPtr(mid);
     }
 
-    pub fn getForPeer(self: *Self, mid: []const u8, peer_id: []const u8) !?struct { msg: *rpc.Message, count: i32 } {
+    pub fn getForPeer(self: *Self, mid: []const u8, peer_id: PeerId) !?struct { msg: *rpc.Message, count: i32 } {
         const msg = self.msgs.getPtr(mid) orelse return null;
 
         const tx_result = try self.peertx.getOrPut(self.msgs.getKey(mid).?);
@@ -215,7 +212,7 @@ pub const MessageCache = struct {
         // Increment transmission count for this peer
         const peer_result = try tx_result.value_ptr.getOrPut(peer_id);
         if (!peer_result.found_existing) {
-            peer_result.key_ptr.* = try self.allocator.dupe(u8, peer_id);
+            peer_result.key_ptr.* = peer_id;
             peer_result.value_ptr.* = 0;
         }
         peer_result.value_ptr.* += 1;
@@ -254,10 +251,6 @@ pub const MessageCache = struct {
                 if (self.peertx.fetchRemove(entry.mid)) |*kv| {
                     // key is used as same as msgs, so it does not need to be freed
                     var peer_map = kv.value;
-                    var peer_iter = peer_map.iterator();
-                    while (peer_iter.next()) |peer_entry| {
-                        self.allocator.free(peer_entry.key_ptr.*);
-                    }
                     peer_map.deinit();
                 }
             }
@@ -462,18 +455,20 @@ test "MessageCache.getForPeer" {
     const mid = try MessageCache.defaultMsgId(null, allocator, msg);
     defer allocator.free(mid);
 
+    const peer_a = try PeerId.random();
     // First call for peer
-    const result1 = try cache.getForPeer(mid, "peer-a");
+    const result1 = try cache.getForPeer(mid, peer_a);
     try testing.expect(result1 != null);
     try testing.expect(result1.?.count == 1);
 
     // Second call for same peer
-    const result2 = try cache.getForPeer(mid, "peer-a");
+    const result2 = try cache.getForPeer(mid, peer_a);
     try testing.expect(result2 != null);
     try testing.expect(result2.?.count == 2);
 
     // First call for different peer
-    const result3 = try cache.getForPeer(mid, "peer-b");
+    const peer_b = try PeerId.random();
+    const result3 = try cache.getForPeer(mid, peer_b);
     try testing.expect(result3 != null);
     try testing.expect(result3.?.count == 1);
 }
@@ -484,7 +479,8 @@ test "MessageCache.getForPeer non-existent message" {
     var cache = try MessageCache.init(allocator, 3, 5, null, MessageCache.defaultMsgId);
     defer cache.deinit();
 
-    const result = try cache.getForPeer("non-existent-id", "peer-a");
+    const peer_a = try PeerId.random();
+    const result = try cache.getForPeer("non-existent-id", peer_a);
     try testing.expect(result == null);
 }
 
@@ -628,8 +624,10 @@ test "MessageCache memory management" {
         const mid = try MessageCache.defaultMsgId(null, allocator, test_msg);
         defer allocator.free(mid);
 
-        _ = try cache.getForPeer(mid, "peer1");
-        _ = try cache.getForPeer(mid, "peer2");
+        const peer1 = try PeerId.random();
+        const peer2 = try PeerId.random();
+        _ = try cache.getForPeer(mid, peer1);
+        _ = try cache.getForPeer(mid, peer2);
     }
 }
 
