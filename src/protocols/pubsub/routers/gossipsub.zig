@@ -208,6 +208,8 @@ pub const Gossipsub = struct {
 
     seen_cache: cache.Cache(void),
 
+    mcache: mcache.MessageCache,
+
     opts: Options,
 
     protocols: []const ProtocolId = &.{ v1_id, v1_1_id },
@@ -303,6 +305,7 @@ pub const Gossipsub = struct {
             .iasked = std.AutoArrayHashMapUnmanaged(PeerId, usize).empty,
             .event_emitter = event.EventEmitter(Event).init(allocator),
             .seen_cache = try cache.Cache(void).init(allocator, .{}),
+            .mcache = try mcache.MessageCache.init(allocator, 128, 1024, pubsub.defaultMsgId),
             .opts = opts,
         };
     }
@@ -337,6 +340,7 @@ pub const Gossipsub = struct {
         self.iasked.deinit(self.allocator);
         self.event_emitter.deinit();
         self.seen_cache.deinit();
+        self.mcache.deinit();
     }
 
     pub fn acceptFrom(self: *Self, peer_id: PeerId) bool {
