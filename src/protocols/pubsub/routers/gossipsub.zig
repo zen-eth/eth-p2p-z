@@ -224,6 +224,8 @@ pub const Gossipsub = struct {
         idontwant_message_size_threshold: usize = 1024,
         max_ihave_messages: usize = 10,
         max_ihave_len: usize = 5000,
+        history_length: usize = 5,
+        history_gossip: usize = 3,
     };
 
     const AddPeerCtx = struct {
@@ -291,6 +293,12 @@ pub const Gossipsub = struct {
     const Self = @This();
 
     pub fn init(self: *Self, allocator: Allocator, peer: Multiaddr, peer_id: PeerId, network_swarm: *Switch, opts: Options) !void {
+        var seen_cache = try cache.Cache(void).init(allocator, .{});
+        errdefer seen_cache.deinit();
+
+        var msg_cache = try mcache.MessageCache.init(allocator, opts.history_gossip, opts.history_length, opts.msg_id_fn);
+        errdefer msg_cache.deinit();
+
         self.* = .{
             .allocator = allocator,
             .peer = peer,
@@ -304,8 +312,8 @@ pub const Gossipsub = struct {
             .control = std.AutoHashMapUnmanaged(PeerId, rpc.ControlMessageReader).empty,
             .iasked = std.AutoArrayHashMapUnmanaged(PeerId, usize).empty,
             .event_emitter = event.EventEmitter(Event).init(allocator),
-            .seen_cache = try cache.Cache(void).init(allocator, .{}),
-            .mcache = try mcache.MessageCache.init(allocator, 128, 1024, pubsub.defaultMsgId),
+            .seen_cache = seen_cache,
+            .mcache = msg_cache,
             .opts = opts,
         };
     }
