@@ -547,6 +547,8 @@ pub const QuicStream = struct {
 
     proposed_protocols: ?[]const []const u8,
 
+    negotiated_protocol: ?[]const u8,
+
     close_ctx: ?CloseCtx,
 
     pub fn init(self: *QuicStream, stream: *lsquic.lsquic_stream_t, conn: *QuicConnection) void {
@@ -557,6 +559,7 @@ pub const QuicStream = struct {
             .active_write = null,
             .proto_msg_handler = null,
             .proposed_protocols = null,
+            .negotiated_protocol = null,
             .close_ctx = null,
         };
     }

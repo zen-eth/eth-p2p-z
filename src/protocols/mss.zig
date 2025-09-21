@@ -55,7 +55,7 @@ pub const Negotiator = struct {
 
     on_selected_ctx: ?*anyopaque,
 
-    on_selected: *const fn (instance: ?*anyopaque, selected_handler: *protocols.AnyProtocolHandler) void,
+    on_selected: *const fn (instance: ?*anyopaque, proto_id: protocols.ProtocolId, selected_handler: *protocols.AnyProtocolHandler) void,
 
     is_initiator: bool,
 
@@ -66,6 +66,7 @@ pub const Negotiator = struct {
     const WriteCallbackContext = struct {
         negotiator: *Self,
         buffer: []const u8,
+        proto_id: ?protocols.ProtocolId,
         selected_handler: ?*protocols.AnyProtocolHandler,
     };
 
@@ -76,7 +77,7 @@ pub const Negotiator = struct {
             if (n) |_| {
                 // Responder case: we have selected a protocol ID, we need to inform the negotiator
                 if (w_ctx.selected_handler) |selected_handler| {
-                    w_ctx.negotiator.on_selected(w_ctx.negotiator.on_selected_ctx, selected_handler);
+                    w_ctx.negotiator.on_selected(w_ctx.negotiator.on_selected_ctx, w_ctx.proto_id.?, selected_handler);
                 }
 
                 w_ctx.negotiator.allocator.free(w_ctx.buffer);
@@ -98,7 +99,7 @@ pub const Negotiator = struct {
         buffer: *std.fifo.LinearFifo(u8, .Slice),
         is_initiator: bool,
         on_selected_ctx: ?*anyopaque,
-        on_selected: *const fn (instance: ?*anyopaque, selected_handler: *protocols.AnyProtocolHandler) void,
+        on_selected: *const fn (instance: ?*anyopaque, proto_id: protocols.ProtocolId, selected_handler: *protocols.AnyProtocolHandler) void,
     ) !void {
         if (supported_protocols.count() == 0) {
             return NegotiatorError.NoSupportedProtocols;
@@ -152,6 +153,7 @@ pub const Negotiator = struct {
         callback_ctx.* = .{
             .negotiator = self,
             .buffer = buffer,
+            .proto_id = null,
             .selected_handler = null,
         };
         writer.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
@@ -222,6 +224,7 @@ pub const Negotiator = struct {
                         callback_ctx.* = .{
                             .negotiator = self,
                             .buffer = buffer,
+                            .proto_id = null,
                             .selected_handler = null,
                         };
                         writer.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
@@ -232,7 +235,7 @@ pub const Negotiator = struct {
                     }
                 } else {
                     const selected_handler = self.supported_protocols.getPtr(proto_id).?;
-                    return self.on_selected(self.on_selected_ctx, selected_handler);
+                    return self.on_selected(self.on_selected_ctx, proto_id, selected_handler);
                 }
             } else {
                 // Responder
@@ -250,6 +253,7 @@ pub const Negotiator = struct {
                         callback_ctx.* = .{
                             .negotiator = self,
                             .buffer = buffer,
+                            .proto_id = s_proto_id.*,
                             .selected_handler = selected_handler,
                         };
                         writer.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
@@ -268,6 +272,7 @@ pub const Negotiator = struct {
                 callback_ctx.* = .{
                     .negotiator = self,
                     .buffer = buffer,
+                    .proto_id = null,
                     .selected_handler = null,
                 };
                 writer.write(proto_buffer.getWritten(), callback_ctx, WriteCallback.callback);
@@ -347,8 +352,9 @@ pub const MultistreamSelectHandler = struct {
         }
 
         // Callback for when multistream negotiation completes
-        fn onNegotiationComplete(instance: ?*anyopaque, selected_handler: *protocols.AnyProtocolHandler) void {
+        fn onNegotiationComplete(instance: ?*anyopaque, proto_id: protocols.ProtocolId, selected_handler: *protocols.AnyProtocolHandler) void {
             const self: *NegotiationSession = @ptrCast(@alignCast(instance.?));
+            self.stream.negotiated_protocol = proto_id;
 
             if (self.is_initiator) {
                 selected_handler.onInitiatorStart(self.stream, self.user_callback_ctx, self.user_callback) catch |err| {

@@ -29,6 +29,7 @@ pub const mcache = @import("mcache.zig");
 
 pub const v1_id: ProtocolId = "/meshsub/1.0.0";
 pub const v1_1_id: ProtocolId = "/meshsub/1.1.0";
+pub const v1_2_id: ProtocolId = "/meshsub/1.2.0";
 
 pub const protocols: []const ProtocolId = &.{ v1_id, v1_1_id };
 
@@ -107,6 +108,7 @@ pub const ValidateError = error{
     FromPresent,
     KeyPresent,
     TransformFailed,
+    MessageIdGenerationFailed,
 } || Allocator.Error;
 
 pub const SignaturePolicy = enum {
@@ -194,20 +196,32 @@ pub const Gossipsub = struct {
 
     subscriptions: std.StringHashMapUnmanaged(void),
 
+    mesh: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)),
+
+    peer_have: std.AutoHashMapUnmanaged(PeerId, usize),
+
+    control: std.AutoHashMapUnmanaged(PeerId, rpc.ControlMessageReader),
+
+    iasked: std.AutoArrayHashMapUnmanaged(PeerId, usize),
+
     event_emitter: event.EventEmitter(Event),
 
-    seen_cache: cache.Cache([]const u8),
+    seen_cache: cache.Cache(void),
 
     opts: Options,
 
     protocols: []const ProtocolId = &.{ v1_id, v1_1_id },
 
     const Options = struct {
-        seen_ttl_s: u64 = 120,
+        seen_ttl_s: u32 = 120,
         max_messages_per_rpc: ?usize = null,
         global_signature_policy: SignaturePolicy = .StrictSign,
         data_transform: ?AnyDataTransform = null,
         msg_id_fn: pubsub.MessageIdFn = pubsub.defaultMsgId,
+        idontwant_min_size: usize = 512,
+        idontwant_message_size_threshold: usize = 1024,
+        max_ihave_messages: usize = 10,
+        max_ihave_len: usize = 5000,
     };
 
     const AddPeerCtx = struct {
@@ -283,8 +297,12 @@ pub const Gossipsub = struct {
             .peers = std.AutoHashMap(PeerId, Semiduplex).init(allocator),
             .topics = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
             .subscriptions = std.StringHashMapUnmanaged(void).empty,
+            .mesh = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
+            .peer_have = std.AutoHashMapUnmanaged(PeerId, usize).empty,
+            .control = std.AutoHashMapUnmanaged(PeerId, rpc.ControlMessageReader).empty,
+            .iasked = std.AutoArrayHashMapUnmanaged(PeerId, usize).empty,
             .event_emitter = event.EventEmitter(Event).init(allocator),
-            .seen_cache = try cache.Cache([]const u8).init(allocator, .{}),
+            .seen_cache = try cache.Cache(void).init(allocator, .{}),
             .opts = opts,
         };
     }
@@ -304,11 +322,25 @@ pub const Gossipsub = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.subscriptions.deinit(self.allocator);
+        var mesh_iter = self.mesh.iterator();
+        while (mesh_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.mesh.deinit(self.allocator);
+        self.peer_have.deinit(self.allocator);
+        var control_iter = self.control.iterator();
+        while (control_iter.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.control.deinit(self.allocator);
+        self.iasked.deinit(self.allocator);
         self.event_emitter.deinit();
         self.seen_cache.deinit();
     }
 
     pub fn acceptFrom(self: *Self, peer_id: PeerId) bool {
+        // TODO: Implement peer acceptance logic
         _ = self;
         _ = peer_id;
         return true;
@@ -322,39 +354,60 @@ pub const Gossipsub = struct {
 
         const subs = try rpc_message.rpc_reader.getSubscriptions(self.allocator);
         defer self.allocator.free(subs);
+
         //TODO:Implement subscription filtering
 
         var subscriptions = std.ArrayListUnmanaged(Subscription).empty;
+        defer subscriptions.deinit(self.allocator);
+        var processed_subs: usize = 0;
+        errdefer {
+            for (subs[processed_subs..]) |*rem| rem.deinit();
+        }
         for (subs) |sub| {
+            defer {
+                sub.deinit();
+                processed_subs += 1;
+            }
+
             const topic_id = sub.getTopicid();
             const subscribe = sub.getSubscribe();
 
             try self.handleSubscription(rpc_message.from, topic_id, subscribe);
 
-            const sub_copied = try self.allocator.dupe(u8, topic_id);
-            errdefer self.allocator.free(sub_copied);
-            try subscriptions.append(self.allocator, .{ .topic = sub_copied, .subscribe = sub.getSubscribe() });
+            try subscriptions.append(self.allocator, .{ .topic = topic_id, .subscribe = subscribe });
         }
 
-        const owned_subscriptions = try subscriptions.toOwnedSlice(self.allocator);
-        defer {
-            for (owned_subscriptions) |s| self.allocator.free(s.topic);
-            self.allocator.free(owned_subscriptions);
-        }
         self.event_emitter.emit(.{ .subscription_changed = .{
             .peer = rpc_message.from,
-            .subscriptions = owned_subscriptions,
+            .subscriptions = subscriptions.items,
         } });
 
         // Handle publish
         const msgs = try rpc_message.rpc_reader.getPublish(self.allocator);
         defer self.allocator.free(msgs);
+
         if (self.opts.max_messages_per_rpc) |max| if (msgs.len > max) {
             std.log.warn("Received {} messages, exceeding limit of {}", .{ msgs.len, max });
             return;
         };
+
+        var processed_msgs: usize = 0;
+        errdefer {
+            for (msgs[processed_msgs..]) |*rem| rem.deinit();
+        }
         for (msgs) |*msg| {
-            try self.handleMessages(msg);
+            defer {
+                msg.deinit();
+                processed_msgs += 1;
+            }
+
+            try self.handleMessage(rpc_message.from, msg);
+        }
+
+        const control = try rpc_message.rpc_reader.getControl(self.allocator);
+        defer control.deinit();
+        if (control.buf.bytes().len > 0) {
+            try self.handleControl(&control, rpc_message.from);
         }
     }
 
@@ -540,7 +593,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn validateReceivedMessage(self: *Self, msg: *const rpc.Message, propagation_source: PeerId) !MessageValidationResult {
+    fn validateReceivedMessage(self: *Self, msg: *const rpc.MessageReader, propagation_source: PeerId) !MessageValidationResult {
         var m: Message = undefined;
         validateMessage(self.allocator, msg, self.opts.global_signature_policy, &m) catch |err| {
             return MessageValidationResult{
@@ -551,7 +604,7 @@ pub const Gossipsub = struct {
             };
         };
 
-        if (self.data_transform) |dt| {
+        if (self.opts.data_transform) |dt| {
             const transformed_data = dt.inboundTransform(m.topic_hash, m.data) catch |err| {
                 std.log.warn("Inbound data transformation failed for message from peer {}: {}", .{ propagation_source, err });
                 return MessageValidationResult{
@@ -563,11 +616,192 @@ pub const Gossipsub = struct {
             };
             m.data = transformed_data;
         }
+
+        const msg_for_id = rpc.Message{
+            .from = msg._from,
+            .data = m.data,
+            .seqno = msg._seqno,
+            .topic = msg._topic,
+            .signature = msg._signature,
+            .key = msg._key,
+        };
+        // Generate message ID using the provided function and the copied message with transformed data
+        const message_id = self.opts.msg_id_fn(self.allocator, &msg_for_id) catch |err| {
+            std.log.warn("Failed to generate message ID for message from peer {}: {}", .{ propagation_source, err });
+            return MessageValidationResult{
+                .invalid = .{
+                    .reason = RejectReason.Error,
+                    .err = error.MessageIdGenerationFailed,
+                },
+            };
+        };
+
+        if (self.seen_cache.contains(message_id)) {
+            return MessageValidationResult{
+                .duplicate = .{
+                    .message_id = message_id,
+                },
+            };
+        } else {
+            try self.seen_cache.put(message_id, {}, .{
+                .ttl = self.opts.seen_ttl_s,
+            });
+        }
+
+        // Here use the origin message's data length to determine if we should send IDontWant
+        if (msg._data) |data| {
+            if (data.len >= self.opts.idontwant_message_size_threshold) {
+                try self.sendIDontWants(m.topic_hash, propagation_source, message_id);
+            }
+        }
+
+        return MessageValidationResult{
+            .valid = .{
+                .message_id = message_id,
+                .message = m,
+            },
+        };
     }
 
-    fn handleMessages(self: *Self, publish: *const rpc.MessageReader) !void {
-        _ = self;
-        _ = publish;
+    fn sendIDontWants(self: *Self, topic: []const u8, source: PeerId, message_id: []const u8) !void {
+        const peer_set = self.mesh.get(topic) orelse return;
+
+        var iter = peer_set.keyIterator();
+        while (iter.next()) |peer_id| {
+            if (self.shouldSendIDontWant(peer_id.*, source)) {
+                std.log.debug("Sending IDontWant for message ID {any} to peer {}", .{ message_id, peer_id });
+                // Here we would normally send the IDontWant message to the peer.
+                // For brevity, this is omitted.
+            }
+        }
+    }
+
+    fn shouldSendIDontWant(self: *Self, peer_id: PeerId, source: PeerId) bool {
+        if (peer_id.eql(&source)) return false;
+
+        const semi_duplex = self.peers.getPtr(peer_id) orelse return false;
+        const initiator = semi_duplex.initiator orelse return false;
+
+        return std.mem.eql(u8, initiator.stream.negotiated_protocol.?, v1_2_id);
+    }
+
+    fn handleMessage(self: *Self, from: PeerId, publish: *const rpc.MessageReader) !void {
+        const validation_result = try self.validateReceivedMessage(publish, from);
+
+        switch (validation_result) {
+            .valid => |valid_msg| {
+                // Here we would normally propagate the message to peers in the mesh
+                // and deliver it to local subscribers. For brevity, this is omitted.
+                _ = valid_msg;
+            },
+            .invalid => |invalid_msg| {
+                _ = invalid_msg;
+                // std.log.warn("Invalid message from peer {?}: {}", .{ publish._from, invalid_msg.err });
+                // Optionally, we could take action based on invalid_msg.reason
+            },
+            .duplicate => |dup_msg| {
+                _ = dup_msg;
+                // std.log.debug("Duplicate message received from peer {}: ID {any}", .{ publish._from, dup_msg.message_id });
+            },
+        }
+    }
+
+    fn handleControl(self: *Self, control: *const rpc.ControlMessageReader, from: PeerId) !void {
+        const ihave_messages = try control.getIhave(self.allocator);
+        defer self.allocator.free(ihave_messages);
+
+        _ = if (ihave_messages.len > 0) blk: {
+            const result = try self.handleIHave(from, ihave_messages);
+            break :blk result;
+        } else blk: {
+            break :blk &.{};
+        };
+    }
+
+    fn handleIHave(self: *Self, from: PeerId, ihave: []const rpc.ControlIHaveReader) ![]const rpc.ControlIWant {
+        if (ihave.len == 0) {
+            return &.{};
+        }
+        const peer_have = (self.peer_have.get(from) orelse 0) + 1;
+        try self.peer_have.put(self.allocator, from, peer_have);
+        if (peer_have > self.opts.max_ihave_messages) {
+            std.log.warn("Peer {} sent too many {d} IHAVE messages within this heartbeat, ignoring further IHAVE messages.", .{ from, peer_have });
+            return &.{};
+        }
+
+        const iasked = self.iasked.get(from) orelse 0;
+        if (iasked > self.opts.max_ihave_len) {
+            std.log.warn("Peer {} sent too many {d} IHAVE message IDs within this heartbeat, ignoring further IHAVE messages.", .{ from, iasked });
+            return &.{};
+        }
+
+        var iwant: std.StringHashMapUnmanaged(void) = .empty;
+        defer iwant.deinit(self.allocator);
+        var processed_ihave: usize = 0;
+        errdefer {
+            for (ihave[processed_ihave..]) |*rem| rem.deinit();
+        }
+        for (ihave) |*ihave_msg| {
+            defer {
+                ihave_msg.deinit();
+                processed_ihave += 1;
+            }
+            if (ihave_msg.getTopicID().len == 0 or ihave_msg.getMessageIDs().len == 0 or !self.mesh.contains(ihave_msg.getTopicID())) {
+                continue;
+            }
+
+            var idonthave: usize = 0;
+            for (ihave_msg.getMessageIDs()) |msg_id| {
+                if (!self.seen_cache.contains(msg_id)) {
+                    try iwant.put(self.allocator, msg_id, {});
+                    idonthave += 1;
+                }
+            }
+        }
+
+        if (iwant.count() == 0) {
+            return &.{};
+        }
+
+        var iask: usize = iwant.count();
+        if (iask + iasked > self.opts.max_ihave_len) {
+            iask = self.opts.max_ihave_len - iasked;
+        }
+
+        std.log.debug("Asking for {d} out of {d} messages from peer {}", .{ iask, iwant.count(), from });
+
+        var iwant_list = try std.ArrayListUnmanaged([]const u8).initCapacity(self.allocator, iwant.count());
+        defer iwant_list.deinit(self.allocator);
+
+        var it = iwant.keyIterator();
+        while (it.next()) |id| {
+            try iwant_list.append(self.allocator, id.*);
+        }
+
+        var prng = std.Random.DefaultPrng.init(blk: {
+            var seed: u64 = undefined;
+            std.posix.getrandom(std.mem.asBytes(&seed)) catch break :blk @intCast(std.time.milliTimestamp());
+            break :blk seed;
+        });
+        const random = prng.random();
+        random.shuffle([]const u8, iwant_list.items);
+        try self.iasked.put(self.allocator, from, iask + iasked);
+
+        const result = try self.allocator.alloc(rpc.ControlIWant, 1);
+        errdefer self.allocator.free(result);
+
+        const selected_ids_raw = iwant_list.items[0..iask];
+
+        const dupe_slice = try self.allocator.dupe([]const u8, selected_ids_raw);
+        errdefer self.allocator.free(dupe_slice);
+
+        const selected_ids: []?[]const u8 = @ptrCast(dupe_slice);
+
+        result[0] = .{
+            .message_i_ds = selected_ids,
+        };
+
+        return result;
     }
 
     fn vtableHandleRPCFn(instance: *anyopaque, rpc_msg: *const pubsub.RPC) anyerror!void {
@@ -598,27 +832,27 @@ pub const Gossipsub = struct {
     }
 };
 
-pub fn validateMessage(allocator: Allocator, msg: *const rpc.Message, policy: SignaturePolicy, m: *Message) ValidateError!void {
+pub fn validateMessage(allocator: Allocator, msg: *const rpc.MessageReader, policy: SignaturePolicy, m: *Message) ValidateError!void {
     switch (policy) {
         SignaturePolicy.StrictNoSign => {
-            if (msg.signature != null) {
+            if (msg._signature != null) {
                 return error.SignaturePresent;
             }
-            if (msg.seqno != null) {
+            if (msg._seqno != null) {
                 return error.SeqnoPresent;
             }
-            if (msg.from != null) {
+            if (msg._from != null) {
                 return error.FromPresent;
             }
-            if (msg.key != null) {
+            if (msg._key != null) {
                 return error.KeyPresent;
             }
 
             m.* = .{
                 .from = null,
-                .data = msg.data orelse &.{},
+                .data = msg.getData(),
                 .seqno = null,
-                .topic_hash = msg.topic.?,
+                .topic_hash = msg.getTopic(),
                 .signature = null,
                 .key = null,
                 .validated = true,
@@ -627,24 +861,24 @@ pub fn validateMessage(allocator: Allocator, msg: *const rpc.Message, policy: Si
             return;
         },
         SignaturePolicy.StrictSign => {
-            if (msg.seqno == null) {
+            if (msg._seqno == null) {
                 return error.InvalidSeqno;
             }
-            if (msg.seqno.?.len != 8) {
+            if (msg._seqno.?.len != 8) {
                 return error.InvalidSeqno;
             }
-            if (msg.signature == null) {
+            if (msg._signature == null) {
                 return error.InvalidSignature;
             }
-            if (msg.from == null) {
+            if (msg._from == null) {
                 return error.InvalidPeerId;
             }
-            const from_peer_id = PeerId.fromBytes(msg.from.?) catch {
+            const from_peer_id = PeerId.fromBytes(msg.getFrom()) catch {
                 return error.InvalidPeerId;
             };
 
             var pubkey_bytes_buf: [128]u8 = undefined; // this is enough space for a PeerId
-            const pubkey_bytes = if (msg.key) |k| k else (from_peer_id.toBytes(&pubkey_bytes_buf) catch {
+            const pubkey_bytes = if (msg._key) |k| k else (from_peer_id.toBytes(&pubkey_bytes_buf) catch {
                 return error.InvalidPeerId;
             })[2..];
             const proto_pubkey_reader = keys.PublicKeyReader.init(allocator, pubkey_bytes) catch {
@@ -662,7 +896,7 @@ pub fn validateMessage(allocator: Allocator, msg: *const rpc.Message, policy: Si
             };
             defer ssl.EVP_PKEY_free(evp_key);
 
-            if (msg.key != null) {
+            if (msg._key != null) {
                 const key_peer_id = PeerId.fromPublicKey(allocator, &proto_pubkey) catch {
                     return error.InvalidPubkey;
                 };
@@ -673,10 +907,10 @@ pub fn validateMessage(allocator: Allocator, msg: *const rpc.Message, policy: Si
             }
 
             const data_to_sign: rpc.Message = .{
-                .seqno = msg.seqno,
-                .data = msg.data,
-                .from = msg.from,
-                .topic = msg.topic,
+                .seqno = msg._seqno,
+                .data = msg._data,
+                .from = msg._from,
+                .topic = msg._topic,
                 .signature = null,
                 .key = null,
             };
@@ -688,7 +922,7 @@ pub fn validateMessage(allocator: Allocator, msg: *const rpc.Message, policy: Si
                 return error.InvalidSignature;
             };
             defer allocator.free(prefixed_data);
-            const is_valid = tls.verifySignature(evp_key, prefixed_data, msg.signature.?) catch {
+            const is_valid = tls.verifySignature(evp_key, prefixed_data, msg.getSignature()) catch {
                 return error.InvalidSignature;
             };
             if (!is_valid) {
@@ -697,10 +931,10 @@ pub fn validateMessage(allocator: Allocator, msg: *const rpc.Message, policy: Si
 
             m.* = .{
                 .from = from_peer_id,
-                .data = msg.data orelse &.{},
-                .seqno = std.mem.readInt(u64, msg.seqno.?[0..8], .big),
-                .topic_hash = msg.topic.?,
-                .signature = msg.signature,
+                .data = msg.getData(),
+                .seqno = std.mem.readInt(u64, msg.getSeqno()[0..8], .big),
+                .topic_hash = msg.getTopic(),
+                .signature = msg.getSignature(),
                 .key = proto_pubkey,
                 .validated = true,
             };
