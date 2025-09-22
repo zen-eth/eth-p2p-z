@@ -746,20 +746,34 @@ pub const Gossipsub = struct {
             }
         }
 
-        const ihave = if (iwant.len > 0) blk: {
+        const ihave = if (iwant_messages.len > 0) blk: {
             const result = try self.handleIWant(from, iwant_messages);
             break :blk result;
         } else blk: {
             break :blk &.{};
         };
         std.log.debug("Sending {d} messages to peer {}", .{ ihave.len, from });
+
+        const graft_messages = try control.getGraft(self.allocator);
+        defer if (graft_messages.len > 0) self.allocator.free(graft_messages);
+
+        const prune = if (graft_messages.len > 0) blk: {
+            const result = try self.handleGraft(from, graft_messages);
+            break :blk result;
+        } else blk: {
+            break :blk &.{};
+        };
+        std.log.debug("Sending {d} PRUNE messages to peer {}", .{ prune.len, from });
+
+        const prune_messages = try control.getPrune(self.allocator);
+        defer if (prune_messages.len > 0) self.allocator.free(prune_messages);
+
+        if (prune_messages.len > 0) {
+            try self.handlePrune(from, prune_messages);
+        }
     }
 
     fn handleIWant(self: *Self, from: PeerId, iwant: []const rpc.ControlIWantReader) ![]*rpc.Message {
-        if (iwant.len == 0) {
-            return &.{};
-        }
-
         var ihave: std.StringHashMapUnmanaged(*rpc.Message) = .empty;
         defer ihave.deinit(self.allocator);
         var iwant_by_topic: std.StringHashMapUnmanaged(usize) = .empty;
@@ -812,9 +826,6 @@ pub const Gossipsub = struct {
     }
 
     fn handleIHave(self: *Self, from: PeerId, ihave: []const rpc.ControlIHaveReader) ![]const rpc.ControlIWant {
-        if (ihave.len == 0) {
-            return &.{};
-        }
         const peer_have = (self.peer_have.get(from) orelse 0) + 1;
         try self.peer_have.put(self.allocator, from, peer_have);
         if (peer_have > self.opts.max_ihave_messages) {
@@ -895,6 +906,61 @@ pub const Gossipsub = struct {
         };
 
         return result;
+    }
+
+    fn handleGraft(self: *Self, from: PeerId, graft: []const rpc.ControlGraftReader) ![]rpc.ControlPrune {
+        var prune: std.StringHashMapUnmanaged(void) = .empty;
+        defer prune.deinit(self.allocator);
+        var processed_graft: usize = 0;
+        errdefer {
+            for (graft[processed_graft..]) |*rem| rem.deinit();
+        }
+        for (graft) |graft_msg| {
+            defer {
+                graft_msg.deinit();
+                processed_graft += 1;
+            }
+            const topic = graft_msg.getTopicID();
+            if (topic.len == 0) continue;
+
+            var peers = self.mesh.get(topic) orelse {
+                try prune.put(self.allocator, topic, {});
+                continue;
+            };
+            _ = try peers.getOrPutValue(self.allocator, from, {});
+        }
+
+        if (prune.count() == 0) {
+            return &.{};
+        }
+
+        var prune_list = try std.ArrayListUnmanaged(rpc.ControlPrune).initCapacity(self.allocator, prune.count());
+        defer prune_list.deinit(self.allocator);
+
+        var it = prune.keyIterator();
+        while (it.next()) |topic| {
+            try prune_list.append(self.allocator, .{ .topic_i_d = topic.* });
+        }
+
+        return prune_list.toOwnedSlice(self.allocator);
+    }
+
+    fn handlePrune(self: *Self, from: PeerId, prune: []const rpc.ControlPruneReader) !void {
+        var processed_prune: usize = 0;
+        errdefer {
+            for (prune[processed_prune..]) |*rem| rem.deinit();
+        }
+        for (prune) |prune_msg| {
+            defer {
+                prune_msg.deinit();
+                processed_prune += 1;
+            }
+            const topic = prune_msg.getTopicID();
+            if (topic.len == 0) continue;
+
+            var peer_set = self.mesh.getPtr(topic) orelse continue;
+            _ = peer_set.remove(from);
+        }
     }
 
     fn vtableHandleRPCFn(instance: *anyopaque, rpc_msg: *const pubsub.RPC) anyerror!void {
