@@ -102,7 +102,7 @@ pub const IOAction = union(enum) {
     },
     quic_write_stream: struct {
         stream: *quic.QuicStream,
-        data: []const u8,
+        data: std.ArrayList(u8),
         callback_ctx: ?*anyopaque,
         callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void,
     },

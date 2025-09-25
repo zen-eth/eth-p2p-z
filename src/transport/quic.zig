@@ -581,11 +581,17 @@ pub const QuicStream = struct {
     }
 
     pub fn write(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
+        var data_copy = std.ArrayList(u8).init(self.conn.engine.allocator);
+        errdefer data_copy.deinit();
+        data_copy.appendSlice(data) catch |err| {
+            callback(callback_ctx, err);
+            return;
+        };
         if (self.conn.engine.transport.io_event_loop.inEventLoopThread()) {
-            self.doWrite(data, callback_ctx, callback);
+            self.doWrite(data_copy, callback_ctx, callback);
         } else {
             const message = io_loop.IOMessage{
-                .action = .{ .quic_write_stream = .{ .stream = self, .data = data, .callback_ctx = callback_ctx, .callback = callback } },
+                .action = .{ .quic_write_stream = .{ .stream = self, .data = data_copy, .callback_ctx = callback_ctx, .callback = callback } },
             };
             self.conn.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
@@ -628,21 +634,14 @@ pub const QuicStream = struct {
     /// It should not be called directly from other threads.
     /// Because the data may be eventually written successfully by the QUIC engine `onStreamWrite` callback multiple times,
     /// it queues the write request and processes it asynchronously.
-    pub fn doWrite(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
-        var data_copy = std.ArrayList(u8).init(self.conn.engine.allocator);
-        data_copy.appendSlice(data) catch |err| {
-            callback(callback_ctx, err);
-            return;
-        };
-
+    pub fn doWrite(self: *QuicStream, data: std.ArrayList(u8), callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
         const write_req = WriteRequest{
-            .data = data_copy,
+            .data = data,
             .callback_ctx = callback_ctx,
             .callback = callback,
         };
 
         self.pending_writes.append(write_req) catch |err| {
-            data_copy.deinit();
             callback(callback_ctx, err);
             return;
         };

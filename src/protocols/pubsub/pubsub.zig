@@ -5,6 +5,143 @@ const rpc = libp2p.protobuf.rpc;
 const PeerId = @import("peer_id").PeerId;
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 
+pub fn deinitRPCMessage(message: *rpc.RPC, allocator: std.mem.Allocator) void {
+    if (message.subscriptions) |subs| {
+        for (subs) |sub| {
+            if (sub) |s| {
+                if (s.topicid) |topic_id| {
+                    allocator.free(topic_id);
+                }
+            }
+        }
+        allocator.free(subs);
+    }
+
+    if (message.publish) |pubs| {
+        for (pubs) |p| {
+            if (p) |m| {
+                if (m.topic) |topic_id| {
+                    allocator.free(topic_id);
+                }
+                if (m.data) |data| {
+                    allocator.free(data);
+                }
+                if (m.seqno) |seqno| {
+                    allocator.free(seqno);
+                }
+                if (m.signature) |sig| {
+                    allocator.free(sig);
+                }
+                if (m.key) |key| {
+                    allocator.free(key);
+                }
+                if (m.from) |from| {
+                    allocator.free(from);
+                }
+            }
+        }
+        allocator.free(pubs);
+    }
+
+    if (message.control) |control| {
+        // internal slice should be freed in `deinitControl` not here
+        if (control.graft) |graft| {
+            allocator.free(graft);
+        }
+        if (control.prune) |prune| {
+            allocator.free(prune);
+        }
+    }
+}
+
+pub fn deinitControl(control: *rpc.ControlMessage, allocator: std.mem.Allocator) void {
+    if (control.graft) |graft| {
+        for (graft) |item| {
+            if (item) |g| {
+                if (g.topic_i_d) |topic_id| {
+                    allocator.free(topic_id);
+                }
+            }
+        }
+        allocator.free(graft);
+    }
+
+    if (control.prune) |prune| {
+        for (prune) |item| {
+            if (item) |p| {
+                if (p.topic_i_d) |topic_id| {
+                    allocator.free(topic_id);
+                }
+                if (p.peers) |peers| {
+                    for (peers) |peer| {
+                        if (peer) |p_id| {
+                            if (p_id.peer_i_d) |id| {
+                                allocator.free(id);
+                            }
+                            if (p_id.signed_peer_record) |r| {
+                                allocator.free(r);
+                            }
+                        }
+                    }
+                    allocator.free(peers);
+                }
+            }
+        }
+        allocator.free(prune);
+    }
+
+    if (control.ihave) |ihave| {
+        for (ihave) |item| {
+            if (item) |h| {
+                if (h.topic_i_d) |topic_id| {
+                    allocator.free(topic_id);
+                }
+                if (h.message_i_ds) |msg_ids| {
+                    for (msg_ids) |msg_id| {
+                        if (msg_id) |m_id| {
+                            allocator.free(m_id);
+                        }
+                    }
+                    allocator.free(msg_ids);
+                }
+            }
+        }
+        allocator.free(ihave);
+    }
+
+    if (control.iwant) |iwant| {
+        for (iwant) |item| {
+            if (item) |w| {
+                if (w.message_i_ds) |msg_ids| {
+                    for (msg_ids) |msg_id| {
+                        if (msg_id) |m_id| {
+                            allocator.free(m_id);
+                        }
+                    }
+                    allocator.free(msg_ids);
+                }
+            }
+        }
+        allocator.free(iwant);
+    }
+
+    if (control.idontwant) |idontwant| {
+        for (idontwant) |item| {
+            if (item) |d| {
+                if (d.message_i_ds) |msg_ids| {
+                    for (msg_ids) |msg_id| {
+                        if (msg_id) |m_id| {
+                            allocator.free(m_id);
+                        }
+                    }
+                    allocator.free(msg_ids);
+                }
+            }
+        }
+        allocator.free(idontwant);
+    }
+}
+
 pub const RPC = struct {
     rpc_reader: rpc.RPCReader,
     from: PeerId,
