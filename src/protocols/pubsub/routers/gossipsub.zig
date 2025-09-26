@@ -17,6 +17,7 @@ const uvarint = multiformats.uvarint;
 const event = libp2p.event;
 const pubsub = @import("../pubsub.zig");
 const cache = @import("cache");
+const p2p_conn = libp2p.conn;
 
 const sign_prefix: []const u8 = "libp2p-pubsub:";
 
@@ -60,9 +61,48 @@ pub const SendingRPCContext = struct {
     gossipsub: *Gossipsub,
     control: ?rpc.ControlMessage,
     ihave: ?[]rpc.ControlIHave,
+    to: PeerId,
+
+    pub fn callback(ctx: ?*anyopaque, res: anyerror!usize) void {
+        const self: *SendingRPCContext = @ptrCast(@alignCast(ctx.?));
+        defer self.gossipsub.allocator.destroy(self);
+
+        _ = res catch |err| {
+            std.log.warn("Failed to send RPC message to peer {}: {}", .{ self.gossipsub.peer_id, err });
+            if (self.control) |*control| {
+                self.gossipsub.control.put(self.gossipsub.allocator, self.to, control.*) catch |e| {
+                    std.log.warn("Failed to cache control message for peer {}: {}", .{ self.gossipsub.peer_id, e });
+                    pubsub.deinitControl(control, self.gossipsub.allocator);
+                };
+            }
+            if (self.ihave) |ihave| {
+                self.gossipsub.gossip.put(self.gossipsub.allocator, self.to, ihave) catch |e| {
+                    std.log.warn("Failed to cache IHAVE message for peer {}: {}", .{ self.gossipsub.peer_id, e });
+                    for (ihave) |item| {
+                        if (item.topic_i_d) |topic_id| {
+                            self.gossipsub.allocator.free(topic_id);
+                        }
+                        if (item.message_i_ds) |msg_ids| {
+                            for (msg_ids) |msg_id| {
+                                if (msg_id) |m_id| {
+                                    self.gossipsub.allocator.free(m_id);
+                                }
+                            }
+                            self.gossipsub.allocator.free(msg_ids);
+                        }
+                    }
+                    self.gossipsub.allocator.free(ihave);
+                };
+            }
+        };
+
+        self.deinit(self.gossipsub.allocator);
+    }
 
     pub fn deinit(self: *SendingRPCContext, allocator: std.mem.Allocator) void {
-        pubsub.deinitControl(&self.control.?, allocator);
+        if (self.control) |*control| {
+            pubsub.deinitControl(control, allocator);
+        }
         // assume ihave owns its items slices
         if (self.ihave) |self_ihave| {
             for (self_ihave) |item| {
@@ -148,6 +188,16 @@ pub const Event = union(enum) {
         peer: PeerId,
         subscriptions: []Subscription,
     },
+    gossipsub_graft: struct {
+        peer: PeerId,
+        topic: []const u8,
+        direction: p2p_conn.Direction,
+    },
+    gossipsub_prune: struct {
+        peer: PeerId,
+        topic: []const u8,
+        direction: p2p_conn.Direction,
+    },
 
     pub fn hash(self: Event, hasher: anytype) void {
         const tag = std.meta.activeTag(self);
@@ -167,6 +217,16 @@ pub const Event = union(enum) {
 
                     hasher.update(std.mem.asBytes(&subscription.subscribe));
                 }
+            },
+            .gossipsub_graft, .gossipsub_prune => |graft_or_prune| {
+                var peer_buf: [128]u8 = undefined; // this is enough space for a PeerId
+                const peer_bytes = graft_or_prune.peer.toBytes(&peer_buf) catch unreachable;
+                hasher.update(peer_bytes);
+
+                hasher.update(std.mem.asBytes(&graft_or_prune.topic.len));
+                hasher.update(graft_or_prune.topic);
+
+                hasher.update(std.mem.asBytes(&graft_or_prune.direction));
             },
         }
     }
@@ -198,6 +258,20 @@ pub const Event = union(enum) {
                 }
 
                 return true;
+            },
+            .gossipsub_graft => |self_graft| {
+                const other_graft = other.gossipsub_graft;
+
+                return self_graft.peer.eql(&other_graft.peer) and
+                    std.mem.eql(u8, self_graft.topic, other_graft.topic) and
+                    self_graft.direction == other_graft.direction;
+            },
+            .gossipsub_prune => |self_prune| {
+                const other_prune = other.gossipsub_prune;
+
+                return self_prune.peer.eql(&other_prune.peer) and
+                    std.mem.eql(u8, self_prune.topic, other_prune.topic) and
+                    self_prune.direction == other_prune.direction;
             },
         }
     }
@@ -669,23 +743,42 @@ pub const Gossipsub = struct {
             };
         }
 
-        //        const rpc_bytes = try rpc_msg.encode(self.allocator);
+        const rpc_bytes = try rpc_msg.encode(self.allocator);
+        defer self.allocator.free(rpc_bytes);
 
-        // initiator.stream.write(rpc_bytes, sending_ctx, struct {
-        //     fn callback(ctx: ?*anyopaque, res: anyerror!?*quic.QuicStream) void {
-        //         const self: *SendingRPCContext = @ptrCast(@alignCast(ctx.?));
-        //         defer self.gossipsub.allocator.destroy(self);
+        initiator.stream.write(rpc_bytes, sending_ctx, SendingRPCContext.callback) catch |err| {
+            std.log.warn("Failed to write RPC message to stream for peer {}: {}", .{ to, err });
+            return false;
+        };
 
-        //         if (res) |err| {
-        //             std.log.warn("Failed to send RPC message to peer {}: {}", .{ self.gossipsub.peer_id, err });
-        //         }
-        //     }
-        // }.callback) catch {
-        //     std.log.warn("Failed to write RPC message to stream for peer {}: {}", .{ to, err });
-        //     return false;
-        // };
+        if (rpc_msg.control) |ctrl| {
+            if (ctrl.graft) |graft| {
+                for (graft) |g_opt| {
+                    const g = g_opt orelse continue;
+                    const topic_id = g.topic_i_d orelse continue;
 
-        return false;
+                    self.event_emitter.emit(.{ .gossipsub_graft = .{
+                        .peer = to,
+                        .topic = topic_id,
+                        .direction = .OUTBOUND,
+                    } });
+                }
+            }
+            if (ctrl.prune) |prune| {
+                for (prune) |p_opt| {
+                    const p = p_opt orelse continue;
+                    const topic_id = p.topic_i_d orelse continue;
+
+                    self.event_emitter.emit(.{ .gossipsub_prune = .{
+                        .peer = to,
+                        .topic = topic_id,
+                        .direction = .OUTBOUND,
+                    } });
+                }
+            }
+        }
+
+        return true;
     }
 
     fn piggybackControl(self: *Self, to: PeerId, rpc_msg: *rpc.RPC, ctrl: *const rpc.ControlMessage) !void {
@@ -1782,6 +1875,9 @@ test "simulate onMessage" {
             switch (e) {
                 .subscription_changed => {
                     std.debug.print("Subscription changed event received\n", .{});
+                },
+                else => {
+                    std.debug.print("Unknown event received\n", .{});
                 },
             }
         }
