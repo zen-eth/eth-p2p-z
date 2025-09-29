@@ -76,7 +76,8 @@ pub const SendingRPCContext = struct {
                 };
             }
             if (self.ihave) |ihave| {
-                self.gossipsub.gossip.put(self.gossipsub.allocator, self.to, ihave) catch |e| {
+                const ihave_list = std.ArrayListUnmanaged(rpc.ControlIHave).fromOwnedSlice(ihave);
+                self.gossipsub.gossip.put(self.gossipsub.allocator, self.to, ihave_list) catch |e| {
                     std.log.warn("Failed to cache IHAVE message for peer {}: {}", .{ self.gossipsub.peer_id, e });
                     for (ihave) |item| {
                         if (item.topic_i_d) |topic_id| {
@@ -299,9 +300,13 @@ pub const Gossipsub = struct {
 
     mesh: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)),
 
+    fanout: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)),
+
+    fanout_last_pub: std.StringHashMapUnmanaged(u64),
+
     peer_have: std.AutoHashMapUnmanaged(PeerId, usize),
 
-    gossip: std.AutoHashMapUnmanaged(PeerId, []rpc.ControlIHave),
+    gossip: std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged(rpc.ControlIHave)),
 
     control: std.AutoHashMapUnmanaged(PeerId, rpc.ControlMessage),
 
@@ -330,6 +335,9 @@ pub const Gossipsub = struct {
         history_length: usize = 5,
         history_gossip: usize = 3,
         gossip_retransmission: usize = 3,
+        D: usize = 6,
+        D_lo: usize = 4,
+        D_hi: usize = 12,
     };
 
     const AddPeerCtx = struct {
@@ -412,8 +420,10 @@ pub const Gossipsub = struct {
             .topics = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
             .subscriptions = std.StringHashMapUnmanaged(void).empty,
             .mesh = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
+            .fanout = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
+            .fanout_last_pub = std.StringHashMapUnmanaged(u64).empty,
             .peer_have = std.AutoHashMapUnmanaged(PeerId, usize).empty,
-            .gossip = std.AutoHashMapUnmanaged(PeerId, []rpc.ControlIHave).empty,
+            .gossip = std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged(rpc.ControlIHave)).empty,
             .control = std.AutoHashMapUnmanaged(PeerId, rpc.ControlMessage).empty,
             .iasked = std.AutoArrayHashMapUnmanaged(PeerId, usize).empty,
             .event_emitter = event.EventEmitter(Event).init(allocator),
@@ -732,8 +742,14 @@ pub const Gossipsub = struct {
                 rpc_storage = rpc_msg_in.*;
                 rpc_msg = &rpc_storage.?;
             }
-            sending_ctx.ihave = entry.value;
-            self.piggybackGossip(rpc_msg, &sending_ctx.ihave) catch |err| {
+            sending_ctx.ihave = entry.value.toOwnedSlice(self.allocator) catch |err| {
+                std.log.err("Failed to own IHAVE message for peer {}: {}", .{ to, err });
+                self.gossip.put(self.allocator, to, entry.value) catch {
+                    std.log.err("Failed to restore IHAVE message for peer {}: {}", .{ to, err });
+                };
+                return false;
+            };
+            self.piggybackGossip(rpc_msg, sending_ctx.ihave.?) catch |err| {
                 std.log.warn("Failed to piggyback gossip message to peer {}: {}", .{ to, err });
                 self.gossip.put(self.allocator, to, sending_ctx.ihave) catch {
                     std.log.err("Failed to restore gossip message for peer {}: {}", .{ to, err });
@@ -1212,6 +1228,186 @@ pub const Gossipsub = struct {
 
             var peer_set = self.mesh.getPtr(topic) orelse continue;
             _ = peer_set.remove(from);
+        }
+    }
+
+    fn pushGossip(self: *Self, peer: PeerId, control_ihave: *const rpc.ControlIHave) !void {
+        var gossip_entry = try self.gossip.getOrPut(self.allocator, peer);
+        if (!gossip_entry.found_existing) {
+            gossip_entry.value_ptr.* = std.ArrayListUnmanaged(rpc.ControlIHave).empty;
+        }
+        try gossip_entry.value_ptr.append(self.allocator, control_ihave.*);
+    }
+
+    fn getRandomGossipPeers(self: *Self, topic: []const u8, count: usize, filter_ctx: ?*anyopaque, filter: *const fn (ctx: ?*anyopaque, peer: PeerId) bool) !std.ArrayListUnmanaged(PeerId) {
+        const peers = self.topics.get(topic) orelse return std.ArrayListUnmanaged(PeerId).empty;
+        if (peers.count() == 0) {
+            return std.ArrayListUnmanaged(PeerId).empty;
+        }
+
+        var candidate_peers = try std.ArrayListUnmanaged(PeerId).initCapacity(self.allocator, peers.count());
+        errdefer candidate_peers.deinit(self.allocator);
+
+        var it = peers.keyIterator();
+        while (it.next()) |peer_id| {
+            const semi_duplex = self.peers.get(peer_id.*) orelse continue;
+            if (semi_duplex.initiator == null) continue;
+
+            if (std.mem.containsAtLeastScalar(ProtocolId, self.protocols, 1, semi_duplex.initiator.?.stream.negotiated_protocol.?) and !filter(filter_ctx, peer_id.*)) {
+                try candidate_peers.append(self.allocator, peer_id.*);
+            }
+        }
+
+        var prng = std.Random.DefaultPrng.init(blk: {
+            var seed: u64 = undefined;
+            std.posix.getrandom(std.mem.asBytes(&seed)) catch break :blk @intCast(std.time.milliTimestamp());
+            break :blk seed;
+        });
+        const random = prng.random();
+        random.shuffle(PeerId, candidate_peers.items);
+
+        if (candidate_peers.items.len > count) {
+            candidate_peers.items = candidate_peers.items[0..count];
+        }
+
+        return candidate_peers;
+    }
+
+    fn sendGraft(self: *Self, to: PeerId, topic: []const u8) void {
+        var graft_msg = try self.allocator.alloc(rpc.ControlGraft, 1) catch |err| {
+            std.log.warn("Failed to allocate GRAFT message for peer {}: {}", .{ to, err });
+            return;
+        };
+        // Note: right now only implement gossipsub v1.0
+        graft_msg[0] = .{
+            .topic_i_d = topic,
+        };
+
+        var rpc_msg: rpc.RPC = .{ .control = .{ .graft = graft_msg } };
+        _ = self.sendRPC(to, &rpc_msg);
+        // TODO: free rpc_msg
+    }
+
+    fn sendPrune(self: *Self, to: PeerId, topic: []const u8) void {
+        var prune_msg = self.allocator.alloc(rpc.ControlPrune, 1) catch |err| {
+            std.log.warn("Failed to allocate PRUNE message for peer {}: {}", .{ to, err });
+            return;
+        };
+        // Note: right now only implement gossipsub v1.0
+        prune_msg[0] = .{
+            .topic_i_d = topic,
+        };
+
+        var rpc_msg: rpc.RPC = .{ .control = .{ .prune = prune_msg } };
+        _ = self.sendRPC(to, &rpc_msg);
+        // TODO: free rpc_msg
+    }
+
+    // fn flush(self: *Self) void {
+    //     // send gossip first, which will also piggyback control
+    //     while (self.gossip.count() > 0) {
+    //         var gossip_iter = self.gossip.iterator();
+    //         const peer = gossip_iter.next().?.key_ptr.*;
+
+    //         const ihave_list = self.gossip.fetchRemove(peer).?.value;
+
+    //         const ihave_slice = ihave_list.toOwnedSlice(self.allocator) catch |err| {
+    //             std.log.warn("Failed to convert IHAVE list to slice for peer {}: {}", .{ peer, err });
+    //             ihave_list.deinit(self.allocator);
+    //             continue;
+    //         };
+
+    //         var rpc_msg: rpc.RPC = .{ .control = .{ .ihave = ihave_slice } };
+    //         defer pubsub.deinitRPCMessage(&rpc_msg, self.allocator);
+    //         _ = self.sendRPC(peer, &rpc_msg);
+    //     }
+
+    //     var control_iter = self.control.iterator();
+    //     while (control_iter.next()) |entry| {
+    //         const peer = entry.key_ptr.*;
+    //         const control_msg = entry.value_ptr.*;
+
+    //         var rpc_msg: rpc.RPC = .{ .control = .{
+    //             .graft = control_msg.graft,
+    //             .prune = control_msg.prune,
+    //         } };
+
+    //         _ = self.sendRPC(peer, &rpc_msg);
+    //     }
+    // }
+
+    fn join(self: *Self, topic: []const u8) !void {
+        if (self.mesh.contains(topic)) {
+            return;
+        }
+
+        var mesh_peers: std.AutoHashMapUnmanaged(PeerId, void) = undefined;
+
+        if (self.fanout.fetchRemove(topic)) |entry| {
+            mesh_peers = entry.value;
+            _ = self.fanout_last_pub.remove(topic);
+
+            if (mesh_peers.count() < self.opts.D) {
+                const FilterCtx = struct {
+                    mesh_peers: *std.AutoHashMapUnmanaged(PeerId, void),
+
+                    fn filter(ctx: ?*anyopaque, peer: PeerId) bool {
+                        const filter_ctx: *@This() = @ptrCast(@alignCast(ctx.?));
+                        return filter_ctx.mesh_peers.contains(peer);
+                    }
+                };
+
+                const filter_ctx: FilterCtx = .{
+                    .mesh_peers = &mesh_peers,
+                };
+                const more_peers = try self.getRandomGossipPeers(topic, self.opts.D - mesh_peers.count(), &filter_ctx, FilterCtx.filter);
+                defer more_peers.deinit(self.allocator);
+                for (more_peers.items) |p| {
+                    // This should not fail as we are just adding new peers.
+                    try mesh_peers.put(self.allocator, p, {});
+                }
+            }
+        } else {
+            const new_peers = try self.getRandomGossipPeers(topic, self.opts.D, null, struct {
+                fn filter(_: ?*anyopaque, _: PeerId) bool {
+                    return false;
+                }
+            }.filter);
+            defer new_peers.deinit(self.allocator);
+
+            mesh_peers = std.AutoHashMapUnmanaged(PeerId, void).empty;
+            for (new_peers.items) |p| {
+                try mesh_peers.put(self.allocator, p, {});
+            }
+        }
+
+        // Take ownership of mesh_peers and topic
+        try self.mesh.put(self.allocator, topic, mesh_peers);
+        var it = mesh_peers.keyIterator();
+        while (it.next()) |peer_id| {
+            // TODO: self.tracer.Graft(p, topic)
+            self.sendGraft(peer_id.*, topic);
+            // TODO: self.tagPeer(p, topic)
+        }
+    }
+
+    fn leave(self: *Self, topic: []const u8) void {
+        const removed_entry = self.mesh.fetchRemove(topic) orelse {
+            return;
+        };
+
+        // TODO: when to free topic? since it is used in the prune message
+        defer self.allocator.free(removed_entry.key);
+        defer removed_entry.value.deinit(self.allocator);
+
+        // TODO: self.tracer.Leave(topic)
+
+        const peer_set = removed_entry.value;
+        var it = peer_set.keyIterator();
+        while (it.next()) |peer_id| {
+            // TODO: self.tracer.Prune(p, topic)
+            self.sendPrune(peer_id.*, topic);
+            // TODO: self.tagPeer(p, topic)
         }
     }
 
