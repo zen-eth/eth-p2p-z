@@ -271,7 +271,7 @@ fn getRawPublicKeyBytes(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]u8 {
 
 /// Signs arbitrary data using the private key within an EVP_PKEY.
 /// The caller owns the returned slice.
-fn signData(allocator: Allocator, pkey: *ssl.EVP_PKEY, data: []const u8) ![]u8 {
+pub fn signData(allocator: Allocator, pkey: *ssl.EVP_PKEY, data: []const u8) ![]u8 {
     const ctx = ssl.EVP_MD_CTX_new() orelse return error.CertSignCreationFailed;
     defer ssl.EVP_MD_CTX_free(ctx);
 

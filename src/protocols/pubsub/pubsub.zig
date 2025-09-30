@@ -142,6 +142,14 @@ pub fn deinitControl(control: *rpc.ControlMessage, allocator: std.mem.Allocator)
     }
 }
 
+pub const PublishPolicy = enum {
+    signing,
+    // TODO: implement other policies
+    //author,
+    //random_author,
+    anonymous,
+};
+
 pub const RPC = struct {
     rpc_reader: rpc.RPCReader,
     from: PeerId,
