@@ -54,91 +54,93 @@ pub fn deinitRPCMessage(message: *rpc.RPC, allocator: std.mem.Allocator) void {
     }
 }
 
-pub fn deinitControl(control: *rpc.ControlMessage, allocator: std.mem.Allocator) void {
-    if (control.graft) |graft| {
-        for (graft) |item| {
-            if (item) |g| {
-                if (g.topic_i_d) |topic_id| {
-                    allocator.free(topic_id);
+pub fn deinitControl(control: *?rpc.ControlMessage, allocator: std.mem.Allocator) void {
+    if (control.*) |*ctrl| {
+        if (ctrl.graft) |graft| {
+            for (graft) |item| {
+                if (item) |g| {
+                    if (g.topic_i_d) |topic_id| {
+                        allocator.free(topic_id);
+                    }
                 }
             }
+            allocator.free(graft);
         }
-        allocator.free(graft);
-    }
 
-    if (control.prune) |prune| {
-        for (prune) |item| {
-            if (item) |p| {
-                if (p.topic_i_d) |topic_id| {
-                    allocator.free(topic_id);
-                }
-                if (p.peers) |peers| {
-                    for (peers) |peer| {
-                        if (peer) |p_id| {
-                            if (p_id.peer_i_d) |id| {
-                                allocator.free(id);
+        if (ctrl.prune) |prune| {
+            for (prune) |item| {
+                if (item) |p| {
+                    if (p.topic_i_d) |topic_id| {
+                        allocator.free(topic_id);
+                    }
+                    if (p.peers) |peers| {
+                        for (peers) |peer| {
+                            if (peer) |p_id| {
+                                if (p_id.peer_i_d) |id| {
+                                    allocator.free(id);
+                                }
+                                if (p_id.signed_peer_record) |r| {
+                                    allocator.free(r);
+                                }
                             }
-                            if (p_id.signed_peer_record) |r| {
-                                allocator.free(r);
+                        }
+                        allocator.free(peers);
+                    }
+                }
+            }
+            allocator.free(prune);
+        }
+
+        if (ctrl.ihave) |ihave| {
+            for (ihave) |item| {
+                if (item) |h| {
+                    if (h.topic_i_d) |topic_id| {
+                        allocator.free(topic_id);
+                    }
+                    if (h.message_i_ds) |msg_ids| {
+                        for (msg_ids) |msg_id| {
+                            if (msg_id) |m_id| {
+                                allocator.free(m_id);
                             }
                         }
+                        allocator.free(msg_ids);
                     }
-                    allocator.free(peers);
                 }
             }
+            allocator.free(ihave);
         }
-        allocator.free(prune);
-    }
 
-    if (control.ihave) |ihave| {
-        for (ihave) |item| {
-            if (item) |h| {
-                if (h.topic_i_d) |topic_id| {
-                    allocator.free(topic_id);
-                }
-                if (h.message_i_ds) |msg_ids| {
-                    for (msg_ids) |msg_id| {
-                        if (msg_id) |m_id| {
-                            allocator.free(m_id);
+        if (ctrl.iwant) |iwant| {
+            for (iwant) |item| {
+                if (item) |w| {
+                    if (w.message_i_ds) |msg_ids| {
+                        for (msg_ids) |msg_id| {
+                            if (msg_id) |m_id| {
+                                allocator.free(m_id);
+                            }
                         }
+                        allocator.free(msg_ids);
                     }
-                    allocator.free(msg_ids);
                 }
             }
+            allocator.free(iwant);
         }
-        allocator.free(ihave);
-    }
 
-    if (control.iwant) |iwant| {
-        for (iwant) |item| {
-            if (item) |w| {
-                if (w.message_i_ds) |msg_ids| {
-                    for (msg_ids) |msg_id| {
-                        if (msg_id) |m_id| {
-                            allocator.free(m_id);
+        if (ctrl.idontwant) |idontwant| {
+            for (idontwant) |item| {
+                if (item) |d| {
+                    if (d.message_i_ds) |msg_ids| {
+                        for (msg_ids) |msg_id| {
+                            if (msg_id) |m_id| {
+                                allocator.free(m_id);
+                            }
                         }
+                        allocator.free(msg_ids);
                     }
-                    allocator.free(msg_ids);
                 }
             }
+            allocator.free(idontwant);
         }
-        allocator.free(iwant);
-    }
-
-    if (control.idontwant) |idontwant| {
-        for (idontwant) |item| {
-            if (item) |d| {
-                if (d.message_i_ds) |msg_ids| {
-                    for (msg_ids) |msg_id| {
-                        if (msg_id) |m_id| {
-                            allocator.free(m_id);
-                        }
-                    }
-                    allocator.free(msg_ids);
-                }
-            }
-        }
-        allocator.free(idontwant);
     }
 }
 

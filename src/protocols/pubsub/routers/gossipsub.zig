@@ -57,10 +57,31 @@ pub const AnyDataTransform = struct {
     }
 };
 
+const FilterCtx = struct {
+    mesh_peers: *std.AutoHashMapUnmanaged(PeerId, void),
+
+    fn filter(ctx: ?*anyopaque, peer: PeerId) bool {
+        const filter_ctx: *@This() = @ptrCast(@alignCast(ctx.?));
+        return filter_ctx.mesh_peers.contains(peer);
+    }
+};
+
+const SelectPeersResult = struct {
+    const SelectPeersCounts = struct {
+        direct: u64,
+        flood: u64,
+        mesh: u64,
+        fanout: u64,
+    };
+
+    to_send: []PeerId,
+    to_send_count: SelectPeersCounts,
+};
+
 pub const SendingRPCContext = struct {
     gossipsub: *Gossipsub,
     control: ?rpc.ControlMessage,
-    ihave: ?[]rpc.ControlIHave,
+    ihave: ?[]?rpc.ControlIHave,
     to: PeerId,
 
     pub fn callback(ctx: ?*anyopaque, res: anyerror!usize) void {
@@ -69,21 +90,20 @@ pub const SendingRPCContext = struct {
 
         _ = res catch |err| {
             std.log.warn("Failed to send RPC message to peer {}: {}", .{ self.gossipsub.peer_id, err });
-            if (self.control) |*control| {
-                self.gossipsub.control.put(self.gossipsub.allocator, self.to, control.*) catch |e| {
-                    std.log.warn("Failed to cache control message for peer {}: {}", .{ self.gossipsub.peer_id, e });
-                    pubsub.deinitControl(control, self.gossipsub.allocator);
-                };
-            }
+            self.gossipsub.control.put(self.gossipsub.allocator, self.to, self.control) catch |e| {
+                std.log.warn("Failed to cache control message for peer {}: {}", .{ self.gossipsub.peer_id, e });
+                pubsub.deinitControl(&self.control, self.gossipsub.allocator);
+            };
+
             if (self.ihave) |ihave| {
-                const ihave_list = std.ArrayListUnmanaged(rpc.ControlIHave).fromOwnedSlice(ihave);
+                const ihave_list = std.ArrayListUnmanaged(?rpc.ControlIHave).fromOwnedSlice(ihave);
                 self.gossipsub.gossip.put(self.gossipsub.allocator, self.to, ihave_list) catch |e| {
                     std.log.warn("Failed to cache IHAVE message for peer {}: {}", .{ self.gossipsub.peer_id, e });
                     for (ihave) |item| {
-                        if (item.topic_i_d) |topic_id| {
+                        if (item.?.topic_i_d) |topic_id| {
                             self.gossipsub.allocator.free(topic_id);
                         }
-                        if (item.message_i_ds) |msg_ids| {
+                        if (item.?.message_i_ds) |msg_ids| {
                             for (msg_ids) |msg_id| {
                                 if (msg_id) |m_id| {
                                     self.gossipsub.allocator.free(m_id);
@@ -101,16 +121,14 @@ pub const SendingRPCContext = struct {
     }
 
     pub fn deinit(self: *SendingRPCContext, allocator: std.mem.Allocator) void {
-        if (self.control) |*control| {
-            pubsub.deinitControl(control, allocator);
-        }
+        pubsub.deinitControl(&self.control, allocator);
         // assume ihave owns its items slices
         if (self.ihave) |self_ihave| {
             for (self_ihave) |item| {
-                if (item.topic_i_d) |topic_id| {
+                if (item.?.topic_i_d) |topic_id| {
                     allocator.free(topic_id);
                 }
-                if (item.message_i_ds) |msg_ids| {
+                if (item.?.message_i_ds) |msg_ids| {
                     for (msg_ids) |msg_id| {
                         if (msg_id) |m_id| {
                             allocator.free(m_id);
@@ -199,6 +217,11 @@ pub const Event = union(enum) {
         topic: []const u8,
         direction: p2p_conn.Direction,
     },
+    message: struct {
+        propagation_source: PeerId,
+        message_id: []const u8,
+        message: *const rpc.Message,
+    },
 
     pub fn hash(self: Event, hasher: anytype) void {
         const tag = std.meta.activeTag(self);
@@ -274,6 +297,11 @@ pub const Event = union(enum) {
                     std.mem.eql(u8, self_prune.topic, other_prune.topic) and
                     self_prune.direction == other_prune.direction;
             },
+            .message => |self_msg| {
+                const other_msg = other.message;
+
+                return std.mem.eql(u8, self_msg.message_id, other_msg.message_id);
+            },
         }
     }
 };
@@ -306,13 +334,13 @@ pub const Gossipsub = struct {
 
     fanout: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)),
 
-    fanout_last_pub: std.StringHashMapUnmanaged(u64),
+    fanout_last_pub: std.StringHashMapUnmanaged(i64),
 
     peer_have: std.AutoHashMapUnmanaged(PeerId, usize),
 
-    gossip: std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged(rpc.ControlIHave)),
+    gossip: std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged(?rpc.ControlIHave)),
 
-    control: std.AutoHashMapUnmanaged(PeerId, rpc.ControlMessage),
+    control: std.AutoHashMapUnmanaged(PeerId, ?rpc.ControlMessage),
 
     iasked: std.AutoArrayHashMapUnmanaged(PeerId, usize),
 
@@ -337,6 +365,8 @@ pub const Gossipsub = struct {
         publish_policy: pubsub.PublishPolicy = .signing,
         data_transform: ?AnyDataTransform = null,
         msg_id_fn: pubsub.MessageIdFn = pubsub.defaultMsgId,
+        flood_publish: bool = true,
+        emit_self: bool = false,
         idontwant_min_size: usize = 512,
         idontwant_message_size_threshold: usize = 1024,
         max_ihave_messages: usize = 10,
@@ -438,10 +468,10 @@ pub const Gossipsub = struct {
             .subscriptions = std.StringHashMapUnmanaged(void).empty,
             .mesh = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
             .fanout = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
-            .fanout_last_pub = std.StringHashMapUnmanaged(u64).empty,
+            .fanout_last_pub = std.StringHashMapUnmanaged(i64).empty,
             .peer_have = std.AutoHashMapUnmanaged(PeerId, usize).empty,
-            .gossip = std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged(rpc.ControlIHave)).empty,
-            .control = std.AutoHashMapUnmanaged(PeerId, rpc.ControlMessage).empty,
+            .gossip = std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged(?rpc.ControlIHave)).empty,
+            .control = std.AutoHashMapUnmanaged(PeerId, ?rpc.ControlMessage).empty,
             .iasked = std.AutoArrayHashMapUnmanaged(PeerId, usize).empty,
             .event_emitter = event.EventEmitter(Event).init(allocator),
             .seen_cache = seen_cache,
@@ -684,16 +714,160 @@ pub const Gossipsub = struct {
             break :blk data;
         };
 
-        var rpc_msg: rpc.Message = undefined;
+        var publish_msg: rpc.Message = undefined;
         var msg_id: []const u8 = undefined;
         errdefer {
             self.allocator.free(msg_id);
             //TODO: free rpc_msg fields
         }
-        self.buildRPCandMsgId(topic, data, transformed_data, &rpc_msg, &msg_id) catch |err| {
+        self.buildRPCandMsgId(topic, data, transformed_data, &publish_msg, &msg_id) catch |err| {
             std.log.warn("Failed to build RPC message for topic {s}: {}", .{ topic, err });
             callback(callback_ctx, err);
             return;
+        };
+
+        if (self.seen_cache.contains(msg_id)) {
+            // Message already seen, do not publish again
+            callback(callback_ctx, error.PublishDuplicate);
+            return;
+        }
+
+        const selected_result = self.selectPeersToPublish(topic) catch |err| {
+            std.log.warn("Failed to select peers to publish for topic {s}: {}", .{ topic, err });
+            callback(callback_ctx, err);
+            return;
+        };
+
+        const will_send_to_self = self.subscriptions.contains(topic) and self.opts.emit_self;
+
+        if (selected_result.to_send.len == 0 and !will_send_to_self) {
+            // No peers to send to, return early
+            callback(callback_ctx, error.NoPeersSubscribedToTopic);
+            return;
+        }
+
+        self.seen_cache.put(msg_id, {}, .{
+            .ttl = self.opts.seen_ttl_s,
+        }) catch |err| {
+            std.log.warn("Failed to cache seen message ID for topic {s}: {}", .{ topic, err });
+            callback(callback_ctx, err);
+            return;
+        };
+
+        self.mcache.put(&publish_msg) catch |err| {
+            std.log.warn("Failed to cache message in message cache for topic {s}: {}", .{ topic, err });
+            callback(callback_ctx, err);
+            return;
+        };
+
+        // TODO: should we support batch publish?
+        // rust-libp2p send idontwant if the message is large enough
+        var receipents = std.ArrayListUnmanaged(PeerId).empty;
+        errdefer receipents.deinit(self.allocator);
+        for (selected_result.to_send) |to| {
+            const rpc_msg = rpc.RPC{
+                .publish = &.{publish_msg},
+            };
+            const sent = self.sendRPC(to, &rpc_msg);
+            if (sent) {
+                receipents.append(self.allocator, to) catch |err| {
+                    std.log.warn("Failed to record sent peer {} for topic {s}: {}", .{ to, topic, err });
+                    callback(callback_ctx, err);
+                    return;
+                };
+            }
+        }
+
+        if (will_send_to_self) {
+            receipents.append(self.allocator, self.peer_id) catch |err| {
+                std.log.warn("Failed to record sent peer {} for topic {s}: {}", .{ self.peer_id, topic, err });
+                callback(callback_ctx, err);
+                return;
+            };
+            self.event_emitter.emit(.{ .message = .{
+                .propagation_source = self.peer_id,
+                .message_id = msg_id,
+                .message = &publish_msg,
+            } });
+        }
+
+        const receipents_slice = receipents.toOwnedSlice(self.allocator) catch |err| {
+            std.log.warn("Failed to finalize receipents list for topic {s}: {}", .{ topic, err });
+            callback(callback_ctx, err);
+            return;
+        };
+        callback(callback_ctx, receipents_slice);
+    }
+
+    fn selectPeersToPublish(self: *Self, topic: []const u8) !SelectPeersResult {
+        var selected_peers = std.ArrayListUnmanaged(PeerId).empty;
+
+        var to_send_count: SelectPeersResult.SelectPeersCounts = .{
+            .direct = 0,
+            .flood = 0,
+            .mesh = 0,
+            .fanout = 0,
+        };
+
+        if (self.topics.getPtr(topic)) |peers_map| {
+            if (self.opts.flood_publish) {
+                var it = peers_map.iterator();
+                while (it.next()) |entry| {
+                    // TODO: support direct peers and peer scoring
+                    to_send_count.flood += 1;
+                    try selected_peers.append(self.allocator, entry.key_ptr.*);
+                }
+            } else {
+                // TODO: support direct peers and floodsub peers
+                if (self.mesh.getPtr(topic)) |mesh_peers| {
+                    var it = mesh_peers.iterator();
+                    while (it.next()) |entry| {
+                        to_send_count.mesh += 1;
+                        try selected_peers.append(self.allocator, entry.key_ptr.*);
+                    }
+
+                    if (mesh_peers.count() < self.opts.D) {
+                        var filter_ctx: FilterCtx = .{
+                            .mesh_peers = mesh_peers,
+                        };
+                        var more_peers = try self.getRandomGossipPeers(topic, self.opts.D - mesh_peers.count(), &filter_ctx, FilterCtx.filter);
+                        defer more_peers.deinit(self.allocator);
+                        try selected_peers.appendSlice(self.allocator, more_peers.items);
+                        to_send_count.fanout += more_peers.items.len;
+                    }
+                } else {
+                    if (self.fanout.getPtr(topic)) |fanout_peers| {
+                        var it = fanout_peers.iterator();
+                        while (it.next()) |entry| {
+                            to_send_count.fanout += 1;
+                            try selected_peers.append(self.allocator, entry.key_ptr.*);
+                        }
+                    } else {
+                        var more_peers = try self.getRandomGossipPeers(topic, self.opts.D, null, struct {
+                            fn filter(_: ?*anyopaque, _: PeerId) bool {
+                                return false;
+                            }
+                        }.filter);
+                        defer more_peers.deinit(self.allocator);
+                        if (more_peers.items.len > 0) {
+                            var new_fanout: std.AutoHashMapUnmanaged(PeerId, void) = .empty;
+                            for (more_peers.items) |p| {
+                                try new_fanout.put(self.allocator, p, {});
+                                try selected_peers.append(self.allocator, p);
+                                to_send_count.fanout += 1;
+                            }
+                            try self.fanout.put(self.allocator, topic, new_fanout);
+                        }
+
+                        try self.fanout_last_pub.put(self.allocator, topic, std.time.milliTimestamp());
+                    }
+                }
+            }
+        }
+
+        return SelectPeersResult{
+            .to_send = try selected_peers.toOwnedSlice(self.allocator),
+            .to_send_count = to_send_count,
         };
     }
 
@@ -783,7 +957,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn sendRPC(self: *Self, to: PeerId, rpc_msg_in: *rpc.RPC) bool {
+    fn sendRPC(self: *Self, to: PeerId, rpc_msg_in: *const rpc.RPC) bool {
         // TODO: Use a pool of pre-allocated contexts?
         var sending_ctx = self.allocator.create(SendingRPCContext) catch |err| {
             std.log.err("Failed to allocate RPC message: {}", .{err});
@@ -794,8 +968,10 @@ pub const Gossipsub = struct {
             .gossipsub = self,
             .control = null,
             .ihave = null,
+            .to = to,
         };
-        // TODO: should we dial the peer if not connected? shpould we return an error?
+
+        // TODO: should we dial the peer if not connected? should we return an error?
         const semi_duplex = self.peers.getPtr(to) orelse {
             std.log.warn("Attempted to send RPC to unknown peer: {}", .{to});
             return false;
@@ -805,54 +981,79 @@ pub const Gossipsub = struct {
             std.log.warn("No outgoing stream to peer: {}", .{to});
             return false;
         };
-        std.debug.print("initiator: {}\n", .{initiator});
+
+        const has_control = self.control.contains(to);
+        const has_gossip = self.gossip.contains(to);
+        const needs_piggyback = has_control or has_gossip;
 
         var rpc_storage: ?rpc.RPC = null;
-        var rpc_msg: *rpc.RPC = rpc_msg_in;
+        var rpc_msg: *const rpc.RPC = rpc_msg_in;
 
-        if (self.control.fetchRemove(to)) |entry| {
+        if (needs_piggyback) {
             rpc_storage = rpc_msg_in.*;
             rpc_msg = &rpc_storage.?;
+        }
+
+        if (has_control) {
+            const entry = self.control.fetchRemove(to).?;
             sending_ctx.control = entry.value;
-            self.piggybackControl(to, rpc_msg, &sending_ctx.control) catch |err| {
+            self.piggybackControl(to, @constCast(rpc_msg), &sending_ctx.control.?) catch |err| {
                 std.log.warn("Failed to piggyback control message to peer {}: {}", .{ to, err });
-                self.control.put(self.allocator, to, sending_ctx.control) catch {
+                self.control.put(self.allocator, to, sending_ctx.control.?) catch {
                     std.log.err("Failed to restore control message for peer {}: {}", .{ to, err });
-                    return false;
                 };
                 return false;
             };
         }
 
-        if (self.gossip.fetchRemove(to)) |entry| {
-            if (rpc_storage == null) {
-                rpc_storage = rpc_msg_in.*;
-                rpc_msg = &rpc_storage.?;
-            }
-            sending_ctx.ihave = entry.value.toOwnedSlice(self.allocator) catch |err| {
+        if (has_gossip) {
+            const entry = self.gossip.fetchRemove(to).?;
+            var value = entry.value;
+            sending_ctx.ihave = value.toOwnedSlice(self.allocator) catch |err| {
                 std.log.err("Failed to own IHAVE message for peer {}: {}", .{ to, err });
                 self.gossip.put(self.allocator, to, entry.value) catch {
                     std.log.err("Failed to restore IHAVE message for peer {}: {}", .{ to, err });
                 };
                 return false;
             };
-            self.piggybackGossip(rpc_msg, sending_ctx.ihave.?) catch |err| {
+            piggybackGossip(@constCast(rpc_msg), sending_ctx.ihave.?) catch |err| {
                 std.log.warn("Failed to piggyback gossip message to peer {}: {}", .{ to, err });
-                self.gossip.put(self.allocator, to, sending_ctx.ihave) catch {
+                var ihave_list: std.ArrayListUnmanaged(?rpc.ControlIHave) = .empty;
+                defer ihave_list.deinit(self.allocator);
+                for (sending_ctx.ihave.?) |msg| {
+                    ihave_list.append(self.allocator, msg) catch continue;
+                }
+                self.gossip.put(self.allocator, to, ihave_list) catch {
                     std.log.err("Failed to restore gossip message for peer {}: {}", .{ to, err });
-                    return false;
                 };
                 return false;
             };
         }
 
-        const rpc_bytes = try rpc_msg.encode(self.allocator);
-        defer self.allocator.free(rpc_bytes);
-
-        initiator.stream.write(rpc_bytes, sending_ctx, SendingRPCContext.callback) catch |err| {
-            std.log.warn("Failed to write RPC message to stream for peer {}: {}", .{ to, err });
+        const rpc_bytes = rpc_msg.encode(self.allocator) catch |err| {
+            std.log.warn("Failed to encode RPC message for peer {}: {}", .{ to, err });
+            if (sending_ctx.control) |ctrl| {
+                self.control.put(self.allocator, to, ctrl) catch {
+                    std.log.warn("Failed to restore control message for peer {}: {}", .{ to, err });
+                };
+            }
+            if (sending_ctx.ihave) |ihave| {
+                var ihave_list: std.ArrayListUnmanaged(?rpc.ControlIHave) = .empty;
+                defer ihave_list.deinit(self.allocator);
+                for (ihave) |msg| {
+                    ihave_list.append(self.allocator, msg) catch {
+                        std.log.warn("Failed to restore IHAVE message for peer {}: {}", .{ to, err });
+                    };
+                }
+                self.gossip.put(self.allocator, to, ihave_list) catch {
+                    std.log.warn("Failed to restore gossip message for peer {}: {}", .{ to, err });
+                };
+            }
             return false;
         };
+        defer self.allocator.free(rpc_bytes);
+
+        initiator.stream.write(rpc_bytes, sending_ctx, SendingRPCContext.callback);
 
         if (rpc_msg.control) |ctrl| {
             if (ctrl.graft) |graft| {
@@ -885,7 +1086,7 @@ pub const Gossipsub = struct {
     }
 
     fn piggybackControl(self: *Self, to: PeerId, rpc_msg: *rpc.RPC, ctrl: *const rpc.ControlMessage) !void {
-        var graft_list: std.ArrayListUnmanaged(rpc.ControlGraft) = .empty;
+        var graft_list: std.ArrayListUnmanaged(?rpc.ControlGraft) = .empty;
         defer graft_list.deinit(self.allocator);
         if (ctrl.graft) |graft| {
             for (graft) |g_opt| {
@@ -899,7 +1100,7 @@ pub const Gossipsub = struct {
             }
         }
 
-        var prune_list: std.ArrayListUnmanaged(rpc.ControlPrune) = .empty;
+        var prune_list: std.ArrayListUnmanaged(?rpc.ControlPrune) = .empty;
         defer prune_list.deinit(self.allocator);
         if (ctrl.prune) |prune| {
             for (prune) |p_opt| {
@@ -930,7 +1131,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn piggybackGossip(rpc_msg: *rpc.RPC, ihave: []const rpc.ControlIHave) !void {
+    fn piggybackGossip(rpc_msg: *rpc.RPC, ihave: []const ?rpc.ControlIHave) !void {
         if (rpc_msg.control == null) {
             rpc_msg.control = .{};
         }
@@ -1340,7 +1541,9 @@ pub const Gossipsub = struct {
             const semi_duplex = self.peers.get(peer_id.*) orelse continue;
             if (semi_duplex.initiator == null) continue;
 
-            if (std.mem.containsAtLeastScalar(ProtocolId, self.protocols, 1, semi_duplex.initiator.?.stream.negotiated_protocol.?) and !filter(filter_ctx, peer_id.*)) {
+            const negotiated_protocol = semi_duplex.initiator.?.stream.negotiated_protocol orelse continue;
+
+            if (self.supportsProtocol(negotiated_protocol) and !filter(filter_ctx, peer_id.*)) {
                 try candidate_peers.append(self.allocator, peer_id.*);
             }
         }
@@ -1360,6 +1563,15 @@ pub const Gossipsub = struct {
         return candidate_peers;
     }
 
+    fn supportsProtocol(self: *Self, protocol: []const u8) bool {
+        for (self.protocols) |supported_protocol| {
+            if (std.mem.eql(u8, protocol, supported_protocol)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn sendGraft(self: *Self, to: PeerId, topic: []const u8) void {
         var graft_msg = try self.allocator.alloc(rpc.ControlGraft, 1) catch |err| {
             std.log.warn("Failed to allocate GRAFT message for peer {}: {}", .{ to, err });
@@ -1370,7 +1582,7 @@ pub const Gossipsub = struct {
             .topic_i_d = topic,
         };
 
-        var rpc_msg: rpc.RPC = .{ .control = .{ .graft = graft_msg } };
+        const rpc_msg: rpc.RPC = .{ .control = .{ .graft = graft_msg } };
         _ = self.sendRPC(to, &rpc_msg);
         // TODO: free rpc_msg
     }
@@ -1385,7 +1597,7 @@ pub const Gossipsub = struct {
             .topic_i_d = topic,
         };
 
-        var rpc_msg: rpc.RPC = .{ .control = .{ .prune = prune_msg } };
+        const rpc_msg: rpc.RPC = .{ .control = .{ .prune = prune_msg } };
         _ = self.sendRPC(to, &rpc_msg);
         // TODO: free rpc_msg
     }
@@ -1435,15 +1647,6 @@ pub const Gossipsub = struct {
             _ = self.fanout_last_pub.remove(topic);
 
             if (mesh_peers.count() < self.opts.D) {
-                const FilterCtx = struct {
-                    mesh_peers: *std.AutoHashMapUnmanaged(PeerId, void),
-
-                    fn filter(ctx: ?*anyopaque, peer: PeerId) bool {
-                        const filter_ctx: *@This() = @ptrCast(@alignCast(ctx.?));
-                        return filter_ctx.mesh_peers.contains(peer);
-                    }
-                };
-
                 const filter_ctx: FilterCtx = .{
                     .mesh_peers = &mesh_peers,
                 };
