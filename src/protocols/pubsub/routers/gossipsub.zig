@@ -547,11 +547,11 @@ pub const Gossipsub = struct {
             }
 
             const topic_id = sub.getTopicid();
-            const subscribe = sub.getSubscribe();
+            const subscribe_msg = sub.getSubscribe();
 
-            try self.handleSubscription(rpc_message.from, topic_id, subscribe);
+            try self.handleSubscription(rpc_message.from, topic_id, subscribe_msg);
 
-            try subscriptions.append(self.allocator, .{ .topic = topic_id, .subscribe = subscribe });
+            try subscriptions.append(self.allocator, .{ .topic = topic_id, .subscribe = subscribe_msg });
         }
 
         self.event_emitter.emit(.{ .subscription_changed = .{
@@ -797,6 +797,50 @@ pub const Gossipsub = struct {
             return;
         };
         callback(callback_ctx, receipents_slice);
+    }
+
+    pub fn subscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+        if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
+            self.doSubscribe(topic, callback_ctx, callback);
+        } else {
+            const message = io_loop.IOMessage{
+                .action = .{ .pubsub_subscribe = .{
+                    .pubsub = self.any(),
+                    .topic = topic,
+                    .callback_ctx = callback_ctx,
+                    .callback = callback,
+                } },
+            };
+            self.swarm.transport.io_event_loop.queueMessage(message) catch unreachable;
+        }
+    }
+
+    fn doSubscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+        if (!self.subscriptions.contains(topic)) {
+            self.subscriptions.put(self.allocator, topic, {}) catch |err| {
+                std.log.warn("Failed to add subscription for topic {s}: {}", .{ topic, err });
+                callback(callback_ctx, err);
+                return;
+            };
+
+            var peers_iter = self.peers.iterator();
+            while (peers_iter.next()) |entry| {
+                const peer_id = entry.key_ptr.*;
+                self.sendSubscriptions(peer_id, &.{topic}, true) catch |err| {
+                    std.log.warn("Failed to send subscription for topic {s} to peer {}: {}", .{ topic, peer_id, err });
+                    callback(callback_ctx, err);
+                    return;
+                };
+            }
+
+            self.join(topic) catch |err| {
+                std.log.warn("Failed to join mesh for topic {s}: {}", .{ topic, err });
+                callback(callback_ctx, err);
+                return;
+            };
+        }
+
+        callback(callback_ctx, {});
     }
 
     fn selectPeersToPublish(self: *Self, topic: []const u8) !SelectPeersResult {
@@ -1138,8 +1182,8 @@ pub const Gossipsub = struct {
         rpc_msg.control.?.ihave = ihave;
     }
 
-    fn handleSubscription(self: *Self, from: PeerId, topic: []const u8, subscribe: bool) !void {
-        if (subscribe) {
+    fn handleSubscription(self: *Self, from: PeerId, topic: []const u8, subscribe_msg: bool) !void {
+        if (subscribe_msg) {
             if (!self.topics.contains(topic)) {
                 const copied_topic_id = try self.allocator.dupe(u8, topic);
                 errdefer self.allocator.free(copied_topic_id);
@@ -1573,7 +1617,7 @@ pub const Gossipsub = struct {
     }
 
     fn sendGraft(self: *Self, to: PeerId, topic: []const u8) void {
-        var graft_msg = try self.allocator.alloc(rpc.ControlGraft, 1) catch |err| {
+        var graft_msg = self.allocator.alloc(?rpc.ControlGraft, 1) catch |err| {
             std.log.warn("Failed to allocate GRAFT message for peer {}: {}", .{ to, err });
             return;
         };
@@ -1602,6 +1646,21 @@ pub const Gossipsub = struct {
         // TODO: free rpc_msg
     }
 
+    fn sendSubscriptions(self: *Self, to: PeerId, topics: []const []const u8, subscribe_msg: bool) !void {
+        var sub_opts: std.ArrayListUnmanaged(?rpc.RPC.SubOpts) = .empty;
+
+        for (topics) |topic| {
+            const sub: rpc.RPC.SubOpts = .{
+                .topicid = topic,
+                .subscribe = subscribe_msg,
+            };
+            try sub_opts.append(self.allocator, sub);
+        }
+
+        const sub_opt_slice = try sub_opts.toOwnedSlice(self.allocator);
+        const rpc_msg: rpc.RPC = .{ .subscriptions = sub_opt_slice };
+        _ = self.sendRPC(to, &rpc_msg);
+    }
     // fn flush(self: *Self) void {
     //     // send gossip first, which will also piggyback control
     //     while (self.gossip.count() > 0) {
@@ -1647,10 +1706,10 @@ pub const Gossipsub = struct {
             _ = self.fanout_last_pub.remove(topic);
 
             if (mesh_peers.count() < self.opts.D) {
-                const filter_ctx: FilterCtx = .{
+                var filter_ctx: FilterCtx = .{
                     .mesh_peers = &mesh_peers,
                 };
-                const more_peers = try self.getRandomGossipPeers(topic, self.opts.D - mesh_peers.count(), &filter_ctx, FilterCtx.filter);
+                var more_peers = try self.getRandomGossipPeers(topic, self.opts.D - mesh_peers.count(), &filter_ctx, FilterCtx.filter);
                 defer more_peers.deinit(self.allocator);
                 for (more_peers.items) |p| {
                     // This should not fail as we are just adding new peers.
@@ -1658,7 +1717,7 @@ pub const Gossipsub = struct {
                 }
             }
         } else {
-            const new_peers = try self.getRandomGossipPeers(topic, self.opts.D, null, struct {
+            var new_peers = try self.getRandomGossipPeers(topic, self.opts.D, null, struct {
                 fn filter(_: ?*anyopaque, _: PeerId) bool {
                     return false;
                 }
@@ -1723,11 +1782,17 @@ pub const Gossipsub = struct {
         self.removePeer(peer, callback_ctx, callback);
     }
 
+    fn vtableSubscribeFn(instance: *anyopaque, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        self.subscribe(topic, callback_ctx, callback);
+    }
+
     // --- Static VTable Instance ---
     const vtable_instance = pubsub.PubSubVTable{
         .handleRPCFn = vtableHandleRPCFn,
         .addPeerFn = vtableAddPeerFn,
         .removePeerFn = vtableRemovePeerFn,
+        .subscribeFn = vtableSubscribeFn,
     };
 
     // --- any() method ---

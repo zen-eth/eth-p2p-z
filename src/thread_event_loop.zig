@@ -126,6 +126,12 @@ pub const IOAction = union(enum) {
         callback_ctx: ?*anyopaque,
         callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void,
     },
+    pubsub_subscribe: struct {
+        pubsub: pubsub.PubSub,
+        topic: []const u8,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void,
+    },
 };
 
 /// Represents a queued message for I/O operations in the event loop.
@@ -511,6 +517,10 @@ pub const ThreadEventLoop = struct {
                 .pubsub_remove_peer => |action_data| {
                     const ps = action_data.pubsub;
                     ps.removePeer(action_data.peer, action_data.callback_ctx, action_data.callback);
+                },
+                .pubsub_subscribe => |action_data| {
+                    const ps = action_data.pubsub;
+                    ps.subscribe(action_data.topic, action_data.callback_ctx, action_data.callback);
                 },
             }
             self.allocator.destroy(m);

@@ -165,6 +165,7 @@ pub const PubSubVTable = struct {
     handleRPCFn: *const fn (instance: *anyopaque, rpc_message: *const RPC) anyerror!void,
     addPeerFn: *const fn (self: *anyopaque, peer: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
     removePeerFn: *const fn (self: *anyopaque, peer: PeerId, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
+    subscribeFn: *const fn (self: *anyopaque, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
 };
 
 /// This is a generic PubSub interface that uses the VTable pattern to provide a type-erased
@@ -188,6 +189,10 @@ pub const PubSub = struct {
 
     pub fn removePeer(self: Self, peer: PeerId, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
         self.vtable.removePeerFn(self.instance, peer, callback_ctx, callback);
+    }
+
+    pub fn subscribe(self: Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+        self.vtable.subscribeFn(self.instance, topic, callback_ctx, callback);
     }
 };
 
