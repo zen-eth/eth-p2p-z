@@ -356,6 +356,8 @@ pub const Gossipsub = struct {
 
     seq_no_pool: std.heap.MemoryPool([8]u8),
 
+    topic_pool: std.StringHashMapUnmanaged(usize),
+
     protocols: []const ProtocolId = &.{ v1_id, v1_1_id },
 
     const Options = struct {
@@ -479,6 +481,7 @@ pub const Gossipsub = struct {
             .opts = opts,
             .counter = std.atomic.Value(u64).init(0),
             .seq_no_pool = seq_no_pool,
+            .topic_pool = std.StringHashMapUnmanaged(usize).empty,
         };
     }
 
@@ -514,6 +517,11 @@ pub const Gossipsub = struct {
         self.seen_cache.deinit();
         self.mcache.deinit();
         self.seq_no_pool.deinit();
+        var topic_pool_iter = self.topic_pool.iterator();
+        while (topic_pool_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.topic_pool.deinit(self.allocator);
     }
 
     pub fn acceptFrom(self: *Self, peer_id: PeerId) bool {
@@ -816,9 +824,15 @@ pub const Gossipsub = struct {
     }
 
     fn doSubscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
-        if (!self.subscriptions.contains(topic)) {
-            self.subscriptions.put(self.allocator, topic, {}) catch |err| {
+        const interned_topic = self.internTopic(topic) catch |err| {
+            callback(callback_ctx, err);
+            return;
+        };
+
+        if (!self.subscriptions.contains(interned_topic)) {
+            self.subscriptions.put(self.allocator, interned_topic, {}) catch |err| {
                 std.log.warn("Failed to add subscription for topic {s}: {}", .{ topic, err });
+                self.releaseTopic(interned_topic);
                 callback(callback_ctx, err);
                 return;
             };
@@ -826,19 +840,39 @@ pub const Gossipsub = struct {
             var peers_iter = self.peers.iterator();
             while (peers_iter.next()) |entry| {
                 const peer_id = entry.key_ptr.*;
-                self.sendSubscriptions(peer_id, &.{topic}, true) catch |err| {
+                self.sendSubscriptions(peer_id, &.{interned_topic}, true) catch |err| {
                     std.log.warn("Failed to send subscription for topic {s} to peer {}: {}", .{ topic, peer_id, err });
                     callback(callback_ctx, err);
-                    return;
+                    continue;
                 };
             }
-
-            self.join(topic) catch |err| {
-                std.log.warn("Failed to join mesh for topic {s}: {}", .{ topic, err });
-                callback(callback_ctx, err);
-                return;
-            };
         }
+
+        self.join(interned_topic) catch |err| {
+            std.log.warn("Failed to join mesh for topic {s}: {}", .{ interned_topic, err });
+            callback(callback_ctx, err);
+            return;
+        };
+
+        callback(callback_ctx, {});
+    }
+
+    fn doUnsubscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+        if (self.subscriptions.fetchRemove(topic)) |removed| {
+            const interned_topic = removed.key;
+            var peers_iter = self.peers.iterator();
+            while (peers_iter.next()) |entry| {
+                const peer_id = entry.key_ptr.*;
+                self.sendSubscriptions(peer_id, &.{interned_topic}, false) catch |err| {
+                    std.log.warn("Failed to send unsubscription for topic {s} to peer {}: {}", .{ topic, peer_id, err });
+                    callback(callback_ctx, err);
+                    continue;
+                };
+            }
+            self.releaseTopic(interned_topic);
+        }
+
+        self.leave(topic);
 
         callback(callback_ctx, {});
     }
@@ -1698,18 +1732,20 @@ pub const Gossipsub = struct {
         if (self.mesh.contains(topic)) {
             return;
         }
+        const interned_topic = try self.internTopic(topic);
 
         var mesh_peers: std.AutoHashMapUnmanaged(PeerId, void) = undefined;
 
-        if (self.fanout.fetchRemove(topic)) |entry| {
+        if (self.fanout.fetchRemove(interned_topic)) |entry| {
+            self.releaseTopic(entry.key);
             mesh_peers = entry.value;
-            _ = self.fanout_last_pub.remove(topic);
+            _ = self.fanout_last_pub.remove(interned_topic);
 
             if (mesh_peers.count() < self.opts.D) {
                 var filter_ctx: FilterCtx = .{
                     .mesh_peers = &mesh_peers,
                 };
-                var more_peers = try self.getRandomGossipPeers(topic, self.opts.D - mesh_peers.count(), &filter_ctx, FilterCtx.filter);
+                var more_peers = try self.getRandomGossipPeers(interned_topic, self.opts.D - mesh_peers.count(), &filter_ctx, FilterCtx.filter);
                 defer more_peers.deinit(self.allocator);
                 for (more_peers.items) |p| {
                     // This should not fail as we are just adding new peers.
@@ -1717,7 +1753,7 @@ pub const Gossipsub = struct {
                 }
             }
         } else {
-            var new_peers = try self.getRandomGossipPeers(topic, self.opts.D, null, struct {
+            var new_peers = try self.getRandomGossipPeers(interned_topic, self.opts.D, null, struct {
                 fn filter(_: ?*anyopaque, _: PeerId) bool {
                     return false;
                 }
@@ -1731,11 +1767,11 @@ pub const Gossipsub = struct {
         }
 
         // Take ownership of mesh_peers and topic
-        try self.mesh.put(self.allocator, topic, mesh_peers);
+        try self.mesh.put(self.allocator, interned_topic, mesh_peers);
         var it = mesh_peers.keyIterator();
         while (it.next()) |peer_id| {
             // TODO: self.tracer.Graft(p, topic)
-            self.sendGraft(peer_id.*, topic);
+            self.sendGraft(peer_id.*, interned_topic);
             // TODO: self.tagPeer(p, topic)
         }
     }
@@ -1745,9 +1781,9 @@ pub const Gossipsub = struct {
             return;
         };
 
-        // TODO: when to free topic? since it is used in the prune message
-        defer self.allocator.free(removed_entry.key);
+        const interned_topic = removed_entry.key;
         defer removed_entry.value.deinit(self.allocator);
+        defer self.releaseTopic(interned_topic);
 
         // TODO: self.tracer.Leave(topic)
 
@@ -1765,6 +1801,48 @@ pub const Gossipsub = struct {
         const buffer = try self.seq_no_pool.create();
         std.mem.writeInt(u64, buffer, counter, .big);
         return buffer;
+    }
+
+    /// Gets or creates an interned version of the topic, incrementing its reference count.
+    ///
+    /// This function will copy the topic string into the interning pool if needed.
+    /// The caller retains ownership of the input parameter.
+    /// The returned slice points to memory in the interning pool, whose lifetime is managed by reference counting.
+    ///
+    /// Example:
+    /// ```zig
+    /// const my_topic = "my-topic"; // String literal or stack slice
+    /// const interned = try self.internTopic(my_topic);
+    /// // my_topic ownership remains with caller, can continue to use or free it
+    /// ```
+    ///
+    /// Note: Must be called from the IO loop thread
+    fn internTopic(self: *Self, topic: []const u8) ![]const u8 {
+        const entry = try self.topic_pool.getOrPut(self.allocator, topic);
+        if (!entry.found_existing) {
+            // New topic, allocate memory and set reference count to 1
+            entry.key_ptr.* = try self.allocator.dupe(u8, topic);
+            entry.value_ptr.* = 1;
+        } else {
+            // Already exists, increment reference count
+            entry.value_ptr.* += 1;
+        }
+
+        return entry.key_ptr.*;
+    }
+
+    /// Decrements the reference count for a topic.
+    /// When the reference count reaches zero, the topic memory is automatically freed.
+    ///
+    /// Note: Must be called from the IO loop thread
+    fn releaseTopic(self: *Self, topic: []const u8) void {
+        if (self.topic_pool.getPtr(topic)) |count_ptr| {
+            count_ptr.* -= 1;
+            if (count_ptr.* == 0) {
+                const removed = self.topic_pool.fetchRemove(topic).?;
+                self.allocator.free(removed.key);
+            }
+        }
     }
 
     fn vtableHandleRPCFn(instance: *anyopaque, rpc_msg: *const pubsub.RPC) anyerror!void {
