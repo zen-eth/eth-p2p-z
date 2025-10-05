@@ -244,19 +244,24 @@ pub const PubSubPeerResponder = struct {
                 return;
             }
 
-            const copied_message = try self.allocator.alloc(u8, msg_len);
-            defer self.allocator.free(copied_message);
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const arena_allocator = arena.allocator();
+
+            const copied_message = try arena_allocator.alloc(u8, msg_len);
             self.received_buffer.discard(msg_len_size);
             const bytes_read = self.received_buffer.read(copied_message);
             std.debug.assert(bytes_read == msg_len);
 
-            const rpc_reader = try rpc.RPCReader.init(self.allocator, copied_message);
+            const rpc_reader = try rpc.RPCReader.init(arena_allocator, copied_message);
             var rpc_message: pubsub.RPC = .{
                 .rpc_reader = rpc_reader,
                 .from = stream.conn.security_session.?.remote_id,
             };
-            defer rpc_message.deinit();
-            try self.pubsub.handleRPC(&rpc_message);
+            // we expect `handleRPC` to process synchronously and not hold onto the `rpc_message`,
+            // if it does, it must copy the data out of it.
+            try self.pubsub.handleRPC(arena_allocator, &rpc_message);
+            // The `copied_message` and `rpc_reader` will be freed when the arena is deinitialized.
         }
     }
 

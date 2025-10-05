@@ -85,6 +85,7 @@ pub fn EventEmitter(comptime T: type) type {
         }
 
         /// Emit an event to all listeners registered for its tag
+        /// `event` ownership is not transferred; it need to copy if needed asynchronously.
         pub fn emit(self: *Self, event: T) void {
             const event_tag = std.meta.activeTag(event);
             if (self.listeners.getPtr(event_tag)) |list| {

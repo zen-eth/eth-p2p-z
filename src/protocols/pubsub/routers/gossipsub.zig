@@ -48,11 +48,11 @@ pub const AnyDataTransform = struct {
 
     const Self = @This();
 
-    pub fn inboundTransform(self: Self, topic: []const u8, data: []const u8) anyerror![]const u8 {
+    pub fn inboundTransform(self: Self, topic: []const u8, data: []const u8) ![]const u8 {
         return self.vtable.inboundTransformFn(self.instance, topic, data);
     }
 
-    pub fn outboundTransform(self: Self, topic: []const u8, data: []const u8) anyerror![]const u8 {
+    pub fn outboundTransform(self: Self, topic: []const u8, data: []const u8) ![]const u8 {
         return self.vtable.outboundTransformFn(self.instance, topic, data);
     }
 };
@@ -326,8 +326,10 @@ pub const Gossipsub = struct {
 
     allocator: Allocator,
 
+    // map of topics peers are interested in
     topics: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)),
 
+    // set of topics we are subscribed to
     subscriptions: std.StringHashMapUnmanaged(void),
 
     mesh: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)),
@@ -490,7 +492,7 @@ pub const Gossipsub = struct {
 
         var topic_iter = self.topics.iterator();
         while (topic_iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
+            self.unrefTopic(entry.key_ptr.*);
             entry.value_ptr.deinit(self.allocator);
         }
         self.topics.deinit(self.allocator);
@@ -531,35 +533,25 @@ pub const Gossipsub = struct {
         return true;
     }
 
-    pub fn handleRPC(self: *Self, rpc_message: *const pubsub.RPC) !void {
+    pub fn handleRPC(self: *Self, arena: Allocator, rpc_message: *const pubsub.RPC) !void {
         if (!self.acceptFrom(rpc_message.from)) {
             std.log.warn("Rejected RPC message from peer: {}", .{rpc_message.from});
             return;
         }
 
-        const subs = try rpc_message.rpc_reader.getSubscriptions(self.allocator);
-        defer self.allocator.free(subs);
+        const subs = try rpc_message.rpc_reader.getSubscriptions(arena);
 
         //TODO:Implement subscription filtering
 
         var subscriptions = std.ArrayListUnmanaged(Subscription).empty;
-        defer subscriptions.deinit(self.allocator);
-        var processed_subs: usize = 0;
-        errdefer {
-            for (subs[processed_subs..]) |*rem| rem.deinit();
-        }
-        for (subs) |sub| {
-            defer {
-                sub.deinit();
-                processed_subs += 1;
-            }
 
+        for (subs) |sub| {
             const topic_id = sub.getTopicid();
             const subscribe_msg = sub.getSubscribe();
 
-            try self.handleSubscription(rpc_message.from, topic_id, subscribe_msg);
+            try self.handleSubscription(&rpc_message.from, topic_id, subscribe_msg);
 
-            try subscriptions.append(self.allocator, .{ .topic = topic_id, .subscribe = subscribe_msg });
+            try subscriptions.append(arena, .{ .topic = topic_id, .subscribe = subscribe_msg });
         }
 
         self.event_emitter.emit(.{ .subscription_changed = .{
@@ -568,24 +560,14 @@ pub const Gossipsub = struct {
         } });
 
         // Handle publish
-        const msgs = try rpc_message.rpc_reader.getPublish(self.allocator);
-        defer self.allocator.free(msgs);
+        const msgs = try rpc_message.rpc_reader.getPublish(arena);
 
         if (self.opts.max_messages_per_rpc) |max| if (msgs.len > max) {
             std.log.warn("Received {} messages, exceeding limit of {}", .{ msgs.len, max });
             return;
         };
 
-        var processed_msgs: usize = 0;
-        errdefer {
-            for (msgs[processed_msgs..]) |*rem| rem.deinit();
-        }
         for (msgs) |*msg| {
-            defer {
-                msg.deinit();
-                processed_msgs += 1;
-            }
-
             try self.handleMessage(rpc_message.from, msg);
         }
 
@@ -824,15 +806,14 @@ pub const Gossipsub = struct {
     }
 
     fn doSubscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
-        const interned_topic = self.internTopic(topic) catch |err| {
-            callback(callback_ctx, err);
-            return;
-        };
-
-        if (!self.subscriptions.contains(interned_topic)) {
+        if (!self.subscriptions.contains(topic)) {
+            const interned_topic = self.refTopic(topic) catch |err| {
+                callback(callback_ctx, err);
+                return;
+            };
             self.subscriptions.put(self.allocator, interned_topic, {}) catch |err| {
                 std.log.warn("Failed to add subscription for topic {s}: {}", .{ topic, err });
-                self.releaseTopic(interned_topic);
+                self.unrefTopic(interned_topic);
                 callback(callback_ctx, err);
                 return;
             };
@@ -848,8 +829,8 @@ pub const Gossipsub = struct {
             }
         }
 
-        self.join(interned_topic) catch |err| {
-            std.log.warn("Failed to join mesh for topic {s}: {}", .{ interned_topic, err });
+        self.join(topic) catch |err| {
+            std.log.warn("Failed to join mesh for topic {s}: {}", .{ topic, err });
             callback(callback_ctx, err);
             return;
         };
@@ -869,7 +850,7 @@ pub const Gossipsub = struct {
                     continue;
                 };
             }
-            self.releaseTopic(interned_topic);
+            self.unrefTopic(interned_topic);
         }
 
         self.leave(topic);
@@ -1216,16 +1197,17 @@ pub const Gossipsub = struct {
         rpc_msg.control.?.ihave = ihave;
     }
 
-    fn handleSubscription(self: *Self, from: PeerId, topic: []const u8, subscribe_msg: bool) !void {
-        if (subscribe_msg) {
+    fn handleSubscription(self: *Self, from: *const PeerId, topic: []const u8, is_subscribe: bool) !void {
+        if (is_subscribe) {
             if (!self.topics.contains(topic)) {
-                const copied_topic_id = try self.allocator.dupe(u8, topic);
-                errdefer self.allocator.free(copied_topic_id);
-                const tmap = std.AutoHashMapUnmanaged(PeerId, void).empty;
+                const copied_topic_id = try self.refTopic(topic);
+                errdefer self.unrefTopic(copied_topic_id);
+                var tmap = std.AutoHashMapUnmanaged(PeerId, void).empty;
+                errdefer tmap.deinit(self.allocator);
                 try self.topics.put(self.allocator, copied_topic_id, tmap);
             }
 
-            const pgop = try self.topics.getPtr(topic).?.getOrPut(self.allocator, from);
+            const pgop = try self.topics.getPtr(topic).?.getOrPut(self.allocator, from.*);
             if (!pgop.found_existing) {
                 pgop.value_ptr.* = {};
             }
@@ -1234,7 +1216,7 @@ pub const Gossipsub = struct {
                 return;
             } else {
                 if (self.topics.getPtr(topic)) |peer_set| {
-                    _ = peer_set.remove(from);
+                    _ = peer_set.remove(from.*);
                 }
             }
         }
@@ -1732,42 +1714,52 @@ pub const Gossipsub = struct {
         if (self.mesh.contains(topic)) {
             return;
         }
-        const interned_topic = try self.internTopic(topic);
 
-        var mesh_peers: std.AutoHashMapUnmanaged(PeerId, void) = undefined;
+        var mesh_peers: std.AutoHashMapUnmanaged(PeerId, void) = .empty;
+        errdefer mesh_peers.deinit(self.allocator);
 
-        if (self.fanout.fetchRemove(interned_topic)) |entry| {
-            self.releaseTopic(entry.key);
-            mesh_peers = entry.value;
-            _ = self.fanout_last_pub.remove(interned_topic);
-
+        if (self.fanout.contains(topic)) {
+            var fanout_peers = self.fanout.get(topic).?;
+            var fanout_peers_iter = fanout_peers.keyIterator();
+            while (fanout_peers_iter.next()) |peer_id| {
+                try mesh_peers.put(self.allocator, peer_id.*, {});
+            }
             if (mesh_peers.count() < self.opts.D) {
                 var filter_ctx: FilterCtx = .{
                     .mesh_peers = &mesh_peers,
                 };
-                var more_peers = try self.getRandomGossipPeers(interned_topic, self.opts.D - mesh_peers.count(), &filter_ctx, FilterCtx.filter);
+                var more_peers = try self.getRandomGossipPeers(topic, self.opts.D - mesh_peers.count(), &filter_ctx, FilterCtx.filter);
                 defer more_peers.deinit(self.allocator);
                 for (more_peers.items) |p| {
                     // This should not fail as we are just adding new peers.
                     try mesh_peers.put(self.allocator, p, {});
                 }
             }
+            _ = self.fanout.remove(topic);
+            self.unrefTopic(topic);
+            fanout_peers.deinit(self.allocator);
+            _ = self.fanout_last_pub.remove(topic);
+            self.unrefTopic(topic);
         } else {
-            var new_peers = try self.getRandomGossipPeers(interned_topic, self.opts.D, null, struct {
+            var new_peers = try self.getRandomGossipPeers(topic, self.opts.D, null, struct {
                 fn filter(_: ?*anyopaque, _: PeerId) bool {
                     return false;
                 }
             }.filter);
             defer new_peers.deinit(self.allocator);
 
-            mesh_peers = std.AutoHashMapUnmanaged(PeerId, void).empty;
             for (new_peers.items) |p| {
                 try mesh_peers.put(self.allocator, p, {});
             }
         }
 
-        // Take ownership of mesh_peers and topic
-        try self.mesh.put(self.allocator, interned_topic, mesh_peers);
+        const interned_topic = try self.refTopic(topic);
+
+        self.mesh.put(self.allocator, interned_topic, mesh_peers) catch |err| {
+            self.unrefTopic(interned_topic);
+            return err;
+        };
+
         var it = mesh_peers.keyIterator();
         while (it.next()) |peer_id| {
             // TODO: self.tracer.Graft(p, topic)
@@ -1783,7 +1775,7 @@ pub const Gossipsub = struct {
 
         const interned_topic = removed_entry.key;
         defer removed_entry.value.deinit(self.allocator);
-        defer self.releaseTopic(interned_topic);
+        defer self.unrefTopic(interned_topic);
 
         // TODO: self.tracer.Leave(topic)
 
@@ -1791,7 +1783,7 @@ pub const Gossipsub = struct {
         var it = peer_set.keyIterator();
         while (it.next()) |peer_id| {
             // TODO: self.tracer.Prune(p, topic)
-            self.sendPrune(peer_id.*, topic);
+            self.sendPrune(peer_id.*, interned_topic);
             // TODO: self.tagPeer(p, topic)
         }
     }
@@ -1817,7 +1809,7 @@ pub const Gossipsub = struct {
     /// ```
     ///
     /// Note: Must be called from the IO loop thread
-    fn internTopic(self: *Self, topic: []const u8) ![]const u8 {
+    fn refTopic(self: *Self, topic: []const u8) ![]const u8 {
         const entry = try self.topic_pool.getOrPut(self.allocator, topic);
         if (!entry.found_existing) {
             // New topic, allocate memory and set reference count to 1
@@ -1835,7 +1827,7 @@ pub const Gossipsub = struct {
     /// When the reference count reaches zero, the topic memory is automatically freed.
     ///
     /// Note: Must be called from the IO loop thread
-    fn releaseTopic(self: *Self, topic: []const u8) void {
+    fn unrefTopic(self: *Self, topic: []const u8) void {
         if (self.topic_pool.getPtr(topic)) |count_ptr| {
             count_ptr.* -= 1;
             if (count_ptr.* == 0) {
@@ -1845,9 +1837,9 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn vtableHandleRPCFn(instance: *anyopaque, rpc_msg: *const pubsub.RPC) anyerror!void {
+    fn vtableHandleRPCFn(instance: *anyopaque, arena: Allocator, rpc_msg: *const pubsub.RPC) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
-        return self.handleRPC(rpc_msg);
+        return self.handleRPC(arena, rpc_msg);
     }
 
     fn vtableAddPeerFn(instance: *anyopaque, peer: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {

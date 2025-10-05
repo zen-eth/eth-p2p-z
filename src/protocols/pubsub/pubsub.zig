@@ -162,7 +162,7 @@ pub const RPC = struct {
 };
 
 pub const PubSubVTable = struct {
-    handleRPCFn: *const fn (instance: *anyopaque, rpc_message: *const RPC) anyerror!void,
+    handleRPCFn: *const fn (instance: *anyopaque, arena: std.mem.Allocator, rpc_message: *const RPC) anyerror!void,
     addPeerFn: *const fn (self: *anyopaque, peer: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
     removePeerFn: *const fn (self: *anyopaque, peer: PeerId, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
     subscribeFn: *const fn (self: *anyopaque, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
@@ -179,8 +179,8 @@ pub const PubSub = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn handleRPC(self: Self, rpc_message: *const RPC) anyerror!void {
-        return self.vtable.handleRPCFn(self.instance, rpc_message);
+    pub fn handleRPC(self: Self, arena: std.mem.Allocator, rpc_message: *const RPC) anyerror!void {
+        return self.vtable.handleRPCFn(self.instance, arena, rpc_message);
     }
 
     pub fn addPeer(self: Self, peer: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
