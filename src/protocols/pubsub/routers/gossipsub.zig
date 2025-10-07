@@ -147,14 +147,13 @@ pub const Subscription = struct {
     subscribe: bool,
 };
 
-pub const Message = struct {
+pub const AppMessage = struct {
     from: ?PeerId,
     data: []const u8,
     seqno: ?u64,
     topic_hash: []const u8,
     signature: ?[]const u8,
     key: ?keys.PublicKey,
-    validated: bool,
 };
 
 pub const MessageStatus = enum {
@@ -166,7 +165,7 @@ pub const MessageStatus = enum {
 pub const MessageValidationResult = union(enum) {
     valid: struct {
         message_id: []const u8,
-        message: Message,
+        message: AppMessage,
     },
     invalid: struct {
         reason: RejectReason,
@@ -568,7 +567,7 @@ pub const Gossipsub = struct {
         };
 
         for (msgs) |*msg| {
-            try self.handleMessage(rpc_message.from, msg);
+            try self.handleMessage(arena, &rpc_message.from, msg);
         }
 
         const control = try rpc_message.rpc_reader.getControl(self.allocator);
@@ -1222,9 +1221,115 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn validateReceivedMessage(self: *Self, msg: *const rpc.MessageReader, propagation_source: PeerId) !MessageValidationResult {
-        var m: Message = undefined;
-        validateMessage(self.allocator, msg, self.opts.global_signature_policy, &m) catch |err| {
+    pub fn validateAndToAppMessage(self: *Self, arena: Allocator, msg: *const rpc.MessageReader, policy: SignaturePolicy, app_msg: *AppMessage) ValidateError!void {
+        switch (policy) {
+            SignaturePolicy.StrictNoSign => {
+                if (msg.getSignature().len != 0) {
+                    return error.SignaturePresent;
+                }
+                if (msg.getSeqno().len != 0) {
+                    return error.SeqnoPresent;
+                }
+                if (msg.getFrom().len != 0) {
+                    return error.FromPresent;
+                }
+
+                app_msg.* = .{
+                    .from = null,
+                    .data = msg.getData(),
+                    .seqno = null,
+                    .topic_hash = msg.getTopic(),
+                    .signature = null,
+                    .key = null,
+                };
+
+                return;
+            },
+            SignaturePolicy.StrictSign => {
+                if (msg.getSeqno().len == 0) {
+                    return error.InvalidSeqno;
+                }
+                if (msg.getSeqno().len != 8) {
+                    return error.InvalidSeqno;
+                }
+                if (msg.getSignature().len == 0) {
+                    return error.InvalidSignature;
+                }
+                if (msg.getFrom().len == 0) {
+                    return error.InvalidPeerId;
+                }
+                const from_peer_id = PeerId.fromBytes(msg.getFrom()) catch {
+                    return error.InvalidPeerId;
+                };
+
+                var pubkey_bytes_buf: [128]u8 = undefined; // this is enough space for a PeerId
+                const pubkey_bytes = if (msg._key) |k| k else (from_peer_id.toBytes(&pubkey_bytes_buf) catch {
+                    return error.InvalidPeerId;
+                })[2..];
+                // This actually no allocates, just use the slice directly
+                const proto_pubkey_reader = keys.PublicKeyReader.init(self.allocator, pubkey_bytes) catch {
+                    return error.InvalidPeerId;
+                };
+
+                // This will be used in app_msg, so we need to allocate as pubkey_bytes_buf is stack memory
+                var proto_pubkey = keys.PublicKey{
+                    .type = proto_pubkey_reader.getType(),
+                    .data = try self.allocator.dupe(u8, proto_pubkey_reader.getData()),
+                };
+                errdefer self.allocator.free(proto_pubkey.data.?);
+
+                const evp_key = tls.reconstructEvpKeyFromPublicKey(&proto_pubkey) catch {
+                    return error.InvalidPubkey;
+                };
+                defer ssl.EVP_PKEY_free(evp_key);
+
+                if (msg._key != null) {
+                    const key_peer_id = PeerId.fromPublicKey(self.allocator, &proto_pubkey) catch {
+                        return error.InvalidPubkey;
+                    };
+
+                    if (!from_peer_id.eql(&key_peer_id)) {
+                        return error.InvalidPeerId;
+                    }
+                }
+
+                const data_to_sign: rpc.Message = .{
+                    .seqno = msg._seqno,
+                    .data = msg._data,
+                    .from = msg._from,
+                    .topic = msg._topic,
+                    .signature = null,
+                    .key = null,
+                };
+                const encoded_data = data_to_sign.encode(arena) catch {
+                    return error.InvalidSignature;
+                };
+                const prefixed_data = std.mem.concat(arena, u8, &.{ sign_prefix, encoded_data }) catch {
+                    return error.InvalidSignature;
+                };
+                const is_valid = tls.verifySignature(evp_key, prefixed_data, msg.getSignature()) catch {
+                    return error.InvalidSignature;
+                };
+                if (!is_valid) {
+                    return error.InvalidSignature;
+                }
+
+                app_msg.* = .{
+                    .from = from_peer_id,
+                    .data = msg.getData(),
+                    .seqno = std.mem.readInt(u64, msg.getSeqno()[0..8], .big),
+                    .topic_hash = msg.getTopic(),
+                    .signature = msg.getSignature(),
+                    .key = proto_pubkey,
+                };
+                return;
+            },
+        }
+    }
+
+    fn validateReceivedMessage(self: *Self, arena: Allocator, msg: *const rpc.MessageReader, propagation_source: PeerId) !MessageValidationResult {
+        var m: AppMessage = undefined;
+        self.validateAndToAppMessage(arena, msg, self.opts.global_signature_policy, &m) catch |err| {
             return MessageValidationResult{
                 .invalid = .{
                     .reason = RejectReason.Error,
@@ -1314,8 +1419,8 @@ pub const Gossipsub = struct {
         return std.mem.eql(u8, initiator.stream.negotiated_protocol.?, v1_2_id);
     }
 
-    fn handleMessage(self: *Self, from: PeerId, publish_msg: *const rpc.MessageReader) !void {
-        const validation_result = try self.validateReceivedMessage(publish_msg, from);
+    fn handleMessage(self: *Self, arena: Allocator, from: *const PeerId, publish_msg: *const rpc.MessageReader) !void {
+        const validation_result = try self.validateReceivedMessage(arena, publish_msg, from.*);
 
         switch (validation_result) {
             .valid => |valid_msg| {
@@ -1870,117 +1975,6 @@ pub const Gossipsub = struct {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 };
-
-pub fn validateMessage(allocator: Allocator, msg: *const rpc.MessageReader, policy: SignaturePolicy, m: *Message) ValidateError!void {
-    switch (policy) {
-        SignaturePolicy.StrictNoSign => {
-            if (msg._signature != null) {
-                return error.SignaturePresent;
-            }
-            if (msg._seqno != null) {
-                return error.SeqnoPresent;
-            }
-            if (msg._from != null) {
-                return error.FromPresent;
-            }
-            if (msg._key != null) {
-                return error.KeyPresent;
-            }
-
-            m.* = .{
-                .from = null,
-                .data = msg.getData(),
-                .seqno = null,
-                .topic_hash = msg.getTopic(),
-                .signature = null,
-                .key = null,
-                .validated = true,
-            };
-
-            return;
-        },
-        SignaturePolicy.StrictSign => {
-            if (msg._seqno == null) {
-                return error.InvalidSeqno;
-            }
-            if (msg._seqno.?.len != 8) {
-                return error.InvalidSeqno;
-            }
-            if (msg._signature == null) {
-                return error.InvalidSignature;
-            }
-            if (msg._from == null) {
-                return error.InvalidPeerId;
-            }
-            const from_peer_id = PeerId.fromBytes(msg.getFrom()) catch {
-                return error.InvalidPeerId;
-            };
-
-            var pubkey_bytes_buf: [128]u8 = undefined; // this is enough space for a PeerId
-            const pubkey_bytes = if (msg._key) |k| k else (from_peer_id.toBytes(&pubkey_bytes_buf) catch {
-                return error.InvalidPeerId;
-            })[2..];
-            const proto_pubkey_reader = keys.PublicKeyReader.init(allocator, pubkey_bytes) catch {
-                return error.InvalidPeerId;
-            };
-
-            var proto_pubkey = keys.PublicKey{
-                .type = proto_pubkey_reader.getType(),
-                .data = try allocator.dupe(u8, proto_pubkey_reader.getData()),
-            };
-            errdefer allocator.free(proto_pubkey.data.?);
-
-            const evp_key = tls.reconstructEvpKeyFromPublicKey(&proto_pubkey) catch {
-                return error.InvalidPubkey;
-            };
-            defer ssl.EVP_PKEY_free(evp_key);
-
-            if (msg._key != null) {
-                const key_peer_id = PeerId.fromPublicKey(allocator, &proto_pubkey) catch {
-                    return error.InvalidPubkey;
-                };
-
-                if (!from_peer_id.eql(&key_peer_id)) {
-                    return error.InvalidPeerId;
-                }
-            }
-
-            const data_to_sign: rpc.Message = .{
-                .seqno = msg._seqno,
-                .data = msg._data,
-                .from = msg._from,
-                .topic = msg._topic,
-                .signature = null,
-                .key = null,
-            };
-            const encoded_data = data_to_sign.encode(allocator) catch {
-                return error.InvalidSignature;
-            };
-            defer allocator.free(encoded_data);
-            const prefixed_data = std.mem.concat(allocator, u8, &.{ sign_prefix, encoded_data }) catch {
-                return error.InvalidSignature;
-            };
-            defer allocator.free(prefixed_data);
-            const is_valid = tls.verifySignature(evp_key, prefixed_data, msg.getSignature()) catch {
-                return error.InvalidSignature;
-            };
-            if (!is_valid) {
-                return error.InvalidSignature;
-            }
-
-            m.* = .{
-                .from = from_peer_id,
-                .data = msg.getData(),
-                .seqno = std.mem.readInt(u64, msg.getSeqno()[0..8], .big),
-                .topic_hash = msg.getTopic(),
-                .signature = msg.getSignature(),
-                .key = proto_pubkey,
-                .validated = true,
-            };
-            return;
-        },
-    }
-}
 
 test "pubsub add peer" {
     const allocator = std.testing.allocator;

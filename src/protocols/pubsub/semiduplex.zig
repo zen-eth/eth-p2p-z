@@ -148,16 +148,16 @@ pub const PubSubPeerInitiator = struct {
 
     const Self = @This();
 
-    pub fn onActivated(self: *Self, stream: *libp2p.QuicStream) anyerror!void {
+    pub fn onActivated(self: *Self, stream: *libp2p.QuicStream) !void {
         self.stream = stream;
         self.callback(self.callback_ctx, self);
     }
 
-    pub fn onMessage(_: *Self, _: *libp2p.QuicStream, msg: []const u8) anyerror!void {
+    pub fn onMessage(_: *Self, _: *libp2p.QuicStream, msg: []const u8) !void {
         std.log.warn("Write stream received a message with size: {d}", .{msg.len});
     }
 
-    pub fn onClose(self: *Self, _: *libp2p.QuicStream) anyerror!void {
+    pub fn onClose(self: *Self, _: *libp2p.QuicStream) !void {
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -165,7 +165,7 @@ pub const PubSubPeerInitiator = struct {
     pub fn vtableOnActivatedFn(
         instance: *anyopaque,
         stream: *libp2p.QuicStream,
-    ) anyerror!void {
+    ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
     }
@@ -174,7 +174,7 @@ pub const PubSubPeerInitiator = struct {
         instance: *anyopaque,
         stream: *libp2p.QuicStream,
         message: []const u8,
-    ) anyerror!void {
+    ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onMessage(stream, message);
     }
@@ -182,7 +182,7 @@ pub const PubSubPeerInitiator = struct {
     pub fn vtableOnCloseFn(
         instance: *anyopaque,
         stream: *libp2p.QuicStream,
-    ) anyerror!void {
+    ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);
     }
@@ -214,7 +214,7 @@ pub const PubSubPeerResponder = struct {
 
     const Self = @This();
 
-    pub fn onActivated(self: *Self, stream: *libp2p.QuicStream) anyerror!void {
+    pub fn onActivated(self: *Self, stream: *libp2p.QuicStream) !void {
         self.stream = stream;
         self.callback(self.callback_ctx, self);
     }
@@ -265,7 +265,7 @@ pub const PubSubPeerResponder = struct {
         }
     }
 
-    pub fn onClose(self: *Self, _: *libp2p.QuicStream) anyerror!void {
+    pub fn onClose(self: *Self, _: *libp2p.QuicStream) !void {
         const allocator = self.allocator;
         self.received_buffer.deinit();
         allocator.destroy(self);
@@ -274,7 +274,7 @@ pub const PubSubPeerResponder = struct {
     pub fn vtableOnActivatedFn(
         instance: *anyopaque,
         stream: *libp2p.QuicStream,
-    ) anyerror!void {
+    ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
     }
@@ -283,7 +283,7 @@ pub const PubSubPeerResponder = struct {
         instance: *anyopaque,
         stream: *libp2p.QuicStream,
         message: []const u8,
-    ) anyerror!void {
+    ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onMessage(stream, message);
     }
@@ -291,7 +291,7 @@ pub const PubSubPeerResponder = struct {
     pub fn vtableOnCloseFn(
         instance: *anyopaque,
         stream: *libp2p.QuicStream,
-    ) anyerror!void {
+    ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);
     }
