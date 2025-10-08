@@ -176,7 +176,7 @@ pub const MessageCache = struct {
         self.history.deinit();
     }
 
-    pub fn put(self: *Self, msg: *rpc.Message) !void {
+    pub fn put(self: *Self, msg: *const rpc.Message) !void {
         const mid = try self.msg_id_fn(self.allocator, msg);
         errdefer self.allocator.free(mid);
         const gop = try self.msgs.getOrPut(mid);
@@ -186,6 +186,28 @@ pub const MessageCache = struct {
         const cloned_msg = try self.cloneMessage(msg);
         gop.value_ptr.* = cloned_msg;
         gop.key_ptr.* = mid;
+
+        // Add to history[0] (current window)
+        const entry: CacheEntry = .{
+            .mid = mid,
+            .topic = cloned_msg.topic orelse return error.MissingTopic,
+        };
+        try self.history.items[0].?.append(entry);
+    }
+
+    pub fn putWithId(self: *Self, mid: []const u8, msg: *const rpc.Message) !void {
+        const gop = try self.msgs.getOrPut(mid);
+        if (gop.found_existing) {
+            return error.DuplicateMessage; // Already exists, do not overwrite
+        }
+        const cloned_msg = try self.cloneMessage(msg);
+        errdefer self.freeMessage(&cloned_msg);
+
+        const cloned_key = try self.allocator.dupe(u8, mid);
+        errdefer self.allocator.free(cloned_key);
+        gop.value_ptr.* = cloned_msg;
+        gop.key_ptr.* = cloned_key;
+        errdefer _ = self.msgs.remove(gop.key_ptr.*);
 
         // Add to history[0] (current window)
         const entry: CacheEntry = .{
@@ -272,7 +294,7 @@ pub const MessageCache = struct {
         if (msg.key) |key| self.allocator.free(key);
     }
 
-    fn cloneMessage(self: *Self, msg: *rpc.Message) !rpc.Message {
+    fn cloneMessage(self: *Self, msg: *const rpc.Message) !rpc.Message {
         return rpc.Message{
             .from = if (msg.from) |from| try self.allocator.dupe(u8, from) else null,
             .seqno = if (msg.seqno) |seqno| try self.allocator.dupe(u8, seqno) else null,

@@ -38,8 +38,8 @@ pub const protocols: []const ProtocolId = &.{ v1_id, v1_1_id };
 /// before sending and after receiving. This allows for custom processing such as
 /// encryption, compression, or other modifications to the message payload.
 pub const DataTransformVTable = struct {
-    inboundTransformFn: *const fn (instance: *anyopaque, topic: []const u8, data: []const u8) anyerror![]const u8,
-    outboundTransformFn: *const fn (instance: *anyopaque, topic: []const u8, data: []const u8) anyerror![]const u8,
+    inboundTransformFn: *const fn (instance: *anyopaque, allocator: Allocator, topic: []const u8, data: []const u8) anyerror![]const u8,
+    outboundTransformFn: *const fn (instance: *anyopaque, allocator: Allocator, topic: []const u8, data: []const u8) anyerror![]const u8,
 };
 
 pub const AnyDataTransform = struct {
@@ -48,12 +48,12 @@ pub const AnyDataTransform = struct {
 
     const Self = @This();
 
-    pub fn inboundTransform(self: Self, topic: []const u8, data: []const u8) ![]const u8 {
-        return self.vtable.inboundTransformFn(self.instance, topic, data);
+    pub fn inboundTransform(self: Self, allocator: Allocator, topic: []const u8, data: []const u8) ![]const u8 {
+        return self.vtable.inboundTransformFn(self.instance, allocator, topic, data);
     }
 
-    pub fn outboundTransform(self: Self, topic: []const u8, data: []const u8) ![]const u8 {
-        return self.vtable.outboundTransformFn(self.instance, topic, data);
+    pub fn outboundTransform(self: Self, allocator: Allocator, topic: []const u8, data: []const u8) ![]const u8 {
+        return self.vtable.outboundTransformFn(self.instance, allocator, topic, data);
     }
 };
 
@@ -148,12 +148,12 @@ pub const Subscription = struct {
 };
 
 pub const AppMessage = struct {
-    from: ?PeerId,
+    from: ?PeerId = null,
     data: []const u8,
-    seqno: ?u64,
-    topic_hash: []const u8,
-    signature: ?[]const u8,
-    key: ?keys.PublicKey,
+    seqno: ?u64 = null,
+    topic: []const u8,
+    signature: ?[]const u8 = null,
+    key: ?keys.PublicKey = null,
 };
 
 pub const MessageStatus = enum {
@@ -219,7 +219,7 @@ pub const Event = union(enum) {
     message: struct {
         propagation_source: PeerId,
         message_id: []const u8,
-        message: *const rpc.Message,
+        message: *const AppMessage,
     },
 
     pub fn hash(self: Event, hasher: anytype) void {
@@ -250,6 +250,10 @@ pub const Event = union(enum) {
                 hasher.update(graft_or_prune.topic);
 
                 hasher.update(std.mem.asBytes(&graft_or_prune.direction));
+            },
+            .message => |msg_event| {
+                hasher.update(std.mem.asBytes(&msg_event.message_id.len));
+                hasher.update(msg_event.message_id);
             },
         }
     }
@@ -570,10 +574,10 @@ pub const Gossipsub = struct {
             try self.handleMessage(arena, &rpc_message.from, msg);
         }
 
-        const control = try rpc_message.rpc_reader.getControl(self.allocator);
+        const control = try rpc_message.rpc_reader.getControl(arena);
         defer control.deinit();
         if (control.buf.bytes().len > 0) {
-            try self.handleControl(&control, rpc_message.from);
+            try self.handleControl(arena, &control, &rpc_message.from);
         }
     }
 
@@ -692,8 +696,12 @@ pub const Gossipsub = struct {
     }
 
     pub fn publish(self: *Self, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
         const transformed_data = if (self.opts.data_transform) |transform| blk: {
-            break :blk transform.outboundTransform(topic, data) catch |err| {
+            break :blk transform.outboundTransform(arena_allocator, topic, data) catch |err| {
                 std.log.warn("Failed to transform outbound message for topic {s}: {}", .{ topic, err });
                 callback(callback_ctx, err);
                 return;
@@ -704,12 +712,10 @@ pub const Gossipsub = struct {
         };
 
         var publish_msg: rpc.Message = undefined;
+        var app_msg: AppMessage = undefined;
         var msg_id: []const u8 = undefined;
-        errdefer {
-            self.allocator.free(msg_id);
-            //TODO: free rpc_msg fields
-        }
-        self.buildRPCandMsgId(topic, data, transformed_data, &publish_msg, &msg_id) catch |err| {
+
+        self.buildRPCandMsgId(arena_allocator, topic, data, transformed_data, &publish_msg, &app_msg, &msg_id) catch |err| {
             std.log.warn("Failed to build RPC message for topic {s}: {}", .{ topic, err });
             callback(callback_ctx, err);
             return;
@@ -776,7 +782,7 @@ pub const Gossipsub = struct {
             self.event_emitter.emit(.{ .message = .{
                 .propagation_source = self.peer_id,
                 .message_id = msg_id,
-                .message = &publish_msg,
+                .message = &app_msg,
             } });
         }
 
@@ -857,6 +863,53 @@ pub const Gossipsub = struct {
         callback(callback_ctx, {});
     }
 
+    fn forwardMessage(self: *Self, arena: Allocator, msg_id: []const u8, rpc_msg: *const rpc.Message, propagation_source: ?PeerId, exclude: ?[]PeerId) !void {
+        // TODO: Implement peer scoring
+        _ = msg_id;
+        const selected_peers = try self.selectPeersToForward(arena, rpc_msg.topic.?, propagation_source, exclude);
+
+        for (selected_peers) |to| {
+            var publish_storage: [1]?rpc.Message = undefined;
+            publish_storage[0] = rpc_msg.*;
+
+            const rpc_to_send = rpc.RPC{
+                .publish = publish_storage[0..],
+            };
+            _ = self.sendRPC(to, &rpc_to_send);
+        }
+    }
+
+    fn selectPeersToForward(self: *Self, arena: Allocator, topic: []const u8, propagation_source: ?PeerId, exclude: ?[]PeerId) ![]PeerId {
+        var selected_peers = std.ArrayListUnmanaged(PeerId).empty;
+
+        if (self.topics.getPtr(topic)) |peers_map| {
+            _ = peers_map;
+            //TODO: implement direct peers, floodsub peers
+        }
+
+        if (self.mesh.getPtr(topic)) |mesh_peers| {
+            var it = mesh_peers.iterator();
+            while (it.next()) |entry| {
+                if (propagation_source) |*source| {
+                    if (entry.key_ptr.*.eql(source)) continue;
+                }
+                if (exclude) |ex| {
+                    var found = false;
+                    for (ex) |*e| {
+                        if (entry.key_ptr.*.eql(e)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) continue;
+                }
+                try selected_peers.append(arena, entry.key_ptr.*);
+            }
+        }
+
+        return try selected_peers.toOwnedSlice(arena);
+    }
+
     fn selectPeersToPublish(self: *Self, topic: []const u8) !SelectPeersResult {
         var selected_peers = std.ArrayListUnmanaged(PeerId).empty;
 
@@ -929,19 +982,23 @@ pub const Gossipsub = struct {
         };
     }
 
-    fn buildRPCandMsgId(self: *Self, topic: []const u8, original_data: []const u8, transformed_data: []const u8, rpc_msg: *rpc.Message, msg_id: *[]const u8) !void {
-        const seq_no = try self.nextSeqno();
+    fn buildRPCandMsgId(self: *Self, arena: Allocator, topic: []const u8, original_data: []const u8, transformed_data: []const u8, rpc_msg: *rpc.Message, app_msg: *AppMessage, msg_id: *[]const u8) !void {
         switch (self.opts.publish_policy) {
             .anonymous => {
                 rpc_msg.* = .{
-                    .seqno = seq_no,
                     .data = original_data,
                     .topic = topic,
                 };
-                msg_id.* = try self.opts.msg_id_fn(self.allocator, rpc_msg);
+                app_msg.* = .{
+                    .data = original_data,
+                    .topic = topic,
+                };
+                msg_id.* = try self.opts.msg_id_fn(arena, rpc_msg);
                 rpc_msg.data = transformed_data;
             },
             .signing => {
+                const seq_no = try self.nextSeqno();
+
                 rpc_msg.* = .{
                     .from = self.peer_id_bytes,
                     .seqno = seq_no,
@@ -949,24 +1006,32 @@ pub const Gossipsub = struct {
                     .topic = topic,
                 };
 
-                const encoded_rpc_msg = try rpc_msg.encode(self.allocator);
-                errdefer self.allocator.free(encoded_rpc_msg);
+                const encoded_rpc_msg = try rpc_msg.encode(arena);
 
-                const data_to_sign = try std.mem.concat(self.allocator, u8, &.{ sign_prefix, encoded_rpc_msg });
-                defer self.allocator.free(data_to_sign);
+                const data_to_sign = try std.mem.concat(arena, u8, &.{ sign_prefix, encoded_rpc_msg });
 
-                const signature = try tls.signData(self.allocator, self.sign_key, data_to_sign);
-                errdefer self.allocator.free(signature);
+                const signature = try tls.signData(arena, self.sign_key, data_to_sign);
 
-                const host_pubkey_proto = try tls.createProtobufEncodedPublicKeyBuf(self.allocator, self.sign_key);
-                errdefer self.allocator.free(host_pubkey_proto);
+                const host_pubkey = try tls.createProtobufEncodedPublicKey(arena, self.sign_key);
+
+                const host_pubkey_proto = try host_pubkey.encode(arena);
 
                 rpc_msg.signature = signature;
                 rpc_msg.key = host_pubkey_proto;
                 rpc_msg.data = original_data;
 
-                msg_id.* = try self.opts.msg_id_fn(self.allocator, rpc_msg);
+                msg_id.* = try self.opts.msg_id_fn(arena, rpc_msg);
                 rpc_msg.data = transformed_data;
+
+                const seq_no_u64 = std.mem.readVarInt(u64, seq_no, .big);
+                app_msg.* = .{
+                    .from = self.peer_id,
+                    .seqno = seq_no_u64,
+                    .data = original_data,
+                    .topic = topic,
+                    .signature = signature,
+                    .key = host_pubkey,
+                };
             },
         }
     }
@@ -1221,7 +1286,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    pub fn validateAndToAppMessage(self: *Self, arena: Allocator, msg: *const rpc.MessageReader, policy: SignaturePolicy, app_msg: *AppMessage) ValidateError!void {
+    fn validateAndToAppMessage(self: *Self, arena: Allocator, msg: *const rpc.MessageReader, policy: SignaturePolicy, app_msg: *AppMessage) ValidateError!void {
         switch (policy) {
             SignaturePolicy.StrictNoSign => {
                 if (msg.getSignature().len != 0) {
@@ -1238,7 +1303,7 @@ pub const Gossipsub = struct {
                     .from = null,
                     .data = msg.getData(),
                     .seqno = null,
-                    .topic_hash = msg.getTopic(),
+                    .topic = msg.getTopic(),
                     .signature = null,
                     .key = null,
                 };
@@ -1274,9 +1339,8 @@ pub const Gossipsub = struct {
                 // This will be used in app_msg, so we need to allocate as pubkey_bytes_buf is stack memory
                 var proto_pubkey = keys.PublicKey{
                     .type = proto_pubkey_reader.getType(),
-                    .data = try self.allocator.dupe(u8, proto_pubkey_reader.getData()),
+                    .data = proto_pubkey_reader.getData(),
                 };
-                errdefer self.allocator.free(proto_pubkey.data.?);
 
                 const evp_key = tls.reconstructEvpKeyFromPublicKey(&proto_pubkey) catch {
                     return error.InvalidPubkey;
@@ -1318,7 +1382,7 @@ pub const Gossipsub = struct {
                     .from = from_peer_id,
                     .data = msg.getData(),
                     .seqno = std.mem.readInt(u64, msg.getSeqno()[0..8], .big),
-                    .topic_hash = msg.getTopic(),
+                    .topic = msg.getTopic(),
                     .signature = msg.getSignature(),
                     .key = proto_pubkey,
                 };
@@ -1339,7 +1403,7 @@ pub const Gossipsub = struct {
         };
 
         if (self.opts.data_transform) |dt| {
-            const transformed_data = dt.inboundTransform(m.topic_hash, m.data) catch |err| {
+            const transformed_data = dt.inboundTransform(arena, m.topic, m.data) catch |err| {
                 std.log.warn("Inbound data transformation failed for message from peer {}: {}", .{ propagation_source, err });
                 return MessageValidationResult{
                     .invalid = .{
@@ -1351,6 +1415,8 @@ pub const Gossipsub = struct {
             m.data = transformed_data;
         }
 
+        // use a copy of the message with transformed data to generate message ID
+        // TODO: maybe change msg_id_fn to take data as parameter `Message` not `rpc.Message`
         const msg_for_id = rpc.Message{
             .from = msg._from,
             .data = m.data,
@@ -1360,7 +1426,7 @@ pub const Gossipsub = struct {
             .key = msg._key,
         };
         // Generate message ID using the provided function and the copied message with transformed data
-        const message_id = self.opts.msg_id_fn(self.allocator, &msg_for_id) catch |err| {
+        const message_id = self.opts.msg_id_fn(arena, &msg_for_id) catch |err| {
             std.log.warn("Failed to generate message ID for message from peer {}: {}", .{ propagation_source, err });
             return MessageValidationResult{
                 .invalid = .{
@@ -1377,6 +1443,7 @@ pub const Gossipsub = struct {
                 },
             };
         } else {
+            // seen_cache clone the message_id internally
             try self.seen_cache.put(message_id, {}, .{
                 .ttl = self.opts.seen_ttl_s,
             });
@@ -1385,7 +1452,7 @@ pub const Gossipsub = struct {
         // Here use the origin message's data length to determine if we should send IDontWant
         if (msg._data) |data| {
             if (data.len >= self.opts.idontwant_message_size_threshold) {
-                try self.sendIDontWants(m.topic_hash, propagation_source, message_id);
+                try self.sendIDontWants(m.topic, propagation_source, message_id);
             }
         }
 
@@ -1424,40 +1491,53 @@ pub const Gossipsub = struct {
 
         switch (validation_result) {
             .valid => |valid_msg| {
-                // Here we would normally propagate the message to peers in the mesh
-                // and deliver it to local subscribers. For brevity, this is omitted.
-                _ = valid_msg;
+                // TODO: Change the mcache to store `rpc.MessageReader` to avoid copying data again.
+                // Store the original publish_msg from network, not the transformed one.
+                const rpc_msg = rpc.Message{
+                    .from = publish_msg._from,
+                    .data = publish_msg._data,
+                    .seqno = publish_msg._seqno,
+                    .topic = publish_msg._topic,
+                    .signature = publish_msg._signature,
+                    .key = publish_msg._key,
+                };
+                try self.mcache.putWithId(valid_msg.message_id, &rpc_msg);
+
+                if (self.subscriptions.contains(valid_msg.message.topic)) {
+                    const is_from_self = from.*.eql(&self.peer_id);
+                    if (!is_from_self or self.opts.emit_self) {
+                        self.event_emitter.emit(.{ .message = .{
+                            .propagation_source = from.*,
+                            .message_id = valid_msg.message_id,
+                            .message = &valid_msg.message,
+                        } });
+                    }
+                }
+
+                try self.forwardMessage(arena, valid_msg.message_id, &rpc_msg, from.*, null);
             },
             .invalid => |invalid_msg| {
-                _ = invalid_msg;
-                // std.log.warn("Invalid message from peer {?}: {}", .{ publish._from, invalid_msg.err });
-                // Optionally, we could take action based on invalid_msg.reason
+                // TODO: We don't have topic validator so that no msg_id in invalid message, should we add it?
+                std.log.warn("Invalid message from peer {}: {}", .{ from.*, invalid_msg.err });
             },
             .duplicate => |dup_msg| {
-                _ = dup_msg;
-                // std.log.debug("Duplicate message received from peer {}: ID {any}", .{ publish._from, dup_msg.message_id });
+                // TODO: When change the `mcache` to store unvalidated message, we can use it here to avoid re-validation.
+                std.log.debug("Duplicate message received from peer {}: ID {any}", .{ from.*, dup_msg.message_id });
             },
         }
     }
 
-    fn handleControl(self: *Self, control: *const rpc.ControlMessageReader, from: PeerId) !void {
-        const ihave_messages = try control.getIhave(self.allocator);
-        defer {
-            // Free only if we allocated, len == 0 returns a static empty slice
-            if (ihave_messages.len > 0) {
-                self.allocator.free(ihave_messages);
-            }
-        }
+    fn handleControl(self: *Self, arena: Allocator, control: *const rpc.ControlMessageReader, from: *const PeerId) !void {
+        const ihave_messages = try control.getIhave(arena);
 
         const iwant = if (ihave_messages.len > 0) blk: {
-            const result = try self.handleIHave(from, ihave_messages);
+            const result = try self.handleIHave(arena, from, ihave_messages);
             break :blk result;
         } else blk: {
             break :blk &.{};
         };
-        defer {}
 
-        std.log.debug("Sending IWANT with {d} message IDs to peer {}", .{ iwant.len, from });
+        std.log.debug("Sending IWANT with {d} message IDs to peer {}", .{ iwant.len, from.* });
 
         const iwant_messages = try control.getIwant(self.allocator);
         defer {
@@ -1468,29 +1548,29 @@ pub const Gossipsub = struct {
         }
 
         const ihave = if (iwant_messages.len > 0) blk: {
-            const result = try self.handleIWant(from, iwant_messages);
+            const result = try self.handleIWant(from.*, iwant_messages);
             break :blk result;
         } else blk: {
             break :blk &.{};
         };
-        std.log.debug("Sending {d} messages to peer {}", .{ ihave.len, from });
+        std.log.debug("Sending {d} messages to peer {}", .{ ihave.len, from.* });
 
         const graft_messages = try control.getGraft(self.allocator);
         defer if (graft_messages.len > 0) self.allocator.free(graft_messages);
 
         const prune = if (graft_messages.len > 0) blk: {
-            const result = try self.handleGraft(from, graft_messages);
+            const result = try self.handleGraft(from.*, graft_messages);
             break :blk result;
         } else blk: {
             break :blk &.{};
         };
-        std.log.debug("Sending {d} PRUNE messages to peer {}", .{ prune.len, from });
+        std.log.debug("Sending {d} PRUNE messages to peer {}", .{ prune.len, from.* });
 
         const prune_messages = try control.getPrune(self.allocator);
         defer if (prune_messages.len > 0) self.allocator.free(prune_messages);
 
         if (prune_messages.len > 0) {
-            try self.handlePrune(from, prune_messages);
+            try self.handlePrune(from.*, prune_messages);
         }
     }
 
@@ -1546,31 +1626,23 @@ pub const Gossipsub = struct {
         return try ihave_list.toOwnedSlice(self.allocator);
     }
 
-    fn handleIHave(self: *Self, from: PeerId, ihave: []const rpc.ControlIHaveReader) ![]const rpc.ControlIWant {
-        const peer_have = (self.peer_have.get(from) orelse 0) + 1;
-        try self.peer_have.put(self.allocator, from, peer_have);
+    fn handleIHave(self: *Self, arena: Allocator, from: *const PeerId, ihave: []const rpc.ControlIHaveReader) ![]const rpc.ControlIWant {
+        const peer_have = (self.peer_have.get(from.*) orelse 0) + 1;
+        try self.peer_have.put(self.allocator, from.*, peer_have);
         if (peer_have > self.opts.max_ihave_messages) {
-            std.log.warn("Peer {} sent too many {d} IHAVE messages within this heartbeat, ignoring further IHAVE messages.", .{ from, peer_have });
+            std.log.warn("Peer {} sent too many {d} IHAVE messages within this heartbeat, ignoring further IHAVE messages.", .{ from.*, peer_have });
             return &.{};
         }
 
-        const iasked = self.iasked.get(from) orelse 0;
+        const iasked = self.iasked.get(from.*) orelse 0;
         if (iasked > self.opts.max_ihave_len) {
-            std.log.warn("Peer {} sent too many {d} IHAVE message IDs within this heartbeat, ignoring further IHAVE messages.", .{ from, iasked });
+            std.log.warn("Peer {} has asked for too many {d} IHAVE message IDs within this heartbeat, ignoring further IHAVE messages.", .{ from.*, iasked });
             return &.{};
         }
 
         var iwant: std.StringHashMapUnmanaged(void) = .empty;
-        defer iwant.deinit(self.allocator);
-        var processed_ihave: usize = 0;
-        errdefer {
-            for (ihave[processed_ihave..]) |*rem| rem.deinit();
-        }
+
         for (ihave) |*ihave_msg| {
-            defer {
-                ihave_msg.deinit();
-                processed_ihave += 1;
-            }
             if (ihave_msg.getTopicID().len == 0 or ihave_msg.getMessageIDs().len == 0 or !self.mesh.contains(ihave_msg.getTopicID())) {
                 continue;
             }
@@ -1578,7 +1650,7 @@ pub const Gossipsub = struct {
             var idonthave: usize = 0;
             for (ihave_msg.getMessageIDs()) |msg_id| {
                 if (!self.seen_cache.contains(msg_id)) {
-                    try iwant.put(self.allocator, msg_id, {});
+                    try iwant.put(arena, msg_id, {});
                     idonthave += 1;
                 }
             }
@@ -1593,14 +1665,13 @@ pub const Gossipsub = struct {
             iask = self.opts.max_ihave_len - iasked;
         }
 
-        std.log.debug("Asking for {d} out of {d} messages from peer {}", .{ iask, iwant.count(), from });
+        std.log.debug("Asking for {d} out of {d} messages from peer {}", .{ iask, iwant.count(), from.* });
 
-        var iwant_list = try std.ArrayListUnmanaged([]const u8).initCapacity(self.allocator, iwant.count());
-        defer iwant_list.deinit(self.allocator);
+        var iwant_list = try std.ArrayListUnmanaged([]const u8).initCapacity(arena, iwant.count());
 
         var it = iwant.keyIterator();
         while (it.next()) |id| {
-            try iwant_list.append(self.allocator, id.*);
+            try iwant_list.append(arena, id.*);
         }
 
         var prng = std.Random.DefaultPrng.init(blk: {
@@ -1610,17 +1681,16 @@ pub const Gossipsub = struct {
         });
         const random = prng.random();
         random.shuffle([]const u8, iwant_list.items);
-        try self.iasked.put(self.allocator, from, iask + iasked);
+        // This is not temporary, we need to keep track of how many IDs we asked for from this peer, so use `self.allocator`
+        try self.iasked.put(self.allocator, from.*, iask + iasked);
 
-        const result = try self.allocator.alloc(rpc.ControlIWant, 1);
-        errdefer self.allocator.free(result);
+        const result = try arena.alloc(rpc.ControlIWant, 1);
 
-        const selected_ids_raw = iwant_list.items[0..iask];
+        var selected_ids = try arena.alloc(?[]const u8, iask);
 
-        const dupe_slice = try self.allocator.dupe([]const u8, selected_ids_raw);
-        errdefer self.allocator.free(dupe_slice);
-
-        const selected_ids: []?[]const u8 = @ptrCast(dupe_slice);
+        for (iwant_list.items[0..iask], 0..) |id, idx| {
+            selected_ids[idx] = id;
+        }
 
         result[0] = .{
             .message_i_ds = selected_ids,
