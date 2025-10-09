@@ -359,8 +359,6 @@ pub const Gossipsub = struct {
 
     counter: std.atomic.Value(u64),
 
-    seq_no_pool: std.heap.MemoryPool([8]u8),
-
     topic_pool: std.StringHashMapUnmanaged(usize),
 
     protocols: []const ProtocolId = &.{ v1_id, v1_1_id },
@@ -460,9 +458,6 @@ pub const Gossipsub = struct {
         var peer_id_buf: [128]u8 = undefined; // this is enough space for a PeerId
         const peer_id_bytes = try peer_id.toBytes(&peer_id_buf);
 
-        var seq_no_pool = std.heap.MemoryPool([8]u8).init(allocator);
-        errdefer seq_no_pool.deinit();
-
         self.* = .{
             .allocator = allocator,
             .peer = peer,
@@ -485,7 +480,6 @@ pub const Gossipsub = struct {
             .mcache = msg_cache,
             .opts = opts,
             .counter = std.atomic.Value(u64).init(0),
-            .seq_no_pool = seq_no_pool,
             .topic_pool = std.StringHashMapUnmanaged(usize).empty,
         };
     }
@@ -521,7 +515,6 @@ pub const Gossipsub = struct {
         self.event_emitter.deinit();
         self.seen_cache.deinit();
         self.mcache.deinit();
-        self.seq_no_pool.deinit();
         var topic_pool_iter = self.topic_pool.iterator();
         while (topic_pool_iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -696,6 +689,37 @@ pub const Gossipsub = struct {
     }
 
     pub fn publish(self: *Self, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
+        const copied_topic = self.allocator.dupe(u8, topic) catch |err| {
+            std.log.warn("Failed to copy topic string: {}", .{err});
+            callback(callback_ctx, err);
+            return;
+        };
+
+        const copied_data = self.allocator.dupe(u8, data) catch |err| {
+            std.log.warn("Failed to copy data buffer: {}", .{err});
+            callback(callback_ctx, err);
+            return;
+        };
+
+        if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
+            self.doPublish(copied_topic, copied_data, callback_ctx, callback);
+        } else {
+            const message = io_loop.IOMessage{
+                .action = .{ .pubsub_publish = .{
+                    .pubsub = self.any(),
+                    .topic = copied_topic,
+                    .message = copied_data,
+                    .callback_ctx = callback_ctx,
+                    .callback = callback,
+                } },
+            };
+            self.swarm.transport.io_event_loop.queueMessage(message) catch unreachable;
+        }
+    }
+
+    pub fn doPublish(self: *Self, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
+        defer self.allocator.free(topic);
+        defer self.allocator.free(data);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_allocator = arena.allocator();
@@ -795,13 +819,18 @@ pub const Gossipsub = struct {
     }
 
     pub fn subscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+        const copied_topic = self.allocator.dupe(u8, topic) catch |err| {
+            std.log.warn("Failed to copy topic string: {}", .{err});
+            callback(callback_ctx, err);
+            return;
+        };
         if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
-            self.doSubscribe(topic, callback_ctx, callback);
+            self.doSubscribe(copied_topic, callback_ctx, callback);
         } else {
             const message = io_loop.IOMessage{
                 .action = .{ .pubsub_subscribe = .{
                     .pubsub = self.any(),
-                    .topic = topic,
+                    .topic = copied_topic,
                     .callback_ctx = callback_ctx,
                     .callback = callback,
                 } },
@@ -811,6 +840,7 @@ pub const Gossipsub = struct {
     }
 
     fn doSubscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+        defer self.allocator.free(topic);
         if (!self.subscriptions.contains(topic)) {
             const interned_topic = self.refTopic(topic) catch |err| {
                 callback(callback_ctx, err);
@@ -843,7 +873,29 @@ pub const Gossipsub = struct {
         callback(callback_ctx, {});
     }
 
+    pub fn unsubscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+        const copied_topic = self.allocator.dupe(u8, topic) catch |err| {
+            std.log.warn("Failed to copy topic string: {}", .{err});
+            callback(callback_ctx, err);
+            return;
+        };
+        if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
+            self.doUnsubscribe(copied_topic, callback_ctx, callback);
+        } else {
+            const message = io_loop.IOMessage{
+                .action = .{ .pubsub_unsubscribe = .{
+                    .pubsub = self.any(),
+                    .topic = copied_topic,
+                    .callback_ctx = callback_ctx,
+                    .callback = callback,
+                } },
+            };
+            self.swarm.transport.io_event_loop.queueMessage(message) catch unreachable;
+        }
+    }
+
     fn doUnsubscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+        defer self.allocator.free(topic);
         if (self.subscriptions.fetchRemove(topic)) |removed| {
             const interned_topic = removed.key;
             var peers_iter = self.peers.iterator();
@@ -997,11 +1049,11 @@ pub const Gossipsub = struct {
                 rpc_msg.data = transformed_data;
             },
             .signing => {
-                const seq_no = try self.nextSeqno();
+                const seq_no = try self.nextSeqno(arena);
 
                 rpc_msg.* = .{
                     .from = self.peer_id_bytes,
-                    .seqno = seq_no,
+                    .seqno = seq_no.@"1",
                     .data = transformed_data,
                     .topic = topic,
                 };
@@ -1023,10 +1075,9 @@ pub const Gossipsub = struct {
                 msg_id.* = try self.opts.msg_id_fn(arena, rpc_msg);
                 rpc_msg.data = transformed_data;
 
-                const seq_no_u64 = std.mem.readVarInt(u64, seq_no, .big);
                 app_msg.* = .{
                     .from = self.peer_id,
-                    .seqno = seq_no_u64,
+                    .seqno = seq_no.@"0",
                     .data = original_data,
                     .topic = topic,
                     .signature = signature,
@@ -1539,27 +1590,20 @@ pub const Gossipsub = struct {
 
         std.log.debug("Sending IWANT with {d} message IDs to peer {}", .{ iwant.len, from.* });
 
-        const iwant_messages = try control.getIwant(self.allocator);
-        defer {
-            // Free only if we allocated, len == 0 returns a static empty slice
-            if (iwant_messages.len > 0) {
-                self.allocator.free(iwant_messages);
-            }
-        }
+        const iwant_messages = try control.getIwant(arena);
 
         const ihave = if (iwant_messages.len > 0) blk: {
-            const result = try self.handleIWant(from.*, iwant_messages);
+            const result = try self.handleIWant(arena, from, iwant_messages);
             break :blk result;
         } else blk: {
             break :blk &.{};
         };
         std.log.debug("Sending {d} messages to peer {}", .{ ihave.len, from.* });
 
-        const graft_messages = try control.getGraft(self.allocator);
-        defer if (graft_messages.len > 0) self.allocator.free(graft_messages);
+        const graft_messages = try control.getGraft(arena);
 
         const prune = if (graft_messages.len > 0) blk: {
-            const result = try self.handleGraft(from.*, graft_messages);
+            const result = try self.handleGraft(arena, from, graft_messages);
             break :blk result;
         } else blk: {
             break :blk &.{};
@@ -1570,42 +1614,32 @@ pub const Gossipsub = struct {
         defer if (prune_messages.len > 0) self.allocator.free(prune_messages);
 
         if (prune_messages.len > 0) {
-            try self.handlePrune(from.*, prune_messages);
+            try self.handlePrune(arena, from, prune_messages);
         }
     }
 
-    fn handleIWant(self: *Self, from: PeerId, iwant: []const rpc.ControlIWantReader) ![]*rpc.Message {
+    fn handleIWant(self: *Self, arena: Allocator, from: *const PeerId, iwant: []const rpc.ControlIWantReader) ![]*rpc.Message {
         var ihave: std.StringHashMapUnmanaged(*rpc.Message) = .empty;
-        defer ihave.deinit(self.allocator);
+
         var iwant_by_topic: std.StringHashMapUnmanaged(usize) = .empty;
-        defer iwant_by_topic.deinit(self.allocator);
         var iwant_dont_have: usize = 0;
 
-        var processed_iwant: usize = 0;
-        errdefer {
-            for (iwant[processed_iwant..]) |*rem| rem.deinit();
-        }
         for (iwant) |*iwant_msg| {
-            defer {
-                iwant_msg.deinit();
-                processed_iwant += 1;
-            }
-
             for (iwant_msg.getMessageIDs()) |msg_id| {
-                const cached = try self.mcache.getForPeer(msg_id, from) orelse {
+                const cached = try self.mcache.getForPeer(msg_id, from.*) orelse {
                     iwant_dont_have += 1;
                     continue;
                 };
 
-                std.debug.assert(cached.msg.topic != null);
-                try iwant_by_topic.put(self.allocator, cached.msg.topic.?, (iwant_by_topic.get(cached.msg.topic.?) orelse 0) + 1);
+                // TODO: used by metrics
+                try iwant_by_topic.put(arena, cached.msg.topic.?, (iwant_by_topic.get(cached.msg.topic.?) orelse 0) + 1);
 
                 if (cached.count > self.opts.gossip_retransmission) {
-                    std.log.debug("Not sending message ID {any} to peer {} as it has been sent {d} times (limit {d})", .{ msg_id, from, cached.count, self.opts.gossip_retransmission });
+                    std.log.debug("Not sending message ID {any} to peer {} as it has been sent {d} times (limit {d})", .{ msg_id, from.*, cached.count, self.opts.gossip_retransmission });
                     continue;
                 }
 
-                try ihave.put(self.allocator, msg_id, cached.msg);
+                try ihave.put(arena, msg_id, cached.msg);
             }
         }
 
@@ -1613,17 +1647,16 @@ pub const Gossipsub = struct {
             return &.{};
         }
 
-        var ihave_list = try std.ArrayListUnmanaged(*rpc.Message).initCapacity(self.allocator, ihave.count());
-        defer ihave_list.deinit(self.allocator);
+        var ihave_list = try std.ArrayListUnmanaged(*rpc.Message).initCapacity(arena, ihave.count());
 
         var it = ihave.valueIterator();
         while (it.next()) |msg| {
-            try ihave_list.append(self.allocator, msg.*);
+            try ihave_list.append(arena, msg.*);
         }
 
-        std.log.debug("Sending {d} messages to peer {}, {d} IWANT IDs not found", .{ ihave_list.items.len, from, iwant_dont_have });
+        std.log.debug("Sending {d} messages to peer {}, {d} IWANT IDs not found", .{ ihave_list.items.len, from.*, iwant_dont_have });
 
-        return try ihave_list.toOwnedSlice(self.allocator);
+        return try ihave_list.toOwnedSlice(arena);
     }
 
     fn handleIHave(self: *Self, arena: Allocator, from: *const PeerId, ihave: []const rpc.ControlIHaveReader) ![]const rpc.ControlIWant {
@@ -1699,58 +1732,61 @@ pub const Gossipsub = struct {
         return result;
     }
 
-    fn handleGraft(self: *Self, from: PeerId, graft: []const rpc.ControlGraftReader) ![]rpc.ControlPrune {
+    fn handleGraft(self: *Self, arena: Allocator, from: *const PeerId, graft: []const rpc.ControlGraftReader) ![]rpc.ControlPrune {
         var prune: std.StringHashMapUnmanaged(void) = .empty;
-        defer prune.deinit(self.allocator);
-        var processed_graft: usize = 0;
-        errdefer {
-            for (graft[processed_graft..]) |*rem| rem.deinit();
-        }
+
         for (graft) |graft_msg| {
-            defer {
-                graft_msg.deinit();
-                processed_graft += 1;
-            }
             const topic = graft_msg.getTopicID();
             if (topic.len == 0) continue;
 
-            var peers = self.mesh.get(topic) orelse {
-                try prune.put(self.allocator, topic, {});
-                continue;
-            };
-            _ = try peers.getOrPutValue(self.allocator, from, {});
+            var peers = self.mesh.get(topic) orelse continue;
+            // This should use `self.allocator` because `self.mesh` is long-lived.
+            if (peers.contains(from.*)) continue;
+
+            const has_outgoing = if (self.peers.getPtr(from.*)) |semi| semi.initiator != null else false;
+
+            if (peers.count() >= self.opts.D_hi and !has_outgoing) {
+                try prune.put(arena, topic, {});
+            } else {
+                try peers.put(self.allocator, from.*, {});
+            }
+
+            self.event_emitter.emit(.{ .gossipsub_graft = .{
+                .peer = from.*,
+                .topic = topic,
+                .direction = .INBOUND,
+            } });
         }
 
         if (prune.count() == 0) {
             return &.{};
         }
 
-        var prune_list = try std.ArrayListUnmanaged(rpc.ControlPrune).initCapacity(self.allocator, prune.count());
-        defer prune_list.deinit(self.allocator);
+        var prune_list = try std.ArrayListUnmanaged(rpc.ControlPrune).initCapacity(arena, prune.count());
 
         var it = prune.keyIterator();
+        // TODO: only support v1.0 now, need to support v1.1 later
         while (it.next()) |topic| {
-            try prune_list.append(self.allocator, .{ .topic_i_d = topic.* });
+            try prune_list.append(arena, .{ .topic_i_d = topic.* });
         }
 
-        return prune_list.toOwnedSlice(self.allocator);
+        return prune_list.toOwnedSlice(arena);
     }
 
-    fn handlePrune(self: *Self, from: PeerId, prune: []const rpc.ControlPruneReader) !void {
-        var processed_prune: usize = 0;
-        errdefer {
-            for (prune[processed_prune..]) |*rem| rem.deinit();
-        }
+    fn handlePrune(self: *Self, arena: Allocator, from: *const PeerId, prune: []const rpc.ControlPruneReader) !void {
+        _ = arena;
         for (prune) |prune_msg| {
-            defer {
-                prune_msg.deinit();
-                processed_prune += 1;
-            }
             const topic = prune_msg.getTopicID();
             if (topic.len == 0) continue;
 
             var peer_set = self.mesh.getPtr(topic) orelse continue;
-            _ = peer_set.remove(from);
+            _ = peer_set.remove(from.*);
+
+            self.event_emitter.emit(.{ .gossipsub_prune = .{
+                .peer = from.*,
+                .topic = topic,
+                .direction = .INBOUND,
+            } });
         }
     }
 
@@ -1823,7 +1859,7 @@ pub const Gossipsub = struct {
     }
 
     fn sendPrune(self: *Self, to: PeerId, topic: []const u8) void {
-        var prune_msg = self.allocator.alloc(rpc.ControlPrune, 1) catch |err| {
+        var prune_msg = self.allocator.alloc(?rpc.ControlPrune, 1) catch |err| {
             std.log.warn("Failed to allocate PRUNE message for peer {}: {}", .{ to, err });
             return;
         };
@@ -1944,7 +1980,7 @@ pub const Gossipsub = struct {
     }
 
     fn leave(self: *Self, topic: []const u8) void {
-        const removed_entry = self.mesh.fetchRemove(topic) orelse {
+        var removed_entry = self.mesh.fetchRemove(topic) orelse {
             return;
         };
 
@@ -1963,11 +1999,11 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn nextSeqno(self: *Self) ![]u8 {
+    fn nextSeqno(self: *Self, arena: Allocator) !struct { u64, []u8 } {
         const counter = self.counter.fetchAdd(1, .monotonic);
-        const buffer = try self.seq_no_pool.create();
-        std.mem.writeInt(u64, buffer, counter, .big);
-        return buffer;
+        const buffer = try arena.alloc(u8, 8);
+        std.mem.writeInt(u64, @as(*[8]u8, @ptrCast(buffer.ptr)), counter, .big);
+        return .{ counter, buffer };
     }
 
     /// Gets or creates an interned version of the topic, incrementing its reference count.
@@ -2032,12 +2068,24 @@ pub const Gossipsub = struct {
         self.subscribe(topic, callback_ctx, callback);
     }
 
+    fn vtablePublishFn(instance: *anyopaque, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        self.publish(topic, data, callback_ctx, callback);
+    }
+
+    fn vtableUnsubscribeFn(instance: *anyopaque, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        self.unsubscribe(topic, callback_ctx, callback);
+    }
+
     // --- Static VTable Instance ---
     const vtable_instance = pubsub.PubSubVTable{
         .handleRPCFn = vtableHandleRPCFn,
         .addPeerFn = vtableAddPeerFn,
         .removePeerFn = vtableRemovePeerFn,
         .subscribeFn = vtableSubscribeFn,
+        .publishFn = vtablePublishFn,
+        .unsubscribeFn = vtableUnsubscribeFn,
     };
 
     // --- any() method ---

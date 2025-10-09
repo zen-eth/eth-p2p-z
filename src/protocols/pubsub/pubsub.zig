@@ -166,6 +166,8 @@ pub const PubSubVTable = struct {
     addPeerFn: *const fn (self: *anyopaque, peer: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
     removePeerFn: *const fn (self: *anyopaque, peer: PeerId, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
     subscribeFn: *const fn (self: *anyopaque, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
+    unsubscribeFn: *const fn (self: *anyopaque, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
+    publishFn: *const fn (self: *anyopaque, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void,
 };
 
 /// This is a generic PubSub interface that uses the VTable pattern to provide a type-erased
@@ -193,6 +195,12 @@ pub const PubSub = struct {
 
     pub fn subscribe(self: Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
         self.vtable.subscribeFn(self.instance, topic, callback_ctx, callback);
+    }
+    pub fn unsubscribe(self: Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
+        self.vtable.unsubscribeFn(self.instance, topic, callback_ctx, callback);
+    }
+    pub fn publish(self: Self, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
+        self.vtable.publishFn(self.instance, topic, data, callback_ctx, callback);
     }
 };
 
