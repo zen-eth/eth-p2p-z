@@ -751,7 +751,7 @@ pub const Gossipsub = struct {
             return;
         }
 
-        const selected_result = self.selectPeersToPublish(topic) catch |err| {
+        const selected_result = self.selectPeersToPublish(arena_allocator, topic) catch |err| {
             std.log.warn("Failed to select peers to publish for topic {s}: {}", .{ topic, err });
             callback(callback_ctx, err);
             return;
@@ -773,7 +773,7 @@ pub const Gossipsub = struct {
             return;
         };
 
-        self.mcache.put(&publish_msg) catch |err| {
+        self.mcache.putWithId(msg_id, &publish_msg) catch |err| {
             std.log.warn("Failed to cache message in message cache for topic {s}: {}", .{ topic, err });
             callback(callback_ctx, err);
             return;
@@ -841,6 +841,10 @@ pub const Gossipsub = struct {
 
     fn doSubscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
         defer self.allocator.free(topic);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
         if (!self.subscriptions.contains(topic)) {
             const interned_topic = self.refTopic(topic) catch |err| {
                 callback(callback_ctx, err);
@@ -855,8 +859,8 @@ pub const Gossipsub = struct {
 
             var peers_iter = self.peers.iterator();
             while (peers_iter.next()) |entry| {
-                const peer_id = entry.key_ptr.*;
-                self.sendSubscriptions(peer_id, &.{interned_topic}, true) catch |err| {
+                const peer_id = entry.key_ptr;
+                self.sendSubscriptions(arena_allocator, peer_id, &.{interned_topic}, true) catch |err| {
                     std.log.warn("Failed to send subscription for topic {s} to peer {}: {}", .{ topic, peer_id, err });
                     callback(callback_ctx, err);
                     continue;
@@ -864,7 +868,7 @@ pub const Gossipsub = struct {
             }
         }
 
-        self.join(topic) catch |err| {
+        self.join(arena_allocator, topic) catch |err| {
             std.log.warn("Failed to join mesh for topic {s}: {}", .{ topic, err });
             callback(callback_ctx, err);
             return;
@@ -896,12 +900,16 @@ pub const Gossipsub = struct {
 
     fn doUnsubscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
         defer self.allocator.free(topic);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
         if (self.subscriptions.fetchRemove(topic)) |removed| {
             const interned_topic = removed.key;
             var peers_iter = self.peers.iterator();
             while (peers_iter.next()) |entry| {
-                const peer_id = entry.key_ptr.*;
-                self.sendSubscriptions(peer_id, &.{interned_topic}, false) catch |err| {
+                const peer_id = entry.key_ptr;
+                self.sendSubscriptions(arena_allocator, peer_id, &.{interned_topic}, false) catch |err| {
                     std.log.warn("Failed to send unsubscription for topic {s} to peer {}: {}", .{ topic, peer_id, err });
                     callback(callback_ctx, err);
                     continue;
@@ -910,7 +918,7 @@ pub const Gossipsub = struct {
             self.unrefTopic(interned_topic);
         }
 
-        self.leave(topic);
+        self.leave(arena_allocator, topic);
 
         callback(callback_ctx, {});
     }
@@ -962,7 +970,7 @@ pub const Gossipsub = struct {
         return try selected_peers.toOwnedSlice(arena);
     }
 
-    fn selectPeersToPublish(self: *Self, topic: []const u8) !SelectPeersResult {
+    fn selectPeersToPublish(self: *Self, arena: Allocator, topic: []const u8) !SelectPeersResult {
         var selected_peers = std.ArrayListUnmanaged(PeerId).empty;
 
         var to_send_count: SelectPeersResult.SelectPeersCounts = .{
@@ -978,7 +986,7 @@ pub const Gossipsub = struct {
                 while (it.next()) |entry| {
                     // TODO: support direct peers and peer scoring
                     to_send_count.flood += 1;
-                    try selected_peers.append(self.allocator, entry.key_ptr.*);
+                    try selected_peers.append(arena, entry.key_ptr.*);
                 }
             } else {
                 // TODO: support direct peers and floodsub peers
@@ -986,7 +994,7 @@ pub const Gossipsub = struct {
                     var it = mesh_peers.iterator();
                     while (it.next()) |entry| {
                         to_send_count.mesh += 1;
-                        try selected_peers.append(self.allocator, entry.key_ptr.*);
+                        try selected_peers.append(arena, entry.key_ptr.*);
                     }
 
                     if (mesh_peers.count() < self.opts.D) {
@@ -995,7 +1003,7 @@ pub const Gossipsub = struct {
                         };
                         var more_peers = try self.getRandomGossipPeers(topic, self.opts.D - mesh_peers.count(), &filter_ctx, FilterCtx.filter);
                         defer more_peers.deinit(self.allocator);
-                        try selected_peers.appendSlice(self.allocator, more_peers.items);
+                        try selected_peers.appendSlice(arena, more_peers.items);
                         to_send_count.fanout += more_peers.items.len;
                     }
                 } else {
@@ -1003,7 +1011,7 @@ pub const Gossipsub = struct {
                         var it = fanout_peers.iterator();
                         while (it.next()) |entry| {
                             to_send_count.fanout += 1;
-                            try selected_peers.append(self.allocator, entry.key_ptr.*);
+                            try selected_peers.append(arena, entry.key_ptr.*);
                         }
                     } else {
                         var more_peers = try self.getRandomGossipPeers(topic, self.opts.D, null, struct {
@@ -1014,9 +1022,10 @@ pub const Gossipsub = struct {
                         defer more_peers.deinit(self.allocator);
                         if (more_peers.items.len > 0) {
                             var new_fanout: std.AutoHashMapUnmanaged(PeerId, void) = .empty;
+                            errdefer new_fanout.deinit(self.allocator);
                             for (more_peers.items) |p| {
                                 try new_fanout.put(self.allocator, p, {});
-                                try selected_peers.append(self.allocator, p);
+                                try selected_peers.append(arena, p);
                                 to_send_count.fanout += 1;
                             }
                             try self.fanout.put(self.allocator, topic, new_fanout);
@@ -1029,7 +1038,7 @@ pub const Gossipsub = struct {
         }
 
         return SelectPeersResult{
-            .to_send = try selected_peers.toOwnedSlice(self.allocator),
+            .to_send = try selected_peers.toOwnedSlice(arena),
             .to_send_count = to_send_count,
         };
     }
@@ -1843,8 +1852,8 @@ pub const Gossipsub = struct {
         return false;
     }
 
-    fn sendGraft(self: *Self, to: PeerId, topic: []const u8) void {
-        var graft_msg = self.allocator.alloc(?rpc.ControlGraft, 1) catch |err| {
+    fn sendGraft(self: *Self, arena: Allocator, to: *const PeerId, topic: []const u8) void {
+        var graft_msg = arena.alloc(?rpc.ControlGraft, 1) catch |err| {
             std.log.warn("Failed to allocate GRAFT message for peer {}: {}", .{ to, err });
             return;
         };
@@ -1854,12 +1863,12 @@ pub const Gossipsub = struct {
         };
 
         const rpc_msg: rpc.RPC = .{ .control = .{ .graft = graft_msg } };
-        _ = self.sendRPC(to, &rpc_msg);
+        _ = self.sendRPC(to.*, &rpc_msg);
         // TODO: free rpc_msg
     }
 
-    fn sendPrune(self: *Self, to: PeerId, topic: []const u8) void {
-        var prune_msg = self.allocator.alloc(?rpc.ControlPrune, 1) catch |err| {
+    fn sendPrune(self: *Self, arena: Allocator, to: *const PeerId, topic: []const u8) void {
+        var prune_msg = arena.alloc(?rpc.ControlPrune, 1) catch |err| {
             std.log.warn("Failed to allocate PRUNE message for peer {}: {}", .{ to, err });
             return;
         };
@@ -1869,24 +1878,23 @@ pub const Gossipsub = struct {
         };
 
         const rpc_msg: rpc.RPC = .{ .control = .{ .prune = prune_msg } };
-        _ = self.sendRPC(to, &rpc_msg);
+        _ = self.sendRPC(to.*, &rpc_msg);
         // TODO: free rpc_msg
     }
 
-    fn sendSubscriptions(self: *Self, to: PeerId, topics: []const []const u8, subscribe_msg: bool) !void {
+    fn sendSubscriptions(self: *Self, arena: Allocator, to: *const PeerId, topics: []const []const u8, subscribe_flag: bool) !void {
         var sub_opts: std.ArrayListUnmanaged(?rpc.RPC.SubOpts) = .empty;
 
         for (topics) |topic| {
             const sub: rpc.RPC.SubOpts = .{
                 .topicid = topic,
-                .subscribe = subscribe_msg,
+                .subscribe = subscribe_flag,
             };
-            try sub_opts.append(self.allocator, sub);
+            try sub_opts.append(arena, sub);
         }
 
-        const sub_opt_slice = try sub_opts.toOwnedSlice(self.allocator);
-        const rpc_msg: rpc.RPC = .{ .subscriptions = sub_opt_slice };
-        _ = self.sendRPC(to, &rpc_msg);
+        const rpc_msg: rpc.RPC = .{ .subscriptions = sub_opts.items };
+        _ = self.sendRPC(to.*, &rpc_msg);
     }
     // fn flush(self: *Self) void {
     //     // send gossip first, which will also piggyback control
@@ -1921,7 +1929,7 @@ pub const Gossipsub = struct {
     //     }
     // }
 
-    fn join(self: *Self, topic: []const u8) !void {
+    fn join(self: *Self, arena: Allocator, topic: []const u8) !void {
         if (self.mesh.contains(topic)) {
             return;
         }
@@ -1929,6 +1937,7 @@ pub const Gossipsub = struct {
         var mesh_peers: std.AutoHashMapUnmanaged(PeerId, void) = .empty;
         errdefer mesh_peers.deinit(self.allocator);
 
+        var cleanup_fanout = false;
         if (self.fanout.contains(topic)) {
             var fanout_peers = self.fanout.get(topic).?;
             var fanout_peers_iter = fanout_peers.keyIterator();
@@ -1946,11 +1955,7 @@ pub const Gossipsub = struct {
                     try mesh_peers.put(self.allocator, p, {});
                 }
             }
-            _ = self.fanout.remove(topic);
-            self.unrefTopic(topic);
-            fanout_peers.deinit(self.allocator);
-            _ = self.fanout_last_pub.remove(topic);
-            self.unrefTopic(topic);
+            cleanup_fanout = true;
         } else {
             var new_peers = try self.getRandomGossipPeers(topic, self.opts.D, null, struct {
                 fn filter(_: ?*anyopaque, _: PeerId) bool {
@@ -1971,15 +1976,23 @@ pub const Gossipsub = struct {
             return err;
         };
 
+        if (cleanup_fanout) {
+            var fanout_peers = self.fanout.fetchRemove(topic).?.value;
+            self.unrefTopic(topic);
+            fanout_peers.deinit(self.allocator);
+            _ = self.fanout_last_pub.remove(topic);
+            self.unrefTopic(topic);
+        }
+
         var it = mesh_peers.keyIterator();
         while (it.next()) |peer_id| {
             // TODO: self.tracer.Graft(p, topic)
-            self.sendGraft(peer_id.*, interned_topic);
+            self.sendGraft(arena, peer_id, interned_topic);
             // TODO: self.tagPeer(p, topic)
         }
     }
 
-    fn leave(self: *Self, topic: []const u8) void {
+    fn leave(self: *Self, arena: Allocator, topic: []const u8) void {
         var removed_entry = self.mesh.fetchRemove(topic) orelse {
             return;
         };
@@ -1994,7 +2007,7 @@ pub const Gossipsub = struct {
         var it = peer_set.keyIterator();
         while (it.next()) |peer_id| {
             // TODO: self.tracer.Prune(p, topic)
-            self.sendPrune(peer_id.*, interned_topic);
+            self.sendPrune(arena, peer_id, interned_topic);
             // TODO: self.tagPeer(p, topic)
         }
     }
