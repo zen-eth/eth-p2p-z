@@ -78,66 +78,72 @@ const SelectPeersResult = struct {
     to_send_count: SelectPeersCounts,
 };
 
+fn deinitControlIHaveOptional(allocator: Allocator, ihave_opt: ?rpc.ControlIHave) void {
+    const ihave = ihave_opt orelse return;
+
+    if (ihave.topic_i_d) |topic_id| {
+        allocator.free(topic_id);
+    }
+
+    if (ihave.message_i_ds) |msg_ids| {
+        for (msg_ids) |maybe_msg_id| {
+            if (maybe_msg_id) |msg_id| {
+                allocator.free(msg_id);
+            }
+        }
+        allocator.free(msg_ids);
+    }
+}
+
+fn deinitControlIHaveList(allocator: Allocator, list: *std.ArrayListUnmanaged(?rpc.ControlIHave)) void {
+    for (list.items) |item| {
+        deinitControlIHaveOptional(allocator, item);
+    }
+    list.deinit(allocator);
+}
+
 pub const SendingRPCContext = struct {
     gossipsub: *Gossipsub,
     control: ?rpc.ControlMessage,
-    ihave: ?[]?rpc.ControlIHave,
+    ihave: ?std.ArrayListUnmanaged(?rpc.ControlIHave),
     to: PeerId,
 
     pub fn callback(ctx: ?*anyopaque, res: anyerror!usize) void {
         const self: *SendingRPCContext = @ptrCast(@alignCast(ctx.?));
         defer self.gossipsub.allocator.destroy(self);
 
-        _ = res catch |err| {
+        if (res) |_| {
+            // nothing to do
+        } else |err| {
             std.log.warn("Failed to send RPC message to peer {}: {}", .{ self.gossipsub.peer_id, err });
-            self.gossipsub.control.put(self.gossipsub.allocator, self.to, self.control) catch |e| {
+            if (self.gossipsub.control.put(self.gossipsub.allocator, self.to, self.control)) |_| {
+                self.control = null;
+            } else |e| {
                 std.log.warn("Failed to cache control message for peer {}: {}", .{ self.gossipsub.peer_id, e });
                 pubsub.deinitControl(&self.control, self.gossipsub.allocator);
-            };
-
-            if (self.ihave) |ihave| {
-                const ihave_list = std.ArrayListUnmanaged(?rpc.ControlIHave).fromOwnedSlice(ihave);
-                self.gossipsub.gossip.put(self.gossipsub.allocator, self.to, ihave_list) catch |e| {
-                    std.log.warn("Failed to cache IHAVE message for peer {}: {}", .{ self.gossipsub.peer_id, e });
-                    for (ihave) |item| {
-                        if (item.?.topic_i_d) |topic_id| {
-                            self.gossipsub.allocator.free(topic_id);
-                        }
-                        if (item.?.message_i_ds) |msg_ids| {
-                            for (msg_ids) |msg_id| {
-                                if (msg_id) |m_id| {
-                                    self.gossipsub.allocator.free(m_id);
-                                }
-                            }
-                            self.gossipsub.allocator.free(msg_ids);
-                        }
-                    }
-                    self.gossipsub.allocator.free(ihave);
-                };
+                self.control = null;
             }
-        };
+
+            if (self.ihave) |*ihave_ptr| {
+                if (self.gossipsub.gossip.put(self.gossipsub.allocator, self.to, ihave_ptr.*)) |_| {
+                    self.ihave = null;
+                } else |put_err| {
+                    std.log.warn("Failed to cache IHAVE message for peer {}: {}", .{ self.gossipsub.peer_id, put_err });
+                    deinitControlIHaveList(self.gossipsub.allocator, ihave_ptr);
+                    self.ihave = null;
+                }
+            }
+        }
 
         self.deinit(self.gossipsub.allocator);
     }
 
     pub fn deinit(self: *SendingRPCContext, allocator: std.mem.Allocator) void {
         pubsub.deinitControl(&self.control, allocator);
-        // assume ihave owns its items slices
-        if (self.ihave) |self_ihave| {
-            for (self_ihave) |item| {
-                if (item.?.topic_i_d) |topic_id| {
-                    allocator.free(topic_id);
-                }
-                if (item.?.message_i_ds) |msg_ids| {
-                    for (msg_ids) |msg_id| {
-                        if (msg_id) |m_id| {
-                            allocator.free(m_id);
-                        }
-                    }
-                    allocator.free(msg_ids);
-                }
-            }
-            allocator.free(self_ihave);
+        self.control = null;
+        if (self.ihave) |*ihave_ptr| {
+            deinitControlIHaveList(allocator, ihave_ptr);
+            self.ihave = null;
         }
     }
 };
@@ -496,12 +502,12 @@ pub const Gossipsub = struct {
 
         var my_topic_iter = self.subscriptions.iterator();
         while (my_topic_iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
+            self.unrefTopic(entry.key_ptr.*);
         }
         self.subscriptions.deinit(self.allocator);
         var mesh_iter = self.mesh.iterator();
         while (mesh_iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
+            self.unrefTopic(entry.key_ptr.*);
             entry.value_ptr.deinit(self.allocator);
         }
         self.mesh.deinit(self.allocator);
@@ -689,26 +695,25 @@ pub const Gossipsub = struct {
     }
 
     pub fn publish(self: *Self, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
-        const copied_topic = self.allocator.dupe(u8, topic) catch |err| {
-            std.log.warn("Failed to copy topic string: {}", .{err});
-            callback(callback_ctx, err);
-            return;
-        };
-
-        const copied_data = self.allocator.dupe(u8, data) catch |err| {
-            std.log.warn("Failed to copy data buffer: {}", .{err});
-            callback(callback_ctx, err);
-            return;
-        };
-
         if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
+            const copied_topic = self.allocator.dupe(u8, topic) catch |err| {
+                std.log.warn("Failed to copy topic string: {}", .{err});
+                callback(callback_ctx, err);
+                return;
+            };
+
+            const copied_data = self.allocator.dupe(u8, data) catch |err| {
+                std.log.warn("Failed to copy data buffer: {}", .{err});
+                callback(callback_ctx, err);
+                return;
+            };
             self.doPublish(copied_topic, copied_data, callback_ctx, callback);
         } else {
             const message = io_loop.IOMessage{
                 .action = .{ .pubsub_publish = .{
                     .pubsub = self.any(),
-                    .topic = copied_topic,
-                    .message = copied_data,
+                    .topic = topic,
+                    .message = data,
                     .callback_ctx = callback_ctx,
                     .callback = callback,
                 } },
@@ -783,14 +788,14 @@ pub const Gossipsub = struct {
         // rust-libp2p send idontwant if the message is large enough
         var receipents = std.ArrayListUnmanaged(PeerId).empty;
         errdefer receipents.deinit(self.allocator);
-        for (selected_result.to_send) |to| {
+        for (selected_result.to_send) |*to| {
             const rpc_msg = rpc.RPC{
                 .publish = &.{publish_msg},
             };
-            const sent = self.sendRPC(to, &rpc_msg);
+            const sent = self.sendRPC(arena_allocator, to, &rpc_msg);
             if (sent) {
-                receipents.append(self.allocator, to) catch |err| {
-                    std.log.warn("Failed to record sent peer {} for topic {s}: {}", .{ to, topic, err });
+                receipents.append(self.allocator, to.*) catch |err| {
+                    std.log.warn("Failed to record sent peer {} for topic {s}: {}", .{ to.*, topic, err });
                     callback(callback_ctx, err);
                     return;
                 };
@@ -819,18 +824,18 @@ pub const Gossipsub = struct {
     }
 
     pub fn subscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
-        const copied_topic = self.allocator.dupe(u8, topic) catch |err| {
-            std.log.warn("Failed to copy topic string: {}", .{err});
-            callback(callback_ctx, err);
-            return;
-        };
         if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
+            const copied_topic = self.allocator.dupe(u8, topic) catch |err| {
+                std.log.warn("Failed to copy topic string: {}", .{err});
+                callback(callback_ctx, err);
+                return;
+            };
             self.doSubscribe(copied_topic, callback_ctx, callback);
         } else {
             const message = io_loop.IOMessage{
                 .action = .{ .pubsub_subscribe = .{
                     .pubsub = self.any(),
-                    .topic = copied_topic,
+                    .topic = topic,
                     .callback_ctx = callback_ctx,
                     .callback = callback,
                 } },
@@ -878,18 +883,18 @@ pub const Gossipsub = struct {
     }
 
     pub fn unsubscribe(self: *Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
-        const copied_topic = self.allocator.dupe(u8, topic) catch |err| {
-            std.log.warn("Failed to copy topic string: {}", .{err});
-            callback(callback_ctx, err);
-            return;
-        };
         if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
+            const copied_topic = self.allocator.dupe(u8, topic) catch |err| {
+                std.log.warn("Failed to copy topic string: {}", .{err});
+                callback(callback_ctx, err);
+                return;
+            };
             self.doUnsubscribe(copied_topic, callback_ctx, callback);
         } else {
             const message = io_loop.IOMessage{
                 .action = .{ .pubsub_unsubscribe = .{
                     .pubsub = self.any(),
-                    .topic = copied_topic,
+                    .topic = topic,
                     .callback_ctx = callback_ctx,
                     .callback = callback,
                 } },
@@ -928,14 +933,14 @@ pub const Gossipsub = struct {
         _ = msg_id;
         const selected_peers = try self.selectPeersToForward(arena, rpc_msg.topic.?, propagation_source, exclude);
 
-        for (selected_peers) |to| {
+        for (selected_peers) |*to| {
             var publish_storage: [1]?rpc.Message = undefined;
             publish_storage[0] = rpc_msg.*;
 
             const rpc_to_send = rpc.RPC{
                 .publish = publish_storage[0..],
             };
-            _ = self.sendRPC(to, &rpc_to_send);
+            _ = self.sendRPC(arena, to, &rpc_to_send);
         }
     }
 
@@ -1140,33 +1145,39 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn sendRPC(self: *Self, to: PeerId, rpc_msg_in: *const rpc.RPC) bool {
+    fn sendRPC(self: *Self, arena: Allocator, to: *const PeerId, rpc_msg_in: *const rpc.RPC) bool {
         // TODO: Use a pool of pre-allocated contexts?
         var sending_ctx = self.allocator.create(SendingRPCContext) catch |err| {
             std.log.err("Failed to allocate RPC message: {}", .{err});
             return false;
         };
-        errdefer self.allocator.destroy(sending_ctx);
+        var handing_off = false;
+        defer {
+            if (!handing_off) {
+                sending_ctx.deinit(self.allocator);
+                self.allocator.destroy(sending_ctx);
+            }
+        }
         sending_ctx.* = .{
             .gossipsub = self,
             .control = null,
             .ihave = null,
-            .to = to,
+            .to = to.*,
         };
 
         // TODO: should we dial the peer if not connected? should we return an error?
-        const semi_duplex = self.peers.getPtr(to) orelse {
-            std.log.warn("Attempted to send RPC to unknown peer: {}", .{to});
+        const semi_duplex = self.peers.getPtr(to.*) orelse {
+            std.log.warn("Attempted to send RPC to unknown peer: {}", .{to.*});
             return false;
         };
 
         const initiator = semi_duplex.initiator orelse {
-            std.log.warn("No outgoing stream to peer: {}", .{to});
+            std.log.warn("No outgoing stream to peer: {}", .{to.*});
             return false;
         };
 
-        const has_control = self.control.contains(to);
-        const has_gossip = self.gossip.contains(to);
+        const has_control = self.control.contains(to.*);
+        const has_gossip = self.gossip.contains(to.*);
         const needs_piggyback = has_control or has_gossip;
 
         var rpc_storage: ?rpc.RPC = null;
@@ -1178,65 +1189,88 @@ pub const Gossipsub = struct {
         }
 
         if (has_control) {
-            const entry = self.control.fetchRemove(to).?;
+            const entry = self.control.fetchRemove(to.*).?;
             sending_ctx.control = entry.value;
-            self.piggybackControl(to, @constCast(rpc_msg), &sending_ctx.control.?) catch |err| {
-                std.log.warn("Failed to piggyback control message to peer {}: {}", .{ to, err });
-                self.control.put(self.allocator, to, sending_ctx.control.?) catch {
-                    std.log.err("Failed to restore control message for peer {}: {}", .{ to, err });
-                };
+            self.piggybackControl(arena, to, @constCast(rpc_msg), &sending_ctx.control.?) catch |err| {
+                std.log.warn("Failed to piggyback control message to peer {}: {}", .{ to.*, err });
+                if (self.control.put(self.allocator, to.*, sending_ctx.control.?)) |_| {
+                    sending_ctx.control = null;
+                } else |put_err| {
+                    std.log.err("Failed to restore control message for peer {}: {}", .{ to.*, put_err });
+                }
                 return false;
             };
         }
 
         if (has_gossip) {
-            const entry = self.gossip.fetchRemove(to).?;
-            var value = entry.value;
-            sending_ctx.ihave = value.toOwnedSlice(self.allocator) catch |err| {
-                std.log.err("Failed to own IHAVE message for peer {}: {}", .{ to, err });
-                self.gossip.put(self.allocator, to, entry.value) catch {
-                    std.log.err("Failed to restore IHAVE message for peer {}: {}", .{ to, err });
-                };
-                return false;
-            };
-            piggybackGossip(@constCast(rpc_msg), sending_ctx.ihave.?) catch |err| {
-                std.log.warn("Failed to piggyback gossip message to peer {}: {}", .{ to, err });
-                var ihave_list: std.ArrayListUnmanaged(?rpc.ControlIHave) = .empty;
-                defer ihave_list.deinit(self.allocator);
-                for (sending_ctx.ihave.?) |msg| {
-                    ihave_list.append(self.allocator, msg) catch continue;
+            const entry = self.gossip.fetchRemove(to.*).?;
+            sending_ctx.ihave = entry.value;
+
+            const ihave_ptr = &sending_ctx.ihave.?;
+            if (piggybackGossip(@constCast(rpc_msg), ihave_ptr)) |_| {
+                // ok
+            } else |err| {
+                std.log.warn("Failed to piggyback gossip message to peer {}: {}", .{ to.*, err });
+
+                if (self.gossip.put(self.allocator, to.*, ihave_ptr.*)) |_| {
+                    sending_ctx.ihave = null;
+                } else |put_err| {
+                    std.log.err("Failed to restore gossip message for peer {}: {}", .{ to.*, put_err });
+                    deinitControlIHaveList(self.allocator, ihave_ptr);
+                    sending_ctx.ihave = null;
                 }
-                self.gossip.put(self.allocator, to, ihave_list) catch {
-                    std.log.err("Failed to restore gossip message for peer {}: {}", .{ to, err });
-                };
                 return false;
-            };
+            }
         }
 
-        const rpc_bytes = rpc_msg.encode(self.allocator) catch |err| {
-            std.log.warn("Failed to encode RPC message for peer {}: {}", .{ to, err });
+        const rpc_bytes = rpc_msg.encode(arena) catch |err| {
+            std.log.warn("Failed to encode RPC message for peer {}: {}", .{ to.*, err });
             if (sending_ctx.control) |ctrl| {
-                self.control.put(self.allocator, to, ctrl) catch {
-                    std.log.warn("Failed to restore control message for peer {}: {}", .{ to, err });
-                };
-            }
-            if (sending_ctx.ihave) |ihave| {
-                var ihave_list: std.ArrayListUnmanaged(?rpc.ControlIHave) = .empty;
-                defer ihave_list.deinit(self.allocator);
-                for (ihave) |msg| {
-                    ihave_list.append(self.allocator, msg) catch {
-                        std.log.warn("Failed to restore IHAVE message for peer {}: {}", .{ to, err });
-                    };
+                if (self.control.put(self.allocator, to.*, ctrl)) |_| {
+                    sending_ctx.control = null;
+                } else |put_err| {
+                    std.log.warn("Failed to restore control message for peer {}: {}", .{ to.*, put_err });
                 }
-                self.gossip.put(self.allocator, to, ihave_list) catch {
-                    std.log.warn("Failed to restore gossip message for peer {}: {}", .{ to, err });
-                };
+            }
+            if (sending_ctx.ihave) |*ihave_ptr| {
+                if (self.gossip.put(self.allocator, to.*, ihave_ptr.*)) |_| {
+                    sending_ctx.ihave = null;
+                } else |put_err| {
+                    std.log.warn("Failed to restore gossip message for peer {}: {}", .{ to.*, put_err });
+                    deinitControlIHaveList(self.allocator, ihave_ptr);
+                    sending_ctx.ihave = null;
+                }
             }
             return false;
         };
-        defer self.allocator.free(rpc_bytes);
 
-        initiator.stream.write(rpc_bytes, sending_ctx, SendingRPCContext.callback);
+        const encoded_size = rpc_msg.calcProtobufSize();
+        var size_buffer: [10]u8 = undefined;
+        const size_bytes = uvarint.encode(usize, encoded_size, &size_buffer);
+
+        const encoded_rpc_msg = std.mem.concat(arena, u8, &.{ size_bytes, rpc_bytes }) catch |err| {
+            std.log.warn("Failed to prepare encoded RPC message for peer {}: {}", .{ to.*, err });
+            if (sending_ctx.control) |ctrl| {
+                if (self.control.put(self.allocator, to.*, ctrl)) |_| {
+                    sending_ctx.control = null;
+                } else |put_err| {
+                    std.log.warn("Failed to restore control message for peer {}: {}", .{ to.*, put_err });
+                }
+            }
+            if (sending_ctx.ihave) |*ihave_ptr| {
+                if (self.gossip.put(self.allocator, to.*, ihave_ptr.*)) |_| {
+                    sending_ctx.ihave = null;
+                } else |put_err| {
+                    std.log.warn("Failed to restore gossip message for peer {}: {}", .{ to.*, put_err });
+                    deinitControlIHaveList(self.allocator, ihave_ptr);
+                    sending_ctx.ihave = null;
+                }
+            }
+            return false;
+        };
+
+        initiator.stream.write(encoded_rpc_msg, sending_ctx, SendingRPCContext.callback);
+        handing_off = true;
 
         if (rpc_msg.control) |ctrl| {
             if (ctrl.graft) |graft| {
@@ -1245,7 +1279,7 @@ pub const Gossipsub = struct {
                     const topic_id = g.topic_i_d orelse continue;
 
                     self.event_emitter.emit(.{ .gossipsub_graft = .{
-                        .peer = to,
+                        .peer = to.*,
                         .topic = topic_id,
                         .direction = .OUTBOUND,
                     } });
@@ -1257,7 +1291,7 @@ pub const Gossipsub = struct {
                     const topic_id = p.topic_i_d orelse continue;
 
                     self.event_emitter.emit(.{ .gossipsub_prune = .{
-                        .peer = to,
+                        .peer = to.*,
                         .topic = topic_id,
                         .direction = .OUTBOUND,
                     } });
@@ -1268,34 +1302,32 @@ pub const Gossipsub = struct {
         return true;
     }
 
-    fn piggybackControl(self: *Self, to: PeerId, rpc_msg: *rpc.RPC, ctrl: *const rpc.ControlMessage) !void {
+    fn piggybackControl(self: *Self, arena: Allocator, to: *const PeerId, rpc_msg: *rpc.RPC, ctrl: *const rpc.ControlMessage) !void {
         var graft_list: std.ArrayListUnmanaged(?rpc.ControlGraft) = .empty;
-        defer graft_list.deinit(self.allocator);
-        if (ctrl.graft) |graft| {
-            for (graft) |g_opt| {
-                const g = g_opt orelse continue;
-                const topic_id = g.topic_i_d orelse continue;
+        if (ctrl.graft) |grafts| {
+            for (grafts) |graft_opt| {
+                const graft = graft_opt orelse continue;
+                const topic_id = graft.topic_i_d orelse continue;
                 const peers = self.mesh.get(topic_id) orelse continue;
 
-                if (peers.contains(to)) {
-                    try graft_list.append(self.allocator, g);
+                if (peers.contains(to.*)) {
+                    try graft_list.append(arena, graft);
                 }
             }
         }
 
         var prune_list: std.ArrayListUnmanaged(?rpc.ControlPrune) = .empty;
-        defer prune_list.deinit(self.allocator);
-        if (ctrl.prune) |prune| {
-            for (prune) |p_opt| {
-                const p = p_opt orelse continue;
-                const topic_id = p.topic_i_d orelse continue;
+        if (ctrl.prune) |prunes| {
+            for (prunes) |prune_opt| {
+                const prune = prune_opt orelse continue;
+                const topic_id = prune.topic_i_d orelse continue;
 
                 if (self.mesh.get(topic_id)) |peers| {
-                    if (!peers.contains(to)) {
-                        try prune_list.append(self.allocator, p);
+                    if (!peers.contains(to.*)) {
+                        try prune_list.append(arena, prune);
                     }
                 } else {
-                    try prune_list.append(self.allocator, p);
+                    try prune_list.append(arena, prune);
                 }
             }
         }
@@ -1306,19 +1338,19 @@ pub const Gossipsub = struct {
             }
 
             if (graft_list.items.len > 0) {
-                rpc_msg.control.?.graft = try graft_list.toOwnedSlice(self.allocator);
+                rpc_msg.control.?.graft = try graft_list.toOwnedSlice(arena);
             }
             if (prune_list.items.len > 0) {
-                rpc_msg.control.?.prune = try prune_list.toOwnedSlice(self.allocator);
+                rpc_msg.control.?.prune = try prune_list.toOwnedSlice(arena);
             }
         }
     }
 
-    fn piggybackGossip(rpc_msg: *rpc.RPC, ihave: []const ?rpc.ControlIHave) !void {
+    fn piggybackGossip(rpc_msg: *rpc.RPC, ihave: *const std.ArrayListUnmanaged(?rpc.ControlIHave)) !void {
         if (rpc_msg.control == null) {
             rpc_msg.control = .{};
         }
-        rpc_msg.control.?.ihave = ihave;
+        rpc_msg.control.?.ihave = ihave.items;
     }
 
     fn handleSubscription(self: *Self, from: *const PeerId, topic: []const u8, is_subscribe: bool) !void {
@@ -1863,7 +1895,7 @@ pub const Gossipsub = struct {
         };
 
         const rpc_msg: rpc.RPC = .{ .control = .{ .graft = graft_msg } };
-        _ = self.sendRPC(to.*, &rpc_msg);
+        _ = self.sendRPC(arena, to, &rpc_msg);
         // TODO: free rpc_msg
     }
 
@@ -1878,7 +1910,7 @@ pub const Gossipsub = struct {
         };
 
         const rpc_msg: rpc.RPC = .{ .control = .{ .prune = prune_msg } };
-        _ = self.sendRPC(to.*, &rpc_msg);
+        _ = self.sendRPC(arena, to, &rpc_msg);
         // TODO: free rpc_msg
     }
 
@@ -1894,7 +1926,7 @@ pub const Gossipsub = struct {
         }
 
         const rpc_msg: rpc.RPC = .{ .subscriptions = sub_opts.items };
-        _ = self.sendRPC(to.*, &rpc_msg);
+        _ = self.sendRPC(arena, to, &rpc_msg);
     }
     // fn flush(self: *Self) void {
     //     // send gossip first, which will also piggyback control
@@ -2106,6 +2138,19 @@ pub const Gossipsub = struct {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 };
+
+const WaitError = error{Timeout};
+
+fn waitForFlag(flag: *std.atomic.Value(bool), timeout_ns: u64) WaitError!void {
+    const step = 10 * std.time.ns_per_ms;
+    var waited: u64 = 0;
+
+    while (!flag.load(.acquire)) {
+        if (waited >= timeout_ns) return error.Timeout;
+        std.time.sleep(step);
+        waited += step;
+    }
+}
 
 test "pubsub add peer" {
     const allocator = std.testing.allocator;
@@ -2780,4 +2825,416 @@ test "simulate onMessage" {
     try std.testing.expectEqual(0, pubsub2.topics.get("test_topic1").?.count());
     try std.testing.expectEqual(1, pubsub2.topics.get("test_topic").?.count());
     try std.testing.expectEqual(1, pubsub2.topics.get("test_topic2").?.count());
+}
+
+test "pubsub subscribe and publish" {
+    const allocator = std.testing.allocator;
+
+    var listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9867");
+    defer listen_address.deinit();
+
+    var loop: io_loop.ThreadEventLoop = undefined;
+    try loop.init(allocator);
+    defer loop.deinit();
+
+    const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(host_key);
+
+    var transport: quic.QuicTransport = undefined;
+    try transport.init(&loop, host_key, keys.KeyType.ED25519, allocator);
+
+    var switch_listen_address = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9867");
+    try switch_listen_address.push(.{ .P2P = transport.local_peer_id });
+    defer switch_listen_address.deinit();
+
+    var network_switch: swarm.Switch = undefined;
+    network_switch.init(allocator, &transport);
+    defer network_switch.deinit();
+
+    var handler = PubSubPeerProtocolHandler.init(allocator);
+    defer handler.deinit();
+    try network_switch.addProtocolHandler(v1_id, handler.any());
+    try network_switch.addProtocolHandler(v1_1_id, handler.any());
+
+    var router: Gossipsub = undefined;
+    try router.init(allocator, listen_address, transport.local_peer_id, host_key, &network_switch, .{ .emit_self = true });
+    defer router.deinit();
+    try network_switch.listen(listen_address, &router, Gossipsub.onIncomingNewStream);
+    std.time.sleep(300 * std.time.us_per_ms);
+
+    const topic = "sanity-topic";
+
+    const SubscribeState = struct {
+        done: *std.atomic.Value(bool),
+        err: *?anyerror,
+    };
+
+    const SubscribeCallback = struct {
+        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+            const state: *SubscribeState = @ptrCast(@alignCast(ctx.?));
+            if (res) |_| {
+                state.err.* = null;
+            } else |err| {
+                state.err.* = err;
+            }
+            state.done.store(true, .release);
+        }
+    };
+
+    var subscribe_done = std.atomic.Value(bool).init(false);
+    var subscribe_err: ?anyerror = null;
+    var subscribe_state = SubscribeState{
+        .done = &subscribe_done,
+        .err = &subscribe_err,
+    };
+    const subscribe_ctx: ?*anyopaque = @ptrCast(@constCast(&subscribe_state));
+    router.subscribe(topic, subscribe_ctx, SubscribeCallback.callback);
+
+    try waitForFlag(&subscribe_done, 5 * std.time.ns_per_s);
+    try std.testing.expect(subscribe_err == null);
+
+    const MessageListener = struct {
+        allocator: std.mem.Allocator,
+        done: *std.atomic.Value(bool),
+        data: *?[]u8,
+        source: *?PeerId,
+        topic: []const u8,
+
+        const Self = @This();
+
+        pub fn handle(self: *Self, e: Event) void {
+            switch (e) {
+                .message => |msg| {
+                    if (!std.mem.eql(u8, msg.message.topic, self.topic)) return;
+                    if (self.data.*) |existing| {
+                        self.allocator.free(existing);
+                        self.data.* = null;
+                    }
+                    const copy = self.allocator.dupe(u8, msg.message.data) catch {
+                        self.done.store(true, .release);
+                        return;
+                    };
+                    self.data.* = copy;
+                    self.source.* = msg.propagation_source;
+                    self.done.store(true, .release);
+                },
+                else => {},
+            }
+        }
+
+        pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
+            const self: *Self = @ptrCast(@alignCast(instance));
+            self.handle(evt);
+        }
+
+        pub const vtable = event.EventListenerVTable(Event){
+            .handleFn = vtableHandleFn,
+        };
+
+        pub fn any(self: *Self) event.AnyEventListener(Event) {
+            return .{
+                .instance = @ptrCast(self),
+                .vtable = &Self.vtable,
+            };
+        }
+    };
+
+    var message_done = std.atomic.Value(bool).init(false);
+    var message_data: ?[]u8 = null;
+    errdefer if (message_data) |data_copy| allocator.free(data_copy);
+    var message_source: ?PeerId = null;
+    var listener: MessageListener = .{
+        .allocator = allocator,
+        .done = &message_done,
+        .data = &message_data,
+        .source = &message_source,
+        .topic = topic,
+    };
+    try router.event_emitter.addListener(.message, listener.any());
+    errdefer _ = router.event_emitter.removeListener(.message, listener.any());
+
+    const PublishState = struct {
+        done: *std.atomic.Value(bool),
+        err: *?anyerror,
+        recipients: *?[]PeerId,
+    };
+
+    const PublishCallback = struct {
+        fn callback(ctx: ?*anyopaque, res: anyerror![]PeerId) void {
+            const state: *PublishState = @ptrCast(@alignCast(ctx.?));
+            const peers = res catch |err| {
+                state.err.* = err;
+                state.recipients.* = null;
+                state.done.store(true, .release);
+                return;
+            };
+            state.err.* = null;
+            state.recipients.* = peers;
+            state.done.store(true, .release);
+        }
+    };
+
+    const payload = "hello from publish";
+
+    var publish_done = std.atomic.Value(bool).init(false);
+    var publish_err: ?anyerror = null;
+    var publish_recipients: ?[]PeerId = null;
+    errdefer if (publish_recipients) |recipients| allocator.free(recipients);
+    var publish_state = PublishState{
+        .done = &publish_done,
+        .err = &publish_err,
+        .recipients = &publish_recipients,
+    };
+    const publish_ctx: ?*anyopaque = @ptrCast(@constCast(&publish_state));
+
+    router.publish(topic, payload, publish_ctx, PublishCallback.callback);
+
+    try waitForFlag(&publish_done, 5 * std.time.ns_per_s);
+    try std.testing.expect(publish_err == null);
+    try std.testing.expect(publish_recipients != null);
+    try std.testing.expectEqual(@as(usize, 1), publish_recipients.?.len);
+    try std.testing.expect(publish_recipients.?[0].eql(&transport.local_peer_id));
+
+    try waitForFlag(&message_done, 5 * std.time.ns_per_s);
+    try std.testing.expect(message_source != null);
+    try std.testing.expect(message_source.?.eql(&transport.local_peer_id));
+    try std.testing.expect(message_data != null);
+    try std.testing.expect(std.mem.eql(u8, message_data.?, payload));
+
+    if (publish_recipients) |recipients| {
+        allocator.free(recipients);
+    }
+
+    if (message_data) |data_copy| {
+        allocator.free(data_copy);
+    }
+
+    const UnsubscribeState = struct {
+        done: *std.atomic.Value(bool),
+        err: *?anyerror,
+    };
+
+    const UnsubscribeCallback = struct {
+        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+            const state: *UnsubscribeState = @ptrCast(@alignCast(ctx.?));
+            if (res) |_| {
+                state.err.* = null;
+            } else |err| {
+                state.err.* = err;
+            }
+            state.done.store(true, .release);
+        }
+    };
+
+    var unsubscribe_done = std.atomic.Value(bool).init(false);
+    var unsubscribe_err: ?anyerror = null;
+    var unsubscribe_state = UnsubscribeState{
+        .done = &unsubscribe_done,
+        .err = &unsubscribe_err,
+    };
+    const unsubscribe_ctx: ?*anyopaque = @ptrCast(@constCast(&unsubscribe_state));
+    router.unsubscribe(topic, unsubscribe_ctx, UnsubscribeCallback.callback);
+
+    try waitForFlag(&unsubscribe_done, 5 * std.time.ns_per_s);
+    try std.testing.expect(unsubscribe_err == null);
+
+    _ = router.event_emitter.removeListener(.message, listener.any());
+}
+
+test "pubsub subscribe and publish between nodes" {
+    const allocator = std.testing.allocator;
+
+    // For now we only verify that two independent nodes can add each other successfully.
+    // Once this is stable, we'll extend the test step-by-step to cover subscribe/publish flows again.
+
+    var listen_addr_a = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9967");
+    defer listen_addr_a.deinit();
+
+    var loop_a: io_loop.ThreadEventLoop = undefined;
+    try loop_a.init(allocator);
+    defer loop_a.deinit();
+
+    const key_a = try tls.generateKeyPair(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(key_a);
+
+    var transport_a: quic.QuicTransport = undefined;
+    try transport_a.init(&loop_a, key_a, keys.KeyType.ED25519, allocator);
+
+    var dial_addr_a = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9967");
+    try dial_addr_a.push(.{ .P2P = transport_a.local_peer_id });
+    defer dial_addr_a.deinit();
+
+    var switch_a: swarm.Switch = undefined;
+    switch_a.init(allocator, &transport_a);
+
+    var handler_a = PubSubPeerProtocolHandler.init(allocator);
+    defer handler_a.deinit();
+    try switch_a.addProtocolHandler(v1_id, handler_a.any());
+    try switch_a.addProtocolHandler(v1_1_id, handler_a.any());
+
+    var router_a: Gossipsub = undefined;
+    try router_a.init(allocator, listen_addr_a, transport_a.local_peer_id, key_a, &switch_a, .{});
+    defer router_a.deinit();
+    defer switch_a.deinit();
+    try switch_a.listen(listen_addr_a, &router_a, Gossipsub.onIncomingNewStream);
+
+    std.time.sleep(300 * std.time.us_per_ms);
+
+    var listen_addr_b = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9968");
+    defer listen_addr_b.deinit();
+
+    var loop_b: io_loop.ThreadEventLoop = undefined;
+    try loop_b.init(allocator);
+    defer loop_b.deinit();
+
+    const key_b = try tls.generateKeyPair(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(key_b);
+
+    var transport_b: quic.QuicTransport = undefined;
+    try transport_b.init(&loop_b, key_b, keys.KeyType.ED25519, allocator);
+
+    var dial_addr_b = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9968");
+    try dial_addr_b.push(.{ .P2P = transport_b.local_peer_id });
+    defer dial_addr_b.deinit();
+
+    var switch_b: swarm.Switch = undefined;
+    switch_b.init(allocator, &transport_b);
+
+    var handler_b = PubSubPeerProtocolHandler.init(allocator);
+    defer handler_b.deinit();
+    try switch_b.addProtocolHandler(v1_id, handler_b.any());
+    try switch_b.addProtocolHandler(v1_1_id, handler_b.any());
+
+    var router_b: Gossipsub = undefined;
+    try router_b.init(allocator, listen_addr_b, transport_b.local_peer_id, key_b, &switch_b, .{});
+    defer router_b.deinit();
+    defer switch_b.deinit();
+    try switch_b.listen(listen_addr_b, &router_b, Gossipsub.onIncomingNewStream);
+
+    std.time.sleep(300 * std.time.us_per_ms);
+
+    const AddPeerState = struct {
+        done: *std.atomic.Value(bool),
+        err: *?anyerror,
+    };
+
+    const logAddPeer = struct {
+        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+            const state: *AddPeerState = @ptrCast(@alignCast(ctx.?));
+            if (res) |_| {
+                std.debug.print("addPeer succeeded\n", .{});
+                state.err.* = null;
+            } else |err| {
+                std.debug.print("addPeer failed: {any}\n", .{err});
+                state.err.* = err;
+            }
+            state.done.store(true, .release);
+        }
+    };
+
+    var add_peer_ab_done = std.atomic.Value(bool).init(false);
+    var add_peer_ab_err: ?anyerror = null;
+    var add_peer_ab_state = AddPeerState{ .done = &add_peer_ab_done, .err = &add_peer_ab_err };
+    router_a.addPeer(dial_addr_b, @ptrCast(@constCast(&add_peer_ab_state)), logAddPeer.callback);
+
+    var add_peer_ba_done = std.atomic.Value(bool).init(false);
+    var add_peer_ba_err: ?anyerror = null;
+    var add_peer_ba_state = AddPeerState{ .done = &add_peer_ba_done, .err = &add_peer_ba_err };
+    router_b.addPeer(dial_addr_a, @ptrCast(@constCast(&add_peer_ba_state)), logAddPeer.callback);
+
+    try waitForFlag(&add_peer_ab_done, 5 * std.time.ns_per_s);
+    try waitForFlag(&add_peer_ba_done, 5 * std.time.ns_per_s);
+    try std.testing.expect(add_peer_ab_err == null);
+    try std.testing.expect(add_peer_ba_err == null);
+
+    std.debug.print("peer counts: A = {d}, B = {d}\n", .{ router_a.peers.count(), router_b.peers.count() });
+    try std.testing.expectEqual(@as(usize, 1), router_a.peers.count());
+    try std.testing.expectEqual(@as(usize, 1), router_b.peers.count());
+
+    try std.testing.expect(router_a.peers.get(transport_b.local_peer_id) != null);
+    try std.testing.expect(router_b.peers.get(transport_a.local_peer_id) != null);
+
+    const topic = "gossip-multi";
+
+    const SubscribeState = struct {
+        done: *std.atomic.Value(bool),
+        err: *?anyerror,
+    };
+
+    const subscribeCallback = struct {
+        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+            const state: *SubscribeState = @ptrCast(@alignCast(ctx.?));
+            if (res) |_| {
+                std.debug.print("subscribe succeeded\n", .{});
+                state.err.* = null;
+            } else |err| {
+                std.debug.print("subscribe failed: {any}\n", .{err});
+                state.err.* = err;
+            }
+            state.done.store(true, .release);
+        }
+    };
+
+    var subscribe_a_done = std.atomic.Value(bool).init(false);
+    var subscribe_a_err: ?anyerror = null;
+    var subscribe_a_state = SubscribeState{ .done = &subscribe_a_done, .err = &subscribe_a_err };
+    router_a.subscribe(topic, @ptrCast(@constCast(&subscribe_a_state)), subscribeCallback.callback);
+
+    var subscribe_b_done = std.atomic.Value(bool).init(false);
+    var subscribe_b_err: ?anyerror = null;
+    var subscribe_b_state = SubscribeState{ .done = &subscribe_b_done, .err = &subscribe_b_err };
+    router_b.subscribe(topic, @ptrCast(@constCast(&subscribe_b_state)), subscribeCallback.callback);
+
+    try waitForFlag(&subscribe_a_done, 5 * std.time.ns_per_s);
+    try waitForFlag(&subscribe_b_done, 5 * std.time.ns_per_s);
+    try std.testing.expect(subscribe_a_err == null);
+    try std.testing.expect(subscribe_b_err == null);
+
+    std.time.sleep(200 * std.time.us_per_ms);
+    try std.testing.expect(router_a.subscriptions.contains(topic));
+    try std.testing.expect(router_b.subscriptions.contains(topic));
+
+    std.debug.print("subscriptions: A = {d}, B = {d}\n", .{ router_a.subscriptions.count(), router_b.subscriptions.count() });
+
+    const RemovePeerState = struct {
+        done: *std.atomic.Value(bool),
+        err: *?anyerror,
+    };
+
+    const removePeerCallback = struct {
+        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+            const state: *RemovePeerState = @ptrCast(@alignCast(ctx.?));
+            if (res) |_| {
+                std.debug.print("removePeer succeeded\n", .{});
+                state.err.* = null;
+            } else |err| {
+                std.debug.print("removePeer failed: {any}\n", .{err});
+                state.err.* = err;
+            }
+            state.done.store(true, .release);
+        }
+    };
+
+    var remove_peer_ab_done = std.atomic.Value(bool).init(false);
+    var remove_peer_ab_err: ?anyerror = null;
+    var remove_peer_ab_state = RemovePeerState{ .done = &remove_peer_ab_done, .err = &remove_peer_ab_err };
+    router_a.removePeer(transport_b.local_peer_id, @ptrCast(@constCast(&remove_peer_ab_state)), removePeerCallback.callback);
+
+    var remove_peer_ba_done = std.atomic.Value(bool).init(false);
+    var remove_peer_ba_err: ?anyerror = null;
+    var remove_peer_ba_state = RemovePeerState{ .done = &remove_peer_ba_done, .err = &remove_peer_ba_err };
+    router_b.removePeer(transport_a.local_peer_id, @ptrCast(@constCast(&remove_peer_ba_state)), removePeerCallback.callback);
+
+    try waitForFlag(&remove_peer_ab_done, 5 * std.time.ns_per_s);
+    try waitForFlag(&remove_peer_ba_done, 5 * std.time.ns_per_s);
+    try std.testing.expect(remove_peer_ab_err == null);
+    try std.testing.expect(remove_peer_ba_err == null);
+
+    std.time.sleep(200 * std.time.us_per_ms);
+
+    try std.testing.expectEqual(@as(usize, 0), router_a.peers.count());
+    try std.testing.expectEqual(@as(usize, 0), router_b.peers.count());
+
+    // Leave further subscription/publish assertions commented out until we stabilise teardown.
+    // std.log.debug("TODO: add subscribe/publish assertions", .{});
 }
