@@ -168,6 +168,8 @@ pub const PubSubVTable = struct {
     subscribeFn: *const fn (self: *anyopaque, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
     unsubscribeFn: *const fn (self: *anyopaque, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
     publishFn: *const fn (self: *anyopaque, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void,
+    publishOwnedFn: *const fn (self: *anyopaque, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void,
+    getAllocatorFn: *const fn (self: *anyopaque) std.mem.Allocator,
 };
 
 /// This is a generic PubSub interface that uses the VTable pattern to provide a type-erased
@@ -201,6 +203,10 @@ pub const PubSub = struct {
     }
     pub fn publish(self: Self, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
         self.vtable.publishFn(self.instance, topic, data, callback_ctx, callback);
+    }
+
+    pub fn allocator(self: Self) std.mem.Allocator {
+        return self.vtable.getAllocatorFn(self.instance);
     }
 };
 

@@ -8,6 +8,7 @@ const ProtocolId = libp2p.protocols.ProtocolId;
 const PeerId = @import("peer_id").PeerId;
 const Allocator = std.mem.Allocator;
 const io_loop = libp2p.thread_event_loop;
+const xev = @import("xev");
 const tls = libp2p.security.tls;
 const keys = @import("peer_id").keys;
 const ssl = @import("ssl");
@@ -63,6 +64,22 @@ const FilterCtx = struct {
     fn filter(ctx: ?*anyopaque, peer: PeerId) bool {
         const filter_ctx: *@This() = @ptrCast(@alignCast(ctx.?));
         return filter_ctx.mesh_peers.contains(peer);
+    }
+};
+
+const GossipFilterCtx = struct {
+    exclude_a: ?*std.AutoHashMapUnmanaged(PeerId, void) = null,
+    exclude_b: ?*std.AutoHashMapUnmanaged(PeerId, void) = null,
+
+    fn filter(ctx: ?*anyopaque, peer: PeerId) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        if (self.exclude_a) |map| {
+            if (map.contains(peer)) return true;
+        }
+        if (self.exclude_b) |map| {
+            if (map.contains(peer)) return true;
+        }
+        return false;
     }
 };
 
@@ -363,6 +380,15 @@ pub const Gossipsub = struct {
 
     opts: Options,
 
+    heartbeat_interval_ns: u64,
+
+    heartbeat_ticks: u64,
+
+    heartbeat_timer: xev.Timer,
+    heartbeat_completion: xev.Completion,
+    heartbeat_cancel_completion: xev.Completion,
+    heartbeat_running: bool,
+
     counter: std.atomic.Value(u64),
 
     topic_pool: std.StringHashMapUnmanaged(usize),
@@ -388,6 +414,10 @@ pub const Gossipsub = struct {
         D: usize = 6,
         D_lo: usize = 4,
         D_hi: usize = 12,
+        D_lazy: usize = 6,
+        heartbeat_interval_ms: u64 = 1_000,
+        fanout_ttl_ms: i64 = 60_000,
+        gossip_factor: f32 = 0.25,
     };
 
     const AddPeerCtx = struct {
@@ -466,6 +496,9 @@ pub const Gossipsub = struct {
         const peer_id_bytes = try allocator.dupe(u8, peer_id_bytes_src);
         errdefer allocator.free(peer_id_bytes);
 
+        var heartbeat_timer = try xev.Timer.init();
+        errdefer heartbeat_timer.deinit();
+
         self.* = .{
             .allocator = allocator,
             .peer = peer,
@@ -487,12 +520,22 @@ pub const Gossipsub = struct {
             .seen_cache = seen_cache,
             .mcache = msg_cache,
             .opts = opts,
+            .heartbeat_interval_ns = opts.heartbeat_interval_ms * std.time.ns_per_ms,
+            .heartbeat_ticks = 0,
             .counter = std.atomic.Value(u64).init(0),
             .topic_pool = std.StringHashMapUnmanaged(usize).empty,
+            .heartbeat_timer = heartbeat_timer,
+            .heartbeat_completion = .{},
+            .heartbeat_cancel_completion = .{},
+            .heartbeat_running = false,
         };
+
+        self.startHeartbeatTimer();
     }
 
     pub fn deinit(self: *Self) void {
+        self.heartbeat_running = false;
+
         self.peers.deinit();
 
         var topic_iter = self.topics.iterator();
@@ -514,11 +557,29 @@ pub const Gossipsub = struct {
         }
         self.mesh.deinit(self.allocator);
         self.peer_have.deinit(self.allocator);
+        var fanout_iter = self.fanout.iterator();
+        while (fanout_iter.next()) |entry| {
+            self.unrefTopic(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.fanout.deinit(self.allocator);
+
+        var fanout_last_pub_iter = self.fanout_last_pub.iterator();
+        while (fanout_last_pub_iter.next()) |entry| {
+            self.unrefTopic(entry.key_ptr.*);
+        }
+        self.fanout_last_pub.deinit(self.allocator);
+
         var control_iter = self.control.iterator();
         while (control_iter.next()) |entry| {
             pubsub.deinitControl(entry.value_ptr, self.allocator);
         }
         self.control.deinit(self.allocator);
+        var gossip_iter = self.gossip.iterator();
+        while (gossip_iter.next()) |entry| {
+            deinitControlIHaveList(self.allocator, entry.value_ptr);
+        }
+        self.gossip.deinit(self.allocator);
         self.iasked.deinit(self.allocator);
         self.event_emitter.deinit();
         self.seen_cache.deinit();
@@ -529,6 +590,61 @@ pub const Gossipsub = struct {
         }
         self.allocator.free(self.peer_id_bytes);
         self.topic_pool.deinit(self.allocator);
+    }
+
+    fn startHeartbeatTimer(self: *Self) void {
+        if (self.heartbeat_running) return;
+        self.heartbeat_running = true;
+        if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
+            self.scheduleHeartbeat();
+        } else {
+            self.swarm.transport.io_event_loop.queueCall(Self, self, onScheduleHeartbeat) catch unreachable;
+        }
+    }
+
+    fn onScheduleHeartbeat(_: *io_loop.ThreadEventLoop, self: *Self) void {
+        if (!self.heartbeat_running) return;
+        self.scheduleHeartbeat();
+    }
+
+    fn scheduleHeartbeat(self: *Self) void {
+        if (!self.heartbeat_running) return;
+        const interval_ms = if (self.opts.heartbeat_interval_ms == 0) 1 else self.opts.heartbeat_interval_ms;
+        self.heartbeat_timer.reset(
+            &self.swarm.transport.io_event_loop.loop,
+            &self.heartbeat_completion,
+            &self.heartbeat_cancel_completion,
+            interval_ms,
+            Self,
+            self,
+            heartbeatTimerCallback,
+        );
+    }
+
+    fn heartbeatTimerCallback(
+        ctx: ?*Self,
+        loop: *xev.Loop,
+        _: *xev.Completion,
+        r: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        if (loop.stopped()) return .disarm;
+
+        const self = ctx.?;
+
+        _ = r catch |err| {
+            std.log.warn("heartbeat timer failed: {}", .{err});
+            return .disarm;
+        };
+
+        if (!self.heartbeat_running) return .disarm;
+
+        self.doHeartbeat();
+
+        if (!self.heartbeat_running) return .disarm;
+
+        self.scheduleHeartbeat();
+
+        return .disarm;
     }
 
     pub fn acceptFrom(self: *Self, peer_id: PeerId) bool {
@@ -587,15 +703,13 @@ pub const Gossipsub = struct {
         if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
             self.doRemovePeer(peer, callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .pubsub_remove_peer = .{
-                    .pubsub = self.any(),
-                    .peer = peer,
-                    .callback_ctx = callback_ctx,
-                    .callback = callback,
-                } },
-            };
-            self.swarm.transport.io_event_loop.queueMessage(message) catch unreachable;
+            io_loop.ThreadEventLoop.PubsubTasks.queuePubsubRemovePeer(
+                self.swarm.transport.io_event_loop,
+                self.any(),
+                peer,
+                callback_ctx,
+                callback,
+            ) catch unreachable;
         }
     }
 
@@ -603,16 +717,13 @@ pub const Gossipsub = struct {
         if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
             self.doAddPeer(peer, callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .pubsub_add_peer = .{
-                    .pubsub = self.any(),
-                    .peer = peer,
-                    .callback_ctx = callback_ctx,
-                    .callback = callback,
-                } },
-            };
-
-            self.swarm.transport.io_event_loop.queueMessage(message) catch unreachable;
+            io_loop.ThreadEventLoop.PubsubTasks.queuePubsubAddPeer(
+                self.swarm.transport.io_event_loop,
+                self.any(),
+                peer,
+                callback_ctx,
+                callback,
+            ) catch unreachable;
         }
     }
 
@@ -698,31 +809,45 @@ pub const Gossipsub = struct {
     }
 
     pub fn publish(self: *Self, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
-        if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
-            const copied_topic = self.allocator.dupe(u8, topic) catch |err| {
-                std.log.warn("Failed to copy topic string: {}", .{err});
-                callback(callback_ctx, err);
-                return;
-            };
+        const copied_topic = self.allocator.dupe(u8, topic) catch |err| {
+            std.log.warn("Failed to copy topic string: {}", .{err});
+            callback(callback_ctx, err);
+            return;
+        };
 
-            const copied_data = self.allocator.dupe(u8, data) catch |err| {
-                std.log.warn("Failed to copy data buffer: {}", .{err});
+        const copied_data = self.allocator.dupe(u8, data) catch |err| {
+            self.allocator.free(copied_topic);
+            std.log.warn("Failed to copy data buffer: {}", .{err});
+            callback(callback_ctx, err);
+            return;
+        };
+
+        if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
+            self.publishOwnedInternal(copied_topic, copied_data, callback_ctx, callback);
+        } else {
+            io_loop.ThreadEventLoop.PubsubTasks.queuePubsubPublish(
+                self.swarm.transport.io_event_loop,
+                self.any(),
+                copied_topic,
+                copied_data,
+                callback_ctx,
+                callback,
+            ) catch |err| {
+                self.allocator.free(copied_data);
+                self.allocator.free(copied_topic);
                 callback(callback_ctx, err);
                 return;
             };
-            self.doPublish(copied_topic, copied_data, callback_ctx, callback);
-        } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .pubsub_publish = .{
-                    .pubsub = self.any(),
-                    .topic = topic,
-                    .message = data,
-                    .callback_ctx = callback_ctx,
-                    .callback = callback,
-                } },
-            };
-            self.swarm.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
+    }
+
+    fn publishOwnedInternal(self: *Self, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
+        std.debug.assert(self.swarm.transport.io_event_loop.inEventLoopThread());
+        self.doPublish(topic, data, callback_ctx, callback);
+    }
+
+    pub fn getAllocator(self: *Self) Allocator {
+        return self.allocator;
     }
 
     pub fn doPublish(self: *Self, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
@@ -835,15 +960,13 @@ pub const Gossipsub = struct {
             };
             self.doSubscribe(copied_topic, callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .pubsub_subscribe = .{
-                    .pubsub = self.any(),
-                    .topic = topic,
-                    .callback_ctx = callback_ctx,
-                    .callback = callback,
-                } },
-            };
-            self.swarm.transport.io_event_loop.queueMessage(message) catch unreachable;
+            io_loop.ThreadEventLoop.PubsubTasks.queuePubsubSubscribe(
+                self.swarm.transport.io_event_loop,
+                self.any(),
+                topic,
+                callback_ctx,
+                callback,
+            ) catch unreachable;
         }
     }
 
@@ -894,15 +1017,13 @@ pub const Gossipsub = struct {
             };
             self.doUnsubscribe(copied_topic, callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .pubsub_unsubscribe = .{
-                    .pubsub = self.any(),
-                    .topic = topic,
-                    .callback_ctx = callback_ctx,
-                    .callback = callback,
-                } },
-            };
-            self.swarm.transport.io_event_loop.queueMessage(message) catch unreachable;
+            io_loop.ThreadEventLoop.PubsubTasks.queuePubsubUnsubscribe(
+                self.swarm.transport.io_event_loop,
+                self.any(),
+                topic,
+                callback_ctx,
+                callback,
+            ) catch unreachable;
         }
     }
 
@@ -1837,9 +1958,47 @@ pub const Gossipsub = struct {
     fn pushGossip(self: *Self, peer: PeerId, control_ihave: *const rpc.ControlIHave) !void {
         var gossip_entry = try self.gossip.getOrPut(self.allocator, peer);
         if (!gossip_entry.found_existing) {
-            gossip_entry.value_ptr.* = std.ArrayListUnmanaged(rpc.ControlIHave).empty;
+            gossip_entry.value_ptr.* = std.ArrayListUnmanaged(?rpc.ControlIHave).empty;
         }
         try gossip_entry.value_ptr.append(self.allocator, control_ihave.*);
+    }
+
+    fn enqueueGossip(self: *Self, peer: PeerId, topic: []const u8, message_ids: [][]const u8) !void {
+        if (message_ids.len == 0) return;
+
+        const limit = @min(message_ids.len, self.opts.max_ihave_len);
+        if (limit == 0) return;
+
+        // NOTE: gossip entries live in `self.gossip` until the next successful
+        // flush. They can survive beyond the heartbeat arena (e.g. if sending
+        // fails and we requeue), so we must allocate from the router allocator
+        // instead of the per-heartbeat arena or `refTopic` pool.
+        const topic_copy = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(topic_copy);
+
+        var ids = try self.allocator.alloc(?[]const u8, limit);
+        errdefer self.allocator.free(ids);
+
+        var copied: usize = 0;
+        errdefer {
+            var idx: usize = 0;
+            while (idx < copied) : (idx += 1) {
+                if (ids[idx]) |message_id| {
+                    self.allocator.free(message_id);
+                }
+            }
+        }
+
+        for (message_ids[0..limit], 0..) |mid, idx| {
+            ids[idx] = try self.allocator.dupe(u8, mid);
+            copied = idx + 1;
+        }
+
+        var control_msg = rpc.ControlIHave{
+            .topic_i_d = topic_copy,
+            .message_i_ds = ids,
+        };
+        try self.pushGossip(peer, &control_msg);
     }
 
     fn getRandomGossipPeers(self: *Self, topic: []const u8, count: usize, filter_ctx: ?*anyopaque, filter: *const fn (ctx: ?*anyopaque, peer: PeerId) bool) !std.ArrayListUnmanaged(PeerId) {
@@ -1887,6 +2046,40 @@ pub const Gossipsub = struct {
         return false;
     }
 
+    fn hasUsableStream(self: *Self, peer: PeerId) bool {
+        const semi_duplex = self.peers.get(peer) orelse return false;
+        const initiator = semi_duplex.initiator orelse return false;
+        const negotiated = initiator.stream.negotiated_protocol orelse return false;
+        return self.supportsProtocol(negotiated);
+    }
+
+    fn collectTopicPeers(
+        self: *Self,
+        arena: Allocator,
+        topic: []const u8,
+        exclude_a: ?*std.AutoHashMapUnmanaged(PeerId, void),
+        exclude_b: ?*std.AutoHashMapUnmanaged(PeerId, void),
+    ) !std.ArrayListUnmanaged(PeerId) {
+        var result = std.ArrayListUnmanaged(PeerId).empty;
+
+        if (self.topics.getPtr(topic)) |topic_peers| {
+            var it = topic_peers.keyIterator();
+            while (it.next()) |peer_id_ptr| {
+                const peer_id = peer_id_ptr.*;
+                if (exclude_a) |map| {
+                    if (map.contains(peer_id)) continue;
+                }
+                if (exclude_b) |map| {
+                    if (map.contains(peer_id)) continue;
+                }
+                if (!self.hasUsableStream(peer_id)) continue;
+                try result.append(arena, peer_id);
+            }
+        }
+
+        return result;
+    }
+
     fn sendGraft(self: *Self, arena: Allocator, to: *const PeerId, topic: []const u8) void {
         var graft_msg = arena.alloc(?rpc.ControlGraft, 1) catch |err| {
             std.log.warn("Failed to allocate GRAFT message for peer {}: {}", .{ to, err });
@@ -1931,38 +2124,281 @@ pub const Gossipsub = struct {
         const rpc_msg: rpc.RPC = .{ .subscriptions = sub_opts.items };
         _ = self.sendRPC(arena, to, &rpc_msg);
     }
-    // fn flush(self: *Self) void {
-    //     // send gossip first, which will also piggyback control
-    //     while (self.gossip.count() > 0) {
-    //         var gossip_iter = self.gossip.iterator();
-    //         const peer = gossip_iter.next().?.key_ptr.*;
 
-    //         const ihave_list = self.gossip.fetchRemove(peer).?.value;
+    pub fn heartbeat(self: *Self) void {
+        if (!self.swarm.transport.io_event_loop.inEventLoopThread()) {
+            std.log.warn("heartbeat should be called from the IO loop thread", .{});
+            return;
+        }
 
-    //         const ihave_slice = ihave_list.toOwnedSlice(self.allocator) catch |err| {
-    //             std.log.warn("Failed to convert IHAVE list to slice for peer {}: {}", .{ peer, err });
-    //             ihave_list.deinit(self.allocator);
-    //             continue;
-    //         };
+        self.doHeartbeat();
+    }
 
-    //         var rpc_msg: rpc.RPC = .{ .control = .{ .ihave = ihave_slice } };
-    //         defer pubsub.deinitRPCMessage(&rpc_msg, self.allocator);
-    //         _ = self.sendRPC(peer, &rpc_msg);
-    //     }
+    fn doHeartbeat(self: *Self) void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
 
-    //     var control_iter = self.control.iterator();
-    //     while (control_iter.next()) |entry| {
-    //         const peer = entry.key_ptr.*;
-    //         const control_msg = entry.value_ptr.*;
+        const now_ms = std.time.milliTimestamp();
+        self.heartbeat_ticks += 1;
 
-    //         var rpc_msg: rpc.RPC = .{ .control = .{
-    //             .graft = control_msg.graft,
-    //             .prune = control_msg.prune,
-    //         } };
+        self.peer_have.deinit(self.allocator);
+        self.peer_have = std.AutoHashMapUnmanaged(PeerId, usize).empty;
+        self.iasked.deinit(self.allocator);
+        self.iasked = std.AutoArrayHashMapUnmanaged(PeerId, usize).empty;
 
-    //         _ = self.sendRPC(peer, &rpc_msg);
-    //     }
-    // }
+        const now_bits: u64 = @bitCast(now_ms);
+        const seed = now_bits ^ (self.heartbeat_ticks ^ 0x9e3779b97f4a7c15);
+        var prng = std.Random.DefaultPrng.init(seed);
+        const random = prng.random();
+
+        var mesh_iter = self.mesh.iterator();
+        while (mesh_iter.next()) |entry| {
+            const topic = entry.key_ptr.*;
+            var peers = entry.value_ptr;
+
+            var stale = std.ArrayListUnmanaged(PeerId).empty;
+            defer stale.deinit(arena_allocator);
+            var peer_it = peers.keyIterator();
+            while (peer_it.next()) |peer_id_ptr| {
+                if (!self.hasUsableStream(peer_id_ptr.*)) {
+                    stale.append(arena_allocator, peer_id_ptr.*) catch {};
+                }
+            }
+
+            for (stale.items) |peer_id| {
+                _ = peers.remove(peer_id);
+            }
+
+            if (peers.count() < self.opts.D_lo) {
+                const deficit = if (self.opts.D > peers.count()) self.opts.D - peers.count() else 0;
+                if (deficit > 0) {
+                    var filter_ctx: FilterCtx = .{ .mesh_peers = peers };
+                    var new_peers = self.getRandomGossipPeers(topic, deficit, &filter_ctx, FilterCtx.filter) catch |err| {
+                        std.log.warn("heartbeat: failed to select mesh peers for topic {s}: {}", .{ topic, err });
+                        continue;
+                    };
+                    defer new_peers.deinit(self.allocator);
+
+                    for (new_peers.items) |peer_id| {
+                        if (peers.contains(peer_id)) continue;
+                        peers.put(self.allocator, peer_id, {}) catch |err| {
+                            std.log.warn("heartbeat: failed to add mesh peer {} for topic {s}: {}", .{ peer_id, topic, err });
+                            continue;
+                        };
+                        self.sendGraft(arena_allocator, &peer_id, topic);
+                    }
+                }
+            }
+
+            if (peers.count() > self.opts.D_hi) {
+                var peer_list = std.ArrayListUnmanaged(PeerId).empty;
+                defer peer_list.deinit(arena_allocator);
+                var it = peers.keyIterator();
+                while (it.next()) |peer_id_ptr| {
+                    peer_list.append(arena_allocator, peer_id_ptr.*) catch {};
+                }
+
+                random.shuffle(PeerId, peer_list.items);
+                const target = self.opts.D;
+                var idx: usize = target;
+                while (idx < peer_list.items.len) : (idx += 1) {
+                    const peer_id = peer_list.items[idx];
+                    if (peers.remove(peer_id)) {
+                        self.sendPrune(arena_allocator, &peer_id, topic);
+                    }
+                }
+            }
+
+            const fanout_ptr = self.fanout.getPtr(topic);
+            var gossip_candidates = self.collectTopicPeers(arena_allocator, topic, peers, fanout_ptr) catch |err| {
+                std.log.warn("heartbeat: failed to collect gossip peers for topic {s}: {}", .{ topic, err });
+                continue;
+            };
+            defer gossip_candidates.deinit(arena_allocator);
+
+            if (gossip_candidates.items.len == 0) continue;
+
+            random.shuffle(PeerId, gossip_candidates.items);
+            var target = self.opts.D_lazy;
+            const candidate_float = @as(f32, @floatFromInt(gossip_candidates.items.len));
+            const factor_float = @ceil(self.opts.gossip_factor * candidate_float);
+            const factor = blk: {
+                if (!std.math.isFinite(factor_float) or factor_float < 0) break :blk 0;
+                const max_f32 = @as(f32, @floatFromInt(std.math.maxInt(usize)));
+                if (factor_float > max_f32) break :blk gossip_candidates.items.len;
+                break :blk @as(usize, @intFromFloat(factor_float));
+            };
+            if (factor > target) target = factor;
+            if (target > gossip_candidates.items.len) target = gossip_candidates.items.len;
+            if (target == 0) continue;
+
+            const gossip_ids = self.mcache.getGossipIDs(topic) catch |err| {
+                std.log.warn("heartbeat: failed to get gossip IDs for topic {s}: {}", .{ topic, err });
+                continue;
+            };
+            defer self.allocator.free(gossip_ids);
+            if (gossip_ids.len == 0) continue;
+
+            for (gossip_candidates.items[0..target]) |peer_id| {
+                self.enqueueGossip(peer_id, topic, gossip_ids) catch |err| {
+                    std.log.warn("heartbeat: failed to enqueue gossip for peer {} topic {s}: {}", .{ peer_id, topic, err });
+                };
+            }
+        }
+
+        var expired = std.ArrayListUnmanaged([]const u8).empty;
+        defer expired.deinit(arena_allocator);
+        var fanout_last_iter = self.fanout_last_pub.iterator();
+        while (fanout_last_iter.next()) |entry| {
+            if (now_ms - entry.value_ptr.* >= self.opts.fanout_ttl_ms) {
+                expired.append(arena_allocator, entry.key_ptr.*) catch {};
+            }
+        }
+
+        for (expired.items) |topic| {
+            if (self.fanout.fetchRemove(topic)) |removed| {
+                var value = removed.value;
+                value.deinit(self.allocator);
+                self.unrefTopic(removed.key);
+            }
+            if (self.fanout_last_pub.fetchRemove(topic)) |removed| {
+                self.unrefTopic(removed.key);
+            }
+        }
+
+        var fanout_iter = self.fanout.iterator();
+        while (fanout_iter.next()) |entry| {
+            const topic = entry.key_ptr.*;
+            var peers_map = entry.value_ptr;
+
+            var removal = std.ArrayListUnmanaged(PeerId).empty;
+            defer removal.deinit(arena_allocator);
+            var it = peers_map.keyIterator();
+            while (it.next()) |peer_id_ptr| {
+                const peer_id = peer_id_ptr.*;
+                const topic_peers = self.topics.getPtr(topic);
+                const still_subscribed = topic_peers != null and topic_peers.?.contains(peer_id);
+                if (!self.hasUsableStream(peer_id) or !still_subscribed) {
+                    removal.append(arena_allocator, peer_id) catch {};
+                }
+            }
+            for (removal.items) |peer_id| {
+                _ = peers_map.remove(peer_id);
+            }
+
+            if (peers_map.count() < self.opts.D) {
+                var candidates = self.collectTopicPeers(arena_allocator, topic, peers_map, null) catch |err| {
+                    std.log.warn("heartbeat: failed to collect fanout peers for topic {s}: {}", .{ topic, err });
+                    continue;
+                };
+                defer candidates.deinit(arena_allocator);
+                if (candidates.items.len > 0) {
+                    random.shuffle(PeerId, candidates.items);
+                    var needed = self.opts.D - peers_map.count();
+                    if (needed > candidates.items.len) needed = candidates.items.len;
+                    for (candidates.items[0..needed]) |peer_id| {
+                        if (!peers_map.contains(peer_id)) {
+                            peers_map.put(self.allocator, peer_id, {}) catch |err| {
+                                std.log.warn("heartbeat: failed to add fanout peer {} for topic {s}: {}", .{ peer_id, topic, err });
+                                break;
+                            };
+                        }
+                    }
+                }
+            }
+
+            var fanout_gossip_candidates = self.collectTopicPeers(arena_allocator, topic, peers_map, null) catch |err| {
+                std.log.warn("heartbeat: failed to collect fanout gossip peers for topic {s}: {}", .{ topic, err });
+                continue;
+            };
+            defer fanout_gossip_candidates.deinit(arena_allocator);
+
+            if (fanout_gossip_candidates.items.len > 0) {
+                random.shuffle(PeerId, fanout_gossip_candidates.items);
+                var target = self.opts.D_lazy;
+                const candidate_float = @as(f32, @floatFromInt(fanout_gossip_candidates.items.len));
+                const factor_float = @ceil(self.opts.gossip_factor * candidate_float);
+                const factor = blk: {
+                    if (!std.math.isFinite(factor_float) or factor_float < 0) break :blk 0;
+                    const max_f32 = @as(f32, @floatFromInt(std.math.maxInt(usize)));
+                    if (factor_float > max_f32) break :blk fanout_gossip_candidates.items.len;
+                    break :blk @as(usize, @intFromFloat(factor_float));
+                };
+                if (factor > target) target = factor;
+                if (target > fanout_gossip_candidates.items.len) target = fanout_gossip_candidates.items.len;
+                if (target > 0) {
+                    const gossip_ids = self.mcache.getGossipIDs(topic) catch |err| {
+                        std.log.warn("heartbeat: failed to get fanout gossip IDs for topic {s}: {}", .{ topic, err });
+                        continue;
+                    };
+                    defer self.allocator.free(gossip_ids);
+                    if (gossip_ids.len > 0) {
+                        for (fanout_gossip_candidates.items[0..target]) |peer_id| {
+                            self.enqueueGossip(peer_id, topic, gossip_ids) catch |err| {
+                                std.log.warn("heartbeat: failed to enqueue fanout gossip for peer {} topic {s}: {}", .{ peer_id, topic, err });
+                            };
+                        }
+                    }
+                }
+            }
+
+            if (self.fanout_last_pub.getPtr(topic)) |value_ptr| {
+                value_ptr.* = now_ms;
+            } else {
+                self.fanout_last_pub.put(self.allocator, topic, now_ms) catch {};
+            }
+        }
+
+        self.flush(arena_allocator);
+        self.mcache.shift();
+    }
+    fn flush(self: *Self, arena: Allocator) void {
+        while (self.gossip.count() > 0) {
+            var iter = self.gossip.iterator();
+            const entry = iter.next() orelse break;
+            const peer = entry.key_ptr.*;
+            const removed = self.gossip.fetchRemove(peer) orelse continue;
+            var ihave_list = removed.value;
+
+            var rpc_msg = rpc.RPC{ .control = .{ .ihave = ihave_list.items } };
+            if (!self.sendRPC(arena, &peer, &rpc_msg)) {
+                if (self.gossip.put(self.allocator, peer, ihave_list)) |_| {
+                    continue;
+                } else |err| {
+                    std.log.warn("heartbeat: failed to requeue gossip for peer {}: {}", .{ peer, err });
+                    deinitControlIHaveList(self.allocator, &ihave_list);
+                }
+            } else {
+                deinitControlIHaveList(self.allocator, &ihave_list);
+            }
+        }
+
+        while (self.control.count() > 0) {
+            var iter = self.control.iterator();
+            const entry = iter.next() orelse break;
+            const peer = entry.key_ptr.*;
+            const removed = self.control.fetchRemove(peer) orelse continue;
+            var ctrl_opt = removed.value;
+
+            if (ctrl_opt) |*ctrl| {
+                var rpc_msg = rpc.RPC{ .control = .{ .graft = ctrl.graft, .prune = ctrl.prune } };
+                if (!self.sendRPC(arena, &peer, &rpc_msg)) {
+                    if (self.control.put(self.allocator, peer, ctrl_opt)) |_| {
+                        ctrl_opt = null;
+                        continue;
+                    } else |err| {
+                        std.log.warn("heartbeat: failed to requeue control message for peer {}: {}", .{ peer, err });
+                        pubsub.deinitControl(&ctrl_opt, self.allocator);
+                        ctrl_opt = null;
+                    }
+                } else {
+                    pubsub.deinitControl(&ctrl_opt, self.allocator);
+                    ctrl_opt = null;
+                }
+            }
+        }
+    }
 
     fn join(self: *Self, arena: Allocator, topic: []const u8) !void {
         if (self.mesh.contains(topic)) {
@@ -2121,9 +2557,19 @@ pub const Gossipsub = struct {
         self.publish(topic, data, callback_ctx, callback);
     }
 
+    fn vtablePublishOwnedFn(instance: *anyopaque, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        self.publishOwnedInternal(topic, data, callback_ctx, callback);
+    }
+
     fn vtableUnsubscribeFn(instance: *anyopaque, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
         const self: *Self = @ptrCast(@alignCast(instance));
         self.unsubscribe(topic, callback_ctx, callback);
+    }
+
+    fn vtableGetAllocatorFn(instance: *anyopaque) Allocator {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.getAllocator();
     }
 
     // --- Static VTable Instance ---
@@ -2133,7 +2579,9 @@ pub const Gossipsub = struct {
         .removePeerFn = vtableRemovePeerFn,
         .subscribeFn = vtableSubscribeFn,
         .publishFn = vtablePublishFn,
+        .publishOwnedFn = vtablePublishOwnedFn,
         .unsubscribeFn = vtableUnsubscribeFn,
+        .getAllocatorFn = vtableGetAllocatorFn,
     };
 
     // --- any() method ---

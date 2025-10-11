@@ -164,10 +164,7 @@ pub const QuicEngine = struct {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             self.doStart();
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_engine_start = .{ .engine = self } },
-            };
-            self.transport.io_event_loop.queueMessage(message) catch unreachable;
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicEngineStart(self.transport.io_event_loop, self) catch unreachable;
         }
     }
 
@@ -231,16 +228,10 @@ pub const QuicEngine = struct {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             self.doConnect(peer_address, callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_connect = .{
-                    .engine = self,
-                    .peer_address = peer_address,
-                    .callback_ctx = callback_ctx,
-                    .callback = callback,
-                } },
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicConnect(self.transport.io_event_loop, self, peer_address, callback_ctx, callback) catch |err| {
+                callback(callback_ctx, err);
+                return;
             };
-
-            self.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
@@ -440,10 +431,10 @@ pub const QuicConnection = struct {
         if (self.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doNewStream(callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_new_stream = .{ .conn = self, .new_stream_ctx = callback_ctx, .new_stream_callback = callback } },
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicNewStream(self.engine.transport.io_event_loop, self, callback_ctx, callback) catch |err| {
+                callback(callback_ctx, err);
+                return;
             };
-            self.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
@@ -472,10 +463,10 @@ pub const QuicConnection = struct {
         if (self.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doClose(callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_close_connection = .{ .conn = self, .callback_ctx = callback_ctx, .callback = callback } },
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicCloseConnection(self.engine.transport.io_event_loop, self, callback_ctx, callback) catch |err| {
+                callback(callback_ctx, err);
+                return;
             };
-            self.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
@@ -590,10 +581,10 @@ pub const QuicStream = struct {
         if (self.conn.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doWrite(data_copy, callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_write_stream = .{ .stream = self, .data = data_copy, .callback_ctx = callback_ctx, .callback = callback } },
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicWriteStream(self.conn.engine.transport.io_event_loop, self, data_copy, callback_ctx, callback) catch |err| {
+                callback(callback_ctx, err);
+                return;
             };
-            self.conn.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
@@ -601,10 +592,10 @@ pub const QuicStream = struct {
         if (self.conn.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doClose(callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_close_stream = .{ .stream = self, .callback_ctx = callback_ctx, .callback = callback } },
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicCloseStream(self.conn.engine.transport.io_event_loop, self, callback_ctx, callback) catch |err| {
+                callback(callback_ctx, err);
+                return;
             };
-            self.conn.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 

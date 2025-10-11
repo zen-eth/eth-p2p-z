@@ -9,8 +9,6 @@ const xev_tcp = libp2p.transport.tcp;
 const quic = libp2p.transport.quic;
 const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
-const pubsub = libp2p.protocols.pubsub;
-const Switch = libp2p.swarm.Switch;
 
 /// Memory pool for managing completion objects in the event loop.
 const CompletionPool = std.heap.MemoryPool(xev.Completion);
@@ -36,114 +34,10 @@ pub const NoOpCtxPool = std.heap.MemoryPool(NoOpCallbackCtx);
 
 /// Represents an I/O action that can be performed in the event loop.
 pub const IOAction = union(enum) {
-    /// Connect to a remote address.
-    connect: struct {
-        /// The address to connect to.
-        address: std.net.Address,
-        /// The transport used for the connection.
-        transport: *xev_tcp.XevTransport,
-        /// The timeout for the connection operation in milliseconds.
-        timeout_ms: u64 = 30000,
-        /// The callback function to be called when the connection is established.
-        callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void,
-        /// The instance to be passed to the callback function.
-        callback_instance: ?*anyopaque = null,
-    },
-    /// Accept a new connection on a server socket.
-    accept: struct {
-        /// The server socket to accept connections on.
-        server: xev.TCP,
-        /// The transport used for the accepted connection.
-        transport: *xev_tcp.XevTransport,
-        /// The timeout for the accept operation in milliseconds.
-        timeout_ms: u64 = 30000,
-        /// The callback function to be called when a new connection is accepted.
-        callback: *const fn (instance: ?*anyopaque, res: anyerror!conn.AnyConn) void,
-        /// The instance to be passed to the callback function.
-        callback_instance: ?*anyopaque = null,
-    },
-    /// Write data to a socket channel.
-    write: struct {
-        /// The buffer containing the data to be written.
-        buffer: []const u8,
-        /// The socket channel to write data to.
-        channel: *xev_tcp.XevSocketChannel,
-        /// The timeout for the write operation in milliseconds.
-        timeout_ms: u64,
-        /// The callback function to be called when the write operation is complete.
-        callback: *const fn (instance: ?*anyopaque, res: anyerror!usize) void,
-        /// The instance to be passed to the callback function.
-        callback_instance: ?*anyopaque = null,
-    },
-    /// Close a socket channel.
-    close: struct {
-        /// The socket channel to be closed.
-        channel: *xev_tcp.XevSocketChannel,
-        /// The callback function to be called when the close operation is complete.
-        callback: *const fn (ud: ?*anyopaque, r: anyerror!void) void,
-        /// The instance to be passed to the callback function.
-        callback_instance: ?*anyopaque = null,
-        /// The timeout for the close operation in milliseconds.
-        timeout_ms: u64,
-    },
-    quic_engine_start: struct {
-        engine: *quic.QuicEngine,
-    },
-    quic_connect: struct { engine: *quic.QuicEngine, peer_address: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void },
-    quic_close_connection: struct {
-        conn: *quic.QuicConnection,
-        callback_ctx: ?*anyopaque,
-        callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void,
-    },
-    quic_new_stream: struct {
-        conn: *quic.QuicConnection,
-        new_stream_ctx: ?*anyopaque,
-        new_stream_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void,
-    },
-    quic_write_stream: struct {
-        stream: *quic.QuicStream,
-        data: std.ArrayList(u8),
-        callback_ctx: ?*anyopaque,
-        callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void,
-    },
-    quic_close_stream: struct {
-        stream: *quic.QuicStream,
-        callback_ctx: ?*anyopaque,
-        callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void,
-    },
-    switch_close: struct {
-        network_switch: *Switch,
-    },
-    pubsub_add_peer: struct {
-        pubsub: pubsub.PubSub,
-        peer: Multiaddr,
-        callback_ctx: ?*anyopaque,
-        callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void,
-    },
-    pubsub_remove_peer: struct {
-        pubsub: pubsub.PubSub,
-        peer: PeerId,
-        callback_ctx: ?*anyopaque,
-        callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void,
-    },
-    pubsub_subscribe: struct {
-        pubsub: pubsub.PubSub,
-        topic: []const u8,
-        callback_ctx: ?*anyopaque,
-        callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void,
-    },
-    pubsub_unsubscribe: struct {
-        pubsub: pubsub.PubSub,
-        topic: []const u8,
-        callback_ctx: ?*anyopaque,
-        callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void,
-    },
-    pubsub_publish: struct {
-        pubsub: pubsub.PubSub,
-        topic: []const u8,
-        message: []const u8,
-        callback_ctx: ?*anyopaque,
-        callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void,
+    call: struct {
+        func: *const fn (loop: *ThreadEventLoop, ctx: ?*anyopaque) void,
+        ctx: ?*anyopaque,
+        deinit: ?*const fn (loop: *ThreadEventLoop, ctx: ?*anyopaque) void = null,
     },
 };
 
@@ -283,6 +177,11 @@ pub const ThreadEventLoop = struct {
 
     const Self = @This();
 
+    pub const TcpTasks = @import("thread_event_loop/tasks/tcp.zig").extend(Self, ConnectCtx, AcceptCtx, WriteCtx, CloseCtx);
+    pub const QuicTasks = @import("thread_event_loop/tasks/quic.zig").extend(Self);
+    pub const SwitchTasks = @import("thread_event_loop/tasks/switch.zig").extend(Self);
+    pub const PubsubTasks = @import("thread_event_loop/tasks/pubsub.zig").extend(Self);
+
     /// Initializes the event loop.
     pub fn init(self: *Self, allocator: Allocator) !void {
         var loop = try xev.Loop.init(.{});
@@ -403,6 +302,52 @@ pub const ThreadEventLoop = struct {
         try self.async_notifier.notify();
     }
 
+    pub fn queueCall(self: *Self, comptime T: type, ctx: *T, comptime func: *const fn (loop: *Self, ctx: *T) void) !void {
+        try self.queueCallWithDeinit(T, ctx, func, null);
+    }
+
+    pub fn queueCallWithDeinit(
+        self: *Self,
+        comptime T: type,
+        ctx: *T,
+        comptime func: *const fn (loop: *Self, ctx: *T) void,
+        comptime destroy_fn: ?*const fn (loop: *Self, ctx: *T) void,
+    ) !void {
+        const message = IOMessage{
+            .action = .{ .call = .{
+                .func = makeCallFunc(T, func),
+                .ctx = ctx,
+                .deinit = if (destroy_fn) |df| makeDeinitFunc(T, df) else null,
+            } },
+        };
+
+        try self.queueMessage(message);
+    }
+
+    fn makeCallFunc(comptime T: type, comptime func: *const fn (loop: *Self, ctx: *T) void) *const fn (loop: *Self, ctx: ?*anyopaque) void {
+        return struct {
+            fn invoke(loop: *Self, raw: ?*anyopaque) void {
+                func(loop, @ptrCast(@alignCast(raw.?)));
+            }
+        }.invoke;
+    }
+
+    fn makeDeinitFunc(comptime T: type, comptime func: *const fn (loop: *Self, ctx: *T) void) *const fn (loop: *Self, ctx: ?*anyopaque) void {
+        return struct {
+            fn invoke(loop: *Self, raw: ?*anyopaque) void {
+                func(loop, @ptrCast(@alignCast(raw.?)));
+            }
+        }.invoke;
+    }
+
+    pub fn makeDestroyTask(comptime T: type) *const fn (loop: *Self, ctx: *T) void {
+        return struct {
+            fn destroy(loop: *Self, ctx: *T) void {
+                loop.allocator.destroy(ctx);
+            }
+        }.destroy;
+    }
+
     pub fn inEventLoopThread(self: *Self) bool {
         return self.loop_thread_id == std.Thread.getCurrentId();
     }
@@ -438,113 +383,14 @@ pub const ThreadEventLoop = struct {
         const self = instance.?;
 
         while (self.task_queue.pop()) |m| {
-            switch (m.action) {
-                .connect => |action_data| {
-                    const address = action_data.address;
-                    var socket = xev.TCP.init(address) catch unreachable;
-                    const c = self.completion_pool.create() catch unreachable;
-                    // const timer = xev.Timer.init() catch unreachable;
-                    // const c_timer = self.completion_pool.create() catch unreachable;
-                    // const connect_timeout = action_data.timeout_ms;
-                    const connect_ctx = self.connect_ctx_pool.create() catch unreachable;
-                    connect_ctx.* = .{
-                        .transport = action_data.transport,
-                        .callback = action_data.callback,
-                        .callback_instance = action_data.callback_instance,
-                    };
-                    // const connect_timeout_ud = self.connect_timeout_pool.create() catch unreachable;
-                    // connect_timeout_ud.* = .{
-                    //     .future = action_data.future,
-                    //     .transport = action_data.transport,
-                    //     .socket = socket,
-                    // };
-                    socket.connect(loop, c, address, ConnectCtx, connect_ctx, xev_tcp.XevTransport.connectCB);
-                    // timer.run(loop, c_timer, connect_timeout, ConnectTimeout, connect_timeout_ud, xev_tcp.XevTransport.connectTimeoutCB);
-                },
-                .accept => |action_data| {
-                    const server = action_data.server;
-                    const c = self.completion_pool.create() catch unreachable;
-                    const accept_ctx = self.accept_ctx_pool.create() catch unreachable;
-                    accept_ctx.* = .{
-                        .callback = action_data.callback,
-                        .callback_instance = action_data.callback_instance,
-                        .transport = action_data.transport,
-                    };
-                    server.accept(loop, c, AcceptCtx, accept_ctx, xev_tcp.XevListener.acceptCB);
-                },
-                .write => |action_data| {
-                    const c = self.completion_pool.create() catch unreachable;
-                    const channel = action_data.channel;
-                    const buffer = action_data.buffer;
-                    const write_ctx = self.write_ctx_pool.create() catch unreachable;
-                    write_ctx.* = .{
-                        .channel = action_data.channel,
-                        .callback_instance = action_data.callback_instance,
-                        .callback = action_data.callback,
-                    };
-                    channel.socket.write(loop, c, .{ .slice = buffer }, WriteCtx, write_ctx, xev_tcp.XevSocketChannel.writeCallback);
-                },
-                .close => |action_data| {
-                    const channel = action_data.channel;
-                    const c = self.completion_pool.create() catch unreachable;
-                    const close_ctx = self.close_ctx_pool.create() catch unreachable;
-                    close_ctx.* = .{
-                        .channel = channel,
-                        .callback_instance = action_data.callback_instance,
-                        .callback = action_data.callback,
-                    };
-                    channel.socket.shutdown(loop, c, CloseCtx, close_ctx, xev_tcp.XevSocketChannel.shutdownCB);
-                },
-                .quic_engine_start => |action_data| {
-                    const engine = action_data.engine;
-                    engine.doStart();
-                },
-                .quic_connect => |action_data| {
-                    const engine = action_data.engine;
-                    engine.doConnect(action_data.peer_address, action_data.callback_ctx, action_data.callback);
-                },
-                .quic_close_connection => |action_data| {
-                    const quic_conn = action_data.conn;
-                    quic_conn.doClose(action_data.callback_ctx, action_data.callback);
-                },
-                .quic_new_stream => |action_data| {
-                    const quic_conn = action_data.conn;
-                    quic_conn.doNewStream(action_data.new_stream_ctx, action_data.new_stream_callback);
-                },
-                .quic_write_stream => |action_data| {
-                    const stream = action_data.stream;
-                    stream.doWrite(action_data.data, action_data.callback_ctx, action_data.callback);
-                },
-                .quic_close_stream => |action_data| {
-                    const stream = action_data.stream;
-                    stream.doClose(action_data.callback_ctx, action_data.callback);
-                },
-                .switch_close => |action_data| {
-                    const sw = action_data.network_switch;
-                    sw.doClose();
-                },
-                .pubsub_add_peer => |action_data| {
-                    const ps = action_data.pubsub;
-                    ps.addPeer(action_data.peer, action_data.callback_ctx, action_data.callback);
-                },
-                .pubsub_remove_peer => |action_data| {
-                    const ps = action_data.pubsub;
-                    ps.removePeer(action_data.peer, action_data.callback_ctx, action_data.callback);
-                },
-                .pubsub_subscribe => |action_data| {
-                    const ps = action_data.pubsub;
-                    ps.subscribe(action_data.topic, action_data.callback_ctx, action_data.callback);
-                },
-                .pubsub_unsubscribe => |action_data| {
-                    const ps = action_data.pubsub;
-                    ps.unsubscribe(action_data.topic, action_data.callback_ctx, action_data.callback);
-                },
-                .pubsub_publish => |action_data| {
-                    const ps = action_data.pubsub;
-                    ps.publish(action_data.topic, action_data.message, action_data.callback_ctx, action_data.callback);
-                },
-            }
+            const action = m.action;
             self.allocator.destroy(m);
+
+            const call = action.call;
+            call.func(self, call.ctx);
+            if (call.deinit) |deinit_fn| {
+                deinit_fn(self, call.ctx);
+            }
         }
 
         if (loop.stopped()) {
