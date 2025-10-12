@@ -556,14 +556,18 @@ pub const QuicStream = struct {
     }
 
     pub fn deinit(self: *QuicStream) void {
-        for (self.pending_writes.items) |*req| {
+        if (self.active_write) |*req| {
+            req.callback(req.callback_ctx, error.StreamClosed);
+            req.data.deinit();
+            self.active_write = null;
+        }
+
+        while (self.pending_writes.items.len > 0) {
+            var req = self.pending_writes.pop().?;
+            req.callback(req.callback_ctx, error.StreamClosed);
             req.data.deinit();
         }
         self.pending_writes.deinit();
-
-        if (self.active_write) |*req| {
-            req.data.deinit();
-        }
     }
 
     pub fn setProtoMsgHandler(self: *QuicStream, handler: protoMsgHandler) void {

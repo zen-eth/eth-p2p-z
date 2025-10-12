@@ -354,7 +354,21 @@ pub const MultistreamSelectHandler = struct {
         // Callback for when multistream negotiation completes
         fn onNegotiationComplete(instance: ?*anyopaque, proto_id: protocols.ProtocolId, selected_handler: *protocols.AnyProtocolHandler) void {
             const self: *NegotiationSession = @ptrCast(@alignCast(instance.?));
-            self.stream.negotiated_protocol = proto_id;
+            const stable_proto_id = blk: {
+                if (self.is_initiator) {
+                    if (self.proposed_protocols) |proposed| {
+                        for (proposed) |candidate| {
+                            if (std.mem.eql(u8, candidate, proto_id)) {
+                                break :blk candidate;
+                            }
+                        }
+                    }
+                }
+
+                break :blk proto_id;
+            };
+
+            self.stream.negotiated_protocol = stable_proto_id;
 
             if (self.is_initiator) {
                 selected_handler.onInitiatorStart(self.stream, self.user_callback_ctx, self.user_callback) catch |err| {

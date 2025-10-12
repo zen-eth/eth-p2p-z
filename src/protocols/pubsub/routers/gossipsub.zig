@@ -337,6 +337,13 @@ pub const Event = union(enum) {
 /// It uses the Semiduplex struct to manage bidirectional communication channels.
 /// It also provides methods to add and remove peers, and to handle incoming RPC messages.
 ///
+const heartbeat_seed_salt: u64 = 0x9e3779b97f4a7c15;
+
+fn heartbeatSeed(now_ms: i64, ticks: u64) u64 {
+    const now_bits: u64 = @bitCast(now_ms);
+    return now_bits ^ (ticks ^ heartbeat_seed_salt);
+}
+
 pub const Gossipsub = struct {
     peers: std.AutoHashMap(PeerId, Semiduplex),
 
@@ -1872,13 +1879,7 @@ pub const Gossipsub = struct {
             try iwant_list.append(arena, id.*);
         }
 
-        var prng = std.Random.DefaultPrng.init(blk: {
-            var seed: u64 = undefined;
-            std.posix.getrandom(std.mem.asBytes(&seed)) catch break :blk @intCast(std.time.milliTimestamp());
-            break :blk seed;
-        });
-        const random = prng.random();
-        random.shuffle([]const u8, iwant_list.items);
+        shuffleWithEntropy([]const u8, iwant_list.items);
         // This is not temporary, we need to keep track of how many IDs we asked for from this peer, so use `self.allocator`
         try self.iasked.put(self.allocator, from.*, iask + iasked);
 
@@ -1955,6 +1956,21 @@ pub const Gossipsub = struct {
         }
     }
 
+    fn initEntropyPrng() std.Random.DefaultPrng {
+        const seed = blk: {
+            var seed: u64 = undefined;
+            std.posix.getrandom(std.mem.asBytes(&seed)) catch break :blk @as(u64, @intCast(std.time.milliTimestamp()));
+            break :blk seed;
+        };
+        return std.Random.DefaultPrng.init(seed);
+    }
+
+    fn shuffleWithEntropy(comptime T: type, slice: []T) void {
+        if (slice.len <= 1) return;
+        var prng = initEntropyPrng();
+        prng.random().shuffle(T, slice);
+    }
+
     fn pushGossip(self: *Self, peer: PeerId, control_ihave: *const rpc.ControlIHave) !void {
         var gossip_entry = try self.gossip.getOrPut(self.allocator, peer);
         if (!gossip_entry.found_existing) {
@@ -1989,9 +2005,39 @@ pub const Gossipsub = struct {
             }
         }
 
-        for (message_ids[0..limit], 0..) |mid, idx| {
-            ids[idx] = try self.allocator.dupe(u8, mid);
-            copied = idx + 1;
+        const need_random_subset = message_ids.len > limit;
+        var indices_buf: ?[]usize = null;
+        defer if (indices_buf) |buf| self.allocator.free(buf);
+
+        var prng_state = initEntropyPrng();
+        const random = prng_state.random();
+
+        if (need_random_subset) {
+            var selection = try self.allocator.alloc(usize, limit);
+            indices_buf = selection;
+
+            for (selection, 0..) |*slot, idx| {
+                slot.* = idx;
+            }
+
+            var i: usize = limit;
+            while (i < message_ids.len) : (i += 1) {
+                const j = random.uintLessThan(usize, i + 1);
+                if (j < limit) {
+                    selection[j] = i;
+                }
+            }
+
+            for (selection, 0..) |idx_ptr, idx| {
+                const mid = message_ids[idx_ptr];
+                ids[idx] = try self.allocator.dupe(u8, mid);
+                copied = idx + 1;
+            }
+        } else {
+            for (message_ids[0..limit], 0..) |mid, idx| {
+                ids[idx] = try self.allocator.dupe(u8, mid);
+                copied = idx + 1;
+            }
         }
 
         var control_msg = rpc.ControlIHave{
@@ -2022,13 +2068,7 @@ pub const Gossipsub = struct {
             }
         }
 
-        var prng = std.Random.DefaultPrng.init(blk: {
-            var seed: u64 = undefined;
-            std.posix.getrandom(std.mem.asBytes(&seed)) catch break :blk @intCast(std.time.milliTimestamp());
-            break :blk seed;
-        });
-        const random = prng.random();
-        random.shuffle(PeerId, candidate_peers.items);
+        shuffleWithEntropy(PeerId, candidate_peers.items);
 
         if (candidate_peers.items.len > count) {
             candidate_peers.items = candidate_peers.items[0..count];
@@ -2110,6 +2150,172 @@ pub const Gossipsub = struct {
         // TODO: free rpc_msg
     }
 
+    const ControlKind = enum { graft, prune };
+
+    fn controlKindLabel(kind: ControlKind) []const u8 {
+        return switch (kind) {
+            .graft => "GRAFT",
+            .prune => "PRUNE",
+        };
+    }
+
+    fn queueControlTopic(
+        self: *Self,
+        allocator: Allocator,
+        map: *std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)),
+        peer: PeerId,
+        topic: []const u8,
+        kind: ControlKind,
+    ) void {
+        _ = self;
+        const label = controlKindLabel(kind);
+        const get_or_put = map.getOrPut(allocator, peer) catch |err| {
+            std.log.warn("heartbeat: failed to track {s} topic {s} for peer {}: {}", .{ label, topic, peer, err });
+            return;
+        };
+
+        if (!get_or_put.found_existing) {
+            get_or_put.value_ptr.* = .empty;
+        }
+
+        get_or_put.value_ptr.append(allocator, topic) catch |err| {
+            std.log.warn("heartbeat: failed to append {s} topic {s} for peer {}: {}", .{ label, topic, peer, err });
+        };
+    }
+
+    fn queueGraftTopic(
+        self: *Self,
+        allocator: Allocator,
+        map: *std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)),
+        peer: PeerId,
+        topic: []const u8,
+    ) void {
+        self.queueControlTopic(allocator, map, peer, topic, .graft);
+    }
+
+    fn queuePruneTopic(
+        self: *Self,
+        allocator: Allocator,
+        map: *std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)),
+        peer: PeerId,
+        topic: []const u8,
+    ) void {
+        self.queueControlTopic(allocator, map, peer, topic, .prune);
+    }
+
+    fn ensureControlMessage(self: *Self, peer: PeerId) ?*rpc.ControlMessage {
+        const entry = self.control.getOrPut(self.allocator, peer) catch |err| {
+            std.log.warn("heartbeat: failed to queue control message for peer {}: {}", .{ peer, err });
+            return null;
+        };
+
+        if (!entry.found_existing) {
+            entry.value_ptr.* = null;
+        }
+
+        if (entry.value_ptr.* == null) {
+            entry.value_ptr.* = rpc.ControlMessage{};
+        }
+
+        return &entry.value_ptr.*.?;
+    }
+
+    fn appendControlTopic(
+        self: *Self,
+        comptime T: type,
+        list_ptr: *?[]const ?T,
+        peer: PeerId,
+        topic: []const u8,
+        kind: ControlKind,
+    ) void {
+        const label = controlKindLabel(kind);
+        if (topic.len == 0) return;
+
+        if (list_ptr.*) |existing| {
+            for (existing) |item_opt| {
+                const item = item_opt orelse continue;
+                const existing_topic = item.topic_i_d orelse continue;
+                if (std.mem.eql(u8, existing_topic, topic)) {
+                    return;
+                }
+            }
+
+            const old_len = existing.len;
+            var new_arr = self.allocator.alloc(?T, old_len + 1) catch |err| {
+                std.log.warn("heartbeat: failed to expand {s} list for peer {} topic {s}: {}", .{ label, peer, topic, err });
+                return;
+            };
+            for (existing, 0..) |item_opt, idx| {
+                new_arr[idx] = item_opt;
+            }
+
+            const topic_copy = self.allocator.dupe(u8, topic) catch |err| {
+                std.log.warn("heartbeat: failed to duplicate {s} topic {s} for peer {}: {}", .{ label, topic, peer, err });
+                self.allocator.free(new_arr);
+                return;
+            };
+
+            new_arr[old_len] = .{ .topic_i_d = topic_copy };
+            self.allocator.free(@constCast(existing));
+            list_ptr.* = new_arr;
+        } else {
+            const topic_copy = self.allocator.dupe(u8, topic) catch |err| {
+                std.log.warn("heartbeat: failed to duplicate {s} topic {s} for peer {}: {}", .{ label, topic, peer, err });
+                return;
+            };
+
+            var arr = self.allocator.alloc(?T, 1) catch |err| {
+                std.log.warn("heartbeat: failed to allocate {s} list for peer {} topic {s}: {}", .{ label, peer, topic, err });
+                self.allocator.free(topic_copy);
+                return;
+            };
+
+            arr[0] = .{ .topic_i_d = topic_copy };
+            list_ptr.* = arr;
+        }
+    }
+
+    fn sendGraftPrune(
+        self: *Self,
+        to_graft: *std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)),
+        to_prune: *std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)),
+        no_px: *std.AutoHashMapUnmanaged(PeerId, bool),
+    ) void {
+        _ = no_px; // PX is not supported in v1.0 implementation yet
+
+        var graft_iter = to_graft.iterator();
+        while (graft_iter.next()) |entry| {
+            const peer_id = entry.key_ptr.*;
+            const topics = entry.value_ptr.*;
+            if (topics.items.len == 0) continue;
+
+            const ctrl = self.ensureControlMessage(peer_id) orelse continue;
+
+            for (topics.items) |topic| {
+                self.appendControlTopic(rpc.ControlGraft, &ctrl.graft, peer_id, topic, .graft);
+            }
+
+            if (to_prune.getPtr(peer_id)) |prune_topics_ptr| {
+                const prune_topics = prune_topics_ptr.*;
+                for (prune_topics.items) |topic| {
+                    self.appendControlTopic(rpc.ControlPrune, &ctrl.prune, peer_id, topic, .prune);
+                }
+            }
+        }
+
+        var prune_iter = to_prune.iterator();
+        while (prune_iter.next()) |entry| {
+            const peer_id = entry.key_ptr.*;
+            const topics = entry.value_ptr.*;
+            if (topics.items.len == 0) continue;
+
+            const ctrl = self.ensureControlMessage(peer_id) orelse continue;
+            for (topics.items) |topic| {
+                self.appendControlTopic(rpc.ControlPrune, &ctrl.prune, peer_id, topic, .prune);
+            }
+        }
+    }
+
     fn sendSubscriptions(self: *Self, arena: Allocator, to: *const PeerId, topics: []const []const u8, subscribe_flag: bool) !void {
         var sub_opts: std.ArrayListUnmanaged(?rpc.RPC.SubOpts) = .empty;
 
@@ -2147,10 +2353,16 @@ pub const Gossipsub = struct {
         self.iasked.deinit(self.allocator);
         self.iasked = std.AutoArrayHashMapUnmanaged(PeerId, usize).empty;
 
-        const now_bits: u64 = @bitCast(now_ms);
-        const seed = now_bits ^ (self.heartbeat_ticks ^ 0x9e3779b97f4a7c15);
+        const seed = heartbeatSeed(now_ms, self.heartbeat_ticks);
         var prng = std.Random.DefaultPrng.init(seed);
         const random = prng.random();
+
+        var tograft = std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)).empty;
+        defer tograft.deinit(arena_allocator);
+        var toprune = std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)).empty;
+        defer toprune.deinit(arena_allocator);
+        var no_px = std.AutoHashMapUnmanaged(PeerId, bool).empty;
+        defer no_px.deinit(arena_allocator);
 
         var mesh_iter = self.mesh.iterator();
         while (mesh_iter.next()) |entry| {
@@ -2186,7 +2398,7 @@ pub const Gossipsub = struct {
                             std.log.warn("heartbeat: failed to add mesh peer {} for topic {s}: {}", .{ peer_id, topic, err });
                             continue;
                         };
-                        self.sendGraft(arena_allocator, &peer_id, topic);
+                        self.queueGraftTopic(arena_allocator, &tograft, peer_id, topic);
                     }
                 }
             }
@@ -2205,7 +2417,7 @@ pub const Gossipsub = struct {
                 while (idx < peer_list.items.len) : (idx += 1) {
                     const peer_id = peer_list.items[idx];
                     if (peers.remove(peer_id)) {
-                        self.sendPrune(arena_allocator, &peer_id, topic);
+                        self.queuePruneTopic(arena_allocator, &toprune, peer_id, topic);
                     }
                 }
             }
@@ -2287,46 +2499,53 @@ pub const Gossipsub = struct {
                 _ = peers_map.remove(peer_id);
             }
 
-            if (peers_map.count() < self.opts.D) {
-                var candidates = self.collectTopicPeers(arena_allocator, topic, peers_map, null) catch |err| {
-                    std.log.warn("heartbeat: failed to collect fanout peers for topic {s}: {}", .{ topic, err });
-                    continue;
-                };
-                defer candidates.deinit(arena_allocator);
-                if (candidates.items.len > 0) {
-                    random.shuffle(PeerId, candidates.items);
-                    var needed = self.opts.D - peers_map.count();
-                    if (needed > candidates.items.len) needed = candidates.items.len;
-                    for (candidates.items[0..needed]) |peer_id| {
-                        if (!peers_map.contains(peer_id)) {
-                            peers_map.put(self.allocator, peer_id, {}) catch |err| {
-                                std.log.warn("heartbeat: failed to add fanout peer {} for topic {s}: {}", .{ peer_id, topic, err });
-                                break;
-                            };
+            var fanout_candidates = self.collectTopicPeers(arena_allocator, topic, peers_map, null) catch |err| {
+                std.log.warn("heartbeat: failed to collect fanout candidates for topic {s}: {}", .{ topic, err });
+                continue;
+            };
+            defer fanout_candidates.deinit(arena_allocator);
+
+            if (fanout_candidates.items.len > 0) {
+                random.shuffle(PeerId, fanout_candidates.items);
+            }
+
+            var gossip_start_index: usize = 0;
+
+            if (peers_map.count() < self.opts.D and fanout_candidates.items.len > 0) {
+                var needed = self.opts.D - peers_map.count();
+                if (needed > fanout_candidates.items.len) needed = fanout_candidates.items.len;
+                if (needed > 0) {
+                    var added_count: usize = 0;
+                    var idx: usize = 0;
+                    while (idx < fanout_candidates.items.len and added_count < needed) : (idx += 1) {
+                        const peer_id = fanout_candidates.items[idx];
+                        if (peers_map.contains(peer_id)) continue;
+                        peers_map.put(self.allocator, peer_id, {}) catch |err| {
+                            std.log.warn("heartbeat: failed to add fanout peer {} for topic {s}: {}", .{ peer_id, topic, err });
+                            break;
+                        };
+                        if (idx != added_count) {
+                            std.mem.swap(PeerId, &fanout_candidates.items[idx], &fanout_candidates.items[added_count]);
                         }
+                        added_count += 1;
                     }
+                    gossip_start_index = added_count;
                 }
             }
 
-            var fanout_gossip_candidates = self.collectTopicPeers(arena_allocator, topic, peers_map, null) catch |err| {
-                std.log.warn("heartbeat: failed to collect fanout gossip peers for topic {s}: {}", .{ topic, err });
-                continue;
-            };
-            defer fanout_gossip_candidates.deinit(arena_allocator);
-
-            if (fanout_gossip_candidates.items.len > 0) {
-                random.shuffle(PeerId, fanout_gossip_candidates.items);
+            const fanout_gossip_candidates = fanout_candidates.items[gossip_start_index..];
+            if (fanout_gossip_candidates.len > 0) {
                 var target = self.opts.D_lazy;
-                const candidate_float = @as(f32, @floatFromInt(fanout_gossip_candidates.items.len));
+                const candidate_float = @as(f32, @floatFromInt(fanout_gossip_candidates.len));
                 const factor_float = @ceil(self.opts.gossip_factor * candidate_float);
                 const factor = blk: {
                     if (!std.math.isFinite(factor_float) or factor_float < 0) break :blk 0;
                     const max_f32 = @as(f32, @floatFromInt(std.math.maxInt(usize)));
-                    if (factor_float > max_f32) break :blk fanout_gossip_candidates.items.len;
+                    if (factor_float > max_f32) break :blk fanout_gossip_candidates.len;
                     break :blk @as(usize, @intFromFloat(factor_float));
                 };
                 if (factor > target) target = factor;
-                if (target > fanout_gossip_candidates.items.len) target = fanout_gossip_candidates.items.len;
+                if (target > fanout_gossip_candidates.len) target = fanout_gossip_candidates.len;
                 if (target > 0) {
                     const gossip_ids = self.mcache.getGossipIDs(topic) catch |err| {
                         std.log.warn("heartbeat: failed to get fanout gossip IDs for topic {s}: {}", .{ topic, err });
@@ -2334,7 +2553,7 @@ pub const Gossipsub = struct {
                     };
                     defer self.allocator.free(gossip_ids);
                     if (gossip_ids.len > 0) {
-                        for (fanout_gossip_candidates.items[0..target]) |peer_id| {
+                        for (fanout_gossip_candidates[0..target]) |peer_id| {
                             self.enqueueGossip(peer_id, topic, gossip_ids) catch |err| {
                                 std.log.warn("heartbeat: failed to enqueue fanout gossip for peer {} topic {s}: {}", .{ peer_id, topic, err });
                             };
@@ -2350,6 +2569,7 @@ pub const Gossipsub = struct {
             }
         }
 
+        self.sendGraftPrune(&tograft, &toprune, &no_px);
         self.flush(arena_allocator);
         self.mcache.shift();
     }
@@ -2629,6 +2849,271 @@ fn waitForTopicPeer(router: *Gossipsub, topic: []const u8, peer: PeerId, timeout
         std.time.sleep(step);
         waited += step;
     }
+}
+
+fn waitForUsableStream(router: *Gossipsub, peer: PeerId, timeout_ns: u64) WaitError!void {
+    const step = 10 * std.time.ns_per_ms;
+    var waited: u64 = 0;
+
+    while (true) {
+        if (router.hasUsableStream(peer)) return;
+
+        if (waited >= timeout_ns) return error.Timeout;
+        std.time.sleep(step);
+        waited += step;
+    }
+}
+
+test "gossipsub heartbeat seed mixing" {
+    const seed_zero = heartbeatSeed(0, 0);
+    try std.testing.expectEqual(heartbeat_seed_salt, seed_zero);
+
+    const sample_now: i64 = 42;
+    const sample_ticks: u64 = 7;
+    const expected_sample = blk: {
+        const now_bits: u64 = @bitCast(sample_now);
+        break :blk now_bits ^ (sample_ticks ^ heartbeat_seed_salt);
+    };
+    try std.testing.expectEqual(expected_sample, heartbeatSeed(sample_now, sample_ticks));
+
+    const next_ticks = sample_ticks + 1;
+    try std.testing.expect(heartbeatSeed(sample_now, sample_ticks) != heartbeatSeed(sample_now, next_ticks));
+
+    const negative_now: i64 = -13579;
+    const expected_negative = blk: {
+        const now_bits: u64 = @bitCast(negative_now);
+        break :blk now_bits ^ (sample_ticks ^ heartbeat_seed_salt);
+    };
+    try std.testing.expectEqual(expected_negative, heartbeatSeed(negative_now, sample_ticks));
+}
+
+test "gossipsub heartbeat prunes mesh peers without usable streams" {
+    const allocator = std.testing.allocator;
+
+    var node: TestGossipsubNode = undefined;
+    try node.init(allocator, 10167, .{});
+    defer node.deinit();
+
+    const topic = "heartbeat-prune";
+    const interned_topic = try node.router.refTopic(topic);
+
+    var mesh_peers = std.AutoHashMapUnmanaged(PeerId, void).empty;
+    var mesh_entry_installed = false;
+    defer {
+        if (mesh_entry_installed) {
+            if (node.router.mesh.fetchRemove(interned_topic)) |removed_const| {
+                var removed = removed_const;
+                removed.value.deinit(node.router.allocator);
+                node.router.unrefTopic(removed.key);
+            }
+        } else {
+            mesh_peers.deinit(node.router.allocator);
+            node.router.unrefTopic(interned_topic);
+        }
+    }
+
+    try mesh_peers.put(node.router.allocator, node.router.peer_id, {});
+    try node.router.mesh.put(node.router.allocator, interned_topic, mesh_peers);
+    mesh_entry_installed = true;
+
+    const mesh_before = node.router.mesh.getPtr(interned_topic).?;
+    try std.testing.expectEqual(@as(usize, 1), mesh_before.count());
+
+    const ticks_before = node.router.heartbeat_ticks;
+    node.router.doHeartbeat();
+    try std.testing.expectEqual(ticks_before + 1, node.router.heartbeat_ticks);
+
+    const mesh_after = node.router.mesh.getPtr(interned_topic).?;
+    try std.testing.expectEqual(@as(usize, 0), mesh_after.count());
+}
+
+test "gossipsub heartbeat timer increments ticks" {
+    const allocator = std.testing.allocator;
+
+    const heartbeat_interval_ms: u64 = 50;
+    var node: TestGossipsubNode = undefined;
+    try node.init(allocator, 10267, .{ .heartbeat_interval_ms = heartbeat_interval_ms });
+    defer node.deinit();
+
+    const initial_ticks = node.router.heartbeat_ticks;
+
+    const wait_timeout_ns = 2 * std.time.ns_per_s;
+    const deadline = std.time.nanoTimestamp() + wait_timeout_ns;
+    while (node.router.heartbeat_ticks == initial_ticks) {
+        if (std.time.nanoTimestamp() >= deadline) break;
+        std.time.sleep(10 * std.time.us_per_ms);
+    }
+
+    try std.testing.expect(node.router.heartbeat_ticks > initial_ticks);
+}
+
+test "gossipsub heartbeat queues graft when mesh under target" {
+    const allocator = std.testing.allocator;
+
+    const opts: Gossipsub.Options = .{
+        .D = 1,
+        .D_lo = 1,
+        .D_hi = 2,
+        .D_lazy = 1,
+    };
+
+    var node_a: TestGossipsubNode = undefined;
+    try node_a.init(allocator, 10367, opts);
+    defer node_a.deinit();
+
+    var node_b: TestGossipsubNode = undefined;
+    try node_b.init(allocator, 10368, opts);
+    defer node_b.deinit();
+
+    try addPeerSync(&node_a.router, node_b.dial_addr);
+    try addPeerSync(&node_b.router, node_a.dial_addr);
+
+    const topic = "mesh-underflow";
+    try subscribeSync(&node_a.router, topic);
+    try subscribeSync(&node_b.router, topic);
+
+    try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
+    try waitForUsableStream(&node_a.router, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
+
+    node_a.router.heartbeat_running = false;
+    node_b.router.heartbeat_running = false;
+
+    var mesh_ptr = node_a.router.mesh.getPtr(topic).?;
+    _ = mesh_ptr.remove(node_b.transport.local_peer_id);
+    try std.testing.expectEqual(@as(usize, 0), mesh_ptr.count());
+
+    var graft_done = std.atomic.Value(bool).init(false);
+    var graft_peer: ?PeerId = null;
+    var graft_topic: ?[]const u8 = null;
+    var graft_topic_buf: ?[]u8 = null;
+    defer if (graft_topic_buf) |buf| std.testing.allocator.free(buf);
+    var graft_direction: ?p2p_conn.Direction = null;
+
+    const GraftListener = struct {
+        done: *std.atomic.Value(bool),
+        peer: *?PeerId,
+        topic: *?[]const u8,
+        direction: *?p2p_conn.Direction,
+        allocator: Allocator,
+        topic_buf: *?[]u8,
+
+        const Self = @This();
+
+        pub fn handle(self: *Self, e: Event) void {
+            switch (e) {
+                .gossipsub_graft => |ev| {
+                    self.peer.* = ev.peer;
+                    const maybe_topic = ev.topic;
+                    if (maybe_topic.len > 0) {
+                        if (self.topic_buf.*) |buf| {
+                            self.allocator.free(buf);
+                            self.topic_buf.* = null;
+                        }
+                        const copy = self.allocator.dupe(u8, maybe_topic) catch unreachable;
+                        self.topic_buf.* = copy;
+                        self.topic.* = copy;
+                    } else {
+                        self.topic.* = maybe_topic;
+                    }
+                    self.direction.* = ev.direction;
+                    self.done.store(true, .release);
+                },
+                else => {},
+            }
+        }
+
+        pub fn vtableHandleFn(instance: *anyopaque, e: Event) void {
+            const self: *Self = @ptrCast(@alignCast(instance));
+            self.handle(e);
+        }
+
+        pub const vtable = event.EventListenerVTable(Event){
+            .handleFn = vtableHandleFn,
+        };
+
+        pub fn any(self: *Self) event.AnyEventListener(Event) {
+            return .{ .instance = @ptrCast(self), .vtable = &Self.vtable };
+        }
+    };
+
+    var listener = GraftListener{
+        .done = &graft_done,
+        .peer = &graft_peer,
+        .topic = &graft_topic,
+        .direction = &graft_direction,
+        .allocator = std.testing.allocator,
+        .topic_buf = &graft_topic_buf,
+    };
+    try node_a.router.event_emitter.addListener(.gossipsub_graft, listener.any());
+    defer _ = node_a.router.event_emitter.removeListener(.gossipsub_graft, listener.any());
+
+    node_a.router.doHeartbeat();
+    try waitForFlag(&graft_done, std.time.ns_per_s);
+
+    try std.testing.expect(graft_peer != null);
+    try std.testing.expect(graft_peer.?.eql(&node_b.transport.local_peer_id));
+    try std.testing.expect(graft_topic != null);
+    try std.testing.expect(std.mem.eql(u8, graft_topic.?, topic));
+    try std.testing.expect(graft_direction != null);
+    try std.testing.expectEqual(p2p_conn.Direction.OUTBOUND, graft_direction.?);
+
+    try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
+}
+
+fn addPeerSync(router: *Gossipsub, addr: Multiaddr) !void {
+    var done = std.atomic.Value(bool).init(false);
+    var err: ?anyerror = null;
+
+    const State = struct {
+        done: *std.atomic.Value(bool),
+        err: *?anyerror,
+    };
+
+    const Callback = struct {
+        fn call(ctx: ?*anyopaque, res: anyerror!void) void {
+            const state: *State = @ptrCast(@alignCast(ctx.?));
+            if (res) |_| {
+                state.err.* = null;
+            } else |e| {
+                state.err.* = e;
+            }
+            state.done.store(true, .release);
+        }
+    };
+
+    var state = State{ .done = &done, .err = &err };
+    router.addPeer(addr, @ptrCast(@constCast(&state)), Callback.call);
+
+    try waitForFlag(&done, 5 * std.time.ns_per_s);
+    if (err) |e| return e;
+}
+
+fn subscribeSync(router: *Gossipsub, topic: []const u8) !void {
+    var done = std.atomic.Value(bool).init(false);
+    var err: ?anyerror = null;
+
+    const State = struct {
+        done: *std.atomic.Value(bool),
+        err: *?anyerror,
+    };
+
+    const Callback = struct {
+        fn call(ctx: ?*anyopaque, res: anyerror!void) void {
+            const state: *State = @ptrCast(@alignCast(ctx.?));
+            if (res) |_| {
+                state.err.* = null;
+            } else |e| {
+                state.err.* = e;
+            }
+            state.done.store(true, .release);
+        }
+    };
+
+    var state = State{ .done = &done, .err = &err };
+    router.subscribe(topic, @ptrCast(@constCast(&state)), Callback.call);
+
+    try waitForFlag(&done, 5 * std.time.ns_per_s);
+    if (err) |e| return e;
 }
 
 const TestGossipsubNode = struct {
@@ -3158,6 +3643,7 @@ test "pubsub subscribe and publish" {
         fn callback(ctx: ?*anyopaque, res: anyerror![]PeerId) void {
             const state: *PublishState = @ptrCast(@alignCast(ctx.?));
             const peers = res catch |err| {
+                std.log.err("publish callback error: {}", .{err});
                 state.err.* = err;
                 state.recipients.* = null;
                 state.done.store(true, .release);
