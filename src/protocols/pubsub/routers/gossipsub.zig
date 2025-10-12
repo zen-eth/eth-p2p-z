@@ -1905,7 +1905,7 @@ pub const Gossipsub = struct {
             const topic = graft_msg.getTopicID();
             if (topic.len == 0) continue;
 
-            var peers = self.mesh.get(topic) orelse continue;
+            const peers = self.mesh.getPtr(topic) orelse continue;
             // This should use `self.allocator` because `self.mesh` is long-lived.
             if (peers.contains(from.*)) continue;
 
