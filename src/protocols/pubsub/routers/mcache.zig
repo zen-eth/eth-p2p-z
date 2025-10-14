@@ -1,6 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rpc = @import("../../../proto/rpc.proto.zig");
+const PeerId = @import("peer_id").PeerId;
+const pubsub = @import("../pubsub.zig");
 const testing = std.testing;
 
 /// This is a message cache implementation follow the
@@ -105,9 +107,7 @@ pub const MessageCache = struct {
     // Number of windows to include in gossip
     gossip: usize,
 
-    msg_id_ctx: ?*anyopaque,
-
-    msg_id_fn: *const fn (ctx: ?*anyopaque, allocator: Allocator, msg: *rpc.Message) anyerror![]const u8,
+    msg_id_fn: pubsub.MessageIdFn,
 
     const Error = error{
         DuplicateMessage,
@@ -116,7 +116,7 @@ pub const MessageCache = struct {
         BothFromAndSeqNoNull,
     };
 
-    const PeerTransmissionMap = std.StringHashMap(i32);
+    const PeerTransmissionMap = std.AutoHashMap(PeerId, i32);
 
     const CacheEntry = struct {
         mid: []const u8,
@@ -125,7 +125,7 @@ pub const MessageCache = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, gossip: usize, history_size: usize, msg_id_ctx: ?*anyopaque, msg_id_fn: fn (ctx: ?*anyopaque, allocator: Allocator, msg: *rpc.Message) anyerror![]const u8) !Self {
+    pub fn init(allocator: Allocator, gossip: usize, history_size: usize, msg_id_fn: pubsub.MessageIdFn) !Self {
         if (gossip > history_size) {
             return error.HistoryLengthExceeded;
         }
@@ -136,7 +136,6 @@ pub const MessageCache = struct {
             .peertx = std.StringHashMap(PeerTransmissionMap).init(allocator),
             .history = std.ArrayList(?std.ArrayList(CacheEntry)).init(allocator),
             .gossip = gossip,
-            .msg_id_ctx = msg_id_ctx,
             .msg_id_fn = msg_id_fn,
         };
 
@@ -164,10 +163,6 @@ pub const MessageCache = struct {
         while (peertx_iter.next()) |entry| {
             // key is used as same as msgs, so it does not need to be freed
             var peer_map = entry.value_ptr.*;
-            var peer_iter = peer_map.iterator();
-            while (peer_iter.next()) |peer_entry| {
-                self.allocator.free(peer_entry.key_ptr.*); // Free owned peer ID string
-            }
             peer_map.deinit();
         }
         self.peertx.deinit();
@@ -181,8 +176,8 @@ pub const MessageCache = struct {
         self.history.deinit();
     }
 
-    pub fn put(self: *Self, msg: *rpc.Message) !void {
-        const mid = try self.msg_id_fn(self.msg_id_ctx, self.allocator, msg);
+    pub fn put(self: *Self, msg: *const rpc.Message) !void {
+        const mid = try self.msg_id_fn(self.allocator, msg);
         errdefer self.allocator.free(mid);
         const gop = try self.msgs.getOrPut(mid);
         if (gop.found_existing) {
@@ -200,11 +195,33 @@ pub const MessageCache = struct {
         try self.history.items[0].?.append(entry);
     }
 
+    pub fn putWithId(self: *Self, mid: []const u8, msg: *const rpc.Message) !void {
+        const gop = try self.msgs.getOrPut(mid);
+        if (gop.found_existing) {
+            return error.DuplicateMessage; // Already exists, do not overwrite
+        }
+        const cloned_msg = try self.cloneMessage(msg);
+        errdefer self.freeMessage(&cloned_msg);
+
+        const cloned_key = try self.allocator.dupe(u8, mid);
+        errdefer self.allocator.free(cloned_key);
+        gop.value_ptr.* = cloned_msg;
+        gop.key_ptr.* = cloned_key;
+        errdefer _ = self.msgs.remove(gop.key_ptr.*);
+
+        // Add to history[0] (current window)
+        const entry: CacheEntry = .{
+            .mid = mid,
+            .topic = cloned_msg.topic orelse return error.MissingTopic,
+        };
+        try self.history.items[0].?.append(entry);
+    }
+
     pub fn get(self: *Self, mid: []const u8) ?*rpc.Message {
         return self.msgs.getPtr(mid);
     }
 
-    pub fn getForPeer(self: *Self, mid: []const u8, peer_id: []const u8) !?struct { msg: *rpc.Message, count: i32 } {
+    pub fn getForPeer(self: *Self, mid: []const u8, peer_id: PeerId) !?struct { msg: *rpc.Message, count: i32 } {
         const msg = self.msgs.getPtr(mid) orelse return null;
 
         const tx_result = try self.peertx.getOrPut(self.msgs.getKey(mid).?);
@@ -215,7 +232,7 @@ pub const MessageCache = struct {
         // Increment transmission count for this peer
         const peer_result = try tx_result.value_ptr.getOrPut(peer_id);
         if (!peer_result.found_existing) {
-            peer_result.key_ptr.* = try self.allocator.dupe(u8, peer_id);
+            peer_result.key_ptr.* = peer_id;
             peer_result.value_ptr.* = 0;
         }
         peer_result.value_ptr.* += 1;
@@ -254,10 +271,6 @@ pub const MessageCache = struct {
                 if (self.peertx.fetchRemove(entry.mid)) |*kv| {
                     // key is used as same as msgs, so it does not need to be freed
                     var peer_map = kv.value;
-                    var peer_iter = peer_map.iterator();
-                    while (peer_iter.next()) |peer_entry| {
-                        self.allocator.free(peer_entry.key_ptr.*);
-                    }
                     peer_map.deinit();
                 }
             }
@@ -272,18 +285,6 @@ pub const MessageCache = struct {
         self.history.items[0] = std.ArrayList(CacheEntry).init(self.allocator);
     }
 
-    /// Computes the default message ID by concatenating `msg.from` and `msg.seqno`.
-    /// The caller must ensure that `dest` is allocated with at least `msg.from.len + msg.seqno.len` bytes.
-    pub fn defaultMsgId(ctx: ?*anyopaque, allocator: Allocator, msg: *rpc.Message) ![]const u8 {
-        _ = ctx;
-
-        if (msg.from == null and msg.seqno == null) {
-            return error.BothFromAndSeqNoNull;
-        }
-
-        return std.mem.concat(allocator, u8, &.{ msg.from orelse "", msg.seqno orelse "" });
-    }
-
     fn freeMessage(self: *Self, msg: *const rpc.Message) void {
         if (msg.from) |from| self.allocator.free(from);
         if (msg.seqno) |seqno| self.allocator.free(seqno);
@@ -293,7 +294,7 @@ pub const MessageCache = struct {
         if (msg.key) |key| self.allocator.free(key);
     }
 
-    fn cloneMessage(self: *Self, msg: *rpc.Message) !rpc.Message {
+    fn cloneMessage(self: *Self, msg: *const rpc.Message) !rpc.Message {
         return rpc.Message{
             .from = if (msg.from) |from| try self.allocator.dupe(u8, from) else null,
             .seqno = if (msg.seqno) |seqno| try self.allocator.dupe(u8, seqno) else null,
@@ -342,8 +343,7 @@ test "MessageCache.init basic initialization" {
 
     var cache = try MessageCache.init(allocator, 3, // gossip
         5, // history_size
-        null, // msg_id_ctx
-        MessageCache.defaultMsgId);
+        pubsub.defaultMsgId);
     defer cache.deinit();
 
     try testing.expect(cache.gossip == 3);
@@ -358,7 +358,7 @@ test "MessageCache.init invalid parameters" {
     // gossip > history_size should fail
     const result = MessageCache.init(allocator, 6, // gossip
         5, // history_size
-        null, MessageCache.defaultMsgId);
+        pubsub.defaultMsgId);
 
     try testing.expectError(error.HistoryLengthExceeded, result);
 }
@@ -370,7 +370,7 @@ test "MessageCache.defaultMsgId" {
     defer allocator.destroy(msg);
     defer freeTestMessage(allocator, msg);
 
-    const result = try MessageCache.defaultMsgId(null, allocator, msg);
+    const result = try pubsub.defaultMsgId(allocator, msg);
     defer allocator.free(result);
     try testing.expectEqualSlices(u8, "peer123seq456", result);
 }
@@ -392,7 +392,7 @@ test "MessageCache.defaultMsgId invalid parameters" {
     defer allocator.free(msg.topic.?);
     defer allocator.free(msg.data.?);
 
-    const result = MessageCache.defaultMsgId(null, allocator, msg);
+    const result = pubsub.defaultMsgId(allocator, msg);
 
     try testing.expectError(error.BothFromAndSeqNoNull, result);
 }
@@ -400,7 +400,7 @@ test "MessageCache.defaultMsgId invalid parameters" {
 test "MessageCache.put and get" {
     const allocator = testing.allocator;
 
-    var cache = try MessageCache.init(allocator, 3, 5, null, MessageCache.defaultMsgId);
+    var cache = try MessageCache.init(allocator, 3, 5, pubsub.defaultMsgId);
     defer cache.deinit();
 
     const msg = try createTestMessage(allocator, "peer123", "seq456", "test-topic", "hello");
@@ -411,7 +411,7 @@ test "MessageCache.put and get" {
     try testing.expect(cache.msgs.count() == 1);
     try testing.expect(cache.history.items[0].?.items.len == 1);
 
-    const expected_mid = try MessageCache.defaultMsgId(null, allocator, msg);
+    const expected_mid = try pubsub.defaultMsgId(allocator, msg);
     defer allocator.free(expected_mid);
     const retrieved_msg = cache.get(expected_mid);
     try testing.expect(retrieved_msg != null);
@@ -421,7 +421,7 @@ test "MessageCache.put and get" {
 test "MessageCache.put duplicate message" {
     const allocator = testing.allocator;
 
-    var cache = try MessageCache.init(allocator, 3, 5, null, MessageCache.defaultMsgId);
+    var cache = try MessageCache.init(allocator, 3, 5, pubsub.defaultMsgId);
     defer cache.deinit();
 
     const msg1 = try createTestMessage(allocator, "peer123", "seq456", "test-topic", "hello");
@@ -442,7 +442,7 @@ test "MessageCache.put duplicate message" {
     try testing.expect(cache.msgs.count() == 1);
     try testing.expect(cache.history.items[0].?.items.len == 1);
 
-    const mid = try MessageCache.defaultMsgId(null, allocator, msg1);
+    const mid = try pubsub.defaultMsgId(allocator, msg1);
     defer allocator.free(mid);
     const retrieved_msg = cache.get(mid).?;
     try testing.expectEqualSlices(u8, "hello", retrieved_msg.data.?);
@@ -451,7 +451,7 @@ test "MessageCache.put duplicate message" {
 test "MessageCache.getForPeer" {
     const allocator = testing.allocator;
 
-    var cache = try MessageCache.init(allocator, 3, 5, null, MessageCache.defaultMsgId);
+    var cache = try MessageCache.init(allocator, 3, 5, pubsub.defaultMsgId);
     defer cache.deinit();
 
     const msg = try createTestMessage(allocator, "peer123", "seq456", "test-topic", "hello");
@@ -459,21 +459,23 @@ test "MessageCache.getForPeer" {
     defer freeTestMessage(allocator, msg);
     try cache.put(msg);
 
-    const mid = try MessageCache.defaultMsgId(null, allocator, msg);
+    const mid = try pubsub.defaultMsgId(allocator, msg);
     defer allocator.free(mid);
 
+    const peer_a = try PeerId.random();
     // First call for peer
-    const result1 = try cache.getForPeer(mid, "peer-a");
+    const result1 = try cache.getForPeer(mid, peer_a);
     try testing.expect(result1 != null);
     try testing.expect(result1.?.count == 1);
 
     // Second call for same peer
-    const result2 = try cache.getForPeer(mid, "peer-a");
+    const result2 = try cache.getForPeer(mid, peer_a);
     try testing.expect(result2 != null);
     try testing.expect(result2.?.count == 2);
 
     // First call for different peer
-    const result3 = try cache.getForPeer(mid, "peer-b");
+    const peer_b = try PeerId.random();
+    const result3 = try cache.getForPeer(mid, peer_b);
     try testing.expect(result3 != null);
     try testing.expect(result3.?.count == 1);
 }
@@ -481,10 +483,11 @@ test "MessageCache.getForPeer" {
 test "MessageCache.getForPeer non-existent message" {
     const allocator = testing.allocator;
 
-    var cache = try MessageCache.init(allocator, 3, 5, null, MessageCache.defaultMsgId);
+    var cache = try MessageCache.init(allocator, 3, 5, pubsub.defaultMsgId);
     defer cache.deinit();
 
-    const result = try cache.getForPeer("non-existent-id", "peer-a");
+    const peer_a = try PeerId.random();
+    const result = try cache.getForPeer("non-existent-id", peer_a);
     try testing.expect(result == null);
 }
 
@@ -492,7 +495,7 @@ test "MessageCache.getGossipIDs" {
     const allocator = testing.allocator;
 
     var cache = try MessageCache.init(allocator, 2, // gossip = 2 windows
-        5, null, MessageCache.defaultMsgId);
+        5, pubsub.defaultMsgId);
     defer cache.deinit();
 
     // Add messages to different topics
@@ -520,7 +523,7 @@ test "MessageCache.getGossipIDs" {
 test "MessageCache.getGossipIDs empty topic" {
     const allocator = testing.allocator;
 
-    var cache = try MessageCache.init(allocator, 3, 5, null, MessageCache.defaultMsgId);
+    var cache = try MessageCache.init(allocator, 3, 5, pubsub.defaultMsgId);
     defer cache.deinit();
 
     const msg = try createTestMessage(allocator, "peer1", "seq1", "topic-a", "data1");
@@ -539,7 +542,7 @@ test "MessageCache.shift" {
     const allocator = testing.allocator;
 
     var cache = try MessageCache.init(allocator, 2, 3, // 3 windows total
-        null, MessageCache.defaultMsgId);
+        pubsub.defaultMsgId);
     defer cache.deinit();
 
     const msg = try createTestMessage(allocator, "peer1", "seq1", "topic-a", "data1");
@@ -576,7 +579,7 @@ test "MessageCache.shift" {
 test "MessageCache.shift empty cache" {
     const allocator = testing.allocator;
 
-    var cache = try MessageCache.init(allocator, 3, 5, null, MessageCache.defaultMsgId);
+    var cache = try MessageCache.init(allocator, 3, 5, pubsub.defaultMsgId);
     defer cache.deinit();
 
     // Shift empty cache should not crash
@@ -597,7 +600,7 @@ test "MessageCache memory management" {
     const allocator = gpa.allocator();
 
     {
-        var cache = try MessageCache.init(allocator, 2, 3, null, MessageCache.defaultMsgId);
+        var cache = try MessageCache.init(allocator, 2, 3, pubsub.defaultMsgId);
         defer cache.deinit();
 
         for (0..10) |i| {
@@ -625,18 +628,20 @@ test "MessageCache memory management" {
         defer freeTestMessage(allocator, test_msg);
         try cache.put(test_msg);
 
-        const mid = try MessageCache.defaultMsgId(null, allocator, test_msg);
+        const mid = try pubsub.defaultMsgId(allocator, test_msg);
         defer allocator.free(mid);
 
-        _ = try cache.getForPeer(mid, "peer1");
-        _ = try cache.getForPeer(mid, "peer2");
+        const peer1 = try PeerId.random();
+        const peer2 = try PeerId.random();
+        _ = try cache.getForPeer(mid, peer1);
+        _ = try cache.getForPeer(mid, peer2);
     }
 }
 
 test "MessageCache comprehensive test" {
     const allocator = testing.allocator;
 
-    var cache = try MessageCache.init(allocator, 3, 5, null, MessageCache.defaultMsgId);
+    var cache = try MessageCache.init(allocator, 3, 5, pubsub.defaultMsgId);
     defer cache.deinit();
 
     // Create 60 test messages
@@ -658,7 +663,7 @@ test "MessageCache comprehensive test" {
 
     // Verify first 10 messages are in cache
     for (0..10) |i| {
-        const mid = try MessageCache.defaultMsgId(null, allocator, msgs[i]);
+        const mid = try pubsub.defaultMsgId(allocator, msgs[i]);
         defer allocator.free(mid);
 
         const m = cache.get(mid);
@@ -673,7 +678,7 @@ test "MessageCache comprehensive test" {
         try testing.expect(gids.len == 10);
 
         for (0..10) |i| {
-            const mid = try MessageCache.defaultMsgId(null, allocator, msgs[i]);
+            const mid = try pubsub.defaultMsgId(allocator, msgs[i]);
             defer allocator.free(mid);
             try testing.expectEqualSlices(u8, mid, gids[i]);
         }
@@ -687,7 +692,7 @@ test "MessageCache comprehensive test" {
 
     // Verify all 20 messages are in cache
     for (0..20) |i| {
-        const mid = try MessageCache.defaultMsgId(null, allocator, msgs[i]);
+        const mid = try pubsub.defaultMsgId(allocator, msgs[i]);
         defer allocator.free(mid);
 
         const m = cache.get(mid);
@@ -703,14 +708,14 @@ test "MessageCache comprehensive test" {
 
         // First 10 messages should be in positions 10-19 (they shifted to window 1)
         for (0..10) |i| {
-            const mid = try MessageCache.defaultMsgId(null, allocator, msgs[i]);
+            const mid = try pubsub.defaultMsgId(allocator, msgs[i]);
             defer allocator.free(mid);
             try testing.expectEqualSlices(u8, mid, gids[10 + i]);
         }
 
         // Next 10 messages should be in positions 0-9 (they're in window 0)
         for (10..20) |i| {
-            const mid = try MessageCache.defaultMsgId(null, allocator, msgs[i]);
+            const mid = try pubsub.defaultMsgId(allocator, msgs[i]);
             defer allocator.free(mid);
             try testing.expectEqualSlices(u8, mid, gids[i - 10]);
         }
@@ -742,7 +747,7 @@ test "MessageCache comprehensive test" {
 
     // First 10 messages should be gone
     for (0..10) |i| {
-        const mid = try MessageCache.defaultMsgId(null, allocator, msgs[i]);
+        const mid = try pubsub.defaultMsgId(allocator, msgs[i]);
         defer allocator.free(mid);
 
         const m = cache.get(mid);
@@ -751,7 +756,7 @@ test "MessageCache comprehensive test" {
 
     // Messages 10-59 should still be in cache
     for (10..60) |i| {
-        const mid = try MessageCache.defaultMsgId(null, allocator, msgs[i]);
+        const mid = try pubsub.defaultMsgId(allocator, msgs[i]);
         defer allocator.free(mid);
 
         const m = cache.get(mid);
@@ -767,21 +772,21 @@ test "MessageCache comprehensive test" {
 
         // Window 0: messages 50-59
         for (0..10) |i| {
-            const mid = try MessageCache.defaultMsgId(null, allocator, msgs[50 + i]);
+            const mid = try pubsub.defaultMsgId(allocator, msgs[50 + i]);
             defer allocator.free(mid);
             try testing.expectEqualSlices(u8, mid, gids[i]);
         }
 
         // Window 1: messages 40-49
         for (10..20) |i| {
-            const mid = try MessageCache.defaultMsgId(null, allocator, msgs[30 + i]);
+            const mid = try pubsub.defaultMsgId(allocator, msgs[30 + i]);
             defer allocator.free(mid);
             try testing.expectEqualSlices(u8, mid, gids[i]);
         }
 
         // Window 2: messages 20-29
         for (20..30) |i| {
-            const mid = try MessageCache.defaultMsgId(null, allocator, msgs[10 + i]);
+            const mid = try pubsub.defaultMsgId(allocator, msgs[10 + i]);
             defer allocator.free(mid);
             try testing.expectEqualSlices(u8, mid, gids[i]);
         }

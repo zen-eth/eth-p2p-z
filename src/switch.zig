@@ -60,13 +60,7 @@ pub const Switch = struct {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             self.doClose();
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .switch_close = .{
-                    .network_switch = self,
-                } },
-            };
-
-            self.transport.io_event_loop.queueMessage(message) catch unreachable;
+            io_loop.ThreadEventLoop.SwitchTasks.queueSwitchClose(self.transport.io_event_loop, self) catch unreachable;
         }
 
         self.stopped_notify.wait();

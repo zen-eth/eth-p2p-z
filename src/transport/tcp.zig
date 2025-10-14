@@ -52,17 +52,7 @@ pub const XevSocketChannel = struct {
             };
             self.socket.write(&self.transport.io_event_loop.loop, c, .{ .slice = buffer }, io_loop.WriteCtx, w_ctx, writeCallback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .write = .{
-                    .channel = self,
-                    .buffer = buffer,
-                    .callback_instance = callback_instance,
-                    .callback = callback,
-                    .timeout_ms = self.write_timeout_ms,
-                } },
-            };
-
-            self.transport.io_event_loop.queueMessage(message) catch |err| {
+            io_loop.ThreadEventLoop.TcpTasks.queueTcpWrite(self.transport.io_event_loop, self, buffer, self.write_timeout_ms, callback_instance, callback) catch |err| {
                 callback(callback_instance, err);
             };
         }
@@ -81,11 +71,7 @@ pub const XevSocketChannel = struct {
             };
             self.socket.shutdown(&self.transport.io_event_loop.loop, c, io_loop.CloseCtx, close_ctx, shutdownCB);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .close = .{ .channel = self, .callback_instance = callback_instance, .callback = callback, .timeout_ms = 30000 } },
-            };
-
-            self.transport.io_event_loop.queueMessage(message) catch |err| {
+            io_loop.ThreadEventLoop.TcpTasks.queueTcpClose(self.transport.io_event_loop, self, 30000, callback_instance, callback) catch |err| {
                 callback(callback_instance, err);
             };
         }
@@ -343,11 +329,7 @@ pub const XevListener = struct {
             };
             self.server.accept(&self.transport.io_event_loop.loop, c, io_loop.AcceptCtx, accept_ud, acceptCB);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .accept = .{ .server = self.server, .transport = self.transport, .callback_instance = callback_instance, .callback = callback, .timeout_ms = 30000 } },
-            };
-
-            self.transport.io_event_loop.queueMessage(message) catch |err| {
+            io_loop.ThreadEventLoop.TcpTasks.queueTcpAccept(self.transport.io_event_loop, self.server, self.transport, 30000, callback_instance, callback) catch |err| {
                 callback(callback_instance, err);
             };
         }
@@ -487,17 +469,7 @@ pub const XevTransport = struct {
             // };
             socket.connect(&self.io_event_loop.loop, c, addr, io_loop.ConnectCtx, connect_ud, connectCB);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .connect = .{
-                    .address = addr,
-                    .transport = self,
-                    .timeout_ms = 30000,
-                    .callback_instance = callback_instance,
-                    .callback = callback,
-                } },
-            };
-
-            self.io_event_loop.queueMessage(message) catch |err| {
+            io_loop.ThreadEventLoop.TcpTasks.queueTcpConnect(self.io_event_loop, addr, self, 30000, callback_instance, callback) catch |err| {
                 callback(callback_instance, err);
             };
         }

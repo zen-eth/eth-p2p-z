@@ -103,6 +103,7 @@ pub const QuicEngine = struct {
         var engine_settings: lsquic.lsquic_engine_settings = undefined;
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
+        engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
         engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
         engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
         engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
@@ -164,10 +165,7 @@ pub const QuicEngine = struct {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             self.doStart();
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_engine_start = .{ .engine = self } },
-            };
-            self.transport.io_event_loop.queueMessage(message) catch unreachable;
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicEngineStart(self.transport.io_event_loop, self) catch unreachable;
         }
     }
 
@@ -203,11 +201,17 @@ pub const QuicEngine = struct {
 
         self.doStart();
 
-        _ = lsquic.lsquic_engine_connect(
+        const local_addr_ptr: *const lsquic.struct_sockaddr = @ptrCast(@alignCast(&self.local_address.any));
+        const remote_addr_ptr: *const lsquic.struct_sockaddr = @ptrCast(@alignCast(&addrAndPeerId.address.any));
+        std.debug.print(
+            "lsquic_engine_connect local={any} remote={any}\n",
+            .{ self.local_address.any, addrAndPeerId.address.any },
+        );
+        const conn_res = lsquic.lsquic_engine_connect(
             self.engine,
             lsquic.N_LSQVER,
-            @ptrCast(&self.local_address.any),
-            @ptrCast(&addrAndPeerId.address.any),
+            local_addr_ptr,
+            remote_addr_ptr,
             self,
             null,
             null,
@@ -217,6 +221,22 @@ pub const QuicEngine = struct {
             null,
             0,
         );
+
+        if (conn_res == null) {
+            const errno_val = std.posix.errno(@as(c_int, -1));
+            std.debug.print(
+                "lsquic_engine_connect failed errno={d} ({s})\n",
+                .{ @intFromEnum(errno_val), @tagName(errno_val) },
+            );
+            if (self.connect_ctx) |connect_ctx| {
+                self.connect_ctx = null;
+                connect_ctx.callback(connect_ctx.callback_ctx, error.ConnectFailed);
+            }
+            self.processConns();
+            return;
+        } else {
+            std.debug.print("lsquic_engine_connect returned conn_ptr={*}\n", .{conn_res});
+        }
 
         self.processConns();
     }
@@ -231,16 +251,10 @@ pub const QuicEngine = struct {
         if (self.transport.io_event_loop.inEventLoopThread()) {
             self.doConnect(peer_address, callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_connect = .{
-                    .engine = self,
-                    .peer_address = peer_address,
-                    .callback_ctx = callback_ctx,
-                    .callback = callback,
-                } },
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicConnect(self.transport.io_event_loop, self, peer_address, callback_ctx, callback) catch |err| {
+                callback(callback_ctx, err);
+                return;
             };
-
-            self.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
@@ -440,10 +454,10 @@ pub const QuicConnection = struct {
         if (self.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doNewStream(callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_new_stream = .{ .conn = self, .new_stream_ctx = callback_ctx, .new_stream_callback = callback } },
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicNewStream(self.engine.transport.io_event_loop, self, callback_ctx, callback) catch |err| {
+                callback(callback_ctx, err);
+                return;
             };
-            self.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
@@ -472,10 +486,10 @@ pub const QuicConnection = struct {
         if (self.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doClose(callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_close_connection = .{ .conn = self, .callback_ctx = callback_ctx, .callback = callback } },
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicCloseConnection(self.engine.transport.io_event_loop, self, callback_ctx, callback) catch |err| {
+                callback(callback_ctx, err);
+                return;
             };
-            self.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
@@ -547,6 +561,8 @@ pub const QuicStream = struct {
 
     proposed_protocols: ?[]const []const u8,
 
+    negotiated_protocol: ?[]const u8,
+
     close_ctx: ?CloseCtx,
 
     pub fn init(self: *QuicStream, stream: *lsquic.lsquic_stream_t, conn: *QuicConnection) void {
@@ -557,19 +573,24 @@ pub const QuicStream = struct {
             .active_write = null,
             .proto_msg_handler = null,
             .proposed_protocols = null,
+            .negotiated_protocol = null,
             .close_ctx = null,
         };
     }
 
     pub fn deinit(self: *QuicStream) void {
-        for (self.pending_writes.items) |*req| {
+        if (self.active_write) |*req| {
+            req.callback(req.callback_ctx, error.StreamClosed);
+            req.data.deinit();
+            self.active_write = null;
+        }
+
+        while (self.pending_writes.items.len > 0) {
+            var req = self.pending_writes.pop().?;
+            req.callback(req.callback_ctx, error.StreamClosed);
             req.data.deinit();
         }
         self.pending_writes.deinit();
-
-        if (self.active_write) |*req| {
-            req.data.deinit();
-        }
     }
 
     pub fn setProtoMsgHandler(self: *QuicStream, handler: protoMsgHandler) void {
@@ -578,13 +599,19 @@ pub const QuicStream = struct {
     }
 
     pub fn write(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
+        var data_copy = std.ArrayList(u8).init(self.conn.engine.allocator);
+        errdefer data_copy.deinit();
+        data_copy.appendSlice(data) catch |err| {
+            callback(callback_ctx, err);
+            return;
+        };
         if (self.conn.engine.transport.io_event_loop.inEventLoopThread()) {
-            self.doWrite(data, callback_ctx, callback);
+            self.doWrite(data_copy, callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_write_stream = .{ .stream = self, .data = data, .callback_ctx = callback_ctx, .callback = callback } },
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicWriteStream(self.conn.engine.transport.io_event_loop, self, data_copy, callback_ctx, callback) catch |err| {
+                callback(callback_ctx, err);
+                return;
             };
-            self.conn.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
@@ -592,10 +619,10 @@ pub const QuicStream = struct {
         if (self.conn.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doClose(callback_ctx, callback);
         } else {
-            const message = io_loop.IOMessage{
-                .action = .{ .quic_close_stream = .{ .stream = self, .callback_ctx = callback_ctx, .callback = callback } },
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicCloseStream(self.conn.engine.transport.io_event_loop, self, callback_ctx, callback) catch |err| {
+                callback(callback_ctx, err);
+                return;
             };
-            self.conn.engine.transport.io_event_loop.queueMessage(message) catch unreachable;
         }
     }
 
@@ -625,21 +652,14 @@ pub const QuicStream = struct {
     /// It should not be called directly from other threads.
     /// Because the data may be eventually written successfully by the QUIC engine `onStreamWrite` callback multiple times,
     /// it queues the write request and processes it asynchronously.
-    pub fn doWrite(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
-        var data_copy = std.ArrayList(u8).init(self.conn.engine.allocator);
-        data_copy.appendSlice(data) catch |err| {
-            callback(callback_ctx, err);
-            return;
-        };
-
+    pub fn doWrite(self: *QuicStream, data: std.ArrayList(u8), callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
         const write_req = WriteRequest{
-            .data = data_copy,
+            .data = data,
             .callback_ctx = callback_ctx,
             .callback = callback,
         };
 
         self.pending_writes.append(write_req) catch |err| {
-            data_copy.deinit();
             callback(callback_ctx, err);
             return;
         };

@@ -118,15 +118,18 @@ pub const Negotiator = struct {
         pub fn callback(w: ?*anyopaque, n: anyerror!usize) void {
             const w_ctx: *WriteCallbackContext = @ptrCast(@alignCast(w.?));
 
+            const negotiator = w_ctx.negotiator;
+            const allocator = negotiator.allocator;
+
             if (n) |_| {
                 // Responder case: we have selected a protocol ID, we need to inform the negotiator
                 if (w_ctx.proto_id) |proto_id| {
-                    w_ctx.negotiator.onProtoSelected(proto_id, w_ctx.ctx) catch |err| {
+                    negotiator.onProtoSelected(proto_id, w_ctx.ctx) catch |err| {
                         w_ctx.ctx.fireErrorCaught(err);
-                        w_ctx.negotiator.deinit();
-                        w_ctx.negotiator.allocator.free(proto_id);
-                        w_ctx.negotiator.allocator.free(w_ctx.buffer);
-                        w_ctx.negotiator.allocator.destroy(w_ctx);
+                        negotiator.deinit();
+                        allocator.free(proto_id);
+                        allocator.free(w_ctx.buffer);
+                        allocator.destroy(w_ctx);
                         const close_ctx = w_ctx.ctx.pipeline.pool_manager.no_op_ctx_pool.create() catch unreachable;
                         close_ctx.* = .{
                             .ctx = w_ctx.ctx,
@@ -134,16 +137,16 @@ pub const Negotiator = struct {
                         w_ctx.ctx.close(close_ctx, io_loop.NoOpCallback.closeCallback);
                         return;
                     };
-                    w_ctx.negotiator.allocator.free(proto_id);
+                    allocator.free(proto_id);
                 }
 
-                w_ctx.negotiator.allocator.free(w_ctx.buffer);
-                w_ctx.negotiator.allocator.destroy(w_ctx);
+                allocator.free(w_ctx.buffer);
+                allocator.destroy(w_ctx);
             } else |err| {
                 w_ctx.ctx.fireErrorCaught(err);
-                w_ctx.negotiator.deinit();
-                w_ctx.negotiator.allocator.free(w_ctx.buffer);
-                w_ctx.negotiator.allocator.destroy(w_ctx);
+                negotiator.deinit();
+                allocator.free(w_ctx.buffer);
+                allocator.destroy(w_ctx);
                 const close_ctx = w_ctx.ctx.pipeline.pool_manager.no_op_ctx_pool.create() catch unreachable;
                 close_ctx.* = .{
                     .ctx = w_ctx.ctx,
