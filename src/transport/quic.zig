@@ -103,6 +103,7 @@ pub const QuicEngine = struct {
         var engine_settings: lsquic.lsquic_engine_settings = undefined;
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
+        engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
         engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
         engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
         engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
@@ -200,11 +201,17 @@ pub const QuicEngine = struct {
 
         self.doStart();
 
-        _ = lsquic.lsquic_engine_connect(
+        const local_addr_ptr: *const lsquic.struct_sockaddr = @ptrCast(@alignCast(&self.local_address.any));
+        const remote_addr_ptr: *const lsquic.struct_sockaddr = @ptrCast(@alignCast(&addrAndPeerId.address.any));
+        std.debug.print(
+            "lsquic_engine_connect local={any} remote={any}\n",
+            .{ self.local_address.any, addrAndPeerId.address.any },
+        );
+        const conn_res = lsquic.lsquic_engine_connect(
             self.engine,
             lsquic.N_LSQVER,
-            @ptrCast(&self.local_address.any),
-            @ptrCast(&addrAndPeerId.address.any),
+            local_addr_ptr,
+            remote_addr_ptr,
             self,
             null,
             null,
@@ -214,6 +221,22 @@ pub const QuicEngine = struct {
             null,
             0,
         );
+
+        if (conn_res == null) {
+            const errno_val = std.posix.errno(@as(c_int, -1));
+            std.debug.print(
+                "lsquic_engine_connect failed errno={d} ({s})\n",
+                .{ @intFromEnum(errno_val), @tagName(errno_val) },
+            );
+            if (self.connect_ctx) |connect_ctx| {
+                self.connect_ctx = null;
+                connect_ctx.callback(connect_ctx.callback_ctx, error.ConnectFailed);
+            }
+            self.processConns();
+            return;
+        } else {
+            std.debug.print("lsquic_engine_connect returned conn_ptr={*}\n", .{conn_res});
+        }
 
         self.processConns();
     }
