@@ -244,6 +244,7 @@ pub const Event = union(enum) {
         message_id: []const u8,
         message: *const AppMessage,
     },
+    heartbeat: struct {},
 
     pub fn hash(self: Event, hasher: anytype) void {
         const tag = std.meta.activeTag(self);
@@ -278,6 +279,7 @@ pub const Event = union(enum) {
                 hasher.update(std.mem.asBytes(&msg_event.message_id.len));
                 hasher.update(msg_event.message_id);
             },
+            .heartbeat => {},
         }
     }
 
@@ -328,6 +330,7 @@ pub const Event = union(enum) {
 
                 return std.mem.eql(u8, self_msg.message_id, other_msg.message_id);
             },
+            .heartbeat => return true,
         }
     }
 };
@@ -2572,6 +2575,8 @@ pub const Gossipsub = struct {
         self.sendGraftPrune(&tograft, &toprune, &no_px);
         self.flush(arena_allocator);
         self.mcache.shift();
+
+        self.event_emitter.emit(.{ .heartbeat = .{} });
     }
     fn flush(self: *Self, arena: Allocator) void {
         while (self.gossip.count() > 0) {
@@ -3572,6 +3577,50 @@ test "simulate onMessage" {
     try std.testing.expectEqual(0, responder.router.topics.get("test_topic1").?.count());
     try std.testing.expectEqual(1, responder.router.topics.get("test_topic").?.count());
     try std.testing.expectEqual(1, responder.router.topics.get("test_topic2").?.count());
+}
+
+test "pubsub heartbeat emits event" {
+    const allocator = std.testing.allocator;
+
+    var node: TestGossipsubNode = undefined;
+    try node.init(allocator, 9655, .{ .heartbeat_interval_ms = 50 });
+    defer node.deinit();
+
+    const HeartbeatListener = struct {
+        done: *std.atomic.Value(bool),
+
+        const Self = @This();
+
+        pub fn handle(self: *Self, evt: Event) void {
+            switch (evt) {
+                .heartbeat => self.done.store(true, .release),
+                else => {},
+            }
+        }
+
+        pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
+            const self: *Self = @ptrCast(@alignCast(instance));
+            self.handle(evt);
+        }
+
+        pub const vtable = event.EventListenerVTable(Event){
+            .handleFn = vtableHandleFn,
+        };
+
+        pub fn any(self: *Self) event.AnyEventListener(Event) {
+            return event.AnyEventListener(Event){
+                .instance = @ptrCast(self),
+                .vtable = &Self.vtable,
+            };
+        }
+    };
+
+    var heartbeat_done = std.atomic.Value(bool).init(false);
+    var listener = HeartbeatListener{ .done = &heartbeat_done };
+    try node.router.event_emitter.addListener(.heartbeat, listener.any());
+    defer _ = node.router.event_emitter.removeListener(.heartbeat, listener.any());
+
+    try waitForFlag(&heartbeat_done, 2 * std.time.ns_per_s);
 }
 
 test "pubsub subscribe and publish" {
