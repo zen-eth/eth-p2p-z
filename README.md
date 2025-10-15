@@ -1,8 +1,16 @@
-# zig-libp2p
+# eth-p2p-z
 
-Zig implementation of [libp2p](https://libp2p.io/), a modular network stack that allows you to build your own peer-to-peer applications.
+Zig implementation of the Ethereum peer-to-peer stack, built on top of the [libp2p](https://libp2p.io/) architecture.
 
-**Note**: This is a work in progress and not yet ready for production use. The API may change frequently as we iterate on the design and implementation.
+**Note**: This project is pre-release software. Expect rapid iteration and frequent breaking API changes while we carve out the Ethereum-focused feature set.
+
+## Project scope
+
+- Transport: QUIC (lsquic-backed) is the only supported transport. TCP, WebRTC, WebTransport, and other stacks are intentionally out of scope.
+- PubSub: Gossipsub v1.0 router is available today; additional Ethereum networking protocols will be layered on top in subsequent milestones.
+- Platform: Zig 0.14.1 toolchain targeting modern desktop/server environments. Browser runtimes are not supported.
+
+If you are looking for a general-purpose libp2p implementation with multiple transports and protocol stacks, this project is not a drop-in replacement.
 
 ## Prerequisites
 
@@ -24,7 +32,7 @@ To run the tests, run the following command in the root directory of the project
 zig build test --summary all
 ```
 
-# Usage
+## Usage
 
 Update `build.zig.zon`:
 
