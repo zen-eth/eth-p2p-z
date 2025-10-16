@@ -65,6 +65,7 @@ pub const PingProtocolHandler = struct {
             .allocator = self.allocator,
             .expected_payload = undefined,
             .received_response = false,
+            .ping_in_flight = false,
         };
         stream.setProtoMsgHandler(handler.any());
     }
@@ -122,12 +123,13 @@ pub const PingInitiator = struct {
     sender: *PingSender,
     expected_payload: [PING_SIZE]u8,
     received_response: bool,
+    ping_in_flight: bool,
 
     const Self = @This();
 
     pub fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
         const sender = self.allocator.create(PingSender) catch unreachable;
-        sender.* = PingSender.init(stream, &self.expected_payload);
+        sender.* = PingSender.init(stream, &self.expected_payload, &self.ping_in_flight);
         self.sender = sender;
 
         // Generate random payload for ping using cryptographically secure random
@@ -151,6 +153,7 @@ pub const PingInitiator = struct {
         }
 
         self.received_response = true;
+        self.ping_in_flight = false;
     }
 
     pub fn onClose(self: *Self, _: *quic.QuicStream) anyerror!void {
@@ -271,21 +274,31 @@ pub const PingResponder = struct {
 pub const PingSender = struct {
     stream: *quic.QuicStream,
     expected_payload_ptr: *[PING_SIZE]u8,
+    ping_in_flight_ptr: *bool,
 
     const Self = @This();
 
-    pub fn init(stream: *quic.QuicStream, expected_payload_ptr: *[PING_SIZE]u8) Self {
+    pub fn init(stream: *quic.QuicStream, expected_payload_ptr: *[PING_SIZE]u8, ping_in_flight_ptr: *bool) Self {
         return Self{
             .stream = stream,
             .expected_payload_ptr = expected_payload_ptr,
+            .ping_in_flight_ptr = ping_in_flight_ptr,
         };
     }
 
     pub fn deinit(_: *Self) void {}
 
-    /// Send a ping with the given 32-byte payload
-    pub fn ping(self: *Self, payload: *const [PING_SIZE]u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
-        // Update the expected payload so the response can be validated
+    /// Send a ping with the given 32-byte payload.
+    /// Returns error.PingInFlight if a previous ping has not yet received a response.
+    /// Concurrent pings are not supported - wait for the previous ping to complete before sending another.
+    pub fn ping(self: *Self, payload: *const [PING_SIZE]u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) !void {
+        // Check if a ping is already in flight to prevent race conditions
+        if (self.ping_in_flight_ptr.*) {
+            return error.PingInFlight;
+        }
+
+        // Mark ping as in-flight and update the expected payload
+        self.ping_in_flight_ptr.* = true;
         @memcpy(self.expected_payload_ptr, payload);
         self.stream.write(payload, callback_ctx, callback);
     }
@@ -403,7 +416,7 @@ test "ping protocol basic functionality" {
         .result = undefined,
     };
 
-    callback.sender.ping(&payload, &send_callback, PingSendCallback.callback_);
+    try callback.sender.ping(&payload, &send_callback, PingSendCallback.callback_);
     send_callback.mutex.wait();
 
     const size = try send_callback.result;
@@ -513,7 +526,7 @@ test "ping protocol periodic ping/pong" {
             .result = undefined,
         };
 
-        callback.sender.ping(&payload, &send_callback, PingSendCallback.callback_);
+        try callback.sender.ping(&payload, &send_callback, PingSendCallback.callback_);
         send_callback.mutex.wait();
 
         const size = send_callback.result catch |err| {
