@@ -205,7 +205,7 @@ pub const PingResponder = struct {
 
     pub fn onActivated(_: *Self, _: *quic.QuicStream) anyerror!void {}
 
-    pub fn onMessage(self: *Self, stream: *quic.QuicStream, msg: []const u8) anyerror!void {
+    pub fn onMessage(_: *Self, stream: *quic.QuicStream, msg: []const u8) anyerror!void {
         // Echo back the received payload
         if (msg.len != PING_SIZE) {
             std.log.warn("Ping responder received invalid payload size: {} (expected {})", .{ msg.len, PING_SIZE });
