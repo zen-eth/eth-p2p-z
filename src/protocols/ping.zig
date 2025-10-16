@@ -13,7 +13,7 @@
 //! ```zig
 //! var ping_handler = PingProtocolHandler.init(allocator);
 //! defer ping_handler.deinit();
-//! try switch.addProtocolHandler("ipfs/ping/1.0.0", ping_handler.any());
+//! try switch.addProtocolHandler("/ipfs/ping/1.0.0", ping_handler.any());
 //!
 //! // On initiator side, after newStream callback:
 //! var payload: [PING_SIZE]u8 = undefined;
@@ -130,10 +130,8 @@ pub const PingInitiator = struct {
         sender.* = PingSender.init(stream);
         self.sender = sender;
 
-        // Generate random payload for ping
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
-        const random = prng.random();
-        random.bytes(&self.expected_payload);
+        // Generate random payload for ping using cryptographically secure random
+        std.crypto.random.bytes(&self.expected_payload);
 
         self.callback(self.callback_ctx, sender);
     }
@@ -338,7 +336,7 @@ test "ping protocol basic functionality" {
 
     var ping_handler = PingProtocolHandler.init(allocator);
     defer ping_handler.deinit();
-    try server_switch.addProtocolHandler("ipfs/ping/1.0.0", ping_handler.any());
+    try server_switch.addProtocolHandler("/ipfs/ping/1.0.0", ping_handler.any());
 
     try server_switch.listen(server_listen_address, null, struct {
         pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {}
@@ -363,7 +361,7 @@ test "ping protocol basic functionality" {
 
     var client_ping_handler = PingProtocolHandler.init(allocator);
     defer client_ping_handler.deinit();
-    try client_switch.addProtocolHandler("ipfs/ping/1.0.0", client_ping_handler.any());
+    try client_switch.addProtocolHandler("/ipfs/ping/1.0.0", client_ping_handler.any());
 
     var callback: TestNewStreamCallback = .{ .mutex = .{}, .sender = undefined };
 
@@ -373,7 +371,7 @@ test "ping protocol basic functionality" {
 
     client_switch.newStream(
         dial_ma,
-        &.{"ipfs/ping/1.0.0"},
+        &.{"/ipfs/ping/1.0.0"},
         &callback,
         TestNewStreamCallback.callback,
     );
@@ -382,9 +380,7 @@ test "ping protocol basic functionality" {
 
     // Send ping
     var payload: [PING_SIZE]u8 = undefined;
-    var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
-    const random = prng.random();
-    random.bytes(&payload);
+    std.crypto.random.bytes(&payload);
 
     const PingSendCallback = struct {
         mutex: std.Thread.ResetEvent,
