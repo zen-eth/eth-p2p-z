@@ -1,3 +1,26 @@
+//! libp2p ping protocol implementation
+//!
+//! This module implements the libp2p ping protocol as specified in:
+//! https://github.com/libp2p/specs/blob/master/ping/ping.md
+//!
+//! Protocol ID: `/ipfs/ping/1.0.0`
+//!
+//! The ping protocol allows peers to measure latency and verify connectivity.
+//! The initiator sends 32 random bytes, and the responder echoes them back.
+//! The initiator then validates that the received response matches the sent payload.
+//!
+//! Usage example:
+//! ```zig
+//! var ping_handler = PingProtocolHandler.init(allocator);
+//! defer ping_handler.deinit();
+//! try switch.addProtocolHandler("ipfs/ping/1.0.0", ping_handler.any());
+//!
+//! // On initiator side, after newStream callback:
+//! var payload: [PING_SIZE]u8 = undefined;
+//! std.crypto.random.bytes(&payload);
+//! ping_sender.ping(&payload, callback_ctx, callback);
+//! ```
+
 const std = @import("std");
 const libp2p = @import("../root.zig");
 const quic = libp2p.transport.quic;
