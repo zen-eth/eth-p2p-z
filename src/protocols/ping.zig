@@ -127,7 +127,7 @@ pub const PingInitiator = struct {
 
     pub fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
         const sender = self.allocator.create(PingSender) catch unreachable;
-        sender.* = PingSender.init(stream);
+        sender.* = PingSender.init(stream, &self.expected_payload);
         self.sender = sender;
 
         // Generate random payload for ping using cryptographically secure random
@@ -270,12 +270,14 @@ pub const PingResponder = struct {
 
 pub const PingSender = struct {
     stream: *quic.QuicStream,
+    expected_payload_ptr: *[PING_SIZE]u8,
 
     const Self = @This();
 
-    pub fn init(stream: *quic.QuicStream) Self {
+    pub fn init(stream: *quic.QuicStream, expected_payload_ptr: *[PING_SIZE]u8) Self {
         return Self{
             .stream = stream,
+            .expected_payload_ptr = expected_payload_ptr,
         };
     }
 
@@ -283,6 +285,8 @@ pub const PingSender = struct {
 
     /// Send a ping with the given 32-byte payload
     pub fn ping(self: *Self, payload: *const [PING_SIZE]u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
+        // Update the expected payload so the response can be validated
+        @memcpy(self.expected_payload_ptr, payload);
         self.stream.write(payload, callback_ctx, callback);
     }
 };
