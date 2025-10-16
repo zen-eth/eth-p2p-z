@@ -408,3 +408,124 @@ test "ping protocol basic functionality" {
     // Give time for response to arrive
     std.time.sleep(1000 * std.time.ns_per_ms);
 }
+
+test "ping protocol periodic ping/pong" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked == .leak) {
+            std.log.warn("Memory leak detected in test!", .{});
+        }
+    }
+    const allocator = gpa.allocator();
+
+    const server_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9201");
+    defer server_listen_address.deinit();
+
+    var server_loop: io_loop.ThreadEventLoop = undefined;
+    try server_loop.init(allocator);
+    defer server_loop.deinit();
+
+    const server_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(server_key);
+
+    var server_transport: quic.QuicTransport = undefined;
+    try server_transport.init(&server_loop, server_key, keys.KeyType.ED25519, allocator);
+
+    var server_pubkey = try tls.createProtobufEncodedPublicKey(allocator, server_key);
+    defer allocator.free(server_pubkey.data.?);
+    const server_peer_id = try PeerId.fromPublicKey(allocator, &server_pubkey);
+
+    var server_switch: swarm.Switch = undefined;
+    server_switch.init(allocator, &server_transport);
+    defer server_switch.deinit();
+
+    var ping_handler = PingProtocolHandler.init(allocator);
+    defer ping_handler.deinit();
+    try server_switch.addProtocolHandler("/ipfs/ping/1.0.0", ping_handler.any());
+
+    try server_switch.listen(server_listen_address, null, struct {
+        pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {}
+    }.callback);
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+
+    // Client setup
+    var client_loop: io_loop.ThreadEventLoop = undefined;
+    try client_loop.init(allocator);
+    defer client_loop.deinit();
+
+    const client_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(client_key);
+
+    var client_transport: quic.QuicTransport = undefined;
+    try client_transport.init(&client_loop, client_key, keys.KeyType.ED25519, allocator);
+
+    var client_switch: swarm.Switch = undefined;
+    client_switch.init(allocator, &client_transport);
+    defer client_switch.deinit();
+
+    var client_ping_handler = PingProtocolHandler.init(allocator);
+    defer client_ping_handler.deinit();
+    try client_switch.addProtocolHandler("/ipfs/ping/1.0.0", client_ping_handler.any());
+
+    var callback: TestNewStreamCallback = .{ .mutex = .{}, .sender = undefined };
+
+    var dial_ma = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9201");
+    defer dial_ma.deinit();
+    try dial_ma.push(.{ .P2P = server_peer_id });
+
+    client_switch.newStream(
+        dial_ma,
+        &.{"/ipfs/ping/1.0.0"},
+        &callback,
+        TestNewStreamCallback.callback,
+    );
+
+    callback.mutex.wait();
+
+    // Send multiple pings in a loop
+    const NUM_PINGS = 10;
+    const PingSendCallback = struct {
+        mutex: std.Thread.ResetEvent,
+        result: anyerror!usize,
+
+        const Self = @This();
+        pub fn callback_(ctx: ?*anyopaque, res: anyerror!usize) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            self.result = res;
+            self.mutex.set();
+        }
+    };
+
+    std.debug.print("Starting {} periodic ping/pong cycles...\n", .{NUM_PINGS});
+
+    for (0..NUM_PINGS) |i| {
+        var payload: [PING_SIZE]u8 = undefined;
+        std.crypto.random.bytes(&payload);
+
+        var send_callback = PingSendCallback{
+            .mutex = .{},
+            .result = undefined,
+        };
+
+        callback.sender.ping(&payload, &send_callback, PingSendCallback.callback_);
+        send_callback.mutex.wait();
+
+        const size = send_callback.result catch |err| {
+            std.debug.print("Failed to send ping {d}: {s}\n", .{ i, @errorName(err) });
+            return err;
+        };
+
+        try std.testing.expectEqual(PING_SIZE, size);
+        std.debug.print("Ping/pong cycle {} completed successfully\n", .{i + 1});
+
+        // Small delay between pings to simulate periodic behavior
+        std.time.sleep(100 * std.time.ns_per_ms);
+    }
+
+    std.debug.print("Successfully completed {} ping/pong cycles!\n", .{NUM_PINGS});
+
+    // Give time for final responses to arrive
+    std.time.sleep(500 * std.time.ns_per_ms);
+}
