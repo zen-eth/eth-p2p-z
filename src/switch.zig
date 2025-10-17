@@ -120,6 +120,15 @@ pub const Switch = struct {
                 return;
             };
 
+            if (stream.close_ctx == null) {
+                stream.close_ctx = .{
+                    .callback_ctx = null,
+                    .callback = null,
+                    .active_callback_ctx = null,
+                    .active_callback = null,
+                };
+            }
+
             self.network_switch.mss_handler.onResponderStart(stream, self.callback_ctx, self.callback) catch |err| {
                 std.log.warn("Failed to start responder: {}", .{err});
                 self.callback(self.callback_ctx, err);
@@ -172,6 +181,15 @@ pub const Switch = struct {
                 self.callback(self.callback_ctx, err);
                 return;
             };
+
+            if (stream.close_ctx == null) {
+                stream.close_ctx = .{
+                    .callback_ctx = null,
+                    .callback = null,
+                    .active_callback_ctx = null,
+                    .active_callback = null,
+                };
+            }
 
             stream.proposed_protocols = self.proposed_protocols;
 
