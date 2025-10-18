@@ -22,16 +22,30 @@ pub const PingProtocolHandler = struct {
     inbound_streams: std.StringHashMap(usize),
     shutting_down: bool = false,
     loop: *io_loop.ThreadEventLoop,
+    responder_behavior: ResponderBehavior,
 
     const Self = @This();
 
+    pub const ResponderBehavior = struct {
+        drop_responses: bool = false,
+    };
+
     pub fn init(allocator: std.mem.Allocator, event_loop: *io_loop.ThreadEventLoop) Self {
+        return Self.initWithBehavior(allocator, event_loop, .{});
+    }
+
+    pub fn initWithBehavior(
+        allocator: std.mem.Allocator,
+        event_loop: *io_loop.ThreadEventLoop,
+        behavior: ResponderBehavior,
+    ) Self {
         return .{
             .allocator = allocator,
             .outbound_streams = std.StringHashMap(usize).init(allocator),
             .inbound_streams = std.StringHashMap(usize).init(allocator),
             .shutting_down = false,
             .loop = event_loop,
+            .responder_behavior = behavior,
         };
     }
 
@@ -133,6 +147,7 @@ pub const PingProtocolHandler = struct {
             .peer_key = peer_key,
             .pending_len = 0,
             .pending_payload = undefined,
+            .behavior = self.responder_behavior,
         };
 
         stream.setProtoMsgHandler(handler.any());
@@ -532,6 +547,7 @@ const PingResponder = struct {
     peer_key: []const u8,
     pending_payload: [payload_length]u8 = undefined,
     pending_len: usize = 0,
+    behavior: PingProtocolHandler.ResponderBehavior,
 
     const Self = @This();
 
@@ -551,6 +567,11 @@ const PingResponder = struct {
         self.pending_len += message.len;
 
         if (self.pending_len < payload_length) {
+            return;
+        }
+
+        if (self.behavior.drop_responses) {
+            self.pending_len = 0;
             return;
         }
 
@@ -713,6 +734,132 @@ test "ping protocol round trip" {
 
     const rtt = ping_ctx.result_ns orelse return error.PingFailed;
     try std.testing.expect(rtt > 0);
+
+    sender.close(null, struct {
+        fn onClosed(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+    }.onClosed);
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+}
+
+test "ping protocol timeout" {
+    const allocator = std.testing.allocator;
+    const tls = libp2p.security.tls;
+    const ssl = @import("ssl");
+    const keys = @import("peer_id").keys;
+    const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+    const quic_transport = libp2p.transport.quic;
+    const swarm = libp2p.swarm;
+
+    var server_loop: io_loop.ThreadEventLoop = undefined;
+    try server_loop.init(allocator);
+    defer server_loop.deinit();
+
+    const server_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(server_key);
+
+    var server_transport: quic_transport.QuicTransport = undefined;
+    try server_transport.init(&server_loop, server_key, keys.KeyType.ED25519, allocator);
+
+    var server_switch: swarm.Switch = undefined;
+    server_switch.init(allocator, &server_transport);
+    defer server_switch.deinit();
+
+    var server_ping = PingProtocolHandler.initWithBehavior(allocator, &server_loop, .{ .drop_responses = true });
+    defer server_ping.deinit();
+
+    try server_switch.addProtocolHandler(protocol_id, server_ping.any());
+
+    var server_pubkey = try tls.createProtobufEncodedPublicKey(allocator, server_key);
+    defer allocator.free(server_pubkey.data.?);
+    const server_peer_id = try PeerId.fromPublicKey(allocator, &server_pubkey);
+
+    const listen_addr = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9405");
+    defer listen_addr.deinit();
+
+    try server_switch.listen(listen_addr, null, struct {
+        fn onStream(_: ?*anyopaque, res: anyerror!?*anyopaque) void {
+            _ = res catch {};
+        }
+    }.onStream);
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+
+    var client_loop: io_loop.ThreadEventLoop = undefined;
+    try client_loop.init(allocator);
+    defer client_loop.deinit();
+
+    const client_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(client_key);
+
+    var client_transport: quic_transport.QuicTransport = undefined;
+    try client_transport.init(&client_loop, client_key, keys.KeyType.ED25519, allocator);
+
+    var client_switch: swarm.Switch = undefined;
+    client_switch.init(allocator, &client_transport);
+    defer client_switch.deinit();
+
+    var client_ping = PingProtocolHandler.init(allocator, &client_loop);
+    defer client_ping.deinit();
+
+    try client_switch.addProtocolHandler(protocol_id, client_ping.any());
+
+    var dial_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9405");
+    defer dial_addr.deinit();
+    try dial_addr.push(.{ .P2P = server_peer_id });
+
+    const StreamCtx = struct {
+        event: std.Thread.ResetEvent,
+        sender: ?*PingSender = null,
+
+        const Self = @This();
+
+        fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            const controller = res catch {
+                self.event.set();
+                return;
+            };
+            self.sender = @ptrCast(@alignCast(controller.?));
+            self.event.set();
+        }
+    };
+
+    var stream_ctx = StreamCtx{ .event = .{} };
+
+    client_switch.newStream(dial_addr, &.{protocol_id}, &stream_ctx, StreamCtx.callback);
+    stream_ctx.event.wait();
+
+    const sender = stream_ctx.sender orelse return error.UnableToOpenPingStream;
+
+    const PingResultCtx = struct {
+        event: std.Thread.ResetEvent,
+        result_ns: ?u64 = null,
+        err: ?anyerror = null,
+
+        const Self = @This();
+
+        fn callback(ctx: ?*anyopaque, res: anyerror!u64) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            self.result_ns = res catch |err| {
+                self.result_ns = null;
+                self.err = err;
+                self.event.set();
+                return;
+            };
+            self.err = null;
+            self.event.set();
+        }
+    };
+
+    var ping_ctx = PingResultCtx{ .event = .{} };
+    const short_timeout_ns = 200 * std.time.ns_per_ms;
+    try sender.ping(short_timeout_ns, &ping_ctx, PingResultCtx.callback);
+    ping_ctx.event.wait();
+
+    try std.testing.expectEqual(@as(?u64, null), ping_ctx.result_ns);
+    try std.testing.expect(ping_ctx.err != null);
+    try std.testing.expectEqual(error.PingTimeout, ping_ctx.err.?);
 
     sender.close(null, struct {
         fn onClosed(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
