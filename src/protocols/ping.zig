@@ -2,6 +2,7 @@ const std = @import("std");
 const libp2p = @import("../root.zig");
 const protocols = libp2p.protocols;
 const quic = libp2p.transport.quic;
+const swarm = libp2p.swarm;
 const PeerId = @import("peer_id").PeerId;
 const io_loop = libp2p.thread_event_loop;
 const xev = @import("xev");
@@ -21,7 +22,7 @@ pub const PingProtocolHandler = struct {
     outbound_streams: std.StringHashMap(usize),
     inbound_streams: std.StringHashMap(usize),
     shutting_down: bool = false,
-    loop: *io_loop.ThreadEventLoop,
+    network_switch: *swarm.Switch,
     responder_behavior: ResponderBehavior,
 
     const Self = @This();
@@ -30,13 +31,13 @@ pub const PingProtocolHandler = struct {
         drop_responses: bool = false,
     };
 
-    pub fn init(allocator: std.mem.Allocator, event_loop: *io_loop.ThreadEventLoop) Self {
-        return Self.initWithBehavior(allocator, event_loop, .{});
+    pub fn init(allocator: std.mem.Allocator, network_switch: *swarm.Switch) Self {
+        return Self.initWithBehavior(allocator, network_switch, .{});
     }
 
     pub fn initWithBehavior(
         allocator: std.mem.Allocator,
-        event_loop: *io_loop.ThreadEventLoop,
+        network_switch: *swarm.Switch,
         behavior: ResponderBehavior,
     ) Self {
         return .{
@@ -44,7 +45,7 @@ pub const PingProtocolHandler = struct {
             .outbound_streams = std.StringHashMap(usize).init(allocator),
             .inbound_streams = std.StringHashMap(usize).init(allocator),
             .shutting_down = false,
-            .loop = event_loop,
+            .network_switch = network_switch,
             .responder_behavior = behavior,
         };
     }
@@ -244,10 +245,14 @@ pub const PingProtocolHandler = struct {
     fn peerKeyFromPeerId(self: *Self, peer_id: *const PeerId) ![]const u8 {
         const len = peer_id.toBase58Len();
         const buf = try self.allocator.alloc(u8, len);
+        defer self.allocator.free(buf);
+
         const encoded = try peer_id.toBase58(buf);
-        const result = try self.allocator.dupe(u8, encoded);
-        self.allocator.free(buf);
-        return result;
+        return try self.allocator.dupe(u8, encoded);
+    }
+
+    fn eventLoop(self: *Self) *io_loop.ThreadEventLoop {
+        return self.network_switch.transport.io_event_loop;
     }
 };
 
@@ -334,10 +339,11 @@ const PingInitiator = struct {
             self.timeout_deadline_ms = 0;
         }
 
-        if (self.handler.loop.inEventLoopThread()) {
-            self.armTimeout(self.handler.loop);
+        const loop = self.handler.eventLoop();
+        if (loop.inEventLoopThread()) {
+            self.armTimeout(loop);
         } else {
-            try self.handler.loop.queueCall(Self, self, startTimeoutOnLoop);
+            try loop.queueCall(Self, self, startTimeoutOnLoop);
         }
     }
 
@@ -398,9 +404,10 @@ const PingInitiator = struct {
         self.timeout_active = false;
         self.timeout_deadline_ms = 0;
 
-        if (self.handler.loop.inEventLoopThread()) {
+        const loop = self.handler.eventLoop();
+        if (loop.inEventLoopThread()) {
             self.timeout_timer.cancel(
-                &self.handler.loop.loop,
+                &loop.loop,
                 &self.timeout_completion,
                 &self.timeout_cancel_completion,
                 Self,
@@ -408,7 +415,7 @@ const PingInitiator = struct {
                 timeoutCancelCallback,
             );
         } else {
-            self.handler.loop.queueCall(Self, self, cancelTimeoutOnLoop) catch |err| {
+            loop.queueCall(Self, self, cancelTimeoutOnLoop) catch |err| {
                 std.log.warn("failed to queue ping timeout cancel: {any}", .{err});
             };
         }
@@ -460,7 +467,10 @@ const PingInitiator = struct {
     }
 
     fn onActivated(self: *Self, _: *quic.QuicStream) anyerror!void {
-        const sender = self.allocator.create(PingSender) catch unreachable;
+        const sender = self.allocator.create(PingSender) catch |err| {
+            self.callback(self.callback_ctx, err);
+            return err;
+        };
         sender.* = .{ .initiator = self };
         self.sender = sender;
 
@@ -627,7 +637,6 @@ test "ping protocol round trip" {
     const keys = @import("peer_id").keys;
     const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
     const quic_transport = libp2p.transport.quic;
-    const swarm = libp2p.swarm;
 
     var server_loop: io_loop.ThreadEventLoop = undefined;
     try server_loop.init(allocator);
@@ -643,7 +652,7 @@ test "ping protocol round trip" {
     server_switch.init(allocator, &server_transport);
     defer server_switch.deinit();
 
-    var server_ping = PingProtocolHandler.init(allocator, &server_loop);
+    var server_ping = PingProtocolHandler.init(allocator, &server_switch);
     defer server_ping.deinit();
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
@@ -677,7 +686,7 @@ test "ping protocol round trip" {
     client_switch.init(allocator, &client_transport);
     defer client_switch.deinit();
 
-    var client_ping = PingProtocolHandler.init(allocator, &client_loop);
+    var client_ping = PingProtocolHandler.init(allocator, &client_switch);
     defer client_ping.deinit();
 
     try client_switch.addProtocolHandler(protocol_id, client_ping.any());
@@ -749,7 +758,6 @@ test "ping protocol timeout" {
     const keys = @import("peer_id").keys;
     const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
     const quic_transport = libp2p.transport.quic;
-    const swarm = libp2p.swarm;
 
     var server_loop: io_loop.ThreadEventLoop = undefined;
     try server_loop.init(allocator);
@@ -765,7 +773,7 @@ test "ping protocol timeout" {
     server_switch.init(allocator, &server_transport);
     defer server_switch.deinit();
 
-    var server_ping = PingProtocolHandler.initWithBehavior(allocator, &server_loop, .{ .drop_responses = true });
+    var server_ping = PingProtocolHandler.initWithBehavior(allocator, &server_switch, .{ .drop_responses = true });
     defer server_ping.deinit();
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
@@ -799,7 +807,7 @@ test "ping protocol timeout" {
     client_switch.init(allocator, &client_transport);
     defer client_switch.deinit();
 
-    var client_ping = PingProtocolHandler.init(allocator, &client_loop);
+    var client_ping = PingProtocolHandler.init(allocator, &client_switch);
     defer client_ping.deinit();
 
     try client_switch.addProtocolHandler(protocol_id, client_ping.any());
@@ -875,7 +883,6 @@ test "ping protocol periodic pings" {
     const keys = @import("peer_id").keys;
     const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
     const quic_transport = libp2p.transport.quic;
-    const swarm = libp2p.swarm;
 
     var server_loop: io_loop.ThreadEventLoop = undefined;
     try server_loop.init(allocator);
@@ -891,7 +898,7 @@ test "ping protocol periodic pings" {
     server_switch.init(allocator, &server_transport);
     defer server_switch.deinit();
 
-    var server_ping = PingProtocolHandler.init(allocator, &server_loop);
+    var server_ping = PingProtocolHandler.init(allocator, &server_switch);
     defer server_ping.deinit();
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
@@ -925,7 +932,7 @@ test "ping protocol periodic pings" {
     client_switch.init(allocator, &client_transport);
     defer client_switch.deinit();
 
-    var client_ping = PingProtocolHandler.init(allocator, &client_loop);
+    var client_ping = PingProtocolHandler.init(allocator, &client_switch);
     defer client_ping.deinit();
 
     try client_switch.addProtocolHandler(protocol_id, client_ping.any());
