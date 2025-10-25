@@ -640,7 +640,10 @@ test "ping protocol round trip" {
 
     var server_loop: io_loop.ThreadEventLoop = undefined;
     try server_loop.init(allocator);
-    defer server_loop.deinit();
+    defer {
+        server_loop.close();
+        server_loop.deinit();
+    }
 
     const server_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(server_key);
@@ -650,7 +653,10 @@ test "ping protocol round trip" {
 
     var server_switch: swarm.Switch = undefined;
     server_switch.init(allocator, &server_transport);
-    defer server_switch.deinit();
+    defer {
+        server_switch.stop();
+        server_switch.deinit();
+    }
 
     var server_ping = PingProtocolHandler.init(allocator, &server_switch);
     defer server_ping.deinit();
@@ -674,7 +680,10 @@ test "ping protocol round trip" {
 
     var client_loop: io_loop.ThreadEventLoop = undefined;
     try client_loop.init(allocator);
-    defer client_loop.deinit();
+    defer {
+        client_loop.close();
+        client_loop.deinit();
+    }
 
     const client_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(client_key);
@@ -684,7 +693,10 @@ test "ping protocol round trip" {
 
     var client_switch: swarm.Switch = undefined;
     client_switch.init(allocator, &client_transport);
-    defer client_switch.deinit();
+    defer {
+        client_switch.stop();
+        client_switch.deinit();
+    }
 
     var client_ping = PingProtocolHandler.init(allocator, &client_switch);
     defer client_ping.deinit();
@@ -761,7 +773,10 @@ test "ping protocol timeout" {
 
     var server_loop: io_loop.ThreadEventLoop = undefined;
     try server_loop.init(allocator);
-    defer server_loop.deinit();
+    defer {
+        server_loop.close();
+        server_loop.deinit();
+    }
 
     const server_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(server_key);
@@ -771,7 +786,10 @@ test "ping protocol timeout" {
 
     var server_switch: swarm.Switch = undefined;
     server_switch.init(allocator, &server_transport);
-    defer server_switch.deinit();
+    defer {
+        server_switch.stop();
+        server_switch.deinit();
+    }
 
     var server_ping = PingProtocolHandler.initWithBehavior(allocator, &server_switch, .{ .drop_responses = true });
     defer server_ping.deinit();
@@ -795,7 +813,10 @@ test "ping protocol timeout" {
 
     var client_loop: io_loop.ThreadEventLoop = undefined;
     try client_loop.init(allocator);
-    defer client_loop.deinit();
+    defer {
+        client_loop.close();
+        client_loop.deinit();
+    }
 
     const client_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(client_key);
@@ -805,7 +826,10 @@ test "ping protocol timeout" {
 
     var client_switch: swarm.Switch = undefined;
     client_switch.init(allocator, &client_transport);
-    defer client_switch.deinit();
+    defer {
+        client_switch.stop();
+        client_switch.deinit();
+    }
 
     var client_ping = PingProtocolHandler.init(allocator, &client_switch);
     defer client_ping.deinit();
@@ -886,7 +910,10 @@ test "ping protocol periodic pings" {
 
     var server_loop: io_loop.ThreadEventLoop = undefined;
     try server_loop.init(allocator);
-    defer server_loop.deinit();
+    defer {
+        server_loop.close();
+        server_loop.deinit();
+    }
 
     const server_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(server_key);
@@ -896,7 +923,10 @@ test "ping protocol periodic pings" {
 
     var server_switch: swarm.Switch = undefined;
     server_switch.init(allocator, &server_transport);
-    defer server_switch.deinit();
+    defer {
+        server_switch.stop();
+        server_switch.deinit();
+    }
 
     var server_ping = PingProtocolHandler.init(allocator, &server_switch);
     defer server_ping.deinit();
@@ -920,7 +950,10 @@ test "ping protocol periodic pings" {
 
     var client_loop: io_loop.ThreadEventLoop = undefined;
     try client_loop.init(allocator);
-    defer client_loop.deinit();
+    defer {
+        client_loop.close();
+        client_loop.deinit();
+    }
 
     const client_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(client_key);
@@ -930,7 +963,10 @@ test "ping protocol periodic pings" {
 
     var client_switch: swarm.Switch = undefined;
     client_switch.init(allocator, &client_transport);
-    defer client_switch.deinit();
+    defer {
+        client_switch.stop();
+        client_switch.deinit();
+    }
 
     var client_ping = PingProtocolHandler.init(allocator, &client_switch);
     defer client_ping.deinit();

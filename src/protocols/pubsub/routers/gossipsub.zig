@@ -3230,11 +3230,13 @@ const TestGossipsubNode = struct {
     }
 
     pub fn deinit(self: *TestGossipsubNode) void {
+        self.sw.stop();
         self.sw.deinit();
         self.router.deinit();
         self.handler.deinit();
         self.dial_addr.deinit();
         self.listen_addr.deinit();
+        self.loop.close();
         self.loop.deinit();
         ssl.EVP_PKEY_free(self.host_key);
     }

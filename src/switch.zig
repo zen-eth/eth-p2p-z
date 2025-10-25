@@ -36,9 +36,7 @@ pub const Switch = struct {
 
     incoming_connections: std.ArrayList(*quic.QuicConnection),
 
-    is_stopping: bool,
-
-    is_stopped: std.atomic.Value(bool),
+    is_stopping: std.atomic.Value(bool),
 
     stopped_notify: std.Thread.ResetEvent,
 
@@ -49,44 +47,35 @@ pub const Switch = struct {
             .allocator = allocator,
             .listeners = std.StringArrayHashMap(quic.QuicListener).init(allocator),
             .incoming_connections = std.ArrayList(*quic.QuicConnection).init(allocator),
-            .is_stopping = false,
-            .is_stopped = std.atomic.Value(bool).init(false),
+            .is_stopping = std.atomic.Value(bool).init(false),
             .mss_handler = mss.MultistreamSelectHandler.init(allocator),
             .stopped_notify = .{},
         };
     }
 
     pub fn deinit(self: *Switch) void {
-        if (self.transport.io_event_loop.inEventLoopThread()) {
-            self.doClose();
-        } else {
-            io_loop.ThreadEventLoop.SwitchTasks.queueSwitchClose(self.transport.io_event_loop, self) catch unreachable;
-        }
+        self.cleanResources();
+    }
+
+    pub fn stop(self: *Switch) void {
+        self.doClose();
 
         self.stopped_notify.wait();
-        // **NOTE**: The async close operation may take some time to complete,
-        // so we wait here to ensure all resources are cleaned up before returning.
-        // This is an important fix for the https://github.com/zen-eth/zig-libp2p/issues/69.
-        // We should improve this in the future by finding a way to not block the caller thread.
-        std.time.sleep(1 * std.time.ns_per_s);
     }
 
     pub fn doClose(self: *Switch) void {
-        self.is_stopping = true;
-        var out_iter = self.outgoing_connections.iterator();
-        while (out_iter.next()) |entry| {
-            entry.value_ptr.*.close(null, struct {
-                fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {}
-            }.callback); // Close the connection, which will trigger the close callback.
+        if (self.is_stopping.swap(true, .acq_rel)) {
+            return;
         }
 
-        for (self.incoming_connections.items) |conn| {
-            conn.close(null, struct {
-                fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicConnection) void {}
-            }.callback); // Close the connection, which will trigger the close callback.
+        var listener_iter = self.listeners.iterator();
+        while (listener_iter.next()) |entry| {
+            entry.value_ptr.stop() catch unreachable;
         }
 
-        self.cleanResources();
+        self.transport.stop() catch unreachable;
+
+        self.stopped_notify.set();
     }
 
     const ListenCallbackCtx = struct {
@@ -274,7 +263,7 @@ pub const Switch = struct {
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) void {
-        if (self.is_stopping) {
+        if (self.is_stopping.load(.acquire)) {
             callback(callback_ctx, error.SwitchStopped);
             return;
         }
@@ -316,7 +305,7 @@ pub const Switch = struct {
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
-        if (self.is_stopping) {
+        if (self.is_stopping.load(.acquire)) {
             return error.SwitchStopped;
         }
         const address_str = std.fmt.allocPrint(self.allocator, "{}", .{address}) catch unreachable;
@@ -413,7 +402,6 @@ pub const Switch = struct {
     }
 
     fn cleanResources(self: *Switch) void {
-        self.transport.deinit();
         var listener_iter = self.listeners.iterator();
         while (listener_iter.next()) |entry| {
             var listener = entry.value_ptr.*;
@@ -432,7 +420,6 @@ pub const Switch = struct {
         self.listeners.deinit();
 
         self.mss_handler.deinit();
-        self.finalCleanup();
 
         // Iterate through any remaining outgoing connections and free their keys
         // before deinitializing the HashMap. This prevents memory leaks if connections
@@ -443,7 +430,8 @@ pub const Switch = struct {
         }
         self.outgoing_connections.deinit();
         self.incoming_connections.deinit();
-        self.stopped_notify.set();
+
+        self.finalCleanup();
     }
 
     fn finalCleanup(_: *Switch) void {

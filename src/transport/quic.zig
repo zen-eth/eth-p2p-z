@@ -86,13 +86,19 @@ pub const QuicEngine = struct {
     process_timer: xev.Timer,
     // Completion object for the process timer
     c_process_timer: xev.Completion,
-    // Completion object for canceling the process timer
+    // Completion object for canceling the process timer (used only during explicit stop)
     c_process_timer_cancel: xev.Completion,
+    // Completion object for canceling during timer reset (internal use by reset())
+    c_process_timer_reset_cancel: xev.Completion,
     // Context for connecting to a peer
     // This is used when the engine is in client mode and is initiating a connection to a peer.
     // The functions in the QuicEngine will be called in the same thread as the event loop.
     // It means that no locks are needed for the engine.
     connect_ctx: ?QuicConnection.ConnectCtx,
+    // Flag to indicate if the engine should stop processing
+    stop_flag: bool,
+
+    stopped: std.Thread.ResetEvent,
 
     pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, transport: *QuicTransport, is_client_mode: bool) !void {
         var flags: c_uint = 0;
@@ -103,11 +109,12 @@ pub const QuicEngine = struct {
         var engine_settings: lsquic.lsquic_engine_settings = undefined;
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
-        engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
+        // engine_settings.es_versions = @as(c_int, 1) << lsquic.LSQVER_I001;
         engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
         engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
         engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
         engine_settings.es_idle_timeout = IdleTimeoutSeconds;
+        // engine_settings.es_retry_token_duration = 60; // 60 seconds
         engine_settings.es_handshake_to = HandshakeTimeoutMicroseconds;
 
         var err_buf: [100]u8 = undefined;
@@ -146,13 +153,66 @@ pub const QuicEngine = struct {
             .process_timer = try xev.Timer.init(),
             .c_process_timer = .{},
             .c_process_timer_cancel = .{},
+            .c_process_timer_reset_cancel = .{},
             .connect_ctx = null,
+            .stop_flag = false,
+            .stopped = .{},
         };
+    }
+
+    /// doStop is a private method that stops the QUIC engine by setting the stop flag.
+    /// It is called from the `stop` method to ensure that the engine stops processing connections.
+    pub fn doStop(self: *QuicEngine) void {
+        std.debug.print("QuicEngine: Stopping engine...\n", .{});
+        self.stop_flag = true;
+
+        self.doCancelProcessTimer();
+    }
+
+    fn doCancelProcessTimer(self: *QuicEngine) void {
+        self.process_timer.cancel(&self.transport.io_event_loop.loop, &self.c_process_timer, &self.c_process_timer_cancel, QuicEngine, self, struct {
+            fn callback(
+                ctx: ?*QuicEngine,
+                _: *xev.Loop,
+                _: *xev.Completion,
+                _: xev.CancelError!void,
+            ) xev.CallbackAction {
+                const engine = ctx.?;
+
+                if (engine.socket.fd != -1) {
+                    posix.close(engine.socket.fd);
+                    engine.socket.fd = -1;
+                }
+
+                lsquic.lsquic_engine_destroy(engine.engine);
+
+                engine.stopped.set();
+
+                return .disarm;
+            }
+        }.callback);
+    }
+
+    /// Stops the QUIC engine by setting the stop flag.
+    /// This function should be called to force stop the engine.
+    /// It is thread-safe and can be called from any thread.
+    pub fn stop(self: *QuicEngine) !void {
+        if (self.transport.io_event_loop.inEventLoopThread()) {
+            self.doStop();
+        } else {
+            try io_loop.ThreadEventLoop.QuicTasks.queueQuicEngineStop(self.transport.io_event_loop, self);
+        }
+
+        self.stopped.wait();
     }
 
     /// doStart is a private method that starts the QUIC engine by initiating the read operation on the UDP socket.
     /// It is called from the `start` method to ensure that the read operation is scheduled in the event loop thread.
     pub fn doStart(self: *QuicEngine) void {
+        if (self.stop_flag) {
+            return;
+        }
+
         self.socket.read(&self.transport.io_event_loop.loop, &self.c_read, &self.read_state, .{ .slice = &self.read_buffer }, QuicEngine, self, readCallback);
         self.processConns();
     }
@@ -176,6 +236,11 @@ pub const QuicEngine = struct {
     /// This function is called from the event loop thread to ensure thread safety.
     /// It should not be called directly from other threads.
     pub fn doConnect(self: *QuicEngine, peer_address: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+        if (self.stop_flag) {
+            callback(callback_ctx, error.EngineStopped);
+            return;
+        }
+
         if (self.connect_ctx != null) {
             callback(callback_ctx, error.AlreadyConnecting);
             return;
@@ -283,7 +348,8 @@ pub const QuicEngine = struct {
             const next_ms = if (diff_us >= lsquic.LSQUIC_DF_CLOCK_GRANULARITY)
                 @divFloor(@as(u64, @intCast(diff_us)), std.time.us_per_ms)
             else if (diff_us <= 0) 0 else @divFloor(@as(u64, @intCast(lsquic.LSQUIC_DF_CLOCK_GRANULARITY)), std.time.us_per_ms);
-            self.process_timer.reset(&self.transport.io_event_loop.loop, &self.c_process_timer, &self.c_process_timer_cancel, next_ms, QuicEngine, self, processConnsCallback);
+            // Use separate completion for reset to avoid triggering the stop cleanup callback
+            self.process_timer.reset(&self.transport.io_event_loop.loop, &self.c_process_timer, &self.c_process_timer_reset_cancel, next_ms, QuicEngine, self, processConnsCallback);
         }
     }
 
@@ -293,7 +359,7 @@ pub const QuicEngine = struct {
     /// This function is not thread-safe and should not be called from multiple threads concurrently.
     fn readCallback(
         ctx: ?*QuicEngine,
-        loop: *xev.Loop,
+        _: *xev.Loop,
         _: *xev.Completion,
         _: *xev.UDP.State,
         address: std.net.Address,
@@ -303,24 +369,27 @@ pub const QuicEngine = struct {
     ) xev.CallbackAction {
         const self = ctx.?;
 
+        if (self.stop_flag) {
+            return .disarm;
+        }
+
         // For UDP read errors, we log the error and continue to listen.
         const n = r catch |err| {
             std.log.warn("UDP read failed with error: {any}. Continuing to listen.", .{err});
-            if (loop.stopped()) {
+            if (self.stop_flag) {
                 return .disarm;
             }
             return .rearm;
         };
-        if (n == 0) {
-            if (loop.stopped()) {
+        if (n <= 0) {
+            if (self.stop_flag) {
                 return .disarm;
             }
             return .rearm;
         }
-
         _ = lsquic.lsquic_engine_packet_in(
             self.engine,
-            b.slice.ptr,
+            b.slice[0..n].ptr,
             n,
             @ptrCast(&self.local_address.any),
             @ptrCast(&address.any),
@@ -330,7 +399,7 @@ pub const QuicEngine = struct {
 
         self.processConns();
 
-        if (loop.stopped()) {
+        if (self.stop_flag) {
             return .disarm;
         }
         return .rearm;
@@ -341,13 +410,13 @@ pub const QuicEngine = struct {
     /// It processes the connections in the lsquic engine and schedules the next processing based on the earliest advertised tick.
     fn processConnsCallback(
         ctx: ?*QuicEngine,
-        loop: *xev.Loop,
+        _: *xev.Loop,
         _: *xev.Completion,
         r: xev.Timer.RunError!void,
     ) xev.CallbackAction {
         const engine = ctx.?;
 
-        if (loop.stopped()) {
+        if (engine.stop_flag) {
             return .disarm;
         }
 
@@ -407,6 +476,7 @@ pub const QuicConnection = struct {
     pub const Error = error{
         NewStreamNotFinished,
         AlreadyAccepting,
+        EngineStopped,
     };
 
     pub const ListenCtx = struct {
@@ -462,6 +532,11 @@ pub const QuicConnection = struct {
     }
 
     pub fn doNewStream(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, stream: anyerror!*QuicStream) void) void {
+        if (self.engine.stop_flag) {
+            callback(callback_ctx, error.EngineStopped);
+            return;
+        }
+
         if (self.new_stream_ctx != null) {
             callback(callback_ctx, error.NewStreamNotFinished);
             return;
@@ -494,6 +569,11 @@ pub const QuicConnection = struct {
     }
 
     pub fn doClose(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+        if (self.engine.stop_flag) {
+            callback(callback_ctx, error.EngineStopped);
+            return;
+        }
+
         if (self.close_ctx) |*close_ctx| {
             // If we are already closing the connection, we just update the callback context and callback.
             close_ctx.active_callback_ctx = callback_ctx;
@@ -526,6 +606,7 @@ pub const QuicStream = struct {
         WriteFailed,
         ReadFailed,
         EndOfStream,
+        EngineStopped,
     };
 
     /// Represents a write request for the QUIC stream.
@@ -627,6 +708,13 @@ pub const QuicStream = struct {
     }
 
     pub fn doClose(self: *QuicStream, callback_ctx: ?*anyopaque, callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicStream) void) void {
+        if (self.conn.engine.stop_flag) {
+            if (callback) |cb| {
+                cb(callback_ctx, error.EngineStopped);
+            }
+            return;
+        }
+
         if (self.close_ctx) |*close_ctx| {
             // In general we should set the passive close callback in the new stream callback to handle the case io exceptional closed not by application.
             close_ctx.active_callback_ctx = callback_ctx;
@@ -653,6 +741,11 @@ pub const QuicStream = struct {
     /// Because the data may be eventually written successfully by the QUIC engine `onStreamWrite` callback multiple times,
     /// it queues the write request and processes it asynchronously.
     pub fn doWrite(self: *QuicStream, data: std.ArrayList(u8), callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
+        if (self.conn.engine.stop_flag) {
+            callback(callback_ctx, error.EngineStopped);
+            return;
+        }
+
         const write_req = WriteRequest{
             .data = data,
             .callback_ctx = callback_ctx,
@@ -704,12 +797,14 @@ pub const QuicListener = struct {
         };
     }
 
-    /// Deinitialize the listener.
-    pub fn deinit(self: *QuicListener) void {
+    pub fn stop(self: *QuicListener) !void {
         if (self.engine) |*engine| {
-            lsquic.lsquic_engine_destroy(engine.engine);
+            try engine.stop();
         }
     }
+
+    /// Deinitialize the listener.
+    pub fn deinit(_: *QuicListener) void {}
 
     /// Starts listening for incoming QUIC connections on the specified address.
     /// It initializes a UDP socket, binds it to the address, and starts the QUIC engine.
@@ -735,7 +830,15 @@ pub const QuicListener = struct {
 /// The transport is not thread-safe and should be used from a single thread, typically the event loop thread.
 /// It provides methods for dialing peers, creating listeners, and managing QUIC connections.
 pub const QuicTransport = struct {
-    pub const DialError = Allocator.Error || xev.ConnectError || error{ AsyncNotifyFailed, AlreadyConnecting, UnsupportedAddressFamily, InitializationFailed };
+    pub const DialError = Allocator.Error || xev.ConnectError || error{
+        AsyncNotifyFailed,
+        AlreadyConnecting,
+        UnsupportedAddressFamily,
+        InitializationFailed,
+        EngineStopped,
+        NoPeerIdFound,
+        ConnectFailed,
+    };
 
     ssl_context: *ssl.SSL_CTX,
 
@@ -784,15 +887,17 @@ pub const QuicTransport = struct {
         };
     }
 
-    pub fn deinit(self: *QuicTransport) void {
-        self.io_event_loop.close();
-
+    pub fn stop(self: *QuicTransport) !void {
         if (self.dialer_v4) |*dialer| {
-            lsquic.lsquic_engine_destroy(dialer.engine);
+            try dialer.stop();
         }
+
         if (self.dialer_v6) |*dialer| {
-            lsquic.lsquic_engine_destroy(dialer.engine);
+            try dialer.stop();
         }
+    }
+
+    pub fn deinit(self: *QuicTransport) void {
         ssl.SSL_CTX_free(self.ssl_context);
         ssl.EVP_PKEY_free(self.subject_keypair);
         ssl.X509_free(self.subject_cert);
@@ -1225,7 +1330,10 @@ pub fn maToStdAddrAndPeerId(ma: Multiaddr) !struct { address: std.net.Address, p
 test "lsquic transport initialization" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
-    defer loop.deinit();
+    defer {
+        loop.close();
+        loop.deinit();
+    }
 
     const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
     if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
@@ -1242,13 +1350,21 @@ test "lsquic transport initialization" {
     var transport: QuicTransport = undefined;
     try transport.init(&loop, host_key, keys.KeyType.ECDSA, std.testing.allocator);
 
-    defer transport.deinit();
+    defer {
+        transport.stop() catch |err| {
+            std.log.err("Failed to stop transport: {}", .{err});
+        };
+        transport.deinit();
+    }
 }
 
 test "lsquic engine initialization" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
-    defer loop.deinit();
+    defer {
+        loop.close();
+        loop.deinit();
+    }
 
     const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
     if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
@@ -1264,122 +1380,41 @@ test "lsquic engine initialization" {
 
     var transport: QuicTransport = undefined;
     try transport.init(&loop, host_key, keys.KeyType.ED25519, std.testing.allocator);
-    defer transport.deinit();
+    defer {
+        transport.stop() catch |err| {
+            std.log.err("Failed to stop transport: {}", .{err});
+        };
+        transport.deinit();
+    }
 
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 9999);
-    const udp = try UDP.init(addr);
-    var engine: QuicEngine = undefined;
-    try engine.init(std.testing.allocator, udp, &transport, false);
-    defer lsquic.lsquic_engine_destroy(engine.engine);
+    const pctx1 = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
+    if (ssl.EVP_PKEY_keygen_init(pctx1) == 0) {
+        return error.OpenSSLFailed;
+    }
+    var maybe_cl_host_key: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_keygen(pctx1, &maybe_cl_host_key) == 0) {
+        return error.OpenSSLFailed;
+    }
+    const cl_host_key = maybe_cl_host_key orelse return error.OpenSSLFailed;
+
+    defer ssl.EVP_PKEY_free(cl_host_key);
+    var pubkey1 = try tls.createProtobufEncodedPublicKey(std.testing.allocator, cl_host_key);
+    defer std.testing.allocator.free(pubkey1.data.?);
+    const cl_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &pubkey1);
+
+    var dial_ma = try Multiaddr.fromString(std.testing.allocator, "/ip4/127.0.0.1/udp/9999");
+    defer dial_ma.deinit();
+    try dial_ma.push(.{ .P2P = cl_peer_id });
+
+    transport.dial(dial_ma, null, struct {
+        pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
+            if (res) |conn| {
+                std.debug.print("Dialed QUIC connection successfully: {*}\n", .{conn});
+            } else |err| {
+                std.debug.print("Failed to dial QUIC connection: {}\n", .{err});
+            }
+        }
+    }.callback);
+
+    std.time.sleep(std.time.ns_per_ms * 200); // Wait for the dial to complete
 }
-
-// test "lsquic transport dialing and listening" {
-//     var server_loop: io_loop.ThreadEventLoop = undefined;
-//     try server_loop.init(std.testing.allocator);
-//     defer server_loop.deinit();
-
-//     const server_pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-//     if (ssl.EVP_PKEY_keygen_init(server_pctx) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     var maybe_server_key: ?*ssl.EVP_PKEY = null;
-//     if (ssl.EVP_PKEY_keygen(server_pctx, &maybe_server_key) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     const server_key = maybe_server_key orelse return error.OpenSSLFailed;
-
-//     defer ssl.EVP_PKEY_free(server_key);
-
-//     var pubkey = try tls.createProtobufEncodedPublicKey(std.testing.allocator, server_key);
-//     defer std.testing.allocator.free(pubkey.data.?);
-//     const server_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &pubkey);
-//     std.debug.print("Server Peer ID: {}\n", .{server_peer_id});
-
-//     var server: QuicTransport = undefined;
-//     try server.init(&server_loop, server_key, keys.KeyType.ECDSA, std.testing.allocator);
-
-//     defer {
-//         server.deinit();
-//     }
-
-//     var listener = server.newListener(null, struct {
-//         pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
-//             if (res) |conn| {
-//                 std.debug.print("Server accepted QUIC connection successfully: {*}\n", .{conn});
-//             } else |err| {
-//                 std.debug.print("Server failed to accept QUIC connection: {}\n", .{err});
-//             }
-//         }
-//     }.callback);
-//     defer listener.deinit();
-
-//     var addr = try std.testing.allocator.create(Multiaddr);
-//     addr.* = try Multiaddr.fromString(std.testing.allocator, "/ip4/0.0.0.0/udp/9997");
-//     defer addr.deinit();
-//     defer std.testing.allocator.destroy(addr);
-//     try listener.listen(addr);
-
-//     var loop: io_loop.ThreadEventLoop = undefined;
-//     try loop.init(std.testing.allocator);
-//     defer loop.deinit();
-
-//     const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-//     if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     var maybe_host_key: ?*ssl.EVP_PKEY = null;
-//     if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
-//         return error.OpenSSLFailed;
-//     }
-//     const host_key = maybe_host_key orelse return error.OpenSSLFailed;
-
-//     defer ssl.EVP_PKEY_free(host_key);
-
-//     var transport: QuicTransport = undefined;
-//     try transport.init(&loop, host_key, keys.KeyType.ECDSA, std.testing.allocator);
-
-//     defer {
-//         transport.deinit();
-//     }
-
-//     const DialCtx = struct {
-//         conn: *QuicConnection,
-//         notify: std.Thread.ResetEvent,
-
-//         const Self = @This();
-//         fn callback(ctx: ?*anyopaque, res: anyerror!*QuicConnection) void {
-//             const self: *Self = @ptrCast(@alignCast(ctx.?));
-//             if (res) |conn| {
-//                 std.debug.print("Dialed QUIC connection successfully: {*}\n", .{conn});
-//                 self.conn = conn;
-//             } else |err| {
-//                 std.debug.print("Failed to dial QUIC connection: {}\n", .{err});
-//             }
-//             self.notify.set();
-//         }
-//     };
-
-//     var dial_ctx = DialCtx{
-//         .conn = undefined,
-//         .notify = .{},
-//     };
-//     var dial_ma = try std.testing.allocator.create(Multiaddr);
-//     dial_ma.* = try Multiaddr.fromString(std.testing.allocator, "/ip4/127.0.0.1/udp/9997");
-//     try dial_ma.push(.{ .P2P = server_peer_id });
-//     defer dial_ma.deinit();
-//     defer std.testing.allocator.destroy(dial_ma);
-//     transport.dial(dial_ma, &dial_ctx, DialCtx.callback);
-//     dial_ctx.notify.wait();
-
-//     dial_ctx.conn.close(null, struct {
-//         pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
-//             if (res) |closed_conn| {
-//                 std.debug.print("Closed QUIC connection successfully: {*}\n", .{closed_conn});
-//             } else |err| {
-//                 std.debug.print("Failed to close QUIC connection: {}\n", .{err});
-//             }
-//         }
-//     }.callback);
-
-//     std.time.sleep(std.time.ns_per_s * 2); // Wait for the connection to close
-// }

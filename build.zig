@@ -109,6 +109,33 @@ pub fn build(b: *std.Build) void {
     libp2p_exe.linkSystemLibrary("zlib");
     b.installArtifact(libp2p_exe);
 
+    const transport_interop_exe = b.addExecutable(.{
+        .name = "libp2p-transport-interop",
+        .root_source_file = b.path("interop/transport/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    transport_interop_exe.root_module.addIncludePath(lsquic_dep.path("include"));
+    transport_interop_exe.root_module.addImport("xev", libxev_module);
+    transport_interop_exe.root_module.addImport("multiformats", zmultiformats_module);
+    transport_interop_exe.root_module.addImport("ssl", ssl_module);
+    transport_interop_exe.root_module.addImport("gremlin", gremlin_module);
+    transport_interop_exe.root_module.addImport("peer_id", peer_id_module);
+    transport_interop_exe.root_module.addImport("cache", cache_module);
+    transport_interop_exe.root_module.addImport("zig-libp2p", root_module);
+    transport_interop_exe.step.dependOn(&protobuf.step);
+    transport_interop_exe.linkLibrary(lsquic_artifact);
+    transport_interop_exe.linkSystemLibrary("zlib");
+    b.installArtifact(transport_interop_exe);
+
+    const transport_interop_run_cmd = b.addRunArtifact(transport_interop_exe);
+    transport_interop_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        transport_interop_run_cmd.addArgs(args);
+    }
+    const transport_interop_step = b.step("transport-interop", "Run the transport interop binary");
+    transport_interop_step.dependOn(&transport_interop_run_cmd.step);
+
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.

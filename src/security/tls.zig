@@ -144,9 +144,7 @@ pub fn buildCert(
     const serial = ssl.ASN1_INTEGER_new() orelse return error.CertSerialCreationFailed;
     defer ssl.ASN1_INTEGER_free(serial);
 
-    var random_bytes_buf: [8]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes_buf);
-    const random_serial: i64 = @bitCast(random_bytes_buf);
+    const random_serial: i64 = std.crypto.random.intRangeAtMost(i64, 1, std.math.maxInt(i64));
 
     if (ssl.ASN1_INTEGER_set_int64(serial, random_serial) <= 0) return error.CertSerialSetFailed;
     if (ssl.X509_set_serialNumber(cert, serial) <= 0) return error.CertSerialSetFailed;
