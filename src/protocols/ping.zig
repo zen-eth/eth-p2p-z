@@ -5,7 +5,7 @@ const quic = libp2p.transport.quic;
 const swarm = libp2p.swarm;
 const PeerId = @import("peer_id").PeerId;
 const io_loop = libp2p.thread_event_loop;
-const xev = @import("xev");
+const xev = libp2p.xev;
 
 /// Protocol identifier for libp2p ping.
 pub const protocol_id = "/ipfs/ping/1.0.0";

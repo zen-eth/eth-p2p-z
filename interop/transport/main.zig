@@ -8,7 +8,8 @@ const protocols = libp2p.protocols;
 const ping = libp2p.protocols.ping;
 const keys = @import("peer_id").keys;
 const ssl = @import("ssl");
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const multiaddr = @import("multiformats").multiaddr;
+const Multiaddr = multiaddr.Multiaddr;
 
 const RedisClient = struct {
     allocator: std.mem.Allocator,
@@ -110,6 +111,15 @@ const RedisClient = struct {
 
     pub fn rpush(self: *RedisClient, key: []const u8, value: []const u8, scratch: *std.ArrayList(u8)) !void {
         const cmd = [_][]const u8{ "RPUSH", key, value };
+        try self.writeCommand(&cmd);
+        const reader = self.reader.reader();
+        const prefix = try reader.readByte();
+        if (prefix != ':') return error.InvalidResponse;
+        _ = try self.readInteger(scratch);
+    }
+
+    pub fn del(self: *RedisClient, key: []const u8, scratch: *std.ArrayList(u8)) !void {
+        const cmd = [_][]const u8{ "DEL", key };
         try self.writeCommand(&cmd);
         const reader = self.reader.reader();
         const prefix = try reader.readByte();
@@ -374,11 +384,11 @@ pub fn main() !void {
         loop.deinit();
     }
 
-    const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    const host_key = try tls.generateKeyPair(keys.KeyType.RSA);
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: quic.QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys.KeyType.ED25519, allocator);
+    try transport.init(&loop, host_key, keys.KeyType.ECDSA, allocator);
 
     var switcher: swarm.Switch = undefined;
     switcher.init(allocator, &transport);
@@ -432,18 +442,94 @@ fn runListener(
     defer allocator.free(peer_buf);
     const peer_slice = try transport.local_peer_id.toBase58(peer_buf);
 
-    const published_addr = try std.fmt.allocPrint(
-        allocator,
-        "/dns4/{s}/udp/{d}/{s}/p2p/{s}",
-        .{ env.publish_host, env.listen_port, env.transport, peer_slice },
-    );
+    var listen_addrs: ?std.ArrayList([]u8) = null;
+    var publish_base: []u8 = undefined;
+
+    discovery: {
+        const discovered = switcher.listenMultiaddrs(allocator) catch |err| {
+            std.log.warn(
+                "unable to enumerate listener addresses via switch: {any}; falling back to configured publish host {s}",
+                .{ err, env.publish_host },
+            );
+            publish_base = try buildBaseMultiaddrString(allocator, env.publish_host, env.listen_port, env.transport);
+            break :discovery;
+        };
+        listen_addrs = discovered;
+        const list_view = listen_addrs.?;
+        std.log.info("enumerated {d} listener address(es):", .{list_view.items.len});
+        for (list_view.items, 0..) |addr, i| {
+            std.log.info("  [{d}] {s}", .{ i, addr });
+        }
+        if (list_view.items.len > 0) {
+            publish_base = try allocator.dupe(u8, list_view.items[0]);
+        } else {
+            std.log.warn(
+                "no listen addresses produced by switch; using configured publish host {s}",
+                .{env.publish_host},
+            );
+            publish_base = try buildBaseMultiaddrString(allocator, env.publish_host, env.listen_port, env.transport);
+        }
+    }
+
+    defer allocator.free(publish_base);
+    defer if (listen_addrs) |*list| swarm.Switch.freeListenMultiaddrs(allocator, list);
+
+    const published_addr = try std.fmt.allocPrint(allocator, "{s}/p2p/{s}", .{ publish_base, peer_slice });
     defer allocator.free(published_addr);
+
+    redis.del("listenerAddr", &scratch) catch |err| {
+        std.log.warn("failed to clear listenerAddr list: {any}", .{err});
+    };
 
     std.log.info("listener publishing {s}", .{published_addr});
     try redis.rpush("listenerAddr", published_addr, &scratch);
 
     const sleep_ns = std.math.clamp(@as(u64, env.timeout_seconds) * std.time.ns_per_s, std.time.ns_per_s, std.math.maxInt(u64));
     std.time.sleep(sleep_ns);
+}
+
+fn buildBaseMultiaddrString(allocator: std.mem.Allocator, host: []const u8, port: u16, transport: []const u8) ![]u8 {
+    var ma = Multiaddr.init(allocator);
+    errdefer ma.deinit();
+
+    const addr = std.net.Address.parseIp(host, port) catch |err| switch (err) {
+        error.InvalidIPAddressFormat => blk: {
+            try ma.push(.{ .Dns4 = host });
+            break :blk null;
+        },
+        else => return err,
+    };
+
+    if (addr) |parsed| {
+        switch (parsed.any.family) {
+            std.posix.AF.INET => {
+                const ip_bytes = std.mem.toBytes(parsed.in.sa.addr);
+                try ma.push(.{ .Ip4 = std.net.Ip4Address.init(ip_bytes, 0) });
+            },
+            std.posix.AF.INET6 => {
+                const ip_bytes = std.mem.toBytes(parsed.in6.sa.addr);
+                try ma.push(.{ .Ip6 = std.net.Ip6Address.init(ip_bytes, 0, 0, 0) });
+            },
+            else => {},
+        }
+    }
+
+    try ma.push(.{ .Udp = port });
+    try pushTransport(&ma, transport);
+
+    const rendered = try ma.toString(allocator);
+    ma.deinit();
+    return rendered;
+}
+
+fn pushTransport(ma: *Multiaddr, transport: []const u8) !void {
+    if (std.mem.eql(u8, transport, "quic")) {
+        try ma.push(.Quic);
+    } else if (std.mem.eql(u8, transport, "quic-v1")) {
+        try ma.push(.QuicV1);
+    } else {
+        return error.UnsupportedTransport;
+    }
 }
 
 fn runDialer(

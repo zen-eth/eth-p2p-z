@@ -4,13 +4,49 @@ const lsquic = @cImport({
     @cInclude("lsxpack_header.h");
 });
 const std = @import("std");
+const builtin = @import("builtin");
 const libp2p = @import("root.zig");
 const quic = libp2p.transport.quic;
 const protocols = libp2p.protocols;
 const Allocator = std.mem.Allocator;
 const mss = protocols.mss;
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const multiaddr = @import("multiformats").multiaddr;
+const Multiaddr = multiaddr.Multiaddr;
+const MultiaddrProtocol = multiaddr.Protocol;
 const io_loop = libp2p.thread_event_loop;
+const net = std.net;
+const posix = std.posix;
+const mem = std.mem;
+
+const has_getifaddrs = switch (builtin.target.os.tag) {
+    .windows, .wasi => false,
+    else => true,
+};
+
+const IFF_LOOPBACK: u32 = 0x8;
+
+const IfAddrs = if (has_getifaddrs)
+    extern struct {
+        ifa_next: ?*IfAddrs,
+        ifa_name: ?[*:0]const u8,
+        ifa_flags: u32,
+        ifa_addr: ?*posix.sockaddr,
+        ifa_netmask: ?*posix.sockaddr,
+        ifa_dstaddr: ?*posix.sockaddr,
+        ifa_data: ?*anyopaque,
+    }
+else
+    opaque {};
+
+const getifaddrs_fn = if (has_getifaddrs)
+    @extern(*const fn (*?*IfAddrs) callconv(.C) i32, .{ .name = "getifaddrs" })
+else
+    @as(*const fn (*?*IfAddrs) callconv(.C) i32, undefined);
+
+const freeifaddrs_fn = if (has_getifaddrs)
+    @extern(*const fn (?*IfAddrs) callconv(.C) void, .{ .name = "freeifaddrs" })
+else
+    @as(*const fn (?*IfAddrs) callconv(.C) void, undefined);
 
 /// The Switch struct is the main entry point for managing connections and protocol handlers.
 /// It acts as a central hub for handling incoming and outgoing connections,
@@ -308,7 +344,7 @@ pub const Switch = struct {
         if (self.is_stopping.load(.acquire)) {
             return error.SwitchStopped;
         }
-        const address_str = std.fmt.allocPrint(self.allocator, "{}", .{address}) catch unreachable;
+        const address_str = try address.toString(self.allocator);
 
         const gop = self.listeners.getOrPut(address_str) catch unreachable;
 
@@ -342,6 +378,250 @@ pub const Switch = struct {
         handler: protocols.AnyProtocolHandler,
     ) !void {
         try self.mss_handler.addProtocolHandler(proto_id, handler);
+    }
+
+    pub const ListenAddressError = Allocator.Error || posix.GetHostNameError || multiaddr.Error || error{ AddressResolutionFailed, NoUsableAddress };
+
+    pub fn listenMultiaddrs(self: *Switch, allocator: Allocator) ListenAddressError!std.ArrayList([]u8) {
+        var results = std.ArrayList([]u8).init(allocator);
+        errdefer Switch.freeListenMultiaddrs(allocator, &results);
+
+        var host_addrs = try collectHostAddrs(allocator);
+        defer host_addrs.deinit();
+
+        var listener_iter = self.listeners.iterator();
+        while (listener_iter.next()) |entry| {
+            const key_slice = entry.key_ptr.*;
+            var base_ma = Multiaddr.fromString(allocator, key_slice) catch |err| {
+                std.log.warn("failed to parse listener multiaddr {s}: {s}", .{ key_slice, @errorName(err) });
+                continue;
+            };
+            defer base_ma.deinit();
+
+            const ip_index = findIpComponentIndex(base_ma) orelse continue;
+
+            for (host_addrs.items) |host| {
+                const proto = host.toProtocol();
+                const maybe_ma = base_ma.replace(allocator, ip_index, proto) catch |err| {
+                    std.log.warn(
+                        "failed to update listener multiaddr {s} with host protocol: {s}",
+                        .{ key_slice, @errorName(err) },
+                    );
+                    continue;
+                };
+                if (maybe_ma) |mut_ma| {
+                    defer mut_ma.deinit();
+                    const addr_str = mut_ma.toString(allocator) catch |err| {
+                        std.log.warn(
+                            "unable to render listener multiaddr for {s}: {s}",
+                            .{ key_slice, @errorName(err) },
+                        );
+                        continue;
+                    };
+                    errdefer allocator.free(addr_str);
+                    if (!containsString(results.items, addr_str)) {
+                        try results.append(addr_str);
+                    } else {
+                        allocator.free(addr_str);
+                    }
+                }
+            }
+        }
+
+        if (results.items.len == 0) {
+            return error.NoUsableAddress;
+        }
+
+        return results;
+    }
+
+    pub fn freeListenMultiaddrs(allocator: Allocator, list: *std.ArrayList([]u8)) void {
+        for (list.items) |addr| {
+            allocator.free(addr);
+        }
+        list.deinit();
+    }
+
+    const HostAddr = union(enum) {
+        ipv4: [4]u8,
+        ipv6: [16]u8,
+
+        fn toProtocol(self: HostAddr) MultiaddrProtocol {
+            return switch (self) {
+                .ipv4 => |bytes| MultiaddrProtocol{ .Ip4 = net.Ip4Address.init(bytes, 0) },
+                .ipv6 => |bytes| MultiaddrProtocol{ .Ip6 = net.Ip6Address.init(bytes, 0, 0, 0) },
+            };
+        }
+    };
+
+    fn collectHostAddrs(allocator: Allocator) ListenAddressError!std.ArrayList(HostAddr) {
+        if (has_getifaddrs) {
+            const maybe_result = collectHostAddrsFromInterfaces(allocator) catch |err| switch (err) {
+                error.AddressResolutionFailed, error.NoUsableAddress => null,
+                else => return err,
+            };
+            if (maybe_result) |res| {
+                return res;
+            }
+        }
+
+        return collectHostAddrsFromHostname(allocator);
+    }
+
+    fn collectHostAddrsFromInterfaces(allocator: Allocator) ListenAddressError!std.ArrayList(HostAddr) {
+        comptime {
+            if (!has_getifaddrs) @compileError("collectHostAddrsFromInterfaces is unavailable on this target");
+        }
+
+        var result = std.ArrayList(HostAddr).init(allocator);
+        errdefer result.deinit();
+
+        var ifaddrs_head: ?*IfAddrs = null;
+        if (getifaddrs_fn(&ifaddrs_head) != 0) {
+            return error.AddressResolutionFailed;
+        }
+        defer freeifaddrs_fn(ifaddrs_head);
+
+        var cursor = ifaddrs_head;
+        while (cursor) |ifa| : (cursor = ifa.*.ifa_next) {
+            const addr_ptr = ifa.*.ifa_addr orelse continue;
+            if ((ifa.*.ifa_flags & IFF_LOOPBACK) != 0) continue;
+
+            switch (addr_ptr.*.family) {
+                posix.AF.INET => {
+                    const bytes: *const [16]u8 = @ptrCast(addr_ptr);
+                    // IPv4 address is at offset 4-7 in sockaddr_in (2 bytes family + 2 bytes port + 4 bytes addr)
+                    const ip_bytes: [4]u8 = bytes[4..8].*;
+                    if (ip_bytes[0] == 127 or ip_bytes[0] == 0) continue;
+                    const candidate = HostAddr{ .ipv4 = ip_bytes };
+                    if (!containsHostAddr(result.items, candidate)) {
+                        try result.append(candidate);
+                    }
+                },
+                posix.AF.INET6 => {
+                    const bytes: *const [28]u8 = @ptrCast(addr_ptr);
+                    // IPv6 address is at offset 8-23 in sockaddr_in6
+                    const ip_bytes: [16]u8 = bytes[8..24].*;
+                    if (isIpv6Loopback(ip_bytes) or isIpv6Unspecified(ip_bytes) or isIpv6LinkLocal(ip_bytes)) {
+                        continue;
+                    }
+                    const candidate = HostAddr{ .ipv6 = ip_bytes };
+                    if (!containsHostAddr(result.items, candidate)) {
+                        try result.append(candidate);
+                    }
+                },
+                else => continue,
+            }
+        }
+
+        if (result.items.len == 0) {
+            return error.NoUsableAddress;
+        }
+
+        return result;
+    }
+
+    fn collectHostAddrsFromHostname(allocator: Allocator) ListenAddressError!std.ArrayList(HostAddr) {
+        var result = std.ArrayList(HostAddr).init(allocator);
+        errdefer result.deinit();
+
+        var hostname_buf: [posix.HOST_NAME_MAX]u8 = undefined;
+        const hostname = try posix.gethostname(&hostname_buf);
+
+        const addr_list = net.getAddressList(allocator, hostname, 0) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.AddressResolutionFailed,
+            };
+        };
+        defer addr_list.deinit();
+
+        for (addr_list.addrs) |addr| {
+            switch (addr.any.family) {
+                posix.AF.INET => {
+                    const ip_bytes = mem.toBytes(addr.in.sa.addr);
+                    if (ip_bytes[0] == 127 or ip_bytes[0] == 0) continue;
+                    const candidate = HostAddr{ .ipv4 = ip_bytes };
+                    if (!containsHostAddr(result.items, candidate)) {
+                        try result.append(candidate);
+                    }
+                },
+                posix.AF.INET6 => {
+                    const ip_bytes = mem.toBytes(addr.in6.sa.addr);
+                    if (isIpv6Loopback(ip_bytes) or isIpv6Unspecified(ip_bytes) or isIpv6LinkLocal(ip_bytes)) {
+                        continue;
+                    }
+                    const candidate = HostAddr{ .ipv6 = ip_bytes };
+                    if (!containsHostAddr(result.items, candidate)) {
+                        try result.append(candidate);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (result.items.len == 0) {
+            return error.NoUsableAddress;
+        }
+
+        return result;
+    }
+
+    fn containsHostAddr(haystack: []const HostAddr, needle: HostAddr) bool {
+        for (haystack) |existing| {
+            switch (existing) {
+                .ipv4 => |bytes| switch (needle) {
+                    .ipv4 => |other| if (mem.eql(u8, &bytes, &other)) return true,
+                    else => {},
+                },
+                .ipv6 => |bytes| switch (needle) {
+                    .ipv6 => |other| if (mem.eql(u8, &bytes, &other)) return true,
+                    else => {},
+                },
+            }
+        }
+        return false;
+    }
+
+    fn containsString(haystack: [][]u8, needle: []const u8) bool {
+        for (haystack) |candidate| {
+            if (mem.eql(u8, candidate, needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn findIpComponentIndex(ma: Multiaddr) ?usize {
+        var iter = ma.iterator();
+        var index: usize = 0;
+        while (true) : (index += 1) {
+            const opt_proto = iter.next() catch return null;
+            const proto = opt_proto orelse break;
+            switch (proto) {
+                .Ip4, .Ip6 => return index,
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn isIpv6Loopback(bytes: [16]u8) bool {
+        for (bytes[0..15]) |b| {
+            if (b != 0) return false;
+        }
+        return bytes[15] == 1;
+    }
+
+    fn isIpv6Unspecified(bytes: [16]u8) bool {
+        for (bytes) |b| {
+            if (b != 0) return false;
+        }
+        return true;
+    }
+
+    fn isIpv6LinkLocal(bytes: [16]u8) bool {
+        return bytes[0] == 0xfe and (bytes[1] & 0xc0) == 0x80;
     }
 
     fn onOutgoingConnectionClose(ctx: ?*anyopaque, res: anyerror!*quic.QuicConnection) void {

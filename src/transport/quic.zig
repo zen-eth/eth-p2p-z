@@ -6,7 +6,7 @@ const lsquic = @cImport({
 const std = @import("std");
 const libp2p = @import("../root.zig");
 const p2p_conn = libp2p.conn;
-const xev = @import("xev");
+const xev = libp2p.xev;
 const io_loop = libp2p.thread_event_loop;
 const ssl = @import("ssl");
 const tls = libp2p.security.tls;
@@ -31,7 +31,12 @@ const IdleTimeoutSeconds = 120; // 2 minutes
 // Handshake timeout in microseconds
 const HandshakeTimeoutMicroseconds = 10 * std.time.us_per_s; // 10 seconds
 
-const SignatureAlgs: []const u16 = &.{ ssl.SSL_SIGN_ED25519, ssl.SSL_SIGN_ECDSA_SECP256R1_SHA256, ssl.SSL_SIGN_RSA_PKCS1_SHA256 };
+const SignatureAlgs: []const u16 = &.{
+    ssl.SSL_SIGN_ED25519,
+    ssl.SSL_SIGN_ECDSA_SECP256R1_SHA256,
+    ssl.SSL_SIGN_RSA_PSS_RSAE_SHA256,
+    ssl.SSL_SIGN_RSA_PKCS1_SHA256,
+};
 
 /// Stream interface for lsquic
 const stream_if: lsquic.lsquic_stream_if = lsquic.lsquic_stream_if{
@@ -109,12 +114,11 @@ pub const QuicEngine = struct {
         var engine_settings: lsquic.lsquic_engine_settings = undefined;
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
-        // engine_settings.es_versions = @as(c_int, 1) << lsquic.LSQVER_I001;
+        engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
         engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
         engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
         engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
         engine_settings.es_idle_timeout = IdleTimeoutSeconds;
-        // engine_settings.es_retry_token_duration = 60; // 60 seconds
         engine_settings.es_handshake_to = HandshakeTimeoutMicroseconds;
 
         var err_buf: [100]u8 = undefined;
@@ -987,6 +991,9 @@ pub const QuicTransport = struct {
         // Set the certificate algorithm preferences for the SSL context.
         if (ssl.SSL_CTX_set_verify_algorithm_prefs(ssl_ctx, SignatureAlgs.ptr, @intCast(SignatureAlgs.len)) == 0)
             @panic("SSL_CTX_set_verify_algorithm_prefs failed\n");
+
+        if (ssl.SSL_CTX_set_signing_algorithm_prefs(ssl_ctx, SignatureAlgs.ptr, @intCast(SignatureAlgs.len)) == 0)
+            @panic("SSL_CTX_set_signing_algorithm_prefs failed\n");
 
         // Set the SSL context to use the provided subject key and certificate.
         if (ssl.SSL_CTX_use_PrivateKey(ssl_ctx, subject_key) == 0) {

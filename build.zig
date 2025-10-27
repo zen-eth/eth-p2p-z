@@ -16,6 +16,10 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    const libxev_backend_opt = b.option([]const u8, "libxev-backend", "Select libxev backend (io_uring, epoll, kqueue, wasi_poll, iocp)");
+    const build_options = b.addOptions();
+    build_options.addOption(?[]const u8, "libxev_backend", libxev_backend_opt);
+
     const libxev_dep = b.dependency("libxev", .{
         .target = target,
         .optimize = optimize,
@@ -71,6 +75,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     root_module.addImport("xev", libxev_module);
+    root_module.addOptions("build_options", build_options);
     root_module.addImport("multiformats", zmultiformats_module);
     root_module.addImport("ssl", ssl_module);
     root_module.addIncludePath(lsquic_dep.path("include"));
@@ -98,6 +103,7 @@ pub fn build(b: *std.Build) void {
     });
     libp2p_exe.root_module.addIncludePath(lsquic_dep.path("include"));
     libp2p_exe.root_module.addImport("xev", libxev_module);
+    libp2p_exe.root_module.addOptions("build_options", build_options);
     libp2p_exe.root_module.addImport("multiformats", zmultiformats_module);
     libp2p_exe.root_module.addImport("ssl", ssl_module);
     libp2p_exe.root_module.addImport("gremlin", gremlin_module);
@@ -117,6 +123,7 @@ pub fn build(b: *std.Build) void {
     });
     transport_interop_exe.root_module.addIncludePath(lsquic_dep.path("include"));
     transport_interop_exe.root_module.addImport("xev", libxev_module);
+    transport_interop_exe.root_module.addOptions("build_options", build_options);
     transport_interop_exe.root_module.addImport("multiformats", zmultiformats_module);
     transport_interop_exe.root_module.addImport("ssl", ssl_module);
     transport_interop_exe.root_module.addImport("gremlin", gremlin_module);
@@ -184,6 +191,7 @@ pub fn build(b: *std.Build) void {
 
     libp2p_exe_unit_tests.root_module.addIncludePath(lsquic_dep.path("include"));
     libp2p_exe_unit_tests.root_module.addImport("xev", libxev_module);
+    libp2p_exe_unit_tests.root_module.addOptions("build_options", build_options);
     libp2p_exe_unit_tests.root_module.addImport("multiformats", zmultiformats_module);
     libp2p_exe_unit_tests.root_module.addImport("gremlin", gremlin_module);
     libp2p_exe_unit_tests.root_module.addImport("peer_id", peer_id_module);

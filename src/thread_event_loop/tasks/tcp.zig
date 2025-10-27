@@ -1,7 +1,7 @@
 const std = @import("std");
 const libp2p = @import("../../root.zig");
 const conn = libp2p.conn;
-const xev = @import("xev");
+const xev = libp2p.xev;
 
 const xev_tcp = libp2p.transport.tcp;
 

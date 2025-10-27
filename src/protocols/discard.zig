@@ -365,11 +365,11 @@ test "discard protocol using switch" {
         loop.deinit();
     }
 
-    const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    const host_key = try tls.generateKeyPair(keys.KeyType.RSA);
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: quic.QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys.KeyType.ED25519, allocator);
+    try transport.init(&loop, host_key, keys.KeyType.RSA, allocator);
 
     var pubkey = try tls.createProtobufEncodedPublicKey(allocator, host_key);
     defer allocator.free(pubkey.data.?);
@@ -405,11 +405,11 @@ test "discard protocol using switch" {
         cl_loop.deinit();
     }
 
-    const cl_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    const cl_host_key = try tls.generateKeyPair(keys.KeyType.RSA);
     defer ssl.EVP_PKEY_free(cl_host_key);
 
     var cl_transport: quic.QuicTransport = undefined;
-    try cl_transport.init(&cl_loop, cl_host_key, keys.KeyType.ED25519, allocator);
+    try cl_transport.init(&cl_loop, cl_host_key, keys.KeyType.RSA, allocator);
 
     var pubkey1 = try tls.createProtobufEncodedPublicKey(allocator, cl_host_key);
     defer allocator.free(pubkey1.data.?);
@@ -439,11 +439,11 @@ test "discard protocol using switch" {
         cl_loop1.deinit();
     }
 
-    const cl_host_key1 = try tls.generateKeyPair(keys.KeyType.ED25519);
+    const cl_host_key1 = try tls.generateKeyPair(keys.KeyType.RSA);
     defer ssl.EVP_PKEY_free(cl_host_key1);
 
     var cl_transport1: quic.QuicTransport = undefined;
-    try cl_transport1.init(&cl_loop1, cl_host_key1, keys.KeyType.ED25519, allocator);
+    try cl_transport1.init(&cl_loop1, cl_host_key1, keys.KeyType.RSA, allocator);
     var switch3: swarm.Switch = undefined;
     switch3.init(allocator, &cl_transport1);
     defer {
