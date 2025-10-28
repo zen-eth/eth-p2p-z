@@ -34,7 +34,7 @@ WORKDIR /app
 
 COPY . .
 
-RUN zig build -Doptimize=ReleaseSafe -Dlibxev-backend=epoll
+RUN zig build -Doptimize=ReleaseFast -Dlibxev-backend=epoll
 
 FROM debian:bookworm-slim AS runtime
 
