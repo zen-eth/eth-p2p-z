@@ -1,5 +1,6 @@
 const std = @import("std");
-const xev = @import("xev");
+const xev_backend = @import("../xev_backend.zig");
+const xev = xev_backend.xev;
 const TCP = xev.TCP;
 const Allocator = std.mem.Allocator;
 const ThreadPool = xev.ThreadPool;

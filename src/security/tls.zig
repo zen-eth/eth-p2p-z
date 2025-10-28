@@ -144,9 +144,7 @@ pub fn buildCert(
     const serial = ssl.ASN1_INTEGER_new() orelse return error.CertSerialCreationFailed;
     defer ssl.ASN1_INTEGER_free(serial);
 
-    var random_bytes_buf: [8]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes_buf);
-    const random_serial: i64 = @bitCast(random_bytes_buf);
+    const random_serial: i64 = std.crypto.random.intRangeAtMost(i64, 1, std.math.maxInt(i64));
 
     if (ssl.ASN1_INTEGER_set_int64(serial, random_serial) <= 0) return error.CertSerialSetFailed;
     if (ssl.X509_set_serialNumber(cert, serial) <= 0) return error.CertSerialSetFailed;
@@ -187,16 +185,51 @@ pub fn buildCert(
 
     try addExtension(cert, Libp2pExtensionOid, true, ext_value_der[0..@intCast(ext_value_der_len)]);
 
-    const message_digest: ?*const ssl.EVP_MD = switch (ssl.EVP_PKEY_base_id(subjectKey)) {
-        ssl.EVP_PKEY_ED25519 => null,
+    const base_id = ssl.EVP_PKEY_base_id(subjectKey);
+    switch (base_id) {
+        ssl.EVP_PKEY_ED25519 => {
+            if (ssl.X509_sign(cert, subjectKey, null) <= 0) {
+                return error.SignCertFailed;
+            }
+        },
 
-        ssl.EVP_PKEY_EC, ssl.EVP_PKEY_RSA => ssl.EVP_sha256(),
+        ssl.EVP_PKEY_EC => {
+            const md = ssl.EVP_sha256();
+            if (ssl.X509_sign(cert, subjectKey, md) <= 0) {
+                return error.SignCertFailed;
+            }
+        },
+
+        ssl.EVP_PKEY_RSA => {
+            const md = ssl.EVP_sha256();
+            const md_ctx = ssl.EVP_MD_CTX_new() orelse return error.CertSignCreationFailed;
+            defer ssl.EVP_MD_CTX_free(md_ctx);
+
+            var pkey_ctx: ?*ssl.EVP_PKEY_CTX = null;
+            if (ssl.EVP_DigestSignInit(md_ctx, &pkey_ctx, md, null, subjectKey) <= 0) {
+                return error.SignCertFailed;
+            }
+
+            const ctx = pkey_ctx orelse return error.SignCertFailed;
+
+            if (ssl.EVP_PKEY_CTX_set_rsa_padding(ctx, ssl.RSA_PKCS1_PSS_PADDING) <= 0) {
+                return error.SignCertFailed;
+            }
+
+            if (ssl.EVP_PKEY_CTX_set_rsa_pss_saltlen(ctx, -1) <= 0) {
+                return error.SignCertFailed;
+            }
+
+            if (ssl.EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, md) <= 0) {
+                return error.SignCertFailed;
+            }
+
+            if (ssl.X509_sign_ctx(cert, md_ctx) <= 0) {
+                return error.SignCertFailed;
+            }
+        },
 
         else => return error.UnsupportedKeyType,
-    };
-
-    if (ssl.X509_sign(cert, subjectKey, message_digest) <= 0) {
-        return error.SignCertFailed;
     }
 
     return cert;
@@ -208,7 +241,16 @@ pub fn createProtobufEncodedPublicKeyBuf(allocator: Allocator, pkey: *ssl.EVP_PK
     var public_key_proto = try createProtobufEncodedPublicKey(allocator, pkey);
     defer allocator.free(public_key_proto.data.?);
 
-    const proto_bytes = try public_key_proto.encode(allocator);
+    var proto_bytes = try public_key_proto.encode(allocator);
+
+    if (public_key_proto.type == .RSA) {
+        // RSA is the default key type (0) so the encoder omits it. Append the tag/value to
+        // match other implementations when hashing protobuf-encoded keys.
+        const type_field = [_]u8{ 0x08, 0x00 };
+        const augmented = try std.mem.concat(allocator, u8, &.{ &type_field, proto_bytes });
+        allocator.free(proto_bytes);
+        proto_bytes = augmented;
+    }
     return proto_bytes;
 }
 
@@ -258,15 +300,41 @@ pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY)
 
 /// Gets the raw public key bytes from an EVP_PKEY.
 /// The caller owns the returned slice.
-fn getRawPublicKeyBytes(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]u8 {
-    var len: usize = 0;
-    if (ssl.EVP_PKEY_get_raw_public_key(pkey, null, &len) == 0) return error.RawPubKeyGetFailed;
-    const buf = try allocator.alloc(u8, len);
-    if (ssl.EVP_PKEY_get_raw_public_key(pkey, buf.ptr, &len) == 0) {
-        allocator.free(buf);
-        return error.RawPubKeyGetFailed;
+fn getRawPublicKeyBytes(allocator: Allocator, evp_key: *ssl.EVP_PKEY) ![]const u8 {
+    const base_id = ssl.EVP_PKEY_base_id(evp_key);
+
+    // For Ed25519, we can use EVP_PKEY_get_raw_public_key
+    if (base_id == ssl.EVP_PKEY_ED25519) {
+        var len: usize = 0;
+        // First call to get the length
+        if (ssl.EVP_PKEY_get_raw_public_key(evp_key, null, &len) != 1) {
+            return error.RawPubKeyGetFailed;
+        }
+        const key = try allocator.alloc(u8, len);
+        errdefer allocator.free(key);
+
+        // Second call to get the actual key
+        if (ssl.EVP_PKEY_get_raw_public_key(evp_key, key.ptr, &len) != 1) {
+            return error.RawPubKeyGetFailed;
+        }
+        return key;
     }
-    return buf;
+
+    // For ECDSA and RSA, we use i2d_PUBKEY to get DER encoding (PKIX)
+    if (base_id == ssl.EVP_PKEY_EC or base_id == ssl.EVP_PKEY_RSA) {
+        var key_ptr: [*c]u8 = null;
+        const len = ssl.i2d_PUBKEY(evp_key, &key_ptr);
+        if (len < 0 or key_ptr == null) {
+            return error.RawPubKeyGetFailed;
+        }
+        defer ssl.OPENSSL_free(key_ptr);
+
+        const key = try allocator.alloc(u8, @intCast(len));
+        @memcpy(key, key_ptr[0..@intCast(len)]);
+        return key;
+    }
+
+    return error.UnsupportedKeyType;
 }
 
 /// Signs arbitrary data using the private key within an EVP_PKEY.
@@ -283,21 +351,51 @@ pub fn signData(allocator: Allocator, pkey: *ssl.EVP_PKEY, data: []const u8) ![]
         else => return error.UnsupportedKeyType,
     };
 
+    if (ssl.EVP_PKEY_base_id(pkey) == ssl.EVP_PKEY_ED25519) {
+        if (ssl.EVP_DigestSignInit(ctx, null, message_digest, null, pkey) <= 0) {
+            return error.CertSignCreationFailed;
+        }
+
+        var sig_len: usize = 0;
+        if (ssl.EVP_DigestSign(ctx, null, &sig_len, data.ptr, data.len) <= 0) {
+            return error.CertSignCreationFailed;
+        }
+
+        var sig_buf = try allocator.alloc(u8, sig_len);
+        errdefer allocator.free(sig_buf);
+
+        if (ssl.EVP_DigestSign(ctx, sig_buf.ptr, &sig_len, data.ptr, data.len) <= 0) {
+            return error.CertSignCreationFailed;
+        }
+
+        if (sig_len != sig_buf.len) sig_buf = try allocator.realloc(sig_buf, sig_len);
+        return sig_buf;
+    }
+
     if (ssl.EVP_DigestSignInit(ctx, null, message_digest, null, pkey) <= 0) {
         return error.CertSignCreationFailed;
     }
 
-    var sig_len: usize = 0;
-    if (ssl.EVP_DigestSign(ctx, null, &sig_len, data.ptr, data.len) <= 0) {
+    if (ssl.EVP_DigestSignUpdate(ctx, data.ptr, data.len) <= 0) {
         return error.CertSignCreationFailed;
     }
 
-    const sig_buf = try allocator.alloc(u8, sig_len);
+    var sig_len: usize = 0;
+    if (ssl.EVP_DigestSignFinal(ctx, null, &sig_len) <= 0) {
+        return error.CertSignCreationFailed;
+    }
+
+    var sig_buf = try allocator.alloc(u8, sig_len);
     errdefer allocator.free(sig_buf);
 
-    if (ssl.EVP_DigestSign(ctx, sig_buf.ptr, &sig_len, data.ptr, data.len) <= 0) {
+    if (ssl.EVP_DigestSignFinal(ctx, sig_buf.ptr, &sig_len) <= 0) {
         return error.CertSignCreationFailed;
     }
+
+    if (sig_len != sig_buf.len) {
+        sig_buf = try allocator.realloc(sig_buf, sig_len);
+    }
+
     return sig_buf;
 }
 
@@ -352,9 +450,17 @@ pub fn reconstructEvpKeyFromPublicKey(public_key: *const keys.PublicKey) !*ssl.E
                 key_data.ptr, key_data.len) orelse error.OpenSSLFailed;
         },
 
-        .RSA, .ECDSA => {
+        .RSA => {
             var key_ptr: [*c]const u8 = key_data.ptr;
             return ssl.d2i_PUBKEY(null, &key_ptr, @intCast(key_data.len)) orelse error.OpenSSLFailed;
+        },
+
+        .ECDSA => {
+            var key_ptr: [*c]const u8 = key_data.ptr;
+            if (ssl.d2i_PUBKEY(null, &key_ptr, @intCast(key_data.len))) |pkey| {
+                return pkey;
+            }
+            return try createEcdsaPkeyFromSec1(key_data);
         },
 
         .SECP256K1 => {
@@ -363,6 +469,45 @@ pub fn reconstructEvpKeyFromPublicKey(public_key: *const keys.PublicKey) !*ssl.E
 
         else => return error.UnsupportedKeyType,
     }
+}
+
+fn createEcdsaPkeyFromSec1(sec1_bytes: []const u8) !*ssl.EVP_PKEY {
+    if (sec1_bytes.len == 0 or sec1_bytes[0] != 0x04) {
+        return error.InvalidKeyLength;
+    }
+
+    const curve_nid: c_int = switch (sec1_bytes.len) {
+        65 => ssl.NID_X9_62_prime256v1,
+        97 => ssl.NID_secp384r1,
+        133 => ssl.NID_secp521r1,
+        else => return error.InvalidKeyLength,
+    };
+
+    var ec_key_managed: ?*ssl.EC_KEY = ssl.EC_KEY_new_by_curve_name(curve_nid);
+    const ec_key = ec_key_managed orelse return error.OpenSSLFailed;
+    defer if (ec_key_managed) |ptr| ssl.EC_KEY_free(ptr);
+
+    const group = ssl.EC_KEY_get0_group(ec_key) orelse return error.OpenSSLFailed;
+    const point = ssl.EC_POINT_new(group) orelse return error.OpenSSLFailed;
+    defer ssl.EC_POINT_free(point);
+
+    if (ssl.EC_POINT_oct2point(group, point, sec1_bytes.ptr, sec1_bytes.len, null) != 1) {
+        return error.OpenSSLFailed;
+    }
+
+    if (ssl.EC_KEY_set_public_key(ec_key, point) != 1) {
+        return error.OpenSSLFailed;
+    }
+
+    const pkey = ssl.EVP_PKEY_new() orelse return error.OpenSSLFailed;
+    errdefer ssl.EVP_PKEY_free(pkey);
+
+    if (ssl.EVP_PKEY_assign_EC_KEY(pkey, ec_key) != 1) {
+        return error.OpenSSLFailed;
+    }
+
+    ec_key_managed = null;
+    return pkey;
 }
 
 fn extractExtensionFields(allocator: Allocator, cert: *const ssl.X509) !ExtensionData {
@@ -452,7 +597,22 @@ pub fn verifySignature(pkey: *ssl.EVP_PKEY, data: []const u8, signature: []const
         return error.OpenSSLFailed;
     }
 
-    const result = ssl.EVP_DigestVerify(ctx, signature.ptr, signature.len, data.ptr, data.len);
+    if (ssl.EVP_PKEY_base_id(pkey) == ssl.EVP_PKEY_ED25519) {
+        const result = ssl.EVP_DigestVerify(ctx, signature.ptr, signature.len, data.ptr, data.len);
+        if (result == 1) {
+            return true;
+        } else if (result == 0) {
+            return false;
+        } else {
+            return error.OpenSSLFailed;
+        }
+    }
+
+    if (ssl.EVP_DigestVerifyUpdate(ctx, data.ptr, data.len) <= 0) {
+        return error.OpenSSLFailed;
+    }
+
+    const result = ssl.EVP_DigestVerifyFinal(ctx, signature.ptr, signature.len);
     if (result == 1) {
         return true;
     } else if (result == 0) {
@@ -793,4 +953,92 @@ test "Verify certificate with Ed25519 keys" {
 
     try std.testing.expect(peer_info.is_valid);
     try std.testing.expect(peer_info.host_pubkey.type == .ED25519);
+
+    var expected_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(expected_pubkey.data.?);
+    const expected_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &expected_pubkey);
+    try std.testing.expect(peer_info.peer_id.eql(&expected_peer_id));
+}
+
+test "Build certificate using ECDSA keys" {
+    const host_key = try generateKeyPair(.ECDSA);
+    defer ssl.EVP_PKEY_free(host_key);
+
+    const subject_key = try generateKeyPair(.ECDSA);
+    defer ssl.EVP_PKEY_free(subject_key);
+
+    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    defer ssl.X509_free(cert);
+
+    const pem_buf = try x509ToPem(std.testing.allocator, cert);
+    defer std.testing.allocator.free(pem_buf);
+
+    // Verify the certificate was created successfully
+    try std.testing.expect(pem_buf.len > 0);
+}
+
+test "Verify certificate with ECDSA keys" {
+    const host_key = try generateKeyPair(.ECDSA);
+    defer ssl.EVP_PKEY_free(host_key);
+
+    const subject_key = try generateKeyPair(.ECDSA);
+    defer ssl.EVP_PKEY_free(subject_key);
+
+    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    defer ssl.X509_free(cert);
+
+    const peer_info = try verifyAndExtractPeerInfo(std.testing.allocator, cert);
+    std.testing.allocator.free(peer_info.host_pubkey.data.?);
+
+    try std.testing.expect(peer_info.is_valid);
+    try std.testing.expect(peer_info.host_pubkey.type == .ECDSA);
+
+    var expected_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(expected_pubkey.data.?);
+    const expected_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &expected_pubkey);
+    try std.testing.expect(peer_info.peer_id.eql(&expected_peer_id));
+}
+
+test "Build certificate using RSA keys" {
+    const host_key = try generateKeyPair(.RSA);
+    defer ssl.EVP_PKEY_free(host_key);
+
+    const subject_key = try generateKeyPair(.RSA);
+    defer ssl.EVP_PKEY_free(subject_key);
+
+    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    defer ssl.X509_free(cert);
+
+    const pem_buf = try x509ToPem(std.testing.allocator, cert);
+    defer std.testing.allocator.free(pem_buf);
+
+    // Dump a sample RSA certificate for interop debugging.
+    const file = try std.fs.cwd().createFile("rsa_test_cert.pem", .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(pem_buf);
+
+    // Verify the certificate was created successfully
+    try std.testing.expect(pem_buf.len > 0);
+}
+
+test "Verify certificate with RSA keys" {
+    const host_key = try generateKeyPair(.RSA);
+    defer ssl.EVP_PKEY_free(host_key);
+
+    const subject_key = try generateKeyPair(.RSA);
+    defer ssl.EVP_PKEY_free(subject_key);
+
+    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    defer ssl.X509_free(cert);
+
+    const peer_info = try verifyAndExtractPeerInfo(std.testing.allocator, cert);
+    std.testing.allocator.free(peer_info.host_pubkey.data.?);
+
+    try std.testing.expect(peer_info.is_valid);
+    try std.testing.expect(peer_info.host_pubkey.type == .RSA);
+
+    var expected_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(expected_pubkey.data.?);
+    const expected_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &expected_pubkey);
+    try std.testing.expect(peer_info.peer_id.eql(&expected_peer_id));
 }

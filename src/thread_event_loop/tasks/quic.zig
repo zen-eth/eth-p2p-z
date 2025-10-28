@@ -6,6 +6,21 @@ const quic = libp2p.transport.quic;
 
 pub fn extend(comptime Loop: type) type {
     return struct {
+        const QuicEngineStopTask = struct {
+            engine: *quic.QuicEngine,
+        };
+
+        fn runQuicEngineStop(_: *Loop, ctx: *QuicEngineStopTask) void {
+            ctx.engine.doStop();
+        }
+
+        pub fn queueQuicEngineStop(self: *Loop, engine: *quic.QuicEngine) !void {
+            const task = try self.allocator.create(QuicEngineStopTask);
+            task.* = .{ .engine = engine };
+            errdefer self.allocator.destroy(task);
+            try self.queueCallWithDeinit(QuicEngineStopTask, task, runQuicEngineStop, Loop.makeDestroyTask(QuicEngineStopTask));
+        }
+
         const QuicEngineStartTask = struct {
             engine: *quic.QuicEngine,
         };

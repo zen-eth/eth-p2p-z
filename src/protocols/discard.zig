@@ -287,7 +287,10 @@ fn spawnSwitch3Test(allocator: std.mem.Allocator, switch3: *swarm.Switch, server
 fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId, client_id: u32) !void {
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
-    defer cl_loop.deinit();
+    defer {
+        cl_loop.close();
+        cl_loop.deinit();
+    }
 
     const cl_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(cl_host_key);
@@ -296,7 +299,10 @@ fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId
     try cl_transport.init(&cl_loop, cl_host_key, keys.KeyType.ED25519, allocator);
     var client_switch: swarm.Switch = undefined;
     client_switch.init(allocator, &cl_transport);
-    defer client_switch.deinit();
+    defer {
+        client_switch.stop();
+        client_switch.deinit();
+    }
 
     var discard_handler = DiscardProtocolHandler.init(allocator);
     defer discard_handler.deinit();
@@ -355,15 +361,15 @@ test "discard protocol using switch" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(allocator);
     defer {
-        // loop.close();
+        loop.close();
         loop.deinit();
     }
 
-    const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    const host_key = try tls.generateKeyPair(keys.KeyType.RSA);
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: quic.QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys.KeyType.ED25519, allocator);
+    try transport.init(&loop, host_key, keys.KeyType.RSA, allocator);
 
     var pubkey = try tls.createProtobufEncodedPublicKey(allocator, host_key);
     defer allocator.free(pubkey.data.?);
@@ -372,6 +378,7 @@ test "discard protocol using switch" {
     var switch1: swarm.Switch = undefined;
     switch1.init(allocator, &transport);
     defer {
+        switch1.stop();
         switch1.deinit();
     }
 
@@ -394,15 +401,15 @@ test "discard protocol using switch" {
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
     defer {
-        // cl_loop.close();
+        cl_loop.close();
         cl_loop.deinit();
     }
 
-    const cl_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    const cl_host_key = try tls.generateKeyPair(keys.KeyType.RSA);
     defer ssl.EVP_PKEY_free(cl_host_key);
 
     var cl_transport: quic.QuicTransport = undefined;
-    try cl_transport.init(&cl_loop, cl_host_key, keys.KeyType.ED25519, allocator);
+    try cl_transport.init(&cl_loop, cl_host_key, keys.KeyType.RSA, allocator);
 
     var pubkey1 = try tls.createProtobufEncodedPublicKey(allocator, cl_host_key);
     defer allocator.free(pubkey1.data.?);
@@ -411,6 +418,7 @@ test "discard protocol using switch" {
     var switch2: swarm.Switch = undefined;
     switch2.init(allocator, &cl_transport);
     defer {
+        switch2.stop();
         switch2.deinit();
     }
 
@@ -427,18 +435,19 @@ test "discard protocol using switch" {
     var cl_loop1: io_loop.ThreadEventLoop = undefined;
     try cl_loop1.init(allocator);
     defer {
-        // cl_loop1.close();
+        cl_loop1.close();
         cl_loop1.deinit();
     }
 
-    const cl_host_key1 = try tls.generateKeyPair(keys.KeyType.ED25519);
+    const cl_host_key1 = try tls.generateKeyPair(keys.KeyType.RSA);
     defer ssl.EVP_PKEY_free(cl_host_key1);
 
     var cl_transport1: quic.QuicTransport = undefined;
-    try cl_transport1.init(&cl_loop1, cl_host_key1, keys.KeyType.ED25519, allocator);
+    try cl_transport1.init(&cl_loop1, cl_host_key1, keys.KeyType.RSA, allocator);
     var switch3: swarm.Switch = undefined;
     switch3.init(allocator, &cl_transport1);
     defer {
+        switch3.stop();
         switch3.deinit();
     }
 
@@ -540,7 +549,10 @@ test "switch newStream connects to multiple peers" {
     // --- Node A setup ---
     var loop_a: io_loop.ThreadEventLoop = undefined;
     try loop_a.init(allocator);
-    defer loop_a.deinit();
+    defer {
+        loop_a.close();
+        loop_a.deinit();
+    }
 
     const host_key_a = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key_a);
@@ -549,7 +561,10 @@ test "switch newStream connects to multiple peers" {
     try transport_a.init(&loop_a, host_key_a, keys.KeyType.ED25519, allocator);
     var switch_a: swarm.Switch = undefined;
     switch_a.init(allocator, &transport_a);
-    defer switch_a.deinit();
+    defer {
+        switch_a.stop();
+        switch_a.deinit();
+    }
 
     var handler_a = DiscardProtocolHandler.init(allocator);
     defer handler_a.deinit();
@@ -565,7 +580,10 @@ test "switch newStream connects to multiple peers" {
     // --- Node B setup ---
     var loop_b: io_loop.ThreadEventLoop = undefined;
     try loop_b.init(allocator);
-    defer loop_b.deinit();
+    defer {
+        loop_b.close();
+        loop_b.deinit();
+    }
 
     const host_key_b = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key_b);
@@ -574,7 +592,10 @@ test "switch newStream connects to multiple peers" {
     try transport_b.init(&loop_b, host_key_b, keys.KeyType.ED25519, allocator);
     var switch_b: swarm.Switch = undefined;
     switch_b.init(allocator, &transport_b);
-    defer switch_b.deinit();
+    defer {
+        switch_b.stop();
+        switch_b.deinit();
+    }
 
     var handler_b = DiscardProtocolHandler.init(allocator);
     defer handler_b.deinit();
@@ -594,7 +615,10 @@ test "switch newStream connects to multiple peers" {
     // --- Node C setup ---
     var loop_c: io_loop.ThreadEventLoop = undefined;
     try loop_c.init(allocator);
-    defer loop_c.deinit();
+    defer {
+        loop_c.close();
+        loop_c.deinit();
+    }
 
     const host_key_c = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key_c);
@@ -603,7 +627,10 @@ test "switch newStream connects to multiple peers" {
     try transport_c.init(&loop_c, host_key_c, keys.KeyType.ED25519, allocator);
     var switch_c: swarm.Switch = undefined;
     switch_c.init(allocator, &transport_c);
-    defer switch_c.deinit();
+    defer {
+        switch_c.stop();
+        switch_c.deinit();
+    }
 
     var handler_c = DiscardProtocolHandler.init(allocator);
     defer handler_c.deinit();
@@ -697,7 +724,10 @@ test "discard protocol using switch with 1MB data" {
 
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
-    defer loop.deinit();
+    defer {
+        loop.close();
+        loop.deinit();
+    }
 
     const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
@@ -710,7 +740,10 @@ test "discard protocol using switch with 1MB data" {
     try transport.init(&loop, host_key, keys.KeyType.ED25519, std.testing.allocator);
     var switch1: swarm.Switch = undefined;
     switch1.init(allocator, &transport);
-    defer switch1.deinit();
+    defer {
+        switch1.stop();
+        switch1.deinit();
+    }
 
     var discard_handler = DiscardProtocolHandler.init(allocator);
     defer discard_handler.deinit();
@@ -724,7 +757,10 @@ test "discard protocol using switch with 1MB data" {
 
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
-    defer cl_loop.deinit();
+    defer {
+        cl_loop.close();
+        cl_loop.deinit();
+    }
 
     const cl_host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(cl_host_key);
@@ -733,7 +769,10 @@ test "discard protocol using switch with 1MB data" {
     try cl_transport.init(&cl_loop, cl_host_key, keys.KeyType.ED25519, allocator);
     var switch2: swarm.Switch = undefined;
     switch2.init(allocator, &cl_transport);
-    defer switch2.deinit();
+    defer {
+        switch2.stop();
+        switch2.deinit();
+    }
 
     var discard_handler2 = DiscardProtocolHandler.init(allocator);
     defer discard_handler2.deinit();
@@ -803,6 +842,7 @@ test "no supported protocols error" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
     defer {
+        loop.close();
         loop.deinit();
     }
 
@@ -818,6 +858,7 @@ test "no supported protocols error" {
     var switch1: swarm.Switch = undefined;
     switch1.init(allocator, &transport);
     defer {
+        switch1.stop();
         switch1.deinit();
     }
 
@@ -836,6 +877,7 @@ test "no supported protocols error" {
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
     defer {
+        cl_loop.close();
         cl_loop.deinit();
     }
 
@@ -847,6 +889,7 @@ test "no supported protocols error" {
     var switch2: swarm.Switch = undefined;
     switch2.init(allocator, &cl_transport);
     defer {
+        switch2.stop();
         switch2.deinit();
     }
 
@@ -888,7 +931,10 @@ test "discard protocol with 5 concurrent clients" {
 
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(allocator);
-    defer loop.deinit();
+    defer {
+        loop.close();
+        loop.deinit();
+    }
 
     const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
@@ -901,7 +947,10 @@ test "discard protocol with 5 concurrent clients" {
 
     var switch1: swarm.Switch = undefined;
     switch1.init(allocator, &transport);
-    defer switch1.deinit();
+    defer {
+        switch1.stop();
+        switch1.deinit();
+    }
 
     var discard_handler = DiscardProtocolHandler.init(allocator);
     defer discard_handler.deinit();

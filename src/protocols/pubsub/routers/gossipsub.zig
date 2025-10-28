@@ -8,7 +8,7 @@ const ProtocolId = libp2p.protocols.ProtocolId;
 const PeerId = @import("peer_id").PeerId;
 const Allocator = std.mem.Allocator;
 const io_loop = libp2p.thread_event_loop;
-const xev = @import("xev");
+const xev = libp2p.xev;
 const tls = libp2p.security.tls;
 const keys = @import("peer_id").keys;
 const ssl = @import("ssl");
@@ -3230,11 +3230,13 @@ const TestGossipsubNode = struct {
     }
 
     pub fn deinit(self: *TestGossipsubNode) void {
+        self.sw.stop();
         self.sw.deinit();
         self.router.deinit();
         self.handler.deinit();
         self.dial_addr.deinit();
         self.listen_addr.deinit();
+        self.loop.close();
         self.loop.deinit();
         ssl.EVP_PKEY_free(self.host_key);
     }
