@@ -384,7 +384,7 @@ pub fn main() !void {
         loop.deinit();
     }
 
-    const host_key = try tls.generateKeyPair(keys.KeyType.RSA);
+    const host_key = try tls.generateKeyPair(keys.KeyType.ECDSA);
     defer ssl.EVP_PKEY_free(host_key);
 
     var transport: quic.QuicTransport = undefined;
