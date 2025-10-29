@@ -2,11 +2,13 @@
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG ZIG_VERSION=0.14.1
+ARG ZIG_LOG_LEVEL=info
 
 FROM debian:bookworm-slim AS build
 
 ARG DEBIAN_FRONTEND
 ARG ZIG_VERSION
+ARG ZIG_LOG_LEVEL
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -34,7 +36,7 @@ WORKDIR /app
 
 COPY . .
 
-RUN zig build -Doptimize=ReleaseFast -Dlibxev-backend=epoll
+RUN zig build -Doptimize=ReleaseFast -Dlibxev-backend=epoll -Dlog-level=${ZIG_LOG_LEVEL}
 
 FROM debian:bookworm-slim AS runtime
 

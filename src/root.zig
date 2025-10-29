@@ -4,6 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 
+pub const std_options = @import("std_options.zig").options;
 pub const concurrent = @import("concurrent.zig");
 pub const conn = @import("conn.zig");
 pub const thread_event_loop = @import("thread_event_loop.zig");
