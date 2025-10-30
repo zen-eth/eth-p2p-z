@@ -1,6 +1,7 @@
+pub const std_options = @import("zig-libp2p").std_options;
+
 const std = @import("std");
 const libp2p = @import("zig-libp2p");
-const std_options = libp2p.std_options;
 const io_loop = libp2p.thread_event_loop;
 const quic = libp2p.transport.quic;
 const tls = libp2p.security.tls;
