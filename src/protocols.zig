@@ -9,7 +9,33 @@ pub const ping = @import("protocols/ping.zig");
 
 pub const ProtocolId = []const u8;
 
-// TODO: Make the stream type generic to allow different stream types.
+pub const ProtocolStreamControllerVTable = struct {
+    getStreamFn: *const fn (instance: *anyopaque) *quic.QuicStream,
+};
+
+pub const ProtocolStreamController = struct {
+    instance: *anyopaque,
+    vtable: *const ProtocolStreamControllerVTable,
+
+    pub fn getStream(self: *ProtocolStreamController) *quic.QuicStream {
+        return self.vtable.getStreamFn(self.instance);
+    }
+};
+
+pub fn initStreamController(instance: *anyopaque, vtable: *const ProtocolStreamControllerVTable) ProtocolStreamController {
+    return .{ .instance = instance, .vtable = vtable };
+}
+
+pub fn asStreamController(controller: ?*anyopaque) ?*ProtocolStreamController {
+    if (controller == null) return null;
+    return @ptrCast(@alignCast(controller.?));
+}
+
+pub fn getStream(controller: ?*anyopaque) ?*quic.QuicStream {
+    const base = asStreamController(controller) orelse return null;
+    return base.getStream();
+}
+
 /// This is the protocol binding interface for QUIC protocol message handlers.
 /// It registers the protocol handler with the QUIC transport and provides
 /// methods to handle protocol-specific messages.

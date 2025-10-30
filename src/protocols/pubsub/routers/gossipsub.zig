@@ -13,6 +13,7 @@ const tls = libp2p.security.tls;
 const keys = @import("peer_id").keys;
 const ssl = @import("ssl");
 const swarm = libp2p.swarm;
+const ping = libp2p.protocols.ping;
 const rpc = libp2p.protobuf.rpc;
 const uvarint = multiformats.uvarint;
 const event = libp2p.event;
@@ -3168,10 +3169,22 @@ const TestGossipsubNode = struct {
     transport: quic.QuicTransport,
     sw: swarm.Switch,
     handler: PubSubPeerProtocolHandler,
+    ping_handler: ping.PingProtocolHandler,
     router: Gossipsub,
     host_key: *ssl.EVP_PKEY,
 
     pub fn init(self: *TestGossipsubNode, allocator: Allocator, port: u16, options: Gossipsub.Options) !void {
+        try self.initWithListenCallback(allocator, port, options, null, Gossipsub.onIncomingNewStream);
+    }
+
+    pub fn initWithListenCallback(
+        self: *TestGossipsubNode,
+        allocator: Allocator,
+        port: u16,
+        options: Gossipsub.Options,
+        listen_ctx: ?*anyopaque,
+        listen_callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
+    ) !void {
         var listen_buf: [64]u8 = undefined;
         const listen_str = try std.fmt.bufPrint(&listen_buf, "/ip4/0.0.0.0/udp/{d}", .{port});
 
@@ -3200,32 +3213,25 @@ const TestGossipsubNode = struct {
         try self.dial_addr.push(.{ .P2P = self.transport.local_peer_id });
 
         self.sw.init(allocator, &self.transport);
-        errdefer {
-            self.sw.deinit();
-            self.transport.deinit();
-            self.loop.deinit();
-        }
 
+        self.ping_handler = ping.PingProtocolHandler.init(allocator, &self.sw);
         self.handler = PubSubPeerProtocolHandler.init(allocator);
         errdefer {
             self.handler.deinit();
+            self.ping_handler.deinit();
             self.sw.deinit();
             self.transport.deinit();
             self.loop.deinit();
         }
+        try self.sw.addProtocolHandler(ping.protocol_id, self.ping_handler.any());
         try self.sw.addProtocolHandler(v1_id, self.handler.any());
         try self.sw.addProtocolHandler(v1_1_id, self.handler.any());
 
         try self.router.init(allocator, self.listen_addr, self.transport.local_peer_id, self.host_key, &self.sw, options);
-        errdefer {
-            self.router.deinit();
-            self.handler.deinit();
-            self.sw.deinit();
-            self.transport.deinit();
-            self.loop.deinit();
-        }
+        errdefer self.router.deinit();
 
-        try self.sw.listen(self.listen_addr, &self.router, Gossipsub.onIncomingNewStream);
+        const effective_ctx: ?*anyopaque = listen_ctx orelse @ptrCast(&self.router);
+        try self.sw.listen(self.listen_addr, effective_ctx, listen_callback);
         std.time.sleep(300 * std.time.us_per_ms);
     }
 
@@ -3234,6 +3240,7 @@ const TestGossipsubNode = struct {
         self.sw.deinit();
         self.router.deinit();
         self.handler.deinit();
+        self.ping_handler.deinit();
         self.dial_addr.deinit();
         self.listen_addr.deinit();
         self.loop.close();
@@ -3241,6 +3248,256 @@ const TestGossipsubNode = struct {
         ssl.EVP_PKEY_free(self.host_key);
     }
 };
+
+test "gossipsub listen callback exposes negotiated protocol" {
+    const allocator = std.testing.allocator;
+
+    const ListenObserver = struct {
+        event: std.Thread.ResetEvent = .{},
+        observed_protocol: ?[]const u8 = null,
+        router: ?*Gossipsub = null,
+
+        const Self = @This();
+
+        fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            defer self.event.set();
+
+            const controller = res catch return;
+            const stream = libp2p.protocols.getStream(controller) orelse return;
+            self.observed_protocol = stream.negotiated_protocol;
+
+            if (self.router) |router| {
+                Gossipsub.onIncomingNewStream(@ptrCast(router), controller);
+            }
+        }
+    };
+
+    var observer = ListenObserver{};
+
+    var server: TestGossipsubNode = undefined;
+    try server.initWithListenCallback(allocator, 9450, .{}, &observer, ListenObserver.callback);
+    observer.router = &server.router;
+    defer server.deinit();
+
+    var client: TestGossipsubNode = undefined;
+    try client.init(allocator, 9451, .{});
+    defer client.deinit();
+
+    client.router.addPeer(server.dial_addr, null, struct {
+        fn callback(_: ?*anyopaque, res: anyerror!void) void {
+            _ = res catch {};
+        }
+    }.callback);
+
+    observer.event.wait();
+
+    try std.testing.expect(observer.observed_protocol != null);
+    const proto = observer.observed_protocol.?;
+    const is_supported = std.mem.eql(u8, proto, v1_id) or std.mem.eql(u8, proto, v1_1_id);
+    try std.testing.expect(is_supported);
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+}
+
+test "switch handles ping and gossipsub simultaneously" {
+    const allocator = std.testing.allocator;
+    const server_port: u16 = 9472;
+    const client_port: u16 = 9473;
+    const topic = "interop/ping-gossipsub";
+    const payload = "ping-gossipsub-payload";
+
+    const ListenDispatch = struct {
+        node: *TestGossipsubNode,
+
+        const Self = @This();
+
+        fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            const controller = res catch return;
+            const stream = libp2p.protocols.getStream(controller) orelse return;
+            const proto = stream.negotiated_protocol orelse return;
+
+            if (std.mem.eql(u8, proto, v1_id) or std.mem.eql(u8, proto, v1_1_id)) {
+                Gossipsub.onIncomingNewStream(@ptrCast(&self.node.router), controller);
+                return;
+            }
+
+            if (std.mem.eql(u8, proto, ping.protocol_id)) {
+                return;
+            }
+
+            stream.close(null, struct {
+                fn onClosed(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+            }.onClosed);
+        }
+    };
+
+    var server: TestGossipsubNode = undefined;
+    var server_dispatch = ListenDispatch{ .node = &server };
+    try server.initWithListenCallback(allocator, server_port, .{}, &server_dispatch, ListenDispatch.callback);
+    defer server.deinit();
+
+    var client: TestGossipsubNode = undefined;
+    var client_dispatch = ListenDispatch{ .node = &client };
+    try client.initWithListenCallback(allocator, client_port, .{}, &client_dispatch, ListenDispatch.callback);
+    defer client.deinit();
+
+    try addPeerSync(&client.router, server.dial_addr);
+    try addPeerSync(&server.router, client.dial_addr);
+
+    try subscribeSync(&server.router, topic);
+    try subscribeSync(&client.router, topic);
+
+    try waitForTopicPeer(&server.router, topic, client.transport.local_peer_id, 5 * std.time.ns_per_s);
+    try waitForTopicPeer(&client.router, topic, server.transport.local_peer_id, 5 * std.time.ns_per_s);
+
+    const MessageListener = struct {
+        allocator: Allocator,
+        done: *std.atomic.Value(bool),
+        data: *?[]u8,
+        source: *?PeerId,
+        topic: []const u8,
+
+        const Self = @This();
+
+        fn handle(self: *Self, evt: Event) void {
+            switch (evt) {
+                .message => |msg| {
+                    if (!std.mem.eql(u8, msg.message.topic, self.topic)) return;
+
+                    if (self.data.*) |existing| {
+                        self.allocator.free(existing);
+                    }
+
+                    const copy = self.allocator.dupe(u8, msg.message.data) catch {
+                        self.source.* = null;
+                        self.data.* = null;
+                        self.done.store(true, .release);
+                        return;
+                    };
+
+                    self.data.* = copy;
+                    self.source.* = msg.propagation_source;
+                    self.done.store(true, .release);
+                },
+                else => {},
+            }
+        }
+
+        fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
+            const self: *Self = @ptrCast(@alignCast(instance));
+            self.handle(evt);
+        }
+
+        const vtable = event.EventListenerVTable(Event){
+            .handleFn = vtableHandleFn,
+        };
+
+        fn any(self: *Self) event.AnyEventListener(Event) {
+            return .{ .instance = @ptrCast(self), .vtable = &Self.vtable };
+        }
+    };
+
+    var message_done = std.atomic.Value(bool).init(false);
+    var message_data: ?[]u8 = null;
+    errdefer if (message_data) |data_copy| allocator.free(data_copy);
+    var message_source: ?PeerId = null;
+
+    var listener = MessageListener{
+        .allocator = allocator,
+        .done = &message_done,
+        .data = &message_data,
+        .source = &message_source,
+        .topic = topic,
+    };
+    try server.router.event_emitter.addListener(.message, listener.any());
+    defer _ = server.router.event_emitter.removeListener(.message, listener.any());
+
+    var ping_addr_buf: [64]u8 = undefined;
+    const ping_addr_str = try std.fmt.bufPrint(&ping_addr_buf, "/ip4/127.0.0.1/udp/{d}", .{server_port});
+    var ping_dial_addr = try Multiaddr.fromString(allocator, ping_addr_str);
+    defer ping_dial_addr.deinit();
+    try ping_dial_addr.push(.{ .P2P = server.transport.local_peer_id });
+
+    const StreamCtx = struct {
+        event: std.Thread.ResetEvent = .{},
+        sender: ?*ping.PingSender = null,
+
+        const Self = @This();
+
+        fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            const controller = res catch {
+                self.event.set();
+                return;
+            };
+            self.sender = @ptrCast(@alignCast(controller.?));
+            self.event.set();
+        }
+    };
+
+    var stream_ctx = StreamCtx{};
+    client.sw.newStream(ping_dial_addr, &.{ping.protocol_id}, &stream_ctx, StreamCtx.callback);
+    stream_ctx.event.wait();
+    try std.testing.expect(stream_ctx.sender != null);
+    const sender = stream_ctx.sender.?;
+
+    const PingResultCtx = struct {
+        event: std.Thread.ResetEvent = .{},
+        result_ns: ?u64 = null,
+        err: ?anyerror = null,
+
+        const Self = @This();
+
+        fn callback(ctx: ?*anyopaque, res: anyerror!u64) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            self.result_ns = res catch |err| {
+                self.err = err;
+                self.result_ns = null;
+                self.event.set();
+                return;
+            };
+            self.err = null;
+            self.event.set();
+        }
+    };
+
+    var ping_ctx = PingResultCtx{};
+    try sender.ping(ping.default_timeout_ns, &ping_ctx, PingResultCtx.callback);
+    ping_ctx.event.wait();
+    try std.testing.expect(ping_ctx.err == null);
+    try std.testing.expect(ping_ctx.result_ns != null);
+    try std.testing.expect(ping_ctx.result_ns.? > 0);
+
+    sender.close(null, struct {
+        fn onClosed(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+    }.onClosed);
+
+    const recipients = try publishSync(&client.router, topic, payload, allocator);
+    defer allocator.free(recipients);
+    try std.testing.expect(recipients.len >= 1);
+
+    var saw_server = false;
+    for (recipients) |peer| {
+        if (peer.eql(&server.transport.local_peer_id)) {
+            saw_server = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_server);
+
+    try waitForFlag(&message_done, 5 * std.time.ns_per_s);
+    try std.testing.expect(message_data != null);
+    try std.testing.expect(std.mem.eql(u8, message_data.?, payload));
+    try std.testing.expect(message_source != null);
+    try std.testing.expect(message_source.?.eql(&client.transport.local_peer_id));
+
+    if (message_data) |data_copy| {
+        allocator.free(data_copy);
+        message_data = null;
+    }
+}
 
 test "pubsub add peer" {
     const allocator = std.testing.allocator;

@@ -80,10 +80,11 @@ pub const PubSubPeerProtocolHandler = struct {
     ) !void {
         const handler = self.allocator.create(PubSubPeerInitiator) catch unreachable;
         handler.* = .{
+            .controller = undefined,
+            .stream = stream,
             .callback_ctx = callback_ctx,
             .callback = callback,
             .allocator = self.allocator,
-            .stream = stream,
         };
         stream.setProtoMsgHandler(handler.any());
     }
@@ -96,11 +97,12 @@ pub const PubSubPeerProtocolHandler = struct {
     ) !void {
         const handler = self.allocator.create(PubSubPeerResponder) catch unreachable;
         handler.* = .{
+            .controller = undefined,
+            .stream = stream,
             .pubsub = undefined,
             .callback_ctx = callback_ctx,
             .callback = callback,
             .allocator = self.allocator,
-            .stream = stream,
             .received_buffer = std.fifo.LinearFifo(u8, .Dynamic).init(self.allocator),
         };
         stream.setProtoMsgHandler(handler.any());
@@ -138,18 +140,29 @@ pub const PubSubPeerProtocolHandler = struct {
 };
 
 pub const PubSubPeerInitiator = struct {
+    controller: protocols.ProtocolStreamController,
+    stream: *libp2p.QuicStream,
     callback_ctx: ?*anyopaque,
 
     callback: *const fn (ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
     allocator: std.mem.Allocator,
 
-    stream: *libp2p.QuicStream,
-
     const Self = @This();
+
+    const stream_controller_vtable = protocols.ProtocolStreamControllerVTable{
+        .getStreamFn = controllerGetStream,
+    };
+
+    fn controllerGetStream(instance: *anyopaque) *libp2p.QuicStream {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.stream;
+    }
 
     pub fn onActivated(self: *Self, stream: *libp2p.QuicStream) !void {
         self.stream = stream;
+        const instance: *anyopaque = @ptrCast(self);
+        self.controller = protocols.initStreamController(instance, &stream_controller_vtable);
         self.callback(self.callback_ctx, self);
     }
 
@@ -200,13 +213,13 @@ pub const PubSubPeerInitiator = struct {
 };
 
 pub const PubSubPeerResponder = struct {
+    controller: protocols.ProtocolStreamController,
+    stream: *libp2p.QuicStream,
     callback_ctx: ?*anyopaque,
 
     callback: *const fn (ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
     allocator: std.mem.Allocator,
-
-    stream: *libp2p.QuicStream,
 
     pubsub: PubSub,
 
@@ -214,8 +227,19 @@ pub const PubSubPeerResponder = struct {
 
     const Self = @This();
 
+    const stream_controller_vtable = protocols.ProtocolStreamControllerVTable{
+        .getStreamFn = controllerGetStream,
+    };
+
+    fn controllerGetStream(instance: *anyopaque) *libp2p.QuicStream {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.stream;
+    }
+
     pub fn onActivated(self: *Self, stream: *libp2p.QuicStream) !void {
         self.stream = stream;
+        const instance: *anyopaque = @ptrCast(self);
+        self.controller = protocols.initStreamController(instance, &stream_controller_vtable);
         self.callback(self.callback_ctx, self);
     }
 

@@ -88,10 +88,10 @@ pub const PingProtocolHandler = struct {
             return err;
         };
         handler.* = .{
+            .stream = stream,
             .allocator = self.allocator,
             .callback_ctx = callback_ctx,
             .callback = callback,
-            .stream = stream,
             .sender = null,
             .pending_request = null,
             .handler = self,
@@ -140,10 +140,11 @@ pub const PingProtocolHandler = struct {
             return err;
         };
         handler.* = .{
+            .controller = undefined,
+            .stream = stream,
             .allocator = self.allocator,
             .callback_ctx = callback_ctx,
             .callback = callback,
-            .stream = stream,
             .handler = self,
             .peer_key = peer_key,
             .pending_len = 0,
@@ -152,10 +153,6 @@ pub const PingProtocolHandler = struct {
         };
 
         stream.setProtoMsgHandler(handler.any());
-
-        // Notify the listener that the responder is ready. We simply pass the handler pointer
-        // so the listener can observe lifecycle events if desired.
-        handler.callback(handler.callback_ctx, handler);
     }
 
     fn vtableOnInitiatorStartFn(
@@ -262,16 +259,40 @@ pub const PingResultCallback = *const fn (ctx: ?*anyopaque, res: anyerror!u64) v
 
 /// Controller returned to initiators that allows issuing ping requests over an established stream.
 pub const PingSender = struct {
+    controller: protocols.ProtocolStreamController,
+    stream: *quic.QuicStream,
     initiator: *PingInitiator,
 
     const Self = @This();
+
+    const stream_controller_vtable = protocols.ProtocolStreamControllerVTable{
+        .getStreamFn = controllerGetStream,
+    };
+
+    fn controllerGetStream(instance: *anyopaque) *quic.QuicStream {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.stream;
+    }
+
+    pub fn init(stream: *quic.QuicStream, initiator: *PingInitiator) Self {
+        return .{
+            .controller = undefined,
+            .stream = stream,
+            .initiator = initiator,
+        };
+    }
+
+    pub fn setup(self: *Self) void {
+        const instance: *anyopaque = @ptrCast(self);
+        self.controller = protocols.initStreamController(instance, &stream_controller_vtable);
+    }
 
     pub fn ping(self: *Self, timeout_ns: u64, callback_ctx: ?*anyopaque, callback: PingResultCallback) !void {
         try self.initiator.beginPing(timeout_ns, callback_ctx, callback);
     }
 
     pub fn close(self: *Self, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void) void {
-        self.initiator.stream.close(callback_ctx, callback);
+        self.stream.close(callback_ctx, callback);
     }
 };
 
@@ -285,10 +306,10 @@ const PingRequest = struct {
 
 /// Handles ping messages on the initiator side.
 const PingInitiator = struct {
+    stream: *quic.QuicStream,
     allocator: std.mem.Allocator,
     callback_ctx: ?*anyopaque,
     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
-    stream: *quic.QuicStream,
     sender: ?*PingSender,
     pending_request: ?*PingRequest,
     handler: *PingProtocolHandler,
@@ -466,12 +487,14 @@ const PingInitiator = struct {
         return .disarm;
     }
 
-    fn onActivated(self: *Self, _: *quic.QuicStream) anyerror!void {
+    fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
+        self.stream = stream;
         const sender = self.allocator.create(PingSender) catch |err| {
             self.callback(self.callback_ctx, err);
             return err;
         };
-        sender.* = .{ .initiator = self };
+        sender.* = PingSender.init(stream, self);
+        sender.setup();
         self.sender = sender;
 
         self.callback(self.callback_ctx, sender);
@@ -549,10 +572,11 @@ const PingInitiator = struct {
 
 /// Handles ping messages on the responder side.
 const PingResponder = struct {
+    controller: protocols.ProtocolStreamController,
+    stream: *quic.QuicStream,
     allocator: std.mem.Allocator,
     callback_ctx: ?*anyopaque,
     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
-    stream: *quic.QuicStream,
     handler: *PingProtocolHandler,
     peer_key: []const u8,
     pending_payload: [payload_length]u8 = undefined,
@@ -561,7 +585,19 @@ const PingResponder = struct {
 
     const Self = @This();
 
-    fn onActivated(self: *Self, _: *quic.QuicStream) anyerror!void {
+    const stream_controller_vtable = protocols.ProtocolStreamControllerVTable{
+        .getStreamFn = controllerGetStream,
+    };
+
+    fn controllerGetStream(instance: *anyopaque) *quic.QuicStream {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.stream;
+    }
+
+    fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
+        self.stream = stream;
+        const instance: *anyopaque = @ptrCast(self);
+        self.controller = protocols.initStreamController(instance, &stream_controller_vtable);
         self.callback(self.callback_ctx, self);
     }
 
@@ -630,6 +666,120 @@ const PingResponder = struct {
     }
 };
 
+test "ping listen callback exposes negotiated protocol" {
+    const allocator = std.testing.allocator;
+    const tls = libp2p.security.tls;
+    const ssl = @import("ssl");
+    const keys = @import("peer_id").keys;
+    const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+    const quic_transport = libp2p.transport.quic;
+
+    var server_loop: io_loop.ThreadEventLoop = undefined;
+    try server_loop.init(allocator);
+    defer {
+        server_loop.close();
+        server_loop.deinit();
+    }
+
+    const server_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(server_key);
+
+    var server_transport: quic_transport.QuicTransport = undefined;
+    try server_transport.init(&server_loop, server_key, keys.KeyType.ED25519, allocator);
+    defer server_transport.deinit();
+
+    var server_switch: swarm.Switch = undefined;
+    server_switch.init(allocator, &server_transport);
+    defer {
+        server_switch.stop();
+        server_switch.deinit();
+    }
+
+    var server_ping = PingProtocolHandler.init(allocator, &server_switch);
+    defer server_ping.deinit();
+
+    try server_switch.addProtocolHandler(protocol_id, server_ping.any());
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9425");
+    defer listen_addr.deinit();
+
+    const ListenCtx = struct {
+        event: std.Thread.ResetEvent = .{},
+        protocol: ?[]const u8 = null,
+
+        const Self = @This();
+
+        fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            defer self.event.set();
+
+            const controller = res catch return;
+            const stream = libp2p.protocols.getStream(controller) orelse return;
+            self.protocol = stream.negotiated_protocol;
+
+            stream.close(null, struct {
+                fn onClosed(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+            }.onClosed);
+        }
+    };
+
+    var listen_ctx = ListenCtx{};
+    try server_switch.listen(listen_addr, &listen_ctx, ListenCtx.callback);
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+
+    var server_pubkey = try tls.createProtobufEncodedPublicKey(allocator, server_key);
+    defer allocator.free(server_pubkey.data.?);
+    const server_peer_id = try PeerId.fromPublicKey(allocator, &server_pubkey);
+
+    var client_loop: io_loop.ThreadEventLoop = undefined;
+    try client_loop.init(allocator);
+    defer {
+        client_loop.close();
+        client_loop.deinit();
+    }
+
+    const client_key = try tls.generateKeyPair(keys.KeyType.ED25519);
+    defer ssl.EVP_PKEY_free(client_key);
+
+    var client_transport: quic_transport.QuicTransport = undefined;
+    try client_transport.init(&client_loop, client_key, keys.KeyType.ED25519, allocator);
+    defer client_transport.deinit();
+
+    var client_switch: swarm.Switch = undefined;
+    client_switch.init(allocator, &client_transport);
+    defer {
+        client_switch.stop();
+        client_switch.deinit();
+    }
+
+    var client_ping = PingProtocolHandler.init(allocator, &client_switch);
+    defer client_ping.deinit();
+
+    try client_switch.addProtocolHandler(protocol_id, client_ping.any());
+
+    var dial_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9425");
+    defer dial_addr.deinit();
+    try dial_addr.push(.{ .P2P = server_peer_id });
+
+    client_switch.newStream(dial_addr, &.{protocol_id}, null, struct {
+        fn callback(_: ?*anyopaque, res: anyerror!?*anyopaque) void {
+            const controller = res catch return;
+            if (libp2p.protocols.getStream(controller)) |stream| {
+                stream.close(null, struct {
+                    fn onClosed(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                }.onClosed);
+            }
+        }
+    }.callback);
+
+    listen_ctx.event.wait();
+    try std.testing.expect(listen_ctx.protocol != null);
+    try std.testing.expect(std.mem.eql(u8, listen_ctx.protocol.?, protocol_id));
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+}
+
 test "ping protocol round trip" {
     const allocator = std.testing.allocator;
     const tls = libp2p.security.tls;
@@ -672,7 +822,15 @@ test "ping protocol round trip" {
 
     try server_switch.listen(listen_addr, null, struct {
         fn onStream(_: ?*anyopaque, res: anyerror!?*anyopaque) void {
-            _ = res catch {};
+            const controller = res catch |err| {
+                std.log.err("failed to accept incoming ping stream: {any}", .{err});
+                return;
+            };
+            const stream = protocols.getStream(controller) orelse {
+                std.log.err("controller did not expose a stream", .{});
+                return;
+            };
+            std.debug.print("Negotiated protocol: {s}", .{stream.negotiated_protocol.?});
         }
     }.onStream);
 
