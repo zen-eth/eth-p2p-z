@@ -93,8 +93,11 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
     });
     libp2p_lib.linkLibrary(lsquic_artifact);
-    libp2p_lib.linkSystemLibrary("zlib");
-
+    const zlib_system_name = switch (target.result.os.tag) {
+        .windows => "zlib1",
+        else => "z",
+    };
+    libp2p_lib.linkSystemLibrary(zlib_system_name);
     b.installArtifact(libp2p_lib);
 
     const libp2p_exe = b.addExecutable(.{
