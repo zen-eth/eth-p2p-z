@@ -17,8 +17,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const libxev_backend_opt = b.option([]const u8, "libxev-backend", "Select libxev backend (io_uring, epoll, kqueue, wasi_poll, iocp)");
+    const log_level_opt = b.option([]const u8, "log-level", "Set std.log level (debug, info, warn, err)");
     const build_options = b.addOptions();
     build_options.addOption(?[]const u8, "libxev_backend", libxev_backend_opt);
+    build_options.addOption(?[]const u8, "log_level", log_level_opt);
 
     const libxev_dep = b.dependency("libxev", .{
         .target = target,

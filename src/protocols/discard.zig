@@ -103,6 +103,7 @@ pub const DiscardInitiator = struct {
     pub fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
         const sender = self.allocator.create(DiscardSender) catch unreachable;
         sender.* = DiscardSender.init(stream);
+        sender.setup();
         self.sender = sender;
         self.callback(self.callback_ctx, sender);
     }
@@ -221,15 +222,31 @@ pub const DiscardResponder = struct {
 };
 
 pub const DiscardSender = struct {
+    controller: protocols.ProtocolStreamController,
     stream: *quic.QuicStream,
 
     const Self = @This();
 
     pub fn init(stream: *quic.QuicStream) Self {
         return Self{
+            .controller = undefined,
             .stream = stream,
         };
     }
+
+    pub fn setup(self: *Self) void {
+        const instance: *anyopaque = @ptrCast(self);
+        self.controller = protocols.initStreamController(instance, &stream_controller_vtable);
+    }
+
+    fn controllerGetStream(instance: *anyopaque) *quic.QuicStream {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        return self.stream;
+    }
+
+    const stream_controller_vtable = protocols.ProtocolStreamControllerVTable{
+        .getStreamFn = controllerGetStream,
+    };
 
     pub fn deinit(_: *Self) void {}
 
@@ -246,11 +263,11 @@ const TestNewStreamCallback = struct {
     const Self = @This();
     pub fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx.?));
-        const sender_ptr = res catch {
+        const controller_ptr = res catch {
             self.mutex.set();
             return;
         };
-        self.sender = @ptrCast(@alignCast(sender_ptr.?));
+        self.sender = @ptrCast(@alignCast(controller_ptr.?));
         self.mutex.set();
     }
 };

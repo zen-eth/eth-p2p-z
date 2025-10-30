@@ -20,6 +20,119 @@ const PeerId = @import("peer_id").PeerId;
 const keys = @import("peer_id").keys;
 const SecuritySession = libp2p.security.Session1;
 
+var lsquic_logger_initialized: bool = false;
+var lsquic_logger_checked_env: bool = false;
+
+fn detectLsquicLevel(line: []const u8) std.log.Level {
+    if (std.mem.indexOfScalar(u8, line, '[')) |start| {
+        if (start + 1 < line.len) {
+            if (std.mem.indexOfScalar(u8, line[start + 1 ..], ']')) |rel_end| {
+                const end = start + 1 + rel_end;
+                const tag = line[start + 1 .. end];
+                if (std.mem.eql(u8, tag, "DEBUG")) return .debug;
+                if (std.mem.eql(u8, tag, "INFO") or std.mem.eql(u8, tag, "NOTICE")) return .info;
+                if (std.mem.eql(u8, tag, "WARN") or std.mem.eql(u8, tag, "WARNING")) return .warn;
+                if (std.mem.eql(u8, tag, "ERROR") or std.mem.eql(u8, tag, "ERR") or std.mem.eql(u8, tag, "CRIT") or std.mem.eql(u8, tag, "ALERT") or std.mem.eql(u8, tag, "EMERG")) return .err;
+            }
+        }
+    }
+    return .info;
+}
+
+fn trimLsquicPrefix(line: []const u8) []const u8 {
+    var slice = line;
+    if (std.mem.indexOfScalar(u8, slice, '[')) |start| {
+        if (start + 1 < slice.len) {
+            if (std.mem.indexOfScalar(u8, slice[start + 1 ..], ']')) |rel_end| {
+                const end = start + 1 + rel_end;
+                if (end + 1 < slice.len) {
+                    slice = slice[end + 1 ..];
+                }
+            }
+        }
+    }
+    return std.mem.trim(u8, slice, " \r\n");
+}
+
+fn lsquicLogCallback(ctx: ?*anyopaque, buf: [*c]const u8, len: usize) callconv(.c) c_int {
+    _ = ctx;
+    if (len == 0 or buf == null) return 0;
+    const bytes: []const u8 = buf[0..len];
+    const level = detectLsquicLevel(bytes);
+    const payload = trimLsquicPrefix(bytes);
+    emitLsquicLog(level, payload);
+    return 0;
+}
+
+fn emitLsquicLog(level: std.log.Level, payload: []const u8) void {
+    switch (level) {
+        .err => std.log.err("lsquic: {s}", .{payload}),
+        .warn => std.log.warn("lsquic: {s}", .{payload}),
+        .info => std.log.info("lsquic: {s}", .{payload}),
+        .debug => std.log.debug("lsquic: {s}", .{payload}),
+    }
+}
+
+fn maybeInitLsquicLogger(allocator: Allocator) void {
+    if (lsquic_logger_initialized) return;
+
+    const log_level_owned = std.process.getEnvVarOwned(allocator, "LIBP2P_LSQUIC_LOG") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => {
+            if (!lsquic_logger_checked_env) {
+                std.log.debug("lsquic logger env LIBP2P_LSQUIC_LOG not set", .{});
+                lsquic_logger_checked_env = true;
+            }
+            return;
+        },
+        else => {
+            if (!lsquic_logger_checked_env) {
+                std.log.debug("lsquic logger env LIBP2P_LSQUIC_LOG unavailable ({s})", .{@errorName(err)});
+                lsquic_logger_checked_env = true;
+            }
+            return;
+        },
+    };
+    defer allocator.free(log_level_owned);
+    if (!lsquic_logger_checked_env) {
+        std.log.debug("lsquic logger env LIBP2P_LSQUIC_LOG={s}", .{log_level_owned});
+        lsquic_logger_checked_env = true;
+    }
+
+    var log_level_z = allocator.alloc(u8, log_level_owned.len + 1) catch return;
+    defer allocator.free(log_level_z);
+    std.mem.copyForwards(u8, log_level_z[0..log_level_owned.len], log_level_owned);
+    log_level_z[log_level_owned.len] = 0;
+
+    const logger_if = lsquic.struct_lsquic_logger_if{ .log_buf = lsquicLogCallback };
+    lsquic.lsquic_logger_init(&logger_if, null, lsquic.LLTS_HHMMSSUS);
+
+    const has_module_spec = std.mem.indexOfScalar(u8, log_level_owned, '=') != null;
+    const set_result = if (has_module_spec)
+        lsquic.lsquic_logger_lopt(@ptrCast(log_level_z.ptr))
+    else
+        lsquic.lsquic_set_log_level(@ptrCast(log_level_z.ptr));
+
+    if (set_result != 0) {
+        std.log.warn("failed to set LSQUIC log level to '{s}'", .{log_level_owned});
+    }
+
+    if (std.process.getEnvVarOwned(allocator, "LIBP2P_LSQUIC_LOG_OPTS")) |log_opts_owned| {
+        defer allocator.free(log_opts_owned);
+        var log_opts_z = allocator.alloc(u8, log_opts_owned.len + 1) catch {
+            lsquic_logger_initialized = true;
+            return;
+        };
+        defer allocator.free(log_opts_z);
+        std.mem.copyForwards(u8, log_opts_z[0..log_opts_owned.len], log_opts_owned);
+        log_opts_z[log_opts_owned.len] = 0;
+        if (lsquic.lsquic_logger_lopt(@ptrCast(log_opts_z.ptr)) != 0) {
+            std.log.warn("failed to apply LSQUIC logger options '{s}'", .{log_opts_owned});
+        }
+    } else |_| {}
+
+    lsquic_logger_initialized = true;
+}
+
 // Maximum stream data for bidirectional streams
 const MaxStreamDataBidiRemote = 64 * 1024 * 1024; // 64 MB
 // Maximum stream data for bidirectional streams (local side)
@@ -167,7 +280,7 @@ pub const QuicEngine = struct {
     /// doStop is a private method that stops the QUIC engine by setting the stop flag.
     /// It is called from the `stop` method to ensure that the engine stops processing connections.
     pub fn doStop(self: *QuicEngine) void {
-        std.debug.print("QuicEngine: Stopping engine...\n", .{});
+        std.log.debug("QuicEngine: Stopping engine...\n", .{});
         self.stop_flag = true;
 
         self.doCancelProcessTimer();
@@ -272,7 +385,7 @@ pub const QuicEngine = struct {
 
         const local_addr_ptr: *const lsquic.struct_sockaddr = @ptrCast(@alignCast(&self.local_address.any));
         const remote_addr_ptr: *const lsquic.struct_sockaddr = @ptrCast(@alignCast(&addrAndPeerId.address.any));
-        std.debug.print(
+        std.log.debug(
             "lsquic_engine_connect local={any} remote={any}\n",
             .{ self.local_address.any, addrAndPeerId.address.any },
         );
@@ -293,7 +406,7 @@ pub const QuicEngine = struct {
 
         if (conn_res == null) {
             const errno_val = std.posix.errno(@as(c_int, -1));
-            std.debug.print(
+            std.log.debug(
                 "lsquic_engine_connect failed errno={d} ({s})\n",
                 .{ @intFromEnum(errno_val), @tagName(errno_val) },
             );
@@ -304,7 +417,7 @@ pub const QuicEngine = struct {
             self.processConns();
             return;
         } else {
-            std.debug.print("lsquic_engine_connect returned conn_ptr={*}\n", .{conn_res});
+            std.log.debug("lsquic_engine_connect returned conn_ptr={*}\n", .{conn_res});
         }
 
         self.processConns();
@@ -349,9 +462,19 @@ pub const QuicEngine = struct {
             // which is important for maintaining the performance and responsiveness of the QUIC engine.
             // The timer is used to schedule the next processing of connections,
             // allowing the engine to handle incoming packets and manage connections efficiently.
-            const next_ms = if (diff_us >= lsquic.LSQUIC_DF_CLOCK_GRANULARITY)
-                @divFloor(@as(u64, @intCast(diff_us)), std.time.us_per_ms)
-            else if (diff_us <= 0) 0 else @divFloor(@as(u64, @intCast(lsquic.LSQUIC_DF_CLOCK_GRANULARITY)), std.time.us_per_ms);
+            const granularity_us: u64 = @as(u64, lsquic.LSQUIC_DF_CLOCK_GRANULARITY);
+            var timeout_us: u64 = granularity_us;
+            if (diff_us >= 0) {
+                timeout_us = @intCast(diff_us);
+                if (timeout_us < granularity_us) {
+                    timeout_us = granularity_us;
+                }
+            }
+
+            var next_ms = (timeout_us + std.time.us_per_ms - 1) / std.time.us_per_ms;
+            if (next_ms == 0) {
+                next_ms = 1;
+            }
             // Use separate completion for reset to avoid triggering the stop cleanup callback
             self.process_timer.reset(&self.transport.io_event_loop.loop, &self.c_process_timer, &self.c_process_timer_reset_cancel, next_ms, QuicEngine, self, processConnsCallback);
         }
@@ -865,6 +988,7 @@ pub const QuicTransport = struct {
     local_peer_id: PeerId,
 
     pub fn init(self: *QuicTransport, loop: *io_loop.ThreadEventLoop, host_keypair: *ssl.EVP_PKEY, cert_key_type: keys.KeyType, allocator: Allocator) !void {
+        maybeInitLsquicLogger(allocator);
         const result = lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT | lsquic.LSQUIC_GLOBAL_SERVER);
         if (result != 0) {
             return error.InitializationFailed;
@@ -1416,9 +1540,9 @@ test "lsquic engine initialization" {
     transport.dial(dial_ma, null, struct {
         pub fn callback(_: ?*anyopaque, res: anyerror!*QuicConnection) void {
             if (res) |conn| {
-                std.debug.print("Dialed QUIC connection successfully: {*}\n", .{conn});
+                std.log.debug("Dialed QUIC connection successfully: {*}\n", .{conn});
             } else |err| {
-                std.debug.print("Failed to dial QUIC connection: {}\n", .{err});
+                std.log.debug("Failed to dial QUIC connection: {}\n", .{err});
             }
         }
     }.callback);
