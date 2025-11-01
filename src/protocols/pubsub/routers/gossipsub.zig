@@ -2324,19 +2324,22 @@ pub const Gossipsub = struct {
     }
 
     fn sendExistingSubscriptionsToPeer(self: *Self, peer: PeerId) !void {
+        if (self.subscriptions.count() == 0) return;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
         var topic_list = std.ArrayListUnmanaged([]const u8).empty;
-        defer topic_list.deinit(self.allocator);
 
         var it = self.subscriptions.keyIterator();
         while (it.next()) |topic_ptr| {
-            try topic_list.append(self.allocator, topic_ptr.*);
+            try topic_list.append(arena_allocator, topic_ptr.*);
         }
 
         if (topic_list.items.len == 0) return;
 
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        try self.sendSubscriptions(arena.allocator(), &peer, topic_list.items, true);
+        try self.sendSubscriptions(arena_allocator, &peer, topic_list.items, true);
     }
 
     fn sendSubscriptions(self: *Self, arena: Allocator, to: *const PeerId, topics: []const []const u8, subscribe_flag: bool) !void {
