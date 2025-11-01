@@ -445,12 +445,11 @@ pub const Gossipsub = struct {
                 return;
             };
             const stream_initiator: *PubSubPeerInitiator = @ptrCast(@alignCast(initiator.?));
+            const peer_id = stream_initiator.stream.conn.security_session.?.remote_id;
 
             if (self.semiduplex) |semi_duplex| {
                 semi_duplex.initiator = stream_initiator;
             } else {
-                const peer_id = stream_initiator.stream.conn.security_session.?.remote_id;
-
                 const result = self.pubsub.peers.getOrPut(peer_id) catch |err| {
                     self.callback(self.callback_ctx, err);
                     return;
@@ -472,6 +471,10 @@ pub const Gossipsub = struct {
                 .active_callback = null,
                 .callback_ctx = self.pubsub,
                 .callback = Gossipsub.onStreamClose,
+            };
+
+            self.pubsub.sendExistingSubscriptionsToPeer(peer_id) catch |err| {
+                std.log.warn("failed to send existing subscriptions to peer {}: {}", .{ peer_id, err });
             };
 
             self.callback(self.callback_ctx, {});
@@ -2320,6 +2323,22 @@ pub const Gossipsub = struct {
         }
     }
 
+    fn sendExistingSubscriptionsToPeer(self: *Self, peer: PeerId) !void {
+        var topic_list = std.ArrayListUnmanaged([]const u8).empty;
+        defer topic_list.deinit(self.allocator);
+
+        var it = self.subscriptions.keyIterator();
+        while (it.next()) |topic_ptr| {
+            try topic_list.append(self.allocator, topic_ptr.*);
+        }
+
+        if (topic_list.items.len == 0) return;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        try self.sendSubscriptions(arena.allocator(), &peer, topic_list.items, true);
+    }
+
     fn sendSubscriptions(self: *Self, arena: Allocator, to: *const PeerId, topics: []const []const u8, subscribe_flag: bool) !void {
         var sub_opts: std.ArrayListUnmanaged(?rpc.RPC.SubOpts) = .empty;
 
@@ -3064,6 +3083,26 @@ test "gossipsub heartbeat queues graft when mesh under target" {
     try std.testing.expectEqual(p2p_conn.Direction.OUTBOUND, graft_direction.?);
 
     try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
+}
+
+test "gossipsub replays existing subscriptions to new peer" {
+    const allocator = std.testing.allocator;
+
+    var node_a: TestGossipsubNode = undefined;
+    try node_a.init(allocator, 10369, .{});
+    defer node_a.deinit();
+
+    var node_b: TestGossipsubNode = undefined;
+    try node_b.init(allocator, 10370, .{});
+    defer node_b.deinit();
+
+    const topic = "existing-subscription";
+    try subscribeSync(&node_a.router, topic);
+
+    try addPeerSync(&node_a.router, node_b.dial_addr);
+    try addPeerSync(&node_b.router, node_a.dial_addr);
+
+    try waitForTopicPeer(&node_b.router, topic, node_a.transport.local_peer_id, 5 * std.time.ns_per_s);
 }
 
 fn addPeerSync(router: *Gossipsub, addr: Multiaddr) !void {
