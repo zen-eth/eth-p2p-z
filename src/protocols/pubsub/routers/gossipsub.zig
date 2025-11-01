@@ -2337,8 +2337,6 @@ pub const Gossipsub = struct {
             try topic_list.append(arena_allocator, topic_ptr.*);
         }
 
-        if (topic_list.items.len == 0) return;
-
         try self.sendSubscriptions(arena_allocator, &peer, topic_list.items, true);
     }
 
