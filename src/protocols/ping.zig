@@ -759,7 +759,6 @@ const PingInitiator = struct {
         self.cancelTimeout();
         self.timeout_timer.deinit();
         const loop = self.handler.eventLoop();
-        _ = self.pending_loop_calls.load(.seq_cst);
         self.destroy_requested = true;
         self.scheduleDestroy(loop);
     }
