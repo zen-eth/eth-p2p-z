@@ -3519,38 +3519,17 @@ test "switch handles ping and gossipsub simultaneously" {
     defer ping_dial_addr.deinit();
     try ping_dial_addr.push(.{ .P2P = server.transport.local_peer_id });
 
-    const StreamCtx = struct {
-        event: std.Thread.ResetEvent = .{},
-        sender: ?*ping.PingSender = null,
-
-        const Self = @This();
-
-        fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx.?));
-            const controller = res catch {
-                self.event.set();
-                return;
-            };
-            self.sender = @ptrCast(@alignCast(controller.?));
-            self.event.set();
-        }
-    };
-
-    var stream_ctx = StreamCtx{};
-    client.sw.newStream(ping_dial_addr, &.{ping.protocol_id}, &stream_ctx, StreamCtx.callback);
-    stream_ctx.event.wait();
-    try std.testing.expect(stream_ctx.sender != null);
-    const sender = stream_ctx.sender.?;
-
     const PingResultCtx = struct {
         event: std.Thread.ResetEvent = .{},
         result_ns: ?u64 = null,
         err: ?anyerror = null,
+        sender: ?*ping.PingStream = null,
 
         const Self = @This();
 
-        fn callback(ctx: ?*anyopaque, res: anyerror!u64) void {
+        fn callback(ctx: ?*anyopaque, sender: ?*ping.PingStream, res: anyerror!u64) void {
             const self: *Self = @ptrCast(@alignCast(ctx.?));
+            self.sender = sender;
             self.result_ns = res catch |err| {
                 self.err = err;
                 self.result_ns = null;
@@ -3563,15 +3542,29 @@ test "switch handles ping and gossipsub simultaneously" {
     };
 
     var ping_ctx = PingResultCtx{};
-    try sender.ping(ping.default_timeout_ns, &ping_ctx, PingResultCtx.callback);
+    var ping_service = ping.PingService.init(allocator, &client.sw);
+    try ping_service.ping(ping_dial_addr, .{}, &ping_ctx, PingResultCtx.callback);
     ping_ctx.event.wait();
     try std.testing.expect(ping_ctx.err == null);
     try std.testing.expect(ping_ctx.result_ns != null);
     try std.testing.expect(ping_ctx.result_ns.? > 0);
 
-    sender.close(null, struct {
-        fn onClosed(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-    }.onClosed);
+    if (ping_ctx.sender) |sender| {
+        const CloseCtx = struct {
+            event: std.Thread.ResetEvent = .{},
+
+            const Self = @This();
+
+            fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+                const self: *Self = @ptrCast(@alignCast(ctx.?));
+                self.event.set();
+            }
+        };
+
+        var close_ctx = CloseCtx{};
+        sender.close(&close_ctx, CloseCtx.callback);
+        close_ctx.event.wait();
+    }
 
     const recipients = try publishSync(&client.router, topic, payload, allocator);
     defer allocator.free(recipients);
