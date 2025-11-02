@@ -144,7 +144,7 @@ const IdleTimeoutSeconds = 120; // 2 minutes
 // Handshake timeout in microseconds
 const HandshakeTimeoutMicroseconds = 10 * std.time.us_per_s; // 10 seconds
 // SCID issuer rate
-const SCID_ISSUER_RATE = 240;
+const SCID_ISSUER_RATE = 120;
 
 const SignatureAlgs: []const u16 = &.{
     ssl.SSL_SIGN_ED25519,
