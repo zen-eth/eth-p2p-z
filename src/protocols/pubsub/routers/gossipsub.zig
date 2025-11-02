@@ -399,6 +399,7 @@ pub const Gossipsub = struct {
     heartbeat_completion: xev.Completion,
     heartbeat_cancel_completion: xev.Completion,
     heartbeat_running: bool,
+    heartbeat_stop_event: std.Thread.ResetEvent = .{},
 
     counter: std.atomic.Value(u64),
 
@@ -542,12 +543,14 @@ pub const Gossipsub = struct {
             .heartbeat_completion = .{},
             .heartbeat_cancel_completion = .{},
             .heartbeat_running = false,
+            .heartbeat_stop_event = .{},
         };
 
         self.startHeartbeatTimer();
     }
 
     pub fn deinit(self: *Self) void {
+        self.stopHeartbeatTimer();
         self.heartbeat_running = false;
 
         self.peers.deinit();
@@ -608,17 +611,50 @@ pub const Gossipsub = struct {
 
     fn startHeartbeatTimer(self: *Self) void {
         if (self.heartbeat_running) return;
-        self.heartbeat_running = true;
         if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
-            self.scheduleHeartbeat();
+            self.startHeartbeatTimerOnLoop();
         } else {
-            self.swarm.transport.io_event_loop.queueCall(Self, self, onScheduleHeartbeat) catch unreachable;
+            io_loop.ThreadEventLoop.PubsubTasks.queuePubsubStartHeartbeat(
+                self.swarm.transport.io_event_loop,
+                self.any(),
+            ) catch unreachable;
         }
     }
 
-    fn onScheduleHeartbeat(_: *io_loop.ThreadEventLoop, self: *Self) void {
-        if (!self.heartbeat_running) return;
+    fn startHeartbeatTimerOnLoop(self: *Self) void {
+        if (self.heartbeat_running) return;
+        self.heartbeat_running = true;
         self.scheduleHeartbeat();
+    }
+
+    fn stopHeartbeatTimer(self: *Self) void {
+        if (!self.heartbeat_running) return;
+        if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
+            self.stopHeartbeatTimerOnLoop();
+        } else {
+            self.heartbeat_stop_event.reset();
+            io_loop.ThreadEventLoop.PubsubTasks.queuePubsubStopHeartbeat(
+                self.swarm.transport.io_event_loop,
+                self.any(),
+            ) catch unreachable;
+            self.heartbeat_stop_event.wait();
+        }
+    }
+
+    fn stopHeartbeatTimerOnLoop(self: *Self) void {
+        if (!self.heartbeat_running) {
+            self.heartbeat_stop_event.set();
+            return;
+        }
+        self.heartbeat_running = false;
+        self.heartbeat_timer.cancel(
+            &self.swarm.transport.io_event_loop.loop,
+            &self.heartbeat_completion,
+            &self.heartbeat_cancel_completion,
+            Self,
+            self,
+            heartbeatCancelCallback,
+        );
     }
 
     fn scheduleHeartbeat(self: *Self) void {
@@ -646,6 +682,7 @@ pub const Gossipsub = struct {
         const self = ctx.?;
 
         _ = r catch |err| {
+            if (err == error.Canceled) return .disarm;
             std.log.warn("heartbeat timer failed: {}", .{err});
             return .disarm;
         };
@@ -658,6 +695,19 @@ pub const Gossipsub = struct {
 
         self.scheduleHeartbeat();
 
+        return .disarm;
+    }
+
+    fn heartbeatCancelCallback(
+        ctx: ?*Self,
+        loop: *xev.Loop,
+        _: *xev.Completion,
+        _: xev.Timer.CancelError!void,
+    ) xev.CallbackAction {
+        if (ctx) |self| {
+            self.heartbeat_stop_event.set();
+        }
+        if (loop.stopped()) return .disarm;
         return .disarm;
     }
 
@@ -2813,6 +2863,16 @@ pub const Gossipsub = struct {
         self.unsubscribe(topic, callback_ctx, callback);
     }
 
+    fn vtableStartHeartbeatFn(instance: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        self.startHeartbeatTimerOnLoop();
+    }
+
+    fn vtableStopHeartbeatFn(instance: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(instance));
+        self.stopHeartbeatTimerOnLoop();
+    }
+
     fn vtableGetAllocatorFn(instance: *anyopaque) Allocator {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.getAllocator();
@@ -2827,6 +2887,8 @@ pub const Gossipsub = struct {
         .publishFn = vtablePublishFn,
         .publishOwnedFn = vtablePublishOwnedFn,
         .unsubscribeFn = vtableUnsubscribeFn,
+        .startHeartbeatFn = vtableStartHeartbeatFn,
+        .stopHeartbeatFn = vtableStopHeartbeatFn,
         .getAllocatorFn = vtableGetAllocatorFn,
     };
 

@@ -65,6 +65,40 @@ pub fn extend(comptime Loop: type) type {
             try self.queueCallWithDeinit(PubsubRemovePeerTask, task, runPubsubRemovePeer, Loop.makeDestroyTask(PubsubRemovePeerTask));
         }
 
+        const PubsubStartHeartbeatTask = struct {
+            ps: pubsub.PubSub,
+        };
+
+        fn runPubsubStartHeartbeat(_: *Loop, ctx: *PubsubStartHeartbeatTask) void {
+            ctx.ps.startHeartbeat();
+        }
+
+        pub fn queuePubsubStartHeartbeat(self: *Loop, ps: pubsub.PubSub) !void {
+            const task = try self.allocator.create(PubsubStartHeartbeatTask);
+            task.* = .{
+                .ps = ps,
+            };
+            errdefer self.allocator.destroy(task);
+            try self.queueCallWithDeinit(PubsubStartHeartbeatTask, task, runPubsubStartHeartbeat, Loop.makeDestroyTask(PubsubStartHeartbeatTask));
+        }
+
+        const PubsubStopHeartbeatTask = struct {
+            ps: pubsub.PubSub,
+        };
+
+        fn runPubsubStopHeartbeat(_: *Loop, ctx: *PubsubStopHeartbeatTask) void {
+            ctx.ps.stopHeartbeat();
+        }
+
+        pub fn queuePubsubStopHeartbeat(self: *Loop, ps: pubsub.PubSub) !void {
+            const task = try self.allocator.create(PubsubStopHeartbeatTask);
+            task.* = .{
+                .ps = ps,
+            };
+            errdefer self.allocator.destroy(task);
+            try self.queueCallWithDeinit(PubsubStopHeartbeatTask, task, runPubsubStopHeartbeat, Loop.makeDestroyTask(PubsubStopHeartbeatTask));
+        }
+
         const PubsubSubscribeTask = struct {
             ps: pubsub.PubSub,
             topic: []const u8,
@@ -254,6 +288,14 @@ test "queuePubsubPublish transfers ownership without duplicating buffers" {
         fn unexpectedPublish(_: *anyopaque, _: []const u8, _: []const u8, _: ?*anyopaque, _: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
             @panic("unexpected publish call");
         }
+
+        fn unexpectedStartHeartbeat(_: *anyopaque) void {
+            @panic("unexpected startHeartbeat call");
+        }
+
+        fn unexpectedStopHeartbeat(_: *anyopaque) void {
+            @panic("unexpected stopHeartbeat call");
+        }
     };
 
     const PubsubTasks = extend(MockLoop);
@@ -269,6 +311,8 @@ test "queuePubsubPublish transfers ownership without duplicating buffers" {
         .unsubscribeFn = MockRouter.unexpectedUnsubscribe,
         .publishFn = MockRouter.unexpectedPublish,
         .publishOwnedFn = MockRouter.publishOwnedFn,
+        .startHeartbeatFn = MockRouter.unexpectedStartHeartbeat,
+        .stopHeartbeatFn = MockRouter.unexpectedStopHeartbeat,
         .getAllocatorFn = MockRouter.getAllocatorFn,
     };
 
