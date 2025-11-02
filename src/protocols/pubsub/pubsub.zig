@@ -169,6 +169,8 @@ pub const PubSubVTable = struct {
     unsubscribeFn: *const fn (self: *anyopaque, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void,
     publishFn: *const fn (self: *anyopaque, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void,
     publishOwnedFn: *const fn (self: *anyopaque, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void,
+    startHeartbeatFn: *const fn (self: *anyopaque) void,
+    stopHeartbeatFn: *const fn (self: *anyopaque) void,
     getAllocatorFn: *const fn (self: *anyopaque) std.mem.Allocator,
 };
 
@@ -197,6 +199,14 @@ pub const PubSub = struct {
 
     pub fn subscribe(self: Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
         self.vtable.subscribeFn(self.instance, topic, callback_ctx, callback);
+    }
+
+    pub fn startHeartbeat(self: Self) void {
+        self.vtable.startHeartbeatFn(self.instance);
+    }
+
+    pub fn stopHeartbeat(self: Self) void {
+        self.vtable.stopHeartbeatFn(self.instance);
     }
     pub fn unsubscribe(self: Self, topic: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void) void {
         self.vtable.unsubscribeFn(self.instance, topic, callback_ctx, callback);
