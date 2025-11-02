@@ -301,44 +301,21 @@ fn parseBool(value: []const u8) !bool {
     return error.InvalidBoolean;
 }
 
-const StreamCtx = struct {
-    event: std.Thread.ResetEvent = .{},
-    sender: ?*ping.PingSender = null,
-    err: ?anyerror = null,
-
-    fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
-        const self: *StreamCtx = @ptrCast(@alignCast(ctx.?));
-        const controller = res catch |err| {
-            self.err = err;
-            self.event.set();
-            return;
-        };
-        self.sender = @ptrCast(@alignCast(controller.?));
-        self.event.set();
-    }
-};
-
 const PingResultCtx = struct {
     event: std.Thread.ResetEvent = .{},
     result_ns: ?u64 = null,
     err: ?anyerror = null,
+    sender: ?*ping.PingStream = null,
 
-    fn callback(ctx: ?*anyopaque, res: anyerror!u64) void {
+    fn callback(ctx: ?*anyopaque, sender: ?*ping.PingStream, res: anyerror!u64) void {
         const self: *PingResultCtx = @ptrCast(@alignCast(ctx.?));
         self.result_ns = res catch |err| {
             self.err = err;
+            self.sender = sender;
             self.event.set();
             return;
         };
-        self.event.set();
-    }
-};
-
-const CloseCtx = struct {
-    event: std.Thread.ResetEvent = .{},
-
-    fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
-        const self: *CloseCtx = @ptrCast(@alignCast(ctx.?));
+        self.sender = sender;
         self.event.set();
     }
 };
@@ -556,18 +533,6 @@ fn runDialer(
     var remote_addr = try Multiaddr.fromString(allocator, trimmed);
     defer remote_addr.deinit();
 
-    var stream_ctx = StreamCtx{};
-    const proposed = [_][]const u8{ping.protocol_id};
-    std.debug.print("interop[dialer] -> creating stream with proposed protocols\n", .{});
-    switcher.newStream(remote_addr, &proposed, &stream_ctx, StreamCtx.callback);
-    stream_ctx.event.wait();
-    if (stream_ctx.err) |err| {
-        std.debug.print("interop[dialer] -> stream creation failed: {any}\n", .{err});
-        return err;
-    }
-    std.debug.print("interop[dialer] -> stream created successfully\n", .{});
-    const sender = stream_ctx.sender orelse return error.UnableToOpenPingStream;
-
     var ping_ctx = PingResultCtx{};
     var timer = try std.time.Timer.start();
     const timeout_ns = @as(u128, env.timeout_seconds) * std.time.ns_per_s;
@@ -576,8 +541,27 @@ fn runDialer(
     else
         @intCast(timeout_ns);
     std.debug.print("interop[dialer] -> initiating ping\n", .{});
-    try sender.ping(ping_timeout_ns, &ping_ctx, PingResultCtx.callback);
+    var ping_service = ping.PingService.init(allocator, switcher);
+    try ping_service.ping(remote_addr, .{ .timeout_ns = ping_timeout_ns }, &ping_ctx, PingResultCtx.callback);
     ping_ctx.event.wait();
+
+    if (ping_ctx.sender) |sender| {
+        const CloseCtx = struct {
+            event: std.Thread.ResetEvent = .{},
+
+            const Self = @This();
+
+            fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+                const self: *Self = @ptrCast(@alignCast(ctx.?));
+                self.event.set();
+            }
+        };
+
+        var close_ctx = CloseCtx{};
+        sender.close(&close_ctx, CloseCtx.callback);
+        close_ctx.event.wait();
+    }
+
     if (ping_ctx.err) |err| {
         std.debug.print("interop[dialer] -> ping failed: {any}\n", .{err});
         return err;
@@ -585,10 +569,6 @@ fn runDialer(
     std.debug.print("interop[dialer] -> ping completed successfully\n", .{});
     const rtt_ns = ping_ctx.result_ns orelse return error.PingFailed;
     const total_ns = timer.read();
-
-    var close_ctx = CloseCtx{};
-    sender.close(&close_ctx, CloseCtx.callback);
-    close_ctx.event.wait();
 
     const handshake_ms = @as(f64, @floatFromInt(total_ns)) / @as(f64, std.time.ns_per_ms);
     const ping_ms = @as(f64, @floatFromInt(rtt_ns)) / @as(f64, std.time.ns_per_ms);

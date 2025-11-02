@@ -1037,7 +1037,12 @@ pub const QuicTransport = struct {
     /// If the connection fails, it invokes the callback with an error.
     /// This is not thread-safe and should not be called from multiple threads concurrently.
     /// Queueuing this operation is recommended.
-    pub fn dial(self: *QuicTransport, peer_address: Multiaddr, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
+    pub fn dial(
+        self: *QuicTransport,
+        peer_address: Multiaddr,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
+    ) void {
         var dialer = self.getOrCreateDialer(peer_address) catch |err| {
             callback(callback_ctx, err);
             return;
@@ -1049,7 +1054,11 @@ pub const QuicTransport = struct {
     /// Creates a new QUIC listener that listens for incoming connections.
     /// The listener is initialized with the provided listen callback and context.
     /// The listener can be used to accept incoming QUIC connections.
-    pub fn newListener(self: *QuicTransport, listen_callback_ctx: ?*anyopaque, listen_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) QuicListener {
+    pub fn newListener(
+        self: *QuicTransport,
+        listen_callback_ctx: ?*anyopaque,
+        listen_callback: *const fn (ctx: ?*anyopaque, res: anyerror!*QuicConnection) void,
+    ) QuicListener {
         var listener: QuicListener = undefined;
         listener.init(self, listen_callback_ctx, listen_callback);
         return listener;

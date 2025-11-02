@@ -40,9 +40,19 @@ pub fn getStream(controller: ?*anyopaque) ?*quic.QuicStream {
 /// It registers the protocol handler with the QUIC transport and provides
 /// methods to handle protocol-specific messages.
 pub const ProtocolHandlerVTable = struct {
-    onInitiatorStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) anyerror!void,
+    onInitiatorStartFn: *const fn (
+        instance: *anyopaque,
+        stream: *quic.QuicStream,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
+    ) anyerror!void,
 
-    onResponderStartFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) anyerror!void,
+    onResponderStartFn: *const fn (
+        instance: *anyopaque,
+        stream: *quic.QuicStream,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
+    ) anyerror!void,
 };
 
 /// This struct represents a protocol handler that can be used with the QUIC transport.
@@ -69,11 +79,21 @@ pub const AnyProtocolHandler = struct {
 /// The methods are called when the protocol is activated, when a message is received,
 /// and when the stream is closed.
 pub const ProtocolMessageHandlerVTable = struct {
-    onActivatedFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream) anyerror!void,
+    onActivatedFn: *const fn (
+        instance: *anyopaque,
+        stream: *quic.QuicStream,
+    ) anyerror!void,
 
-    onMessageFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream, message: []const u8) anyerror!void,
+    onMessageFn: *const fn (
+        instance: *anyopaque,
+        stream: *quic.QuicStream,
+        message: []const u8,
+    ) anyerror!void,
 
-    onCloseFn: *const fn (instance: *anyopaque, stream: *quic.QuicStream) anyerror!void,
+    onCloseFn: *const fn (
+        instance: *anyopaque,
+        stream: *quic.QuicStream,
+    ) anyerror!void,
 };
 
 /// This struct represents a protocol message handler that can be used with the QUIC transport.
