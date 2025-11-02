@@ -1029,23 +1029,6 @@ test "ping listen callback exposes negotiated protocol" {
     try std.testing.expect(listen_ctx.protocol != null);
     try std.testing.expect(std.mem.eql(u8, listen_ctx.protocol.?, protocol_id));
 
-    if (listen_ctx.stream) |server_stream| {
-        const CloseCtx = struct {
-            event: std.Thread.ResetEvent = .{},
-
-            const Self = @This();
-
-            fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
-                const self: *Self = @ptrCast(@alignCast(ctx.?));
-                self.event.set();
-            }
-        };
-
-        var close_ctx = CloseCtx{};
-        server_stream.close(&close_ctx, CloseCtx.callback);
-        close_ctx.event.wait();
-    }
-
     std.time.sleep(200 * std.time.ns_per_ms);
 }
 
