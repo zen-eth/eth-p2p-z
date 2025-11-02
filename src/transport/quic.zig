@@ -143,6 +143,8 @@ const MaxStreamsBidi = 1000;
 const IdleTimeoutSeconds = 120; // 2 minutes
 // Handshake timeout in microseconds
 const HandshakeTimeoutMicroseconds = 10 * std.time.us_per_s; // 10 seconds
+// SCID issuer rate
+const SCID_ISSUER_RATE = 240;
 
 const SignatureAlgs: []const u16 = &.{
     ssl.SSL_SIGN_ED25519,
@@ -233,6 +235,7 @@ pub const QuicEngine = struct {
         engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
         engine_settings.es_idle_timeout = IdleTimeoutSeconds;
         engine_settings.es_handshake_to = HandshakeTimeoutMicroseconds;
+        engine_settings.es_scid_iss_rate = SCID_ISSUER_RATE;
 
         var err_buf: [100]u8 = undefined;
         if (lsquic.lsquic_engine_check_settings(
