@@ -551,7 +551,6 @@ pub const Gossipsub = struct {
 
     pub fn deinit(self: *Self) void {
         self.stopHeartbeatTimer();
-        self.heartbeat_running = false;
 
         self.peers.deinit();
 
@@ -610,7 +609,6 @@ pub const Gossipsub = struct {
     }
 
     fn startHeartbeatTimer(self: *Self) void {
-        if (self.heartbeat_running) return;
         if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
             self.startHeartbeatTimerOnLoop();
         } else {
@@ -628,7 +626,6 @@ pub const Gossipsub = struct {
     }
 
     fn stopHeartbeatTimer(self: *Self) void {
-        if (!self.heartbeat_running) return;
         if (self.swarm.transport.io_event_loop.inEventLoopThread()) {
             self.stopHeartbeatTimerOnLoop();
         } else {
