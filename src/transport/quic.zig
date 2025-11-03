@@ -146,7 +146,7 @@ const HandshakeTimeoutMicroseconds = 10 * std.time.us_per_s; // 10 seconds
 // BBR congestion control algorithm
 const CCAlgoBBR: c_int = 2;
 // Source Connection ID Issuance Rate
-const SCIDIssRate: c_int = 300; // 300 SCIDs per minute
+const SCIDIssRate: c_int = 360; // 360 SCIDs per minute
 // Enable Explicit Congestion Notification (ECN)
 const EnableECN: c_int = 1;
 // Enable Packet Pacing
