@@ -230,7 +230,8 @@ pub const QuicEngine = struct {
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
         engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
-        engine_settings.es_cc_algo = CCAlgoBBR;
+        // engine_settings.es_cc_algo = CCAlgoBBR;
+        engine_settings.es_scid_len = 4;
         engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
         engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
         engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
