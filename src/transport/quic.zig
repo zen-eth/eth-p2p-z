@@ -147,10 +147,6 @@ const HandshakeTimeoutMicroseconds = 10 * std.time.us_per_s; // 10 seconds
 const CCAlgoBBR: c_int = 2;
 // Source Connection ID Issuance Rate
 const SCIDIssRate: c_int = 360; // 360 SCIDs per minute
-// Enable Explicit Congestion Notification (ECN)
-const EnableECN: c_int = 1;
-// Enable Packet Pacing
-const EnablePacketPacing: c_int = 1;
 
 const SignatureAlgs: []const u16 = &.{
     ssl.SSL_SIGN_ED25519,
@@ -238,8 +234,6 @@ pub const QuicEngine = struct {
         engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
         engine_settings.es_cc_algo = CCAlgoBBR;
         engine_settings.es_scid_iss_rate = SCIDIssRate;
-        engine_settings.es_pace_packets = EnablePacketPacing;
-        engine_settings.es_ecn = EnableECN;
         engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
         engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
         engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
