@@ -220,7 +220,9 @@ pub const QuicEngine = struct {
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
         engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
-        engine_settings.es_scid_iss_rate = SCID_ISSUER_RATE;
+        engine_settings.es_cc_algo = @as(c_int, 2); // BBR
+        // engine_settings.es_pace_packets = @as(c_int, 1); // Enable packet pacing
+        // engine_settings.es_ecn = @as(c_int, 1); // Enable ECN
 
         var err_buf: [100]u8 = undefined;
         if (lsquic.lsquic_engine_check_settings(
