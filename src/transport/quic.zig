@@ -145,8 +145,6 @@ const IdleTimeoutSeconds = 120; // 2 minutes
 const HandshakeTimeoutMicroseconds = 10 * std.time.us_per_s; // 10 seconds
 // BBR congestion control algorithm
 const CCAlgoBBR: c_int = 2;
-// Enable ECN
-const EnableECN: c_int = 1;
 
 const SignatureAlgs: []const u16 = &.{
     ssl.SSL_SIGN_ED25519,
@@ -233,7 +231,6 @@ pub const QuicEngine = struct {
 
         engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
         engine_settings.es_cc_algo = CCAlgoBBR;
-        engine_settings.es_ecn = EnableECN;
         engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
         engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
         engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
