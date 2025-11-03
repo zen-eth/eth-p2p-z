@@ -4259,6 +4259,14 @@ test "pubsub subscribe and publish between nodes" {
 
     std.debug.print("subscriptions: A = {d}, B = {d}\n", .{ node_a.router.subscriptions.count(), node_b.router.subscriptions.count() });
 
+    const wait_ns = 5 * std.time.ns_per_s;
+    try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, wait_ns);
+    try waitForTopicPeer(&node_b.router, topic, node_a.transport.local_peer_id, wait_ns);
+    try waitForMeshTopic(&node_a.router, topic, wait_ns);
+    try waitForMeshTopic(&node_b.router, topic, wait_ns);
+    try waitForUsableStream(&node_a.router, node_b.transport.local_peer_id, wait_ns);
+    try waitForUsableStream(&node_b.router, node_a.transport.local_peer_id, wait_ns);
+
     const MessageListener = struct {
         allocator: std.mem.Allocator,
         done: *std.atomic.Value(bool),
@@ -4370,6 +4378,7 @@ test "pubsub subscribe and publish between nodes" {
     node_a.router.publish(topic, payload, publish_ctx, PublishCallback.callback);
 
     try waitForFlag(&publish_done, 5 * std.time.ns_per_s);
+    std.debug.print("publish done on node A {?}\n", .{publish_err});
     try std.testing.expect(publish_err == null);
     try std.testing.expect(publish_recipients != null);
     try std.testing.expectEqual(@as(usize, 1), publish_recipients.?.len);
