@@ -146,7 +146,7 @@ const HandshakeTimeoutMicroseconds = 10 * std.time.us_per_s; // 10 seconds
 // BBR congestion control algorithm
 const CCAlgoBBR: c_int = 2;
 // Source Connection ID Issuance Rate
-const SCIDIssRate: c_int = 360; // 360 SCIDs per minute
+const SCIDIssRate: c_int = 120; // 120 SCIDs per minute
 
 const SignatureAlgs: []const u16 = &.{
     ssl.SSL_SIGN_ED25519,
