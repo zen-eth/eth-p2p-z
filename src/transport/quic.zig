@@ -133,8 +133,24 @@ fn maybeInitLsquicLogger(allocator: Allocator) void {
     lsquic_logger_initialized = true;
 }
 
-// SCID issuer rate limit in tokens per minute
-const SCID_ISSUER_RATE = 300; // 300 per minute
+// Maximum stream data for bidirectional streams
+const MaxStreamDataBidiRemote = 64 * 1024 * 1024; // 64 MB
+// Maximum stream data for bidirectional streams (local side)
+const MaxStreamDataBidiLocal = 64 * 1024 * 1024; // 64 MB
+// Maximum number of bidirectional streams
+const MaxStreamsBidi = 1000;
+// Idle timeout for connections in seconds
+const IdleTimeoutSeconds = 120; // 2 minutes
+// Handshake timeout in microseconds
+const HandshakeTimeoutMicroseconds = 10 * std.time.us_per_s; // 10 seconds
+// BBR congestion control algorithm
+const CCAlgoBBR: c_int = 2;
+// Source Connection ID Issuance Rate
+const SCIDIssRate: c_int = 300; // 300 SCIDs per minute
+// Enable Explicit Congestion Notification (ECN)
+const EnableECN: c_int = 1;
+// Enable Packet Pacing
+const EnablePacketPacing: c_int = 1;
 
 const SignatureAlgs: []const u16 = &.{
     ssl.SSL_SIGN_ED25519,
@@ -220,7 +236,15 @@ pub const QuicEngine = struct {
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
         engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
-        engine_settings.es_scid_iss_rate = SCID_ISSUER_RATE;
+        engine_settings.es_cc_algo = CCAlgoBBR;
+        engine_settings.es_scid_iss_rate = SCIDIssRate;
+        engine_settings.es_pace_packets = EnablePacketPacing;
+        engine_settings.es_ecn = EnableECN;
+        engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
+        engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
+        engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
+        engine_settings.es_idle_timeout = IdleTimeoutSeconds;
+        engine_settings.es_handshake_to = HandshakeTimeoutMicroseconds;
 
         var err_buf: [100]u8 = undefined;
         if (lsquic.lsquic_engine_check_settings(
