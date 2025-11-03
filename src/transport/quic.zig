@@ -133,18 +133,8 @@ fn maybeInitLsquicLogger(allocator: Allocator) void {
     lsquic_logger_initialized = true;
 }
 
-// Maximum stream data for bidirectional streams
-const MaxStreamDataBidiRemote = 64 * 1024 * 1024; // 64 MB
-// Maximum stream data for bidirectional streams (local side)
-const MaxStreamDataBidiLocal = 64 * 1024 * 1024; // 64 MB
-// Maximum number of bidirectional streams
-const MaxStreamsBidi = 1000;
-// Idle timeout for connections in seconds
-const IdleTimeoutSeconds = 120; // 2 minutes
-// Handshake timeout in microseconds
-const HandshakeTimeoutMicroseconds = 10 * std.time.us_per_s; // 10 seconds
-// SCID issuer rate
-const SCID_ISSUER_RATE = 120;
+// SCID issuer rate limit in tokens per minute
+const SCID_ISSUER_RATE = 300; // 300 per minute
 
 const SignatureAlgs: []const u16 = &.{
     ssl.SSL_SIGN_ED25519,
@@ -230,11 +220,6 @@ pub const QuicEngine = struct {
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
         engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
-        engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
-        engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
-        engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
-        engine_settings.es_idle_timeout = IdleTimeoutSeconds;
-        engine_settings.es_handshake_to = HandshakeTimeoutMicroseconds;
         engine_settings.es_scid_iss_rate = SCID_ISSUER_RATE;
 
         var err_buf: [100]u8 = undefined;
