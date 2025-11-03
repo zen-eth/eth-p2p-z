@@ -3,6 +3,8 @@ const lsquic = @cImport({
     @cInclude("lsquic_types.h");
     @cInclude("lsxpack_header.h");
 });
+extern fn lsquic_conn_retire_cid(conn: *lsquic.lsquic_conn_t) void;
+
 const std = @import("std");
 const libp2p = @import("../root.zig");
 const p2p_conn = libp2p.conn;
@@ -133,9 +135,6 @@ fn maybeInitLsquicLogger(allocator: Allocator) void {
     lsquic_logger_initialized = true;
 }
 
-// SCID issuer rate limit in tokens per minute
-const SCID_ISSUER_RATE = 300; // 300 per minute
-
 const SignatureAlgs: []const u16 = &.{
     ssl.SSL_SIGN_ED25519,
     ssl.SSL_SIGN_ECDSA_SECP256R1_SHA256,
@@ -220,7 +219,7 @@ pub const QuicEngine = struct {
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
         engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
-        engine_settings.es_cc_algo = @as(c_int, 2); // BBR
+        // engine_settings.es_cc_algo = @as(c_int, 2); // BBR
         // engine_settings.es_pace_packets = @as(c_int, 1); // Enable packet pacing
         // engine_settings.es_ecn = @as(c_int, 1); // Enable ECN
 
@@ -588,6 +587,8 @@ pub const QuicConnection = struct {
     // Callback context for when a new stream is created in the server mode.
     on_stream_ctx: ?NewStreamCtx,
 
+    retired_extra_cids: bool = false,
+
     security_session: ?SecuritySession,
 
     pub const Error = error{
@@ -672,6 +673,12 @@ pub const QuicConnection = struct {
         lsquic.lsquic_conn_make_stream(self.conn);
 
         self.engine.processConns();
+    }
+
+    fn retireExtraConnectionIds(self: *QuicConnection) void {
+        if (self.retired_extra_cids) return;
+        self.retired_extra_cids = true;
+        lsquic_conn_retire_cid(self.conn);
     }
 
     pub fn close(self: *QuicConnection, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicConnection) void) void {
@@ -1235,6 +1242,7 @@ fn onHskDone(conn: ?*lsquic.lsquic_conn_t, status: lsquic.enum_lsquic_hsk_status
                 _ = lsquic.lsquic_conn_close(conn);
                 return;
             }
+            lsquic_conn.retireExtraConnectionIds();
             lsquic_conn.connect_ctx.?.callback(lsquic_conn.connect_ctx.?.callback_ctx, lsquic_conn);
         }
     }
