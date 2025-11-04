@@ -232,13 +232,14 @@ pub const QuicEngine = struct {
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
         engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
-        engine_settings.es_cc_algo = CCAlgoBBR;
-        engine_settings.es_scid_iss_rate = SCIDIssRate;
-        engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
-        engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
-        engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
-        engine_settings.es_idle_timeout = IdleTimeoutSeconds;
-        engine_settings.es_handshake_to = HandshakeTimeoutMicroseconds;
+        // engine_settings.es_cc_algo = CCAlgoBBR;
+        // engine_settings.es_scid_iss_rate = SCIDIssRate;
+        engine_settings.es_scid_len = 20;
+        // engine_settings.es_init_max_stream_data_bidi_remote = MaxStreamDataBidiRemote;
+        // engine_settings.es_init_max_stream_data_bidi_local = MaxStreamDataBidiLocal;
+        // engine_settings.es_init_max_streams_bidi = MaxStreamsBidi;
+        // engine_settings.es_idle_timeout = IdleTimeoutSeconds;
+        // engine_settings.es_handshake_to = HandshakeTimeoutMicroseconds;
 
         var err_buf: [100]u8 = undefined;
         if (lsquic.lsquic_engine_check_settings(
