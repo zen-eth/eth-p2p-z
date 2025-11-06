@@ -12,7 +12,7 @@
     // In a future version of Zig it will be used for package deduplication.
     .version = "0.1.0",
 
-    .fingerprint = 0x227d092b812780e4,
+    .fingerprint = 0x227d092bf7bb6f72,
 
     // This field is optional.
     // This is currently advisory only; Zig does not yet do anything
@@ -44,6 +44,10 @@
         .cache = .{
             .url = "git+https://github.com/karlseguin/cache.zig#9f3329b05b3e98da928fe9988d74971da70328b4",
             .hash = "cache-0.0.0-winRwKaSAAAKIcUzY8IXwcbH050imeWPFMbPW_sCdPLF",
+        },
+        .secp256k1 = .{
+            .url = "git+https://github.com/zig-bitcoin/libsecp256k1-zig#b96922b375a601f3303bf43be1dceb3d101df6c6",
+            .hash = "secp256k1-0.0.0-AAAAAPPgAAADPOkS7brnO1B26LjbhZsxwz6Kx8a6jCwB",
         },
     },
     .paths = .{

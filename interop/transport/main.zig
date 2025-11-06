@@ -4,12 +4,11 @@ const std = @import("std");
 const libp2p = @import("zig-libp2p");
 const io_loop = libp2p.thread_event_loop;
 const quic = libp2p.transport.quic;
-const tls = libp2p.security.tls;
+const identity = libp2p.identity;
 const swarm = libp2p.swarm;
 const protocols = libp2p.protocols;
 const ping = libp2p.protocols.ping;
 const keys = @import("peer_id").keys;
-const ssl = @import("ssl");
 const multiaddr = @import("multiformats").multiaddr;
 const Multiaddr = multiaddr.Multiaddr;
 
@@ -363,11 +362,11 @@ pub fn main() !void {
         loop.deinit();
     }
 
-    const host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(host_key);
+    var host_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer host_key.deinit();
 
     var transport: quic.QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys.KeyType.ECDSA, allocator);
+    try transport.init(&loop, &host_key, keys.KeyType.ECDSA, allocator);
 
     var switcher: swarm.Switch = undefined;
     switcher.init(allocator, &transport);

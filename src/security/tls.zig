@@ -1,5 +1,7 @@
 const std = @import("std");
 const ssl = @import("ssl");
+const secp = @import("secp256k1");
+const secp_context = @import("../secp_context.zig");
 const Allocator = std.mem.Allocator;
 const keys = @import("peer_id").keys;
 const PeerId = @import("peer_id").PeerId;
@@ -53,6 +55,8 @@ pub const ExtensionData = struct {
     host_pubkey: []u8,
     signature: []u8,
 };
+
+pub const SignCallback = *const fn (ctx: ?*anyopaque, allocator: Allocator, data: []const u8) anyerror![]u8;
 
 /// Generates a new key pair based on the specified key type.
 /// This is a helper function to encapsulate the complexity of key generation using OpenSSL.
@@ -125,15 +129,17 @@ pub fn generateKeyPair(cert_key_type: keys.KeyType) !*ssl.EVP_PKEY {
 /// Builds a self-signed X.509 certificate suitable for libp2p's TLS handshake,
 /// The caller owns the returned certificate and must free it with ssl.X509.free().
 ///
-/// `hostKey` param represents host's key pair. Its private key signs the extension,
-/// and its public key is embedded in the extension.
+/// `host_public_key` contains the identity key that signs the libp2p extension.
+/// `host_sign_fn` is invoked with the corresponding context to sign the extension payload.
 /// `subjectKey` param represents the subject's key pair. Its public key is the certificate's
 /// main public key, and its private key signs the certificate.
 ///
 /// The returned certificate is owned by the caller and must be freed with `ssl.X509_free()`.
 pub fn buildCert(
     allocator: Allocator,
-    hostKey: *ssl.EVP_PKEY,
+    host_public_key: *const keys.PublicKey,
+    host_sign_ctx: ?*anyopaque,
+    host_sign_fn: SignCallback,
     subjectKey: *ssl.EVP_PKEY,
 ) !*ssl.X509 {
     const cert = ssl.X509_new() orelse return error.CertCreationFailed;
@@ -173,10 +179,16 @@ pub fn buildCert(
     @memcpy(data_to_sign[0..CertificatePrefix.len], CertificatePrefix);
     @memcpy(data_to_sign[CertificatePrefix.len..], subject_pubkey_der);
 
-    const signature = try signData(allocator, hostKey, data_to_sign);
+    const signature = host_sign_fn(host_sign_ctx, allocator, data_to_sign) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.SignDataFailed,
+    };
     defer allocator.free(signature);
 
-    const host_pubkey_proto = try createProtobufEncodedPublicKeyBuf(allocator, hostKey);
+    const host_pubkey_proto = host_public_key.encode(allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidData,
+    };
     defer allocator.free(host_pubkey_proto);
 
     var ext_value_der: [*c]u8 = null;
@@ -399,6 +411,11 @@ pub fn signData(allocator: Allocator, pkey: *ssl.EVP_PKEY, data: []const u8) ![]
     return sig_buf;
 }
 
+pub fn signDataWithTlsKey(ctx: ?*anyopaque, allocator: Allocator, data: []const u8) anyerror![]u8 {
+    const key_ptr: *ssl.EVP_PKEY = @ptrCast(@alignCast(ctx orelse return error.SignDataFailed));
+    return signData(allocator, key_ptr, data);
+}
+
 pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !struct { is_valid: bool, host_pubkey: keys.PublicKey, peer_id: PeerId } {
     const ext_data = try extractExtensionFields(allocator, cert);
     defer {
@@ -413,9 +430,6 @@ pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !st
         .data = try allocator.dupe(u8, host_pubkey_reader.getData()),
     };
     errdefer allocator.free(host_pubkey.data.?);
-
-    const evp_key = try reconstructEvpKeyFromPublicKey(&host_pubkey);
-    defer ssl.EVP_PKEY_free(evp_key);
 
     const peer_id = try PeerId.fromPublicKey(allocator, &host_pubkey);
 
@@ -434,7 +448,7 @@ pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !st
     @memcpy(data_to_verify[0..CertificatePrefix.len], CertificatePrefix);
     @memcpy(data_to_verify[CertificatePrefix.len..], cert_pubkey_der);
 
-    const is_valid = try verifySignature(evp_key, data_to_verify, ext_data.signature);
+    const is_valid = try verifyHostSignature(&host_pubkey, data_to_verify, ext_data.signature);
     return .{ .is_valid = is_valid, .host_pubkey = host_pubkey, .peer_id = peer_id };
 }
 
@@ -620,6 +634,37 @@ pub fn verifySignature(pkey: *ssl.EVP_PKEY, data: []const u8, signature: []const
     } else {
         return error.OpenSSLFailed;
     }
+}
+
+fn verifyHostSignature(host_pubkey: *const keys.PublicKey, data: []const u8, signature: []const u8) !bool {
+    switch (host_pubkey.type) {
+        .SECP256K1 => return verifySecp256k1Signature(host_pubkey.data orelse return error.InvalidData, data, signature),
+        else => {
+            const evp_key = try reconstructEvpKeyFromPublicKey(host_pubkey);
+            defer ssl.EVP_PKEY_free(evp_key);
+            return verifySignature(evp_key, data, signature);
+        },
+    }
+}
+
+fn verifySecp256k1Signature(pubkey_bytes: []const u8, data: []const u8, signature: []const u8) !bool {
+    if (signature.len == 0) return false;
+
+    const context = secp_context.get();
+    const public_key = secp.PublicKey.fromSlice(pubkey_bytes) catch return error.InvalidData;
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(data);
+    const digest = hasher.finalResult();
+
+    const message = secp.Message{ .inner = digest };
+
+    const sig = secp.ecdsa.Signature.fromDer(signature) catch return error.InvalidData;
+
+    context.verifyEcdsa(message, sig, public_key) catch {
+        return false;
+    };
+    return true;
 }
 
 /// Creates the DER-encoded value for the libp2p extension.
@@ -927,7 +972,16 @@ test "Build certificate using Ed25519 keys" {
     const subject_key = try generateKeyPair(.ED25519);
     defer ssl.EVP_PKEY_free(subject_key);
 
-    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    var host_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(host_pubkey.data.?);
+
+    const cert = try buildCert(
+        std.testing.allocator,
+        &host_pubkey,
+        @as(?*anyopaque, @ptrCast(host_key)),
+        signDataWithTlsKey,
+        subject_key,
+    );
     defer ssl.X509_free(cert);
 
     // TODO: Write the certificate to a file for checking the cert file outside, will use assert once verify side is implemented.
@@ -945,7 +999,16 @@ test "Verify certificate with Ed25519 keys" {
     const subject_key = try generateKeyPair(.ED25519);
     defer ssl.EVP_PKEY_free(subject_key);
 
-    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    var host_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(host_pubkey.data.?);
+
+    const cert = try buildCert(
+        std.testing.allocator,
+        &host_pubkey,
+        @as(?*anyopaque, @ptrCast(host_key)),
+        signDataWithTlsKey,
+        subject_key,
+    );
     defer ssl.X509_free(cert);
 
     const peer_info = try verifyAndExtractPeerInfo(std.testing.allocator, cert);
@@ -967,7 +1030,16 @@ test "Build certificate using ECDSA keys" {
     const subject_key = try generateKeyPair(.ECDSA);
     defer ssl.EVP_PKEY_free(subject_key);
 
-    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    var host_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(host_pubkey.data.?);
+
+    const cert = try buildCert(
+        std.testing.allocator,
+        &host_pubkey,
+        @as(?*anyopaque, @ptrCast(host_key)),
+        signDataWithTlsKey,
+        subject_key,
+    );
     defer ssl.X509_free(cert);
 
     const pem_buf = try x509ToPem(std.testing.allocator, cert);
@@ -984,7 +1056,16 @@ test "Verify certificate with ECDSA keys" {
     const subject_key = try generateKeyPair(.ECDSA);
     defer ssl.EVP_PKEY_free(subject_key);
 
-    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    var host_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(host_pubkey.data.?);
+
+    const cert = try buildCert(
+        std.testing.allocator,
+        &host_pubkey,
+        @as(?*anyopaque, @ptrCast(host_key)),
+        signDataWithTlsKey,
+        subject_key,
+    );
     defer ssl.X509_free(cert);
 
     const peer_info = try verifyAndExtractPeerInfo(std.testing.allocator, cert);
@@ -1006,7 +1087,16 @@ test "Build certificate using RSA keys" {
     const subject_key = try generateKeyPair(.RSA);
     defer ssl.EVP_PKEY_free(subject_key);
 
-    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    var host_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(host_pubkey.data.?);
+
+    const cert = try buildCert(
+        std.testing.allocator,
+        &host_pubkey,
+        @as(?*anyopaque, @ptrCast(host_key)),
+        signDataWithTlsKey,
+        subject_key,
+    );
     defer ssl.X509_free(cert);
 
     const pem_buf = try x509ToPem(std.testing.allocator, cert);
@@ -1028,7 +1118,16 @@ test "Verify certificate with RSA keys" {
     const subject_key = try generateKeyPair(.RSA);
     defer ssl.EVP_PKEY_free(subject_key);
 
-    const cert = try buildCert(std.testing.allocator, host_key, subject_key);
+    var host_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(host_pubkey.data.?);
+
+    const cert = try buildCert(
+        std.testing.allocator,
+        &host_pubkey,
+        @as(?*anyopaque, @ptrCast(host_key)),
+        signDataWithTlsKey,
+        subject_key,
+    );
     defer ssl.X509_free(cert);
 
     const peer_info = try verifyAndExtractPeerInfo(std.testing.allocator, cert);

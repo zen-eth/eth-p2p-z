@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 const io_loop = libp2p.thread_event_loop;
 const xev = libp2p.xev;
 const tls = libp2p.security.tls;
+const identity = libp2p.identity;
 const keys = @import("peer_id").keys;
 const ssl = @import("ssl");
 const swarm = libp2p.swarm;
@@ -359,7 +360,7 @@ pub const Gossipsub = struct {
 
     peer_id_bytes: []const u8,
 
-    sign_key: *ssl.EVP_PKEY,
+    sign_key: *identity.KeyPair,
 
     allocator: Allocator,
 
@@ -499,7 +500,7 @@ pub const Gossipsub = struct {
 
     const Self = @This();
 
-    pub fn init(self: *Self, allocator: Allocator, peer: Multiaddr, peer_id: PeerId, sign_key: *ssl.EVP_PKEY, network_swarm: *Switch, opts: Options) !void {
+    pub fn init(self: *Self, allocator: Allocator, peer: Multiaddr, peer_id: PeerId, sign_key: *identity.KeyPair, network_swarm: *Switch, opts: Options) !void {
         var seen_cache = try cache.Cache(void).init(allocator, .{});
         errdefer seen_cache.deinit();
 
@@ -1261,9 +1262,9 @@ pub const Gossipsub = struct {
 
                 const data_to_sign = try std.mem.concat(arena, u8, &.{ sign_prefix, encoded_rpc_msg });
 
-                const signature = try tls.signData(arena, self.sign_key, data_to_sign);
+                const signature = try self.sign_key.signData(arena, data_to_sign);
 
-                const host_pubkey = try tls.createProtobufEncodedPublicKey(arena, self.sign_key);
+                const host_pubkey = try self.sign_key.publicKey(arena);
 
                 const host_pubkey_proto = try host_pubkey.encode(arena);
 
@@ -3270,7 +3271,7 @@ const TestGossipsubNode = struct {
     handler: PubSubPeerProtocolHandler,
     ping_handler: ping.PingProtocolHandler,
     router: Gossipsub,
-    host_key: *ssl.EVP_PKEY,
+    host_key: identity.KeyPair,
 
     pub fn init(self: *TestGossipsubNode, allocator: Allocator, port: u16, options: Gossipsub.Options) !void {
         try self.initWithListenCallback(allocator, port, options, null, Gossipsub.onIncomingNewStream);
@@ -3297,13 +3298,13 @@ const TestGossipsubNode = struct {
         self.dial_addr = try Multiaddr.fromString(allocator, dial_str);
         errdefer self.dial_addr.deinit();
 
-        self.host_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-        errdefer ssl.EVP_PKEY_free(self.host_key);
+        self.host_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+        errdefer self.host_key.deinit();
 
         try self.loop.init(allocator);
         errdefer self.loop.deinit();
 
-        try self.transport.init(&self.loop, self.host_key, keys.KeyType.ED25519, allocator);
+        try self.transport.init(&self.loop, &self.host_key, keys.KeyType.ED25519, allocator);
         errdefer {
             self.transport.deinit();
             self.loop.deinit();
@@ -3326,7 +3327,7 @@ const TestGossipsubNode = struct {
         try self.sw.addProtocolHandler(v1_id, self.handler.any());
         try self.sw.addProtocolHandler(v1_1_id, self.handler.any());
 
-        try self.router.init(allocator, self.listen_addr, self.transport.local_peer_id, self.host_key, &self.sw, options);
+        try self.router.init(allocator, self.listen_addr, self.transport.local_peer_id, &self.host_key, &self.sw, options);
         errdefer self.router.deinit();
 
         const effective_ctx: ?*anyopaque = listen_ctx orelse @ptrCast(&self.router);
@@ -3344,7 +3345,7 @@ const TestGossipsubNode = struct {
         self.listen_addr.deinit();
         self.loop.close();
         self.loop.deinit();
-        ssl.EVP_PKEY_free(self.host_key);
+        self.host_key.deinit();
     }
 };
 

@@ -10,6 +10,7 @@ const xev = libp2p.xev;
 const io_loop = libp2p.thread_event_loop;
 const ssl = @import("ssl");
 const tls = libp2p.security.tls;
+const identity = libp2p.identity;
 const Allocator = std.mem.Allocator;
 const UDP = xev.UDP;
 const posix = std.posix;
@@ -968,7 +969,7 @@ pub const QuicTransport = struct {
 
     dialer_v6: ?QuicEngine,
 
-    host_keypair: *ssl.EVP_PKEY,
+    host_keypair: *identity.KeyPair,
 
     subject_keypair: *ssl.EVP_PKEY,
 
@@ -978,7 +979,7 @@ pub const QuicTransport = struct {
 
     local_peer_id: PeerId,
 
-    pub fn init(self: *QuicTransport, loop: *io_loop.ThreadEventLoop, host_keypair: *ssl.EVP_PKEY, cert_key_type: keys.KeyType, allocator: Allocator) !void {
+    pub fn init(self: *QuicTransport, loop: *io_loop.ThreadEventLoop, host_keypair: *identity.KeyPair, cert_key_type: keys.KeyType, allocator: Allocator) !void {
         maybeInitLsquicLogger(allocator);
         const result = lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT | lsquic.LSQUIC_GLOBAL_SERVER);
         if (result != 0) {
@@ -987,10 +988,20 @@ pub const QuicTransport = struct {
 
         const subject_keypair = try tls.generateKeyPair(cert_key_type);
 
-        const subject_cert = try tls.buildCert(allocator, host_keypair, subject_keypair);
+        var host_pubkey = try host_keypair.publicKey(allocator);
+        errdefer if (host_pubkey.data) |data| allocator.free(data);
 
-        var pubkey = try tls.createProtobufEncodedPublicKey(allocator, host_keypair);
-        defer allocator.free(pubkey.data.?);
+        const host_sign_ctx = @as(?*anyopaque, @ptrCast(host_keypair));
+
+        const subject_cert = try tls.buildCert(
+            allocator,
+            &host_pubkey,
+            host_sign_ctx,
+            identity.signWithKeyPair,
+            subject_keypair,
+        );
+
+        defer if (host_pubkey.data) |data| allocator.free(data);
 
         self.* = .{
             .ssl_context = try initSslContext(subject_keypair, subject_cert),
@@ -1002,7 +1013,7 @@ pub const QuicTransport = struct {
             .cert_key_type = cert_key_type,
             .subject_keypair = subject_keypair,
             .subject_cert = subject_cert,
-            .local_peer_id = try PeerId.fromPublicKey(allocator, &pubkey),
+            .local_peer_id = try PeerId.fromPublicKey(allocator, &host_pubkey),
         };
     }
 
@@ -1466,20 +1477,11 @@ test "lsquic transport initialization" {
         loop.deinit();
     }
 
-    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
-        return error.OpenSSLFailed;
-    }
-    var maybe_host_key: ?*ssl.EVP_PKEY = null;
-    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
-        return error.OpenSSLFailed;
-    }
-    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
-
-    defer ssl.EVP_PKEY_free(host_key);
+    var host_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer host_key.deinit();
 
     var transport: QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys.KeyType.ECDSA, std.testing.allocator);
+    try transport.init(&loop, &host_key, keys.KeyType.ECDSA, std.testing.allocator);
 
     defer {
         transport.stop() catch |err| {
@@ -1497,20 +1499,11 @@ test "lsquic engine initialization" {
         loop.deinit();
     }
 
-    const pctx = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-    if (ssl.EVP_PKEY_keygen_init(pctx) == 0) {
-        return error.OpenSSLFailed;
-    }
-    var maybe_host_key: ?*ssl.EVP_PKEY = null;
-    if (ssl.EVP_PKEY_keygen(pctx, &maybe_host_key) == 0) {
-        return error.OpenSSLFailed;
-    }
-    const host_key = maybe_host_key orelse return error.OpenSSLFailed;
-
-    defer ssl.EVP_PKEY_free(host_key);
+    var host_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer host_key.deinit();
 
     var transport: QuicTransport = undefined;
-    try transport.init(&loop, host_key, keys.KeyType.ED25519, std.testing.allocator);
+    try transport.init(&loop, &host_key, keys.KeyType.ED25519, std.testing.allocator);
     defer {
         transport.stop() catch |err| {
             std.log.err("Failed to stop transport: {}", .{err});
@@ -1518,18 +1511,9 @@ test "lsquic engine initialization" {
         transport.deinit();
     }
 
-    const pctx1 = ssl.EVP_PKEY_CTX_new_id(ssl.EVP_PKEY_ED25519, null) orelse return error.OpenSSLFailed;
-    if (ssl.EVP_PKEY_keygen_init(pctx1) == 0) {
-        return error.OpenSSLFailed;
-    }
-    var maybe_cl_host_key: ?*ssl.EVP_PKEY = null;
-    if (ssl.EVP_PKEY_keygen(pctx1, &maybe_cl_host_key) == 0) {
-        return error.OpenSSLFailed;
-    }
-    const cl_host_key = maybe_cl_host_key orelse return error.OpenSSLFailed;
-
-    defer ssl.EVP_PKEY_free(cl_host_key);
-    var pubkey1 = try tls.createProtobufEncodedPublicKey(std.testing.allocator, cl_host_key);
+    var cl_host_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer cl_host_key.deinit();
+    var pubkey1 = try cl_host_key.publicKey(std.testing.allocator);
     defer std.testing.allocator.free(pubkey1.data.?);
     const cl_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &pubkey1);
 
