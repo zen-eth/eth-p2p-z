@@ -57,6 +57,12 @@ pub fn build(b: *std.Build) void {
     });
     const cache_module = cache_dep.module("cache");
 
+    const secp_dep = b.dependency("secp256k1", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const secp_module = secp_dep.module("secp256k1");
+
     const protobuf = ProtoGenStep.create(
         b,
         .{
@@ -84,6 +90,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("gremlin", gremlin_module);
     root_module.addImport("peer_id", peer_id_module);
     root_module.addImport("cache", cache_module);
+    root_module.addImport("secp256k1", secp_module);
 
     const libp2p_lib = b.addLibrary(.{
         .name = "zig-libp2p",
@@ -114,6 +121,7 @@ pub fn build(b: *std.Build) void {
     libp2p_exe.root_module.addImport("gremlin", gremlin_module);
     libp2p_exe.root_module.addImport("peer_id", peer_id_module);
     libp2p_exe.root_module.addImport("cache", cache_module);
+    libp2p_exe.root_module.addImport("secp256k1", secp_module);
     libp2p_exe.step.dependOn(&protobuf.step);
 
     libp2p_exe.linkLibrary(lsquic_artifact);
@@ -135,6 +143,7 @@ pub fn build(b: *std.Build) void {
     transport_interop_exe.root_module.addImport("peer_id", peer_id_module);
     transport_interop_exe.root_module.addImport("cache", cache_module);
     transport_interop_exe.root_module.addImport("zig-libp2p", root_module);
+    transport_interop_exe.root_module.addImport("secp256k1", secp_module);
     transport_interop_exe.step.dependOn(&protobuf.step);
     transport_interop_exe.linkLibrary(lsquic_artifact);
     transport_interop_exe.linkSystemLibrary(zlib_system_name);
@@ -202,6 +211,7 @@ pub fn build(b: *std.Build) void {
     libp2p_exe_unit_tests.root_module.addImport("peer_id", peer_id_module);
     libp2p_exe_unit_tests.root_module.addImport("ssl", ssl_module);
     libp2p_exe_unit_tests.root_module.addImport("cache", cache_module);
+    libp2p_exe_unit_tests.root_module.addImport("secp256k1", secp_module);
     libp2p_exe_unit_tests.step.dependOn(&protobuf.step);
 
     libp2p_exe_unit_tests.linkLibrary(lsquic_artifact);

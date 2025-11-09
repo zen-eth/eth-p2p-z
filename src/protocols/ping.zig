@@ -8,6 +8,8 @@ const Multiaddr = multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 const io_loop = libp2p.thread_event_loop;
 const xev = libp2p.xev;
+const identity = libp2p.identity;
+const keys = @import("peer_id").keys;
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic;
 
@@ -887,9 +889,6 @@ const PingResponder = struct {
 
 test "ping listen callback exposes negotiated protocol" {
     const allocator = std.testing.allocator;
-    const tls = libp2p.security.tls;
-    const ssl = @import("ssl");
-    const keys = @import("peer_id").keys;
     const quic_transport = libp2p.transport.quic;
 
     var server_loop: io_loop.ThreadEventLoop = undefined;
@@ -899,11 +898,11 @@ test "ping listen callback exposes negotiated protocol" {
         server_loop.deinit();
     }
 
-    const server_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(server_key);
+    var server_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer server_key.deinit();
 
     var server_transport: quic_transport.QuicTransport = undefined;
-    try server_transport.init(&server_loop, server_key, keys.KeyType.ED25519, allocator);
+    try server_transport.init(&server_loop, &server_key, keys.KeyType.ED25519, allocator);
     defer server_transport.deinit();
 
     var server_switch: swarm.Switch = undefined;
@@ -944,7 +943,7 @@ test "ping listen callback exposes negotiated protocol" {
 
     std.time.sleep(200 * std.time.ns_per_ms);
 
-    var server_pubkey = try tls.createProtobufEncodedPublicKey(allocator, server_key);
+    var server_pubkey = try server_key.publicKey(allocator);
     defer allocator.free(server_pubkey.data.?);
     const server_peer_id = try PeerId.fromPublicKey(allocator, &server_pubkey);
 
@@ -955,11 +954,11 @@ test "ping listen callback exposes negotiated protocol" {
         client_loop.deinit();
     }
 
-    const client_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(client_key);
+    var client_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer client_key.deinit();
 
     var client_transport: quic_transport.QuicTransport = undefined;
-    try client_transport.init(&client_loop, client_key, keys.KeyType.ED25519, allocator);
+    try client_transport.init(&client_loop, &client_key, keys.KeyType.ED25519, allocator);
     defer client_transport.deinit();
 
     var client_switch: swarm.Switch = undefined;
@@ -1033,9 +1032,6 @@ test "ping listen callback exposes negotiated protocol" {
 
 test "ping protocol round trip" {
     const allocator = std.testing.allocator;
-    const tls = libp2p.security.tls;
-    const ssl = @import("ssl");
-    const keys = @import("peer_id").keys;
     const quic_transport = libp2p.transport.quic;
 
     var server_loop: io_loop.ThreadEventLoop = undefined;
@@ -1045,11 +1041,11 @@ test "ping protocol round trip" {
         server_loop.deinit();
     }
 
-    const server_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(server_key);
+    var server_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer server_key.deinit();
 
     var server_transport: quic_transport.QuicTransport = undefined;
-    try server_transport.init(&server_loop, server_key, keys.KeyType.ED25519, allocator);
+    try server_transport.init(&server_loop, &server_key, keys.KeyType.ED25519, allocator);
 
     var server_switch: swarm.Switch = undefined;
     server_switch.init(allocator, &server_transport);
@@ -1063,7 +1059,7 @@ test "ping protocol round trip" {
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
 
-    var server_pubkey = try tls.createProtobufEncodedPublicKey(allocator, server_key);
+    var server_pubkey = try server_key.publicKey(allocator);
     defer allocator.free(server_pubkey.data.?);
     const server_peer_id = try PeerId.fromPublicKey(allocator, &server_pubkey);
 
@@ -1092,11 +1088,11 @@ test "ping protocol round trip" {
         client_loop.deinit();
     }
 
-    const client_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(client_key);
+    var client_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer client_key.deinit();
 
     var client_transport: quic_transport.QuicTransport = undefined;
-    try client_transport.init(&client_loop, client_key, keys.KeyType.ED25519, allocator);
+    try client_transport.init(&client_loop, &client_key, keys.KeyType.ED25519, allocator);
 
     var client_switch: swarm.Switch = undefined;
     client_switch.init(allocator, &client_transport);
@@ -1167,9 +1163,6 @@ test "ping protocol round trip" {
 
 test "ping multiaddr round trip" {
     const allocator = std.testing.allocator;
-    const tls = libp2p.security.tls;
-    const ssl = @import("ssl");
-    const keys = @import("peer_id").keys;
     const quic_transport = libp2p.transport.quic;
 
     var server_loop: io_loop.ThreadEventLoop = undefined;
@@ -1179,11 +1172,11 @@ test "ping multiaddr round trip" {
         server_loop.deinit();
     }
 
-    const server_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(server_key);
+    var server_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer server_key.deinit();
 
     var server_transport: quic_transport.QuicTransport = undefined;
-    try server_transport.init(&server_loop, server_key, keys.KeyType.ED25519, allocator);
+    try server_transport.init(&server_loop, &server_key, keys.KeyType.ED25519, allocator);
 
     var server_switch: swarm.Switch = undefined;
     server_switch.init(allocator, &server_transport);
@@ -1197,7 +1190,7 @@ test "ping multiaddr round trip" {
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
 
-    var server_pubkey = try tls.createProtobufEncodedPublicKey(allocator, server_key);
+    var server_pubkey = try server_key.publicKey(allocator);
     defer allocator.free(server_pubkey.data.?);
     const server_peer_id = try PeerId.fromPublicKey(allocator, &server_pubkey);
 
@@ -1219,11 +1212,11 @@ test "ping multiaddr round trip" {
         client_loop.deinit();
     }
 
-    const client_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(client_key);
+    var client_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer client_key.deinit();
 
     var client_transport: quic_transport.QuicTransport = undefined;
-    try client_transport.init(&client_loop, client_key, keys.KeyType.ED25519, allocator);
+    try client_transport.init(&client_loop, &client_key, keys.KeyType.ED25519, allocator);
 
     var client_switch: swarm.Switch = undefined;
     client_switch.init(allocator, &client_transport);
@@ -1291,9 +1284,6 @@ test "ping multiaddr round trip" {
 
 test "ping protocol timeout" {
     const allocator = std.testing.allocator;
-    const tls = libp2p.security.tls;
-    const ssl = @import("ssl");
-    const keys = @import("peer_id").keys;
     const quic_transport = libp2p.transport.quic;
 
     var server_loop: io_loop.ThreadEventLoop = undefined;
@@ -1303,11 +1293,11 @@ test "ping protocol timeout" {
         server_loop.deinit();
     }
 
-    const server_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(server_key);
+    var server_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer server_key.deinit();
 
     var server_transport: quic_transport.QuicTransport = undefined;
-    try server_transport.init(&server_loop, server_key, keys.KeyType.ED25519, allocator);
+    try server_transport.init(&server_loop, &server_key, keys.KeyType.ED25519, allocator);
 
     var server_switch: swarm.Switch = undefined;
     server_switch.init(allocator, &server_transport);
@@ -1321,7 +1311,7 @@ test "ping protocol timeout" {
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
 
-    var server_pubkey = try tls.createProtobufEncodedPublicKey(allocator, server_key);
+    var server_pubkey = try server_key.publicKey(allocator);
     defer allocator.free(server_pubkey.data.?);
     const server_peer_id = try PeerId.fromPublicKey(allocator, &server_pubkey);
 
@@ -1343,11 +1333,11 @@ test "ping protocol timeout" {
         client_loop.deinit();
     }
 
-    const client_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(client_key);
+    var client_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer client_key.deinit();
 
     var client_transport: quic_transport.QuicTransport = undefined;
-    try client_transport.init(&client_loop, client_key, keys.KeyType.ED25519, allocator);
+    try client_transport.init(&client_loop, &client_key, keys.KeyType.ED25519, allocator);
 
     var client_switch: swarm.Switch = undefined;
     client_switch.init(allocator, &client_transport);
@@ -1419,9 +1409,6 @@ test "ping protocol timeout" {
 
 test "ping protocol periodic pings" {
     const allocator = std.testing.allocator;
-    const tls = libp2p.security.tls;
-    const ssl = @import("ssl");
-    const keys = @import("peer_id").keys;
     const quic_transport = libp2p.transport.quic;
 
     var server_loop: io_loop.ThreadEventLoop = undefined;
@@ -1431,11 +1418,11 @@ test "ping protocol periodic pings" {
         server_loop.deinit();
     }
 
-    const server_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(server_key);
+    var server_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer server_key.deinit();
 
     var server_transport: quic_transport.QuicTransport = undefined;
-    try server_transport.init(&server_loop, server_key, keys.KeyType.ED25519, allocator);
+    try server_transport.init(&server_loop, &server_key, keys.KeyType.ED25519, allocator);
 
     var server_switch: swarm.Switch = undefined;
     server_switch.init(allocator, &server_transport);
@@ -1449,7 +1436,7 @@ test "ping protocol periodic pings" {
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
 
-    var server_pubkey = try tls.createProtobufEncodedPublicKey(allocator, server_key);
+    var server_pubkey = try server_key.publicKey(allocator);
     defer allocator.free(server_pubkey.data.?);
     const server_peer_id = try PeerId.fromPublicKey(allocator, &server_pubkey);
 
@@ -1471,11 +1458,11 @@ test "ping protocol periodic pings" {
         client_loop.deinit();
     }
 
-    const client_key = try tls.generateKeyPair(keys.KeyType.ED25519);
-    defer ssl.EVP_PKEY_free(client_key);
+    var client_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer client_key.deinit();
 
     var client_transport: quic_transport.QuicTransport = undefined;
-    try client_transport.init(&client_loop, client_key, keys.KeyType.ED25519, allocator);
+    try client_transport.init(&client_loop, &client_key, keys.KeyType.ED25519, allocator);
 
     var client_switch: swarm.Switch = undefined;
     client_switch.init(allocator, &client_transport);
