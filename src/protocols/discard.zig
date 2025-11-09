@@ -556,6 +556,7 @@ test "discard protocol using switch" {
 test "discard protocol using switch with secp256k1 identities" {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     defer {
+        @import("../secp_context.zig").deinit();
         const leaked = gpa.deinit();
         if (leaked == .leak) {
             std.log.warn("Memory leak detected in test!", .{});
