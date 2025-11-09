@@ -12,7 +12,7 @@
     // In a future version of Zig it will be used for package deduplication.
     .version = "0.1.0",
 
-    .fingerprint = 0x227d092bf7bb6f72,
+    .fingerprint = 0x227d092b880b3d4a,
 
     // This field is optional.
     // This is currently advisory only; Zig does not yet do anything
@@ -26,8 +26,8 @@
     // internet connectivity.
     .dependencies = .{
         .libxev = .{
-            .url = "git+https://github.com/mitchellh/libxev#ae62fb5d24bada8bd5a60d33df4da9ee5c4b387d",
-            .hash = "libxev-0.0.0-86vtcx8dEwC4LusagnPXhf_-bnEzlasbr_DoOpj_bHGM",
+            .url = "git+https://github.com/zen-eth/libxev#fe9928d11540b723aa131fe097c2c4b5359bb073",
+            .hash = "libxev-0.0.0-86vtc5gdEwBLKZucNlSW_tEfwaN9l4z6kqRegMdaux4-",
         },
         .zmultiformats = .{
             .url = "git+https://github.com/zen-eth/multiformats-zig#1359ac3ab12a6af173c2b7f13ae9c4f5ff34e11e",

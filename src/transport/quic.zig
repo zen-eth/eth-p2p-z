@@ -137,7 +137,7 @@ fn maybeInitLsquicLogger(allocator: Allocator) void {
 // BBR congestion control algorithm
 const CCAlgoBBR: c_int = 2;
 // Source Connection ID Issuance Rate
-const SCIDIssRate: c_int = 180; // 180 SCIDs per minute
+const SCIDIssRate: c_int = 0; // Disable SCID issuance rate limiting
 
 const SignatureAlgs: []const u16 = &.{
     ssl.SSL_SIGN_ED25519,
