@@ -137,7 +137,7 @@ fn maybeInitLsquicLogger(allocator: Allocator) void {
 // BBR congestion control algorithm
 const CCAlgoBBR: c_int = 2;
 // Source Connection ID Issuance Rate
-const SCIDIssRate: c_int = 0; // Disable SCID issuance rate limiting
+const SCIDIssRate: c_int = 180; // Disable SCID issuance rate limiting
 
 const SignatureAlgs: []const u16 = &.{
     ssl.SSL_SIGN_ED25519,
@@ -223,7 +223,7 @@ pub const QuicEngine = struct {
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
         engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
-        // engine_settings.es_cc_algo = CCAlgoBBR;
+        engine_settings.es_cc_algo = CCAlgoBBR;
         engine_settings.es_scid_iss_rate = SCIDIssRate;
 
         var err_buf: [100]u8 = undefined;
@@ -1394,7 +1394,7 @@ pub fn onStreamWrite(
             }
         }
     } else {
-        // _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
+        _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
         return;
     }
 }
