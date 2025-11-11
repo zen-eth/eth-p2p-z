@@ -755,7 +755,7 @@ test "switch newStream connects to multiple peers" {
     var loop_a: io_loop.ThreadEventLoop = undefined;
     try loop_a.init(allocator);
     defer {
-        loop_a.close();
+        // loop_a.close();
         loop_a.deinit();
     }
 
@@ -768,6 +768,7 @@ test "switch newStream connects to multiple peers" {
     switch_a.init(allocator, &transport_a);
     defer {
         switch_a.stop();
+        loop_a.close();
         switch_a.deinit();
     }
 
@@ -786,7 +787,7 @@ test "switch newStream connects to multiple peers" {
     var loop_b: io_loop.ThreadEventLoop = undefined;
     try loop_b.init(allocator);
     defer {
-        loop_b.close();
+        // loop_b.close();
         loop_b.deinit();
     }
 
@@ -799,6 +800,7 @@ test "switch newStream connects to multiple peers" {
     switch_b.init(allocator, &transport_b);
     defer {
         switch_b.stop();
+        loop_b.close();
         switch_b.deinit();
     }
 
@@ -821,7 +823,7 @@ test "switch newStream connects to multiple peers" {
     var loop_c: io_loop.ThreadEventLoop = undefined;
     try loop_c.init(allocator);
     defer {
-        loop_c.close();
+        // loop_c.close();
         loop_c.deinit();
     }
 
@@ -834,6 +836,7 @@ test "switch newStream connects to multiple peers" {
     switch_c.init(allocator, &transport_c);
     defer {
         switch_c.stop();
+        loop_c.close();
         switch_c.deinit();
     }
 
@@ -930,7 +933,7 @@ test "discard protocol using switch with 1MB data" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
     defer {
-        loop.close();
+        // loop.close();
         loop.deinit();
     }
 
@@ -947,6 +950,7 @@ test "discard protocol using switch with 1MB data" {
     switch1.init(allocator, &transport);
     defer {
         switch1.stop();
+        loop.close();
         switch1.deinit();
     }
 
@@ -963,7 +967,7 @@ test "discard protocol using switch with 1MB data" {
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
     defer {
-        cl_loop.close();
+        // cl_loop.close();
         cl_loop.deinit();
     }
 
@@ -976,6 +980,7 @@ test "discard protocol using switch with 1MB data" {
     switch2.init(allocator, &cl_transport);
     defer {
         switch2.stop();
+        cl_loop.close();
         switch2.deinit();
     }
 
@@ -1047,7 +1052,7 @@ test "no supported protocols error" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(std.testing.allocator);
     defer {
-        loop.close();
+        // loop.close();
         loop.deinit();
     }
 
@@ -1064,6 +1069,7 @@ test "no supported protocols error" {
     switch1.init(allocator, &transport);
     defer {
         switch1.stop();
+        loop.close();
         switch1.deinit();
     }
 
@@ -1082,7 +1088,7 @@ test "no supported protocols error" {
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
     defer {
-        cl_loop.close();
+        // cl_loop.close();
         cl_loop.deinit();
     }
 
@@ -1095,6 +1101,7 @@ test "no supported protocols error" {
     switch2.init(allocator, &cl_transport);
     defer {
         switch2.stop();
+        cl_loop.close();
         switch2.deinit();
     }
 
@@ -1137,7 +1144,7 @@ test "discard protocol with 5 concurrent clients" {
     var loop: io_loop.ThreadEventLoop = undefined;
     try loop.init(allocator);
     defer {
-        loop.close();
+        // loop.close();
         loop.deinit();
     }
 
@@ -1154,6 +1161,7 @@ test "discard protocol with 5 concurrent clients" {
     switch1.init(allocator, &transport);
     defer {
         switch1.stop();
+        loop.close();
         switch1.deinit();
     }
 

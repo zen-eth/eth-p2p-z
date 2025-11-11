@@ -111,6 +111,7 @@ pub const Switch = struct {
 
         self.transport.stop() catch unreachable;
 
+        self.finalCleanup();
         self.stopped_notify.set();
     }
 
@@ -711,7 +712,7 @@ pub const Switch = struct {
         self.outgoing_connections.deinit();
         self.incoming_connections.deinit();
 
-        self.finalCleanup();
+        // self.finalCleanup();
     }
 
     fn finalCleanup(_: *Switch) void {

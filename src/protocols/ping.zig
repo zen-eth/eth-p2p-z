@@ -1289,7 +1289,7 @@ test "ping protocol timeout" {
     var server_loop: io_loop.ThreadEventLoop = undefined;
     try server_loop.init(allocator);
     defer {
-        server_loop.close();
+        // server_loop.close();
         server_loop.deinit();
     }
 
@@ -1303,6 +1303,7 @@ test "ping protocol timeout" {
     server_switch.init(allocator, &server_transport);
     defer {
         server_switch.stop();
+        server_loop.close();
         server_switch.deinit();
     }
 
@@ -1329,7 +1330,7 @@ test "ping protocol timeout" {
     var client_loop: io_loop.ThreadEventLoop = undefined;
     try client_loop.init(allocator);
     defer {
-        client_loop.close();
+        // client_loop.close();
         client_loop.deinit();
     }
 
@@ -1343,6 +1344,7 @@ test "ping protocol timeout" {
     client_switch.init(allocator, &client_transport);
     defer {
         client_switch.stop();
+        client_loop.close();
         client_switch.deinit();
     }
 
@@ -1414,7 +1416,7 @@ test "ping protocol periodic pings" {
     var server_loop: io_loop.ThreadEventLoop = undefined;
     try server_loop.init(allocator);
     defer {
-        server_loop.close();
+        // server_loop.close();
         server_loop.deinit();
     }
 
@@ -1428,6 +1430,7 @@ test "ping protocol periodic pings" {
     server_switch.init(allocator, &server_transport);
     defer {
         server_switch.stop();
+        server_loop.close();
         server_switch.deinit();
     }
 
@@ -1454,7 +1457,7 @@ test "ping protocol periodic pings" {
     var client_loop: io_loop.ThreadEventLoop = undefined;
     try client_loop.init(allocator);
     defer {
-        client_loop.close();
+        // client_loop.close();
         client_loop.deinit();
     }
 
@@ -1468,6 +1471,7 @@ test "ping protocol periodic pings" {
     client_switch.init(allocator, &client_transport);
     defer {
         client_switch.stop();
+        client_loop.close();
         client_switch.deinit();
     }
 

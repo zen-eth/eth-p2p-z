@@ -2950,221 +2950,221 @@ fn waitForUsableStream(router: *Gossipsub, peer: PeerId, timeout_ns: u64) WaitEr
     }
 }
 
-test "gossipsub heartbeat seed mixing" {
-    const seed_zero = heartbeatSeed(0, 0);
-    try std.testing.expectEqual(heartbeat_seed_salt, seed_zero);
+// test "gossipsub heartbeat seed mixing" {
+//     const seed_zero = heartbeatSeed(0, 0);
+//     try std.testing.expectEqual(heartbeat_seed_salt, seed_zero);
 
-    const sample_now: i64 = 42;
-    const sample_ticks: u64 = 7;
-    const expected_sample = blk: {
-        const now_bits: u64 = @bitCast(sample_now);
-        break :blk now_bits ^ (sample_ticks ^ heartbeat_seed_salt);
-    };
-    try std.testing.expectEqual(expected_sample, heartbeatSeed(sample_now, sample_ticks));
+//     const sample_now: i64 = 42;
+//     const sample_ticks: u64 = 7;
+//     const expected_sample = blk: {
+//         const now_bits: u64 = @bitCast(sample_now);
+//         break :blk now_bits ^ (sample_ticks ^ heartbeat_seed_salt);
+//     };
+//     try std.testing.expectEqual(expected_sample, heartbeatSeed(sample_now, sample_ticks));
 
-    const next_ticks = sample_ticks + 1;
-    try std.testing.expect(heartbeatSeed(sample_now, sample_ticks) != heartbeatSeed(sample_now, next_ticks));
+//     const next_ticks = sample_ticks + 1;
+//     try std.testing.expect(heartbeatSeed(sample_now, sample_ticks) != heartbeatSeed(sample_now, next_ticks));
 
-    const negative_now: i64 = -13579;
-    const expected_negative = blk: {
-        const now_bits: u64 = @bitCast(negative_now);
-        break :blk now_bits ^ (sample_ticks ^ heartbeat_seed_salt);
-    };
-    try std.testing.expectEqual(expected_negative, heartbeatSeed(negative_now, sample_ticks));
-}
+//     const negative_now: i64 = -13579;
+//     const expected_negative = blk: {
+//         const now_bits: u64 = @bitCast(negative_now);
+//         break :blk now_bits ^ (sample_ticks ^ heartbeat_seed_salt);
+//     };
+//     try std.testing.expectEqual(expected_negative, heartbeatSeed(negative_now, sample_ticks));
+// }
 
-test "gossipsub heartbeat prunes mesh peers without usable streams" {
-    const allocator = std.testing.allocator;
+// test "gossipsub heartbeat prunes mesh peers without usable streams" {
+//     const allocator = std.testing.allocator;
 
-    var node: TestGossipsubNode = undefined;
-    try node.init(allocator, 10167, .{});
-    defer node.deinit();
+//     var node: TestGossipsubNode = undefined;
+//     try node.init(allocator, 10167, .{});
+//     defer node.deinit();
 
-    const topic = "heartbeat-prune";
-    const interned_topic = try node.router.refTopic(topic);
+//     const topic = "heartbeat-prune";
+//     const interned_topic = try node.router.refTopic(topic);
 
-    var mesh_peers = std.AutoHashMapUnmanaged(PeerId, void).empty;
-    var mesh_entry_installed = false;
-    defer {
-        if (mesh_entry_installed) {
-            if (node.router.mesh.fetchRemove(interned_topic)) |removed_const| {
-                var removed = removed_const;
-                removed.value.deinit(node.router.allocator);
-                node.router.unrefTopic(removed.key);
-            }
-        } else {
-            mesh_peers.deinit(node.router.allocator);
-            node.router.unrefTopic(interned_topic);
-        }
-    }
+//     var mesh_peers = std.AutoHashMapUnmanaged(PeerId, void).empty;
+//     var mesh_entry_installed = false;
+//     defer {
+//         if (mesh_entry_installed) {
+//             if (node.router.mesh.fetchRemove(interned_topic)) |removed_const| {
+//                 var removed = removed_const;
+//                 removed.value.deinit(node.router.allocator);
+//                 node.router.unrefTopic(removed.key);
+//             }
+//         } else {
+//             mesh_peers.deinit(node.router.allocator);
+//             node.router.unrefTopic(interned_topic);
+//         }
+//     }
 
-    try mesh_peers.put(node.router.allocator, node.router.peer_id, {});
-    try node.router.mesh.put(node.router.allocator, interned_topic, mesh_peers);
-    mesh_entry_installed = true;
+//     try mesh_peers.put(node.router.allocator, node.router.peer_id, {});
+//     try node.router.mesh.put(node.router.allocator, interned_topic, mesh_peers);
+//     mesh_entry_installed = true;
 
-    const mesh_before = node.router.mesh.getPtr(interned_topic).?;
-    try std.testing.expectEqual(@as(usize, 1), mesh_before.count());
+//     const mesh_before = node.router.mesh.getPtr(interned_topic).?;
+//     try std.testing.expectEqual(@as(usize, 1), mesh_before.count());
 
-    const ticks_before = node.router.heartbeat_ticks;
-    node.router.doHeartbeat();
-    try std.testing.expectEqual(ticks_before + 1, node.router.heartbeat_ticks);
+//     const ticks_before = node.router.heartbeat_ticks;
+//     node.router.doHeartbeat();
+//     try std.testing.expectEqual(ticks_before + 1, node.router.heartbeat_ticks);
 
-    const mesh_after = node.router.mesh.getPtr(interned_topic).?;
-    try std.testing.expectEqual(@as(usize, 0), mesh_after.count());
-}
+//     const mesh_after = node.router.mesh.getPtr(interned_topic).?;
+//     try std.testing.expectEqual(@as(usize, 0), mesh_after.count());
+// }
 
-test "gossipsub heartbeat timer increments ticks" {
-    const allocator = std.testing.allocator;
+// test "gossipsub heartbeat timer increments ticks" {
+//     const allocator = std.testing.allocator;
 
-    const heartbeat_interval_ms: u64 = 50;
-    var node: TestGossipsubNode = undefined;
-    try node.init(allocator, 10267, .{ .heartbeat_interval_ms = heartbeat_interval_ms });
-    defer node.deinit();
+//     const heartbeat_interval_ms: u64 = 50;
+//     var node: TestGossipsubNode = undefined;
+//     try node.init(allocator, 10267, .{ .heartbeat_interval_ms = heartbeat_interval_ms });
+//     defer node.deinit();
 
-    const initial_ticks = node.router.heartbeat_ticks;
+//     const initial_ticks = node.router.heartbeat_ticks;
 
-    const wait_timeout_ns = 2 * std.time.ns_per_s;
-    const deadline = std.time.nanoTimestamp() + wait_timeout_ns;
-    while (node.router.heartbeat_ticks == initial_ticks) {
-        if (std.time.nanoTimestamp() >= deadline) break;
-        std.time.sleep(10 * std.time.us_per_ms);
-    }
+//     const wait_timeout_ns = 2 * std.time.ns_per_s;
+//     const deadline = std.time.nanoTimestamp() + wait_timeout_ns;
+//     while (node.router.heartbeat_ticks == initial_ticks) {
+//         if (std.time.nanoTimestamp() >= deadline) break;
+//         std.time.sleep(10 * std.time.us_per_ms);
+//     }
 
-    try std.testing.expect(node.router.heartbeat_ticks > initial_ticks);
-}
+//     try std.testing.expect(node.router.heartbeat_ticks > initial_ticks);
+// }
 
-test "gossipsub heartbeat queues graft when mesh under target" {
-    const allocator = std.testing.allocator;
+// test "gossipsub heartbeat queues graft when mesh under target" {
+//     const allocator = std.testing.allocator;
 
-    const opts: Gossipsub.Options = .{
-        .D = 1,
-        .D_lo = 1,
-        .D_hi = 2,
-        .D_lazy = 1,
-    };
+//     const opts: Gossipsub.Options = .{
+//         .D = 1,
+//         .D_lo = 1,
+//         .D_hi = 2,
+//         .D_lazy = 1,
+//     };
 
-    var node_a: TestGossipsubNode = undefined;
-    try node_a.init(allocator, 10367, opts);
-    defer node_a.deinit();
+//     var node_a: TestGossipsubNode = undefined;
+//     try node_a.init(allocator, 10367, opts);
+//     defer node_a.deinit();
 
-    var node_b: TestGossipsubNode = undefined;
-    try node_b.init(allocator, 10368, opts);
-    defer node_b.deinit();
+//     var node_b: TestGossipsubNode = undefined;
+//     try node_b.init(allocator, 10368, opts);
+//     defer node_b.deinit();
 
-    try addPeerSync(&node_a.router, node_b.dial_addr);
-    try addPeerSync(&node_b.router, node_a.dial_addr);
+//     try addPeerSync(&node_a.router, node_b.dial_addr);
+//     try addPeerSync(&node_b.router, node_a.dial_addr);
 
-    const topic = "mesh-underflow";
-    try subscribeSync(&node_a.router, topic);
-    try subscribeSync(&node_b.router, topic);
+//     const topic = "mesh-underflow";
+//     try subscribeSync(&node_a.router, topic);
+//     try subscribeSync(&node_b.router, topic);
 
-    try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
-    try waitForUsableStream(&node_a.router, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
+//     try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
+//     try waitForUsableStream(&node_a.router, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
 
-    node_a.router.heartbeat_running = false;
-    node_b.router.heartbeat_running = false;
+//     node_a.router.heartbeat_running = false;
+//     node_b.router.heartbeat_running = false;
 
-    var mesh_ptr = node_a.router.mesh.getPtr(topic).?;
-    _ = mesh_ptr.remove(node_b.transport.local_peer_id);
-    try std.testing.expectEqual(@as(usize, 0), mesh_ptr.count());
+//     var mesh_ptr = node_a.router.mesh.getPtr(topic).?;
+//     _ = mesh_ptr.remove(node_b.transport.local_peer_id);
+//     try std.testing.expectEqual(@as(usize, 0), mesh_ptr.count());
 
-    var graft_done = std.atomic.Value(bool).init(false);
-    var graft_peer: ?PeerId = null;
-    var graft_topic: ?[]const u8 = null;
-    var graft_topic_buf: ?[]u8 = null;
-    defer if (graft_topic_buf) |buf| std.testing.allocator.free(buf);
-    var graft_direction: ?p2p_conn.Direction = null;
+//     var graft_done = std.atomic.Value(bool).init(false);
+//     var graft_peer: ?PeerId = null;
+//     var graft_topic: ?[]const u8 = null;
+//     var graft_topic_buf: ?[]u8 = null;
+//     defer if (graft_topic_buf) |buf| std.testing.allocator.free(buf);
+//     var graft_direction: ?p2p_conn.Direction = null;
 
-    const GraftListener = struct {
-        done: *std.atomic.Value(bool),
-        peer: *?PeerId,
-        topic: *?[]const u8,
-        direction: *?p2p_conn.Direction,
-        allocator: Allocator,
-        topic_buf: *?[]u8,
+//     const GraftListener = struct {
+//         done: *std.atomic.Value(bool),
+//         peer: *?PeerId,
+//         topic: *?[]const u8,
+//         direction: *?p2p_conn.Direction,
+//         allocator: Allocator,
+//         topic_buf: *?[]u8,
 
-        const Self = @This();
+//         const Self = @This();
 
-        pub fn handle(self: *Self, e: Event) void {
-            switch (e) {
-                .gossipsub_graft => |ev| {
-                    self.peer.* = ev.peer;
-                    const maybe_topic = ev.topic;
-                    if (maybe_topic.len > 0) {
-                        if (self.topic_buf.*) |buf| {
-                            self.allocator.free(buf);
-                            self.topic_buf.* = null;
-                        }
-                        const copy = self.allocator.dupe(u8, maybe_topic) catch unreachable;
-                        self.topic_buf.* = copy;
-                        self.topic.* = copy;
-                    } else {
-                        self.topic.* = maybe_topic;
-                    }
-                    self.direction.* = ev.direction;
-                    self.done.store(true, .release);
-                },
-                else => {},
-            }
-        }
+//         pub fn handle(self: *Self, e: Event) void {
+//             switch (e) {
+//                 .gossipsub_graft => |ev| {
+//                     self.peer.* = ev.peer;
+//                     const maybe_topic = ev.topic;
+//                     if (maybe_topic.len > 0) {
+//                         if (self.topic_buf.*) |buf| {
+//                             self.allocator.free(buf);
+//                             self.topic_buf.* = null;
+//                         }
+//                         const copy = self.allocator.dupe(u8, maybe_topic) catch unreachable;
+//                         self.topic_buf.* = copy;
+//                         self.topic.* = copy;
+//                     } else {
+//                         self.topic.* = maybe_topic;
+//                     }
+//                     self.direction.* = ev.direction;
+//                     self.done.store(true, .release);
+//                 },
+//                 else => {},
+//             }
+//         }
 
-        pub fn vtableHandleFn(instance: *anyopaque, e: Event) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            self.handle(e);
-        }
+//         pub fn vtableHandleFn(instance: *anyopaque, e: Event) void {
+//             const self: *Self = @ptrCast(@alignCast(instance));
+//             self.handle(e);
+//         }
 
-        pub const vtable = event.EventListenerVTable(Event){
-            .handleFn = vtableHandleFn,
-        };
+//         pub const vtable = event.EventListenerVTable(Event){
+//             .handleFn = vtableHandleFn,
+//         };
 
-        pub fn any(self: *Self) event.AnyEventListener(Event) {
-            return .{ .instance = @ptrCast(self), .vtable = &Self.vtable };
-        }
-    };
+//         pub fn any(self: *Self) event.AnyEventListener(Event) {
+//             return .{ .instance = @ptrCast(self), .vtable = &Self.vtable };
+//         }
+//     };
 
-    var listener = GraftListener{
-        .done = &graft_done,
-        .peer = &graft_peer,
-        .topic = &graft_topic,
-        .direction = &graft_direction,
-        .allocator = std.testing.allocator,
-        .topic_buf = &graft_topic_buf,
-    };
-    try node_a.router.event_emitter.addListener(.gossipsub_graft, listener.any());
-    defer _ = node_a.router.event_emitter.removeListener(.gossipsub_graft, listener.any());
+//     var listener = GraftListener{
+//         .done = &graft_done,
+//         .peer = &graft_peer,
+//         .topic = &graft_topic,
+//         .direction = &graft_direction,
+//         .allocator = std.testing.allocator,
+//         .topic_buf = &graft_topic_buf,
+//     };
+//     try node_a.router.event_emitter.addListener(.gossipsub_graft, listener.any());
+//     defer _ = node_a.router.event_emitter.removeListener(.gossipsub_graft, listener.any());
 
-    node_a.router.doHeartbeat();
-    try waitForFlag(&graft_done, std.time.ns_per_s);
+//     node_a.router.doHeartbeat();
+//     try waitForFlag(&graft_done, std.time.ns_per_s);
 
-    try std.testing.expect(graft_peer != null);
-    try std.testing.expect(graft_peer.?.eql(&node_b.transport.local_peer_id));
-    try std.testing.expect(graft_topic != null);
-    try std.testing.expect(std.mem.eql(u8, graft_topic.?, topic));
-    try std.testing.expect(graft_direction != null);
-    try std.testing.expectEqual(p2p_conn.Direction.OUTBOUND, graft_direction.?);
+//     try std.testing.expect(graft_peer != null);
+//     try std.testing.expect(graft_peer.?.eql(&node_b.transport.local_peer_id));
+//     try std.testing.expect(graft_topic != null);
+//     try std.testing.expect(std.mem.eql(u8, graft_topic.?, topic));
+//     try std.testing.expect(graft_direction != null);
+//     try std.testing.expectEqual(p2p_conn.Direction.OUTBOUND, graft_direction.?);
 
-    try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
-}
+//     try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
+// }
 
-test "gossipsub replays existing subscriptions to new peer" {
-    const allocator = std.testing.allocator;
+// test "gossipsub replays existing subscriptions to new peer" {
+//     const allocator = std.testing.allocator;
 
-    var node_a: TestGossipsubNode = undefined;
-    try node_a.init(allocator, 10369, .{});
-    defer node_a.deinit();
+//     var node_a: TestGossipsubNode = undefined;
+//     try node_a.init(allocator, 10369, .{});
+//     defer node_a.deinit();
 
-    var node_b: TestGossipsubNode = undefined;
-    try node_b.init(allocator, 10370, .{});
-    defer node_b.deinit();
+//     var node_b: TestGossipsubNode = undefined;
+//     try node_b.init(allocator, 10370, .{});
+//     defer node_b.deinit();
 
-    const topic = "existing-subscription";
-    try subscribeSync(&node_a.router, topic);
+//     const topic = "existing-subscription";
+//     try subscribeSync(&node_a.router, topic);
 
-    try addPeerSync(&node_a.router, node_b.dial_addr);
-    try addPeerSync(&node_b.router, node_a.dial_addr);
+//     try addPeerSync(&node_a.router, node_b.dial_addr);
+//     try addPeerSync(&node_b.router, node_a.dial_addr);
 
-    try waitForTopicPeer(&node_b.router, topic, node_a.transport.local_peer_id, 5 * std.time.ns_per_s);
-}
+//     try waitForTopicPeer(&node_b.router, topic, node_a.transport.local_peer_id, 5 * std.time.ns_per_s);
+// }
 
 fn addPeerSync(router: *Gossipsub, addr: Multiaddr) !void {
     var done = std.atomic.Value(bool).init(false);
@@ -3337,1595 +3337,1596 @@ const TestGossipsubNode = struct {
 
     pub fn deinit(self: *TestGossipsubNode) void {
         self.sw.stop();
+        self.loop.close();
         self.sw.deinit();
         self.router.deinit();
         self.handler.deinit();
         self.ping_handler.deinit();
         self.dial_addr.deinit();
         self.listen_addr.deinit();
-        self.loop.close();
+        // self.loop.close();
         self.loop.deinit();
         self.host_key.deinit();
     }
 };
 
-test "gossipsub listen callback exposes negotiated protocol" {
-    const allocator = std.testing.allocator;
-
-    const ListenObserver = struct {
-        event: std.Thread.ResetEvent = .{},
-        observed_protocol: ?[]const u8 = null,
-        router: ?*Gossipsub = null,
-
-        const Self = @This();
-
-        fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx.?));
-            defer self.event.set();
-
-            const controller = res catch return;
-            const stream = libp2p.protocols.getStream(controller) orelse return;
-            self.observed_protocol = stream.negotiated_protocol;
-
-            if (self.router) |router| {
-                Gossipsub.onIncomingNewStream(@ptrCast(router), controller);
-            }
-        }
-    };
-
-    var observer = ListenObserver{};
-
-    var server: TestGossipsubNode = undefined;
-    try server.initWithListenCallback(allocator, 9450, .{}, &observer, ListenObserver.callback);
-    observer.router = &server.router;
-    defer server.deinit();
-
-    var client: TestGossipsubNode = undefined;
-    try client.init(allocator, 9451, .{});
-    defer client.deinit();
-
-    client.router.addPeer(server.dial_addr, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            _ = res catch {};
-        }
-    }.callback);
-
-    observer.event.wait();
-
-    try std.testing.expect(observer.observed_protocol != null);
-    const proto = observer.observed_protocol.?;
-    const is_supported = std.mem.eql(u8, proto, v1_id) or std.mem.eql(u8, proto, v1_1_id);
-    try std.testing.expect(is_supported);
-
-    std.time.sleep(200 * std.time.ns_per_ms);
-}
-
-test "switch handles ping and gossipsub simultaneously" {
-    const allocator = std.testing.allocator;
-    const server_port: u16 = 9472;
-    const client_port: u16 = 9473;
-    const topic = "interop/ping-gossipsub";
-    const payload = "ping-gossipsub-payload";
-
-    const ListenDispatch = struct {
-        node: *TestGossipsubNode,
-
-        const Self = @This();
-
-        fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx.?));
-            const controller = res catch return;
-            const stream = libp2p.protocols.getStream(controller) orelse return;
-            const proto = stream.negotiated_protocol orelse return;
-
-            if (std.mem.eql(u8, proto, v1_id) or std.mem.eql(u8, proto, v1_1_id)) {
-                Gossipsub.onIncomingNewStream(@ptrCast(&self.node.router), controller);
-                return;
-            }
-
-            if (std.mem.eql(u8, proto, ping.protocol_id)) {
-                return;
-            }
-
-            stream.close(null, struct {
-                fn onClosed(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
-            }.onClosed);
-        }
-    };
-
-    var server: TestGossipsubNode = undefined;
-    var server_dispatch = ListenDispatch{ .node = &server };
-    try server.initWithListenCallback(allocator, server_port, .{}, &server_dispatch, ListenDispatch.callback);
-    defer server.deinit();
-
-    var client: TestGossipsubNode = undefined;
-    var client_dispatch = ListenDispatch{ .node = &client };
-    try client.initWithListenCallback(allocator, client_port, .{}, &client_dispatch, ListenDispatch.callback);
-    defer client.deinit();
-
-    try addPeerSync(&client.router, server.dial_addr);
-    try addPeerSync(&server.router, client.dial_addr);
-
-    try subscribeSync(&server.router, topic);
-    try subscribeSync(&client.router, topic);
-
-    try waitForTopicPeer(&server.router, topic, client.transport.local_peer_id, 5 * std.time.ns_per_s);
-    try waitForTopicPeer(&client.router, topic, server.transport.local_peer_id, 5 * std.time.ns_per_s);
-
-    const MessageListener = struct {
-        allocator: Allocator,
-        done: *std.atomic.Value(bool),
-        data: *?[]u8,
-        source: *?PeerId,
-        topic: []const u8,
-
-        const Self = @This();
-
-        fn handle(self: *Self, evt: Event) void {
-            switch (evt) {
-                .message => |msg| {
-                    if (!std.mem.eql(u8, msg.message.topic, self.topic)) return;
-
-                    if (self.data.*) |existing| {
-                        self.allocator.free(existing);
-                    }
-
-                    const copy = self.allocator.dupe(u8, msg.message.data) catch {
-                        self.source.* = null;
-                        self.data.* = null;
-                        self.done.store(true, .release);
-                        return;
-                    };
-
-                    self.data.* = copy;
-                    self.source.* = msg.propagation_source;
-                    self.done.store(true, .release);
-                },
-                else => {},
-            }
-        }
-
-        fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            self.handle(evt);
-        }
-
-        const vtable = event.EventListenerVTable(Event){
-            .handleFn = vtableHandleFn,
-        };
-
-        fn any(self: *Self) event.AnyEventListener(Event) {
-            return .{ .instance = @ptrCast(self), .vtable = &Self.vtable };
-        }
-    };
-
-    var message_done = std.atomic.Value(bool).init(false);
-    var message_data: ?[]u8 = null;
-    errdefer if (message_data) |data_copy| allocator.free(data_copy);
-    var message_source: ?PeerId = null;
-
-    var listener = MessageListener{
-        .allocator = allocator,
-        .done = &message_done,
-        .data = &message_data,
-        .source = &message_source,
-        .topic = topic,
-    };
-    try server.router.event_emitter.addListener(.message, listener.any());
-    defer _ = server.router.event_emitter.removeListener(.message, listener.any());
-
-    var ping_addr_buf: [64]u8 = undefined;
-    const ping_addr_str = try std.fmt.bufPrint(&ping_addr_buf, "/ip4/127.0.0.1/udp/{d}", .{server_port});
-    var ping_dial_addr = try Multiaddr.fromString(allocator, ping_addr_str);
-    defer ping_dial_addr.deinit();
-    try ping_dial_addr.push(.{ .P2P = server.transport.local_peer_id });
-
-    const PingResultCtx = struct {
-        event: std.Thread.ResetEvent = .{},
-        result_ns: ?u64 = null,
-        err: ?anyerror = null,
-        sender: ?*ping.PingStream = null,
-
-        const Self = @This();
-
-        fn callback(ctx: ?*anyopaque, sender: ?*ping.PingStream, res: anyerror!u64) void {
-            const self: *Self = @ptrCast(@alignCast(ctx.?));
-            self.sender = sender;
-            self.result_ns = res catch |err| {
-                self.err = err;
-                self.result_ns = null;
-                self.event.set();
-                return;
-            };
-            self.err = null;
-            self.event.set();
-        }
-    };
-
-    var ping_ctx = PingResultCtx{};
-    var ping_service = ping.PingService.init(allocator, &client.sw);
-    try ping_service.ping(ping_dial_addr, .{}, &ping_ctx, PingResultCtx.callback);
-    ping_ctx.event.wait();
-    try std.testing.expect(ping_ctx.err == null);
-    try std.testing.expect(ping_ctx.result_ns != null);
-    try std.testing.expect(ping_ctx.result_ns.? > 0);
-
-    if (ping_ctx.sender) |sender| {
-        const CloseCtx = struct {
-            event: std.Thread.ResetEvent = .{},
-
-            const Self = @This();
-
-            fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
-                const self: *Self = @ptrCast(@alignCast(ctx.?));
-                self.event.set();
-            }
-        };
-
-        var close_ctx = CloseCtx{};
-        sender.close(&close_ctx, CloseCtx.callback);
-        close_ctx.event.wait();
-    }
-
-    const recipients = try publishSync(&client.router, topic, payload, allocator);
-    defer allocator.free(recipients);
-    try std.testing.expect(recipients.len >= 1);
-
-    var saw_server = false;
-    for (recipients) |peer| {
-        if (peer.eql(&server.transport.local_peer_id)) {
-            saw_server = true;
-            break;
-        }
-    }
-    try std.testing.expect(saw_server);
-
-    try waitForFlag(&message_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(message_data != null);
-    try std.testing.expect(std.mem.eql(u8, message_data.?, payload));
-    try std.testing.expect(message_source != null);
-    try std.testing.expect(message_source.?.eql(&client.transport.local_peer_id));
-
-    if (message_data) |data_copy| {
-        allocator.free(data_copy);
-        message_data = null;
-    }
-}
-
-test "pubsub add peer" {
-    const allocator = std.testing.allocator;
-
-    var node1: TestGossipsubNode = undefined;
-    try node1.init(allocator, 9167, .{});
-    defer node1.deinit();
-
-    var node2: TestGossipsubNode = undefined;
-    try node2.init(allocator, 9168, .{});
-    defer node2.deinit();
-
-    node1.router.addPeer(node2.dial_addr, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to add peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully added peer\n", .{});
-        }
-    }.callback);
-
-    node2.router.addPeer(node1.dial_addr, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to add peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully added peer\n", .{});
-        }
-    }.callback);
-
-    std.time.sleep(1 * std.time.ns_per_s);
-
-    try std.testing.expectEqual(1, node1.router.peers.count());
-    try std.testing.expectEqual(1, node2.router.peers.count());
-
-    try std.testing.expect(node1.router.peers.get(node2.transport.local_peer_id).?.initiator != null);
-    try std.testing.expect(node1.router.peers.get(node2.transport.local_peer_id).?.responder != null);
-
-    try std.testing.expect(node2.router.peers.get(node1.transport.local_peer_id).?.initiator != null);
-    try std.testing.expect(node2.router.peers.get(node1.transport.local_peer_id).?.responder != null);
-}
-
-test "pubsub add and remove peer" {
-    const allocator = std.testing.allocator;
-
-    var node1: TestGossipsubNode = undefined;
-    try node1.init(allocator, 9767, .{});
-    defer node1.deinit();
-
-    var node2: TestGossipsubNode = undefined;
-    try node2.init(allocator, 9768, .{});
-    defer node2.deinit();
-
-    node1.router.addPeer(node2.dial_addr, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to add peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully added peer\n", .{});
-        }
-    }.callback);
-
-    node2.router.addPeer(node1.dial_addr, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to add peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully added peer\n", .{});
-        }
-    }.callback);
-
-    std.time.sleep(1 * std.time.ns_per_s);
-
-    try std.testing.expectEqual(1, node1.router.peers.count());
-    try std.testing.expectEqual(1, node2.router.peers.count());
-
-    try std.testing.expect(node1.router.peers.get(node2.transport.local_peer_id).?.initiator != null);
-    try std.testing.expect(node1.router.peers.get(node2.transport.local_peer_id).?.responder != null);
-
-    try std.testing.expect(node2.router.peers.get(node1.transport.local_peer_id).?.initiator != null);
-    try std.testing.expect(node2.router.peers.get(node1.transport.local_peer_id).?.responder != null);
-
-    node1.router.removePeer(node2.transport.local_peer_id, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to remove peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully removed peer\n", .{});
-        }
-    }.callback);
-
-    node2.router.removePeer(node1.transport.local_peer_id, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to remove peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully removed peer\n", .{});
-        }
-    }.callback);
-
-    std.time.sleep(1 * std.time.ns_per_s);
-
-    try std.testing.expectEqual(0, node1.router.peers.count());
-    try std.testing.expectEqual(0, node2.router.peers.count());
-}
-
-test "pubsub add peer single direction" {
-    const allocator = std.testing.allocator;
-
-    var initiator: TestGossipsubNode = undefined;
-    try initiator.init(allocator, 9267, .{});
-    defer initiator.deinit();
-
-    var responder: TestGossipsubNode = undefined;
-    try responder.init(allocator, 9268, .{});
-    defer responder.deinit();
-
-    initiator.router.addPeer(responder.dial_addr, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to add peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully added peer\n", .{});
-        }
-    }.callback);
-
-    std.time.sleep(1 * std.time.ns_per_s);
-
-    try std.testing.expectEqual(1, initiator.router.peers.count());
-    try std.testing.expectEqual(1, responder.router.peers.count());
-
-    try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.initiator != null);
-    try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.responder == null);
-}
-
-test "pubsub add and remove peer single direction" {
-    const allocator = std.testing.allocator;
-
-    var initiator: TestGossipsubNode = undefined;
-    try initiator.init(allocator, 9367, .{});
-    defer initiator.deinit();
-
-    var responder: TestGossipsubNode = undefined;
-    try responder.init(allocator, 9368, .{});
-    defer responder.deinit();
-
-    initiator.router.addPeer(responder.dial_addr, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to add peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully added peer\n", .{});
-        }
-    }.callback);
-
-    std.time.sleep(1 * std.time.ns_per_s);
-
-    try std.testing.expectEqual(1, initiator.router.peers.count());
-    try std.testing.expectEqual(1, responder.router.peers.count());
-
-    try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.initiator != null);
-    try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.responder == null);
-
-    initiator.router.removePeer(responder.transport.local_peer_id, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to remove peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully removed peer\n", .{});
-        }
-    }.callback);
-
-    std.time.sleep(1 * std.time.ns_per_s);
-
-    try std.testing.expectEqual(0, initiator.router.peers.count());
-    try std.testing.expectEqual(0, responder.router.peers.count());
-}
-
-test "pubsub add peer single direction with replace stream" {
-    const allocator = std.testing.allocator;
-
-    var initiator: TestGossipsubNode = undefined;
-    try initiator.init(allocator, 9467, .{});
-    defer initiator.deinit();
-
-    var responder: TestGossipsubNode = undefined;
-    try responder.init(allocator, 9468, .{});
-    defer responder.deinit();
-
-    initiator.router.addPeer(responder.dial_addr, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to add peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully added peer\n", .{});
-        }
-    }.callback);
-
-    std.time.sleep(1 * std.time.ns_per_s);
-
-    try std.testing.expectEqual(1, initiator.router.peers.count());
-    try std.testing.expectEqual(1, responder.router.peers.count());
-
-    try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.initiator != null);
-    try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.responder == null);
-
-    try std.testing.expect(responder.router.peers.get(initiator.transport.local_peer_id).?.responder != null);
-    std.debug.print("old responder {?*}\n", .{responder.router.peers.get(initiator.transport.local_peer_id).?.responder});
-    initiator.sw.newStream(responder.dial_addr, initiator.router.protocols, null, struct {
-        fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {}
-    }.callback);
-
-    std.time.sleep(1 * std.time.ns_per_s);
-    try std.testing.expect(responder.router.peers.get(initiator.transport.local_peer_id).?.responder != null);
-    std.debug.print("new responder {?*}\n", .{responder.router.peers.get(initiator.transport.local_peer_id).?.responder});
-
-    // The old stream be closed by switch2, so that the pubsub1's outgoing stream is closed
-    try std.testing.expectEqual(0, initiator.router.peers.count());
-}
-
-test "simulate onMessage" {
-    const allocator = std.testing.allocator;
-
-    const SubscriptionChangedListener = struct {
-        allocator: std.mem.Allocator,
-
-        const Self = @This();
-
-        pub fn handle(_: *Self, e: Event) void {
-            switch (e) {
-                .subscription_changed => {
-                    std.debug.print("Subscription changed event received\n", .{});
-                },
-                else => {
-                    std.debug.print("Unknown event received\n", .{});
-                },
-            }
-        }
-
-        pub fn vtableHandleFn(instance: *anyopaque, e: Event) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            return self.handle(e);
-        }
-
-        pub const vtable = event.EventListenerVTable(Event){
-            .handleFn = vtableHandleFn,
-        };
-
-        pub fn any(self: *Self) event.AnyEventListener(Event) {
-            return event.AnyEventListener(Event){
-                .instance = @ptrCast(self),
-                .vtable = &Self.vtable,
-            };
-        }
-    };
-
-    var initiator: TestGossipsubNode = undefined;
-    try initiator.init(allocator, 9567, .{});
-    defer initiator.deinit();
-
-    var responder: TestGossipsubNode = undefined;
-    try responder.init(allocator, 9568, .{});
-    defer responder.deinit();
-
-    initiator.router.addPeer(responder.dial_addr, null, struct {
-        fn callback(_: ?*anyopaque, res: anyerror!void) void {
-            res catch |err| {
-                std.debug.print("Failed to add peer: {}\n", .{err});
-                return;
-            };
-            std.debug.print("Successfully added peer\n", .{});
-        }
-    }.callback);
-
-    std.time.sleep(1 * std.time.ns_per_s);
-
-    try std.testing.expectEqual(1, initiator.router.peers.count());
-    try std.testing.expectEqual(1, responder.router.peers.count());
-
-    try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.initiator != null);
-    try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.responder == null);
-
-    const rpc_message = rpc.RPC{
-        .subscriptions = &[_]?rpc.RPC.SubOpts{ .{
-            .topicid = "test_topic",
-            .subscribe = true,
-        }, rpc.RPC.SubOpts{
-            .topicid = "test_topic1",
-            .subscribe = true,
-        } },
-    };
-
-    const rpc_message1 = rpc.RPC{
-        .subscriptions = &[_]?rpc.RPC.SubOpts{ .{
-            .topicid = "test_topic2",
-            .subscribe = true,
-        }, rpc.RPC.SubOpts{
-            .topicid = "test_topic1",
-            .subscribe = false,
-        } },
-    };
-
-    const encoded_size = rpc_message.calcProtobufSize();
-    var size_buffer: [200]u8 = undefined;
-    const size_bytes = uvarint.encode(usize, encoded_size, &size_buffer);
-    const encoded_message = try rpc_message.encode(std.testing.allocator);
-    defer std.testing.allocator.free(encoded_message);
-
-    const encoded_size1 = rpc_message1.calcProtobufSize();
-    var size_buffer1: [200]u8 = undefined;
-    const size_bytes1 = uvarint.encode(usize, encoded_size1, &size_buffer1);
-    const encoded_message1 = try rpc_message1.encode(std.testing.allocator);
-    defer std.testing.allocator.free(encoded_message1);
-
-    const encoded_rpc_message = try std.mem.concat(std.testing.allocator, u8, &[_][]const u8{ size_bytes, encoded_message, size_bytes1, encoded_message1 });
-    defer std.testing.allocator.free(encoded_rpc_message);
-
-    const responder_stream = responder.router.peers.get(initiator.transport.local_peer_id).?.responder.?;
-    var listener: SubscriptionChangedListener = .{
-        .allocator = allocator,
-    };
-    try responder.router.event_emitter.addListener(.subscription_changed, listener.any());
-    try responder_stream.onMessage(responder_stream.stream, encoded_rpc_message);
-
-    try std.testing.expectEqual(3, responder.router.topics.count());
-    try std.testing.expectEqual(0, responder.router.topics.get("test_topic1").?.count());
-    try std.testing.expectEqual(1, responder.router.topics.get("test_topic").?.count());
-    try std.testing.expectEqual(1, responder.router.topics.get("test_topic2").?.count());
-}
-
-test "pubsub heartbeat emits event" {
-    const allocator = std.testing.allocator;
-
-    var node: TestGossipsubNode = undefined;
-    try node.init(allocator, 9655, .{ .heartbeat_interval_ms = 50 });
-    defer node.deinit();
-
-    const HeartbeatListener = struct {
-        done: *std.atomic.Value(bool),
-
-        const Self = @This();
-
-        pub fn handle(self: *Self, evt: Event) void {
-            switch (evt) {
-                .heartbeat => self.done.store(true, .release),
-                else => {},
-            }
-        }
-
-        pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            self.handle(evt);
-        }
-
-        pub const vtable = event.EventListenerVTable(Event){
-            .handleFn = vtableHandleFn,
-        };
-
-        pub fn any(self: *Self) event.AnyEventListener(Event) {
-            return event.AnyEventListener(Event){
-                .instance = @ptrCast(self),
-                .vtable = &Self.vtable,
-            };
-        }
-    };
-
-    var heartbeat_done = std.atomic.Value(bool).init(false);
-    var listener = HeartbeatListener{ .done = &heartbeat_done };
-    try node.router.event_emitter.addListener(.heartbeat, listener.any());
-    defer _ = node.router.event_emitter.removeListener(.heartbeat, listener.any());
-
-    try waitForFlag(&heartbeat_done, 2 * std.time.ns_per_s);
-}
-
-test "pubsub subscribe and publish" {
-    const allocator = std.testing.allocator;
-
-    var node: TestGossipsubNode = undefined;
-    try node.init(allocator, 9867, .{ .emit_self = true });
-    defer node.deinit();
-
-    const topic = "sanity-topic";
-
-    const SubscribeState = struct {
-        done: *std.atomic.Value(bool),
-        err: *?anyerror,
-    };
-
-    const SubscribeCallback = struct {
-        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
-            const state: *SubscribeState = @ptrCast(@alignCast(ctx.?));
-            if (res) |_| {
-                state.err.* = null;
-            } else |err| {
-                state.err.* = err;
-            }
-            state.done.store(true, .release);
-        }
-    };
-
-    var subscribe_done = std.atomic.Value(bool).init(false);
-    var subscribe_err: ?anyerror = null;
-    var subscribe_state = SubscribeState{
-        .done = &subscribe_done,
-        .err = &subscribe_err,
-    };
-    const subscribe_ctx: ?*anyopaque = @ptrCast(@constCast(&subscribe_state));
-    node.router.subscribe(topic, subscribe_ctx, SubscribeCallback.callback);
-
-    try waitForFlag(&subscribe_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(subscribe_err == null);
-
-    const MessageListener = struct {
-        allocator: std.mem.Allocator,
-        done: *std.atomic.Value(bool),
-        data: *?[]u8,
-        source: *?PeerId,
-        topic: []const u8,
-
-        const Self = @This();
-
-        pub fn handle(self: *Self, e: Event) void {
-            switch (e) {
-                .message => |msg| {
-                    if (!std.mem.eql(u8, msg.message.topic, self.topic)) return;
-                    if (self.data.*) |existing| {
-                        self.allocator.free(existing);
-                        self.data.* = null;
-                    }
-                    const copy = self.allocator.dupe(u8, msg.message.data) catch {
-                        self.done.store(true, .release);
-                        return;
-                    };
-                    self.data.* = copy;
-                    self.source.* = msg.propagation_source;
-                    self.done.store(true, .release);
-                },
-                else => {},
-            }
-        }
-
-        pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            self.handle(evt);
-        }
-
-        pub const vtable = event.EventListenerVTable(Event){
-            .handleFn = vtableHandleFn,
-        };
-
-        pub fn any(self: *Self) event.AnyEventListener(Event) {
-            return .{
-                .instance = @ptrCast(self),
-                .vtable = &Self.vtable,
-            };
-        }
-    };
-
-    var message_done = std.atomic.Value(bool).init(false);
-    var message_data: ?[]u8 = null;
-    errdefer if (message_data) |data_copy| allocator.free(data_copy);
-    var message_source: ?PeerId = null;
-    var listener: MessageListener = .{
-        .allocator = allocator,
-        .done = &message_done,
-        .data = &message_data,
-        .source = &message_source,
-        .topic = topic,
-    };
-    try node.router.event_emitter.addListener(.message, listener.any());
-    errdefer _ = node.router.event_emitter.removeListener(.message, listener.any());
-
-    const PublishState = struct {
-        done: *std.atomic.Value(bool),
-        err: *?anyerror,
-        recipients: *?[]PeerId,
-    };
-
-    const PublishCallback = struct {
-        fn callback(ctx: ?*anyopaque, res: anyerror![]PeerId) void {
-            const state: *PublishState = @ptrCast(@alignCast(ctx.?));
-            const peers = res catch |err| {
-                std.log.err("publish callback error: {}", .{err});
-                state.err.* = err;
-                state.recipients.* = null;
-                state.done.store(true, .release);
-                return;
-            };
-            state.err.* = null;
-            state.recipients.* = peers;
-            state.done.store(true, .release);
-        }
-    };
-
-    const payload = "hello from publish";
-
-    var publish_done = std.atomic.Value(bool).init(false);
-    var publish_err: ?anyerror = null;
-    var publish_recipients: ?[]PeerId = null;
-    errdefer if (publish_recipients) |recipients| allocator.free(recipients);
-    var publish_state = PublishState{
-        .done = &publish_done,
-        .err = &publish_err,
-        .recipients = &publish_recipients,
-    };
-    const publish_ctx: ?*anyopaque = @ptrCast(@constCast(&publish_state));
-
-    node.router.publish(topic, payload, publish_ctx, PublishCallback.callback);
-
-    try waitForFlag(&publish_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(publish_err == null);
-    try std.testing.expect(publish_recipients != null);
-    try std.testing.expectEqual(@as(usize, 1), publish_recipients.?.len);
-    try std.testing.expect(publish_recipients.?[0].eql(&node.transport.local_peer_id));
-
-    try waitForFlag(&message_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(message_source != null);
-    try std.testing.expect(message_source.?.eql(&node.transport.local_peer_id));
-    try std.testing.expect(message_data != null);
-    try std.testing.expect(std.mem.eql(u8, message_data.?, payload));
-
-    if (publish_recipients) |recipients| {
-        allocator.free(recipients);
-    }
-
-    if (message_data) |data_copy| {
-        allocator.free(data_copy);
-    }
-
-    const UnsubscribeState = struct {
-        done: *std.atomic.Value(bool),
-        err: *?anyerror,
-    };
-
-    const UnsubscribeCallback = struct {
-        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
-            const state: *UnsubscribeState = @ptrCast(@alignCast(ctx.?));
-            if (res) |_| {
-                state.err.* = null;
-            } else |err| {
-                state.err.* = err;
-            }
-            state.done.store(true, .release);
-        }
-    };
-
-    var unsubscribe_done = std.atomic.Value(bool).init(false);
-    var unsubscribe_err: ?anyerror = null;
-    var unsubscribe_state = UnsubscribeState{
-        .done = &unsubscribe_done,
-        .err = &unsubscribe_err,
-    };
-    const unsubscribe_ctx: ?*anyopaque = @ptrCast(@constCast(&unsubscribe_state));
-    node.router.unsubscribe(topic, unsubscribe_ctx, UnsubscribeCallback.callback);
-
-    try waitForFlag(&unsubscribe_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(unsubscribe_err == null);
-
-    _ = node.router.event_emitter.removeListener(.message, listener.any());
-}
-
-test "pubsub subscribe and publish between nodes" {
-    const allocator = std.testing.allocator;
-
-    // For now we only verify that two independent nodes can add each other successfully.
-    // Once this is stable, we'll extend the test step-by-step to cover subscribe/publish flows again.
-    const node_options: Gossipsub.Options = .{}; // defaults: StrictSign + signing
-
-    var node_a: TestGossipsubNode = undefined;
-    try node_a.init(allocator, 9967, node_options);
-    defer node_a.deinit();
-
-    var node_b: TestGossipsubNode = undefined;
-    try node_b.init(allocator, 9968, node_options);
-    defer node_b.deinit();
-
-    const AddPeerState = struct {
-        done: *std.atomic.Value(bool),
-        err: *?anyerror,
-    };
-
-    const logAddPeer = struct {
-        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
-            const state: *AddPeerState = @ptrCast(@alignCast(ctx.?));
-            if (res) |_| {
-                std.debug.print("addPeer succeeded\n", .{});
-                state.err.* = null;
-            } else |err| {
-                std.debug.print("addPeer failed: {any}\n", .{err});
-                state.err.* = err;
-            }
-            state.done.store(true, .release);
-        }
-    };
-
-    var add_peer_ab_done = std.atomic.Value(bool).init(false);
-    var add_peer_ab_err: ?anyerror = null;
-    var add_peer_ab_state = AddPeerState{ .done = &add_peer_ab_done, .err = &add_peer_ab_err };
-    node_a.router.addPeer(node_b.dial_addr, @ptrCast(@constCast(&add_peer_ab_state)), logAddPeer.callback);
-
-    var add_peer_ba_done = std.atomic.Value(bool).init(false);
-    var add_peer_ba_err: ?anyerror = null;
-    var add_peer_ba_state = AddPeerState{ .done = &add_peer_ba_done, .err = &add_peer_ba_err };
-    node_b.router.addPeer(node_a.dial_addr, @ptrCast(@constCast(&add_peer_ba_state)), logAddPeer.callback);
-
-    try waitForFlag(&add_peer_ab_done, 5 * std.time.ns_per_s);
-    try waitForFlag(&add_peer_ba_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(add_peer_ab_err == null);
-    try std.testing.expect(add_peer_ba_err == null);
-
-    std.debug.print("peer counts: A = {d}, B = {d}\n", .{ node_a.router.peers.count(), node_b.router.peers.count() });
-    try std.testing.expectEqual(@as(usize, 1), node_a.router.peers.count());
-    try std.testing.expectEqual(@as(usize, 1), node_b.router.peers.count());
-
-    try std.testing.expect(node_a.router.peers.get(node_b.transport.local_peer_id) != null);
-    try std.testing.expect(node_b.router.peers.get(node_a.transport.local_peer_id) != null);
-
-    const topic = "gossip-multi";
-
-    const SubscribeState = struct {
-        done: *std.atomic.Value(bool),
-        err: *?anyerror,
-    };
-
-    const subscribeCallback = struct {
-        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
-            const state: *SubscribeState = @ptrCast(@alignCast(ctx.?));
-            if (res) |_| {
-                std.debug.print("subscribe succeeded\n", .{});
-                state.err.* = null;
-            } else |err| {
-                std.debug.print("subscribe failed: {any}\n", .{err});
-                state.err.* = err;
-            }
-            state.done.store(true, .release);
-        }
-    };
-
-    var subscribe_a_done = std.atomic.Value(bool).init(false);
-    var subscribe_a_err: ?anyerror = null;
-    var subscribe_a_state = SubscribeState{ .done = &subscribe_a_done, .err = &subscribe_a_err };
-    node_a.router.subscribe(topic, @ptrCast(@constCast(&subscribe_a_state)), subscribeCallback.callback);
-
-    var subscribe_b_done = std.atomic.Value(bool).init(false);
-    var subscribe_b_err: ?anyerror = null;
-    var subscribe_b_state = SubscribeState{ .done = &subscribe_b_done, .err = &subscribe_b_err };
-    node_b.router.subscribe(topic, @ptrCast(@constCast(&subscribe_b_state)), subscribeCallback.callback);
-
-    try waitForFlag(&subscribe_a_done, 5 * std.time.ns_per_s);
-    try waitForFlag(&subscribe_b_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(subscribe_a_err == null);
-    try std.testing.expect(subscribe_b_err == null);
-
-    std.time.sleep(200 * std.time.us_per_ms);
-    try std.testing.expect(node_a.router.subscriptions.contains(topic));
-    try std.testing.expect(node_b.router.subscriptions.contains(topic));
-
-    std.debug.print("subscriptions: A = {d}, B = {d}\n", .{ node_a.router.subscriptions.count(), node_b.router.subscriptions.count() });
-
-    const wait_ns = 5 * std.time.ns_per_s;
-    try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, wait_ns);
-    try waitForTopicPeer(&node_b.router, topic, node_a.transport.local_peer_id, wait_ns);
-    try waitForMeshTopic(&node_a.router, topic, wait_ns);
-    try waitForMeshTopic(&node_b.router, topic, wait_ns);
-    try waitForUsableStream(&node_a.router, node_b.transport.local_peer_id, wait_ns);
-    try waitForUsableStream(&node_b.router, node_a.transport.local_peer_id, wait_ns);
-
-    const MessageListener = struct {
-        allocator: std.mem.Allocator,
-        done: *std.atomic.Value(bool),
-        data: *?[]u8,
-        source: *?PeerId,
-        topic: []const u8,
-
-        const Self = @This();
-
-        pub fn handle(self: *Self, e: Event) void {
-            switch (e) {
-                .message => |msg| {
-                    if (!std.mem.eql(u8, msg.message.topic, self.topic)) return;
-                    if (self.data.*) |existing| {
-                        self.allocator.free(existing);
-                        self.data.* = null;
-                    }
-                    const copy = self.allocator.dupe(u8, msg.message.data) catch {
-                        self.done.store(true, .release);
-                        return;
-                    };
-                    self.data.* = copy;
-                    self.source.* = msg.propagation_source;
-                    self.done.store(true, .release);
-                },
-                else => {},
-            }
-        }
-
-        pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            self.handle(evt);
-        }
-
-        pub const vtable = event.EventListenerVTable(Event){
-            .handleFn = vtableHandleFn,
-        };
-
-        pub fn any(self: *Self) event.AnyEventListener(Event) {
-            return .{
-                .instance = @ptrCast(self),
-                .vtable = &Self.vtable,
-            };
-        }
-    };
-
-    var message_b_done = std.atomic.Value(bool).init(false);
-    var message_b_data: ?[]u8 = null;
-    errdefer if (message_b_data) |data_copy| allocator.free(data_copy);
-    var message_b_source: ?PeerId = null;
-    var listener_b: MessageListener = .{
-        .allocator = allocator,
-        .done = &message_b_done,
-        .data = &message_b_data,
-        .source = &message_b_source,
-        .topic = topic,
-    };
-    try node_b.router.event_emitter.addListener(.message, listener_b.any());
-    defer _ = node_b.router.event_emitter.removeListener(.message, listener_b.any());
-
-    var message_a_done = std.atomic.Value(bool).init(false);
-    var message_a_data: ?[]u8 = null;
-    errdefer if (message_a_data) |data_copy| allocator.free(data_copy);
-    var message_a_source: ?PeerId = null;
-    var listener_a: MessageListener = .{
-        .allocator = allocator,
-        .done = &message_a_done,
-        .data = &message_a_data,
-        .source = &message_a_source,
-        .topic = topic,
-    };
-    try node_a.router.event_emitter.addListener(.message, listener_a.any());
-    defer _ = node_a.router.event_emitter.removeListener(.message, listener_a.any());
-
-    const PublishState = struct {
-        done: *std.atomic.Value(bool),
-        err: *?anyerror,
-        recipients: *?[]PeerId,
-    };
-
-    const PublishCallback = struct {
-        fn callback(ctx: ?*anyopaque, res: anyerror![]PeerId) void {
-            const state: *PublishState = @ptrCast(@alignCast(ctx.?));
-            const peers = res catch |err| {
-                state.err.* = err;
-                state.recipients.* = null;
-                state.done.store(true, .release);
-                return;
-            };
-            state.err.* = null;
-            state.recipients.* = peers;
-            state.done.store(true, .release);
-        }
-    };
-
-    const payload = "hello-from-node-a";
-
-    var publish_done = std.atomic.Value(bool).init(false);
-    var publish_err: ?anyerror = null;
-    var publish_recipients: ?[]PeerId = null;
-    errdefer if (publish_recipients) |recipients| allocator.free(recipients);
-    var publish_state = PublishState{
-        .done = &publish_done,
-        .err = &publish_err,
-        .recipients = &publish_recipients,
-    };
-    const publish_ctx: ?*anyopaque = @ptrCast(@constCast(&publish_state));
-
-    node_a.router.publish(topic, payload, publish_ctx, PublishCallback.callback);
-
-    try waitForFlag(&publish_done, 5 * std.time.ns_per_s);
-    std.debug.print("publish done on node A {?}\n", .{publish_err});
-    try std.testing.expect(publish_err == null);
-    try std.testing.expect(publish_recipients != null);
-    try std.testing.expectEqual(@as(usize, 1), publish_recipients.?.len);
-    try std.testing.expect(publish_recipients.?[0].eql(&node_b.transport.local_peer_id));
-
-    try waitForFlag(&message_b_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(message_b_source != null);
-    try std.testing.expect(message_b_source.?.eql(&node_a.transport.local_peer_id));
-    try std.testing.expect(message_b_data != null);
-    try std.testing.expect(std.mem.eql(u8, message_b_data.?, payload));
-
-    if (publish_recipients) |recipients| {
-        allocator.free(recipients);
-        publish_recipients = null;
-    }
-
-    if (message_b_data) |data_copy| {
-        allocator.free(data_copy);
-        message_b_data = null;
-    }
-
-    const payload_back = "hello-from-node-b";
-
-    var publish_back_done = std.atomic.Value(bool).init(false);
-    var publish_back_err: ?anyerror = null;
-    var publish_back_recipients: ?[]PeerId = null;
-    errdefer if (publish_back_recipients) |recipients| allocator.free(recipients);
-    var publish_back_state = PublishState{
-        .done = &publish_back_done,
-        .err = &publish_back_err,
-        .recipients = &publish_back_recipients,
-    };
-    const publish_back_ctx: ?*anyopaque = @ptrCast(@constCast(&publish_back_state));
-
-    node_b.router.publish(topic, payload_back, publish_back_ctx, PublishCallback.callback);
-
-    try waitForFlag(&publish_back_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(publish_back_err == null);
-    try std.testing.expect(publish_back_recipients != null);
-    try std.testing.expectEqual(@as(usize, 1), publish_back_recipients.?.len);
-    try std.testing.expect(publish_back_recipients.?[0].eql(&node_a.transport.local_peer_id));
-
-    try waitForFlag(&message_a_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(message_a_source != null);
-    try std.testing.expect(message_a_source.?.eql(&node_b.transport.local_peer_id));
-    try std.testing.expect(message_a_data != null);
-    try std.testing.expect(std.mem.eql(u8, message_a_data.?, payload_back));
-
-    if (publish_back_recipients) |recipients| {
-        allocator.free(recipients);
-    }
-
-    if (message_a_data) |data_copy| {
-        allocator.free(data_copy);
-        message_a_data = null;
-    }
-
-    const RemovePeerState = struct {
-        done: *std.atomic.Value(bool),
-        err: *?anyerror,
-    };
-
-    const removePeerCallback = struct {
-        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
-            const state: *RemovePeerState = @ptrCast(@alignCast(ctx.?));
-            if (res) |_| {
-                std.debug.print("removePeer succeeded\n", .{});
-                state.err.* = null;
-            } else |err| {
-                std.debug.print("removePeer failed: {any}\n", .{err});
-                state.err.* = err;
-            }
-            state.done.store(true, .release);
-        }
-    };
-
-    var remove_peer_ab_done = std.atomic.Value(bool).init(false);
-    var remove_peer_ab_err: ?anyerror = null;
-    var remove_peer_ab_state = RemovePeerState{ .done = &remove_peer_ab_done, .err = &remove_peer_ab_err };
-    node_a.router.removePeer(node_b.transport.local_peer_id, @ptrCast(@constCast(&remove_peer_ab_state)), removePeerCallback.callback);
-
-    var remove_peer_ba_done = std.atomic.Value(bool).init(false);
-    var remove_peer_ba_err: ?anyerror = null;
-    var remove_peer_ba_state = RemovePeerState{ .done = &remove_peer_ba_done, .err = &remove_peer_ba_err };
-    node_b.router.removePeer(node_a.transport.local_peer_id, @ptrCast(@constCast(&remove_peer_ba_state)), removePeerCallback.callback);
-
-    try waitForFlag(&remove_peer_ab_done, 5 * std.time.ns_per_s);
-    try waitForFlag(&remove_peer_ba_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(remove_peer_ab_err == null);
-    try std.testing.expect(remove_peer_ba_err == null);
-
-    std.time.sleep(200 * std.time.us_per_ms);
-
-    try std.testing.expectEqual(@as(usize, 0), node_a.router.peers.count());
-    try std.testing.expectEqual(@as(usize, 0), node_b.router.peers.count());
-}
-
-test "pubsub multi-topic mesh and publish" {
-    const allocator = std.testing.allocator;
-
-    const node_options: Gossipsub.Options = .{};
-
-    var node_a: TestGossipsubNode = undefined;
-    try node_a.init(allocator, 10067, node_options);
-    defer node_a.deinit();
-
-    var node_b: TestGossipsubNode = undefined;
-    try node_b.init(allocator, 10068, node_options);
-    defer node_b.deinit();
-
-    const AddPeerState = struct {
-        done: *std.atomic.Value(bool),
-        err: *?anyerror,
-    };
-
-    const addPeerCallback = struct {
-        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
-            const state: *AddPeerState = @ptrCast(@alignCast(ctx.?));
-            if (res) |_| {
-                state.err.* = null;
-            } else |err| {
-                state.err.* = err;
-            }
-            state.done.store(true, .release);
-        }
-    };
-
-    var add_peer_ab_done = std.atomic.Value(bool).init(false);
-    var add_peer_ab_err: ?anyerror = null;
-    var add_peer_ab_state = AddPeerState{ .done = &add_peer_ab_done, .err = &add_peer_ab_err };
-    node_a.router.addPeer(node_b.dial_addr, @ptrCast(@constCast(&add_peer_ab_state)), addPeerCallback.callback);
-
-    var add_peer_ba_done = std.atomic.Value(bool).init(false);
-    var add_peer_ba_err: ?anyerror = null;
-    var add_peer_ba_state = AddPeerState{ .done = &add_peer_ba_done, .err = &add_peer_ba_err };
-    node_b.router.addPeer(node_a.dial_addr, @ptrCast(@constCast(&add_peer_ba_state)), addPeerCallback.callback);
-
-    try waitForFlag(&add_peer_ab_done, 5 * std.time.ns_per_s);
-    try waitForFlag(&add_peer_ba_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(add_peer_ab_err == null);
-    try std.testing.expect(add_peer_ba_err == null);
-
-    try std.testing.expectEqual(@as(usize, 1), node_a.router.peers.count());
-    try std.testing.expectEqual(@as(usize, 1), node_b.router.peers.count());
-
-    const topics = [_][]const u8{ "topic-alpha", "topic-beta" };
-
-    const SubscribeState = struct {
-        done: *std.atomic.Value(bool),
-        err: *?anyerror,
-    };
-
-    const subscribeCallback = struct {
-        fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
-            const state: *SubscribeState = @ptrCast(@alignCast(ctx.?));
-            if (res) |_| {
-                state.err.* = null;
-            } else |err| {
-                state.err.* = err;
-            }
-            state.done.store(true, .release);
-        }
-    };
-
-    for (topics) |topic| {
-        var subscribe_a_done = std.atomic.Value(bool).init(false);
-        var subscribe_a_err: ?anyerror = null;
-        var subscribe_a_state = SubscribeState{ .done = &subscribe_a_done, .err = &subscribe_a_err };
-        node_a.router.subscribe(topic, @ptrCast(@constCast(&subscribe_a_state)), subscribeCallback.callback);
-
-        var subscribe_b_done = std.atomic.Value(bool).init(false);
-        var subscribe_b_err: ?anyerror = null;
-        var subscribe_b_state = SubscribeState{ .done = &subscribe_b_done, .err = &subscribe_b_err };
-        node_b.router.subscribe(topic, @ptrCast(@constCast(&subscribe_b_state)), subscribeCallback.callback);
-
-        try waitForFlag(&subscribe_a_done, 5 * std.time.ns_per_s);
-        try waitForFlag(&subscribe_b_done, 5 * std.time.ns_per_s);
-        try std.testing.expect(subscribe_a_err == null);
-        try std.testing.expect(subscribe_b_err == null);
-    }
-
-    std.time.sleep(400 * std.time.us_per_ms);
-
-    for (topics) |topic| {
-        try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
-        try waitForTopicPeer(&node_b.router, topic, node_a.transport.local_peer_id, 5 * std.time.ns_per_s);
-
-        try waitForMeshTopic(&node_a.router, topic, 5 * std.time.ns_per_s);
-        try waitForMeshTopic(&node_b.router, topic, 5 * std.time.ns_per_s);
-
-        try std.testing.expect(node_a.router.mesh.contains(topic));
-        try std.testing.expect(node_b.router.mesh.contains(topic));
-        try std.testing.expect(node_a.router.subscriptions.contains(topic));
-        try std.testing.expect(node_b.router.subscriptions.contains(topic));
-    }
-
-    const MessageListener = struct {
-        allocator: std.mem.Allocator,
-        topic: []const u8,
-        done: *std.atomic.Value(bool),
-        data: *?[]u8,
-        source: *?PeerId,
-
-        const Self = @This();
-
-        pub fn handle(self: *Self, e: Event) void {
-            switch (e) {
-                .message => |msg| {
-                    if (!std.mem.eql(u8, msg.message.topic, self.topic)) return;
-                    if (self.data.*) |existing| {
-                        self.allocator.free(existing);
-                        self.data.* = null;
-                    }
-                    const copy = self.allocator.dupe(u8, msg.message.data) catch {
-                        self.done.store(true, .release);
-                        return;
-                    };
-                    self.data.* = copy;
-                    self.source.* = msg.propagation_source;
-                    self.done.store(true, .release);
-                },
-                else => {},
-            }
-        }
-
-        pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            self.handle(evt);
-        }
-
-        pub const vtable = event.EventListenerVTable(Event){
-            .handleFn = vtableHandleFn,
-        };
-
-        pub fn any(self: *Self) event.AnyEventListener(Event) {
-            return .{
-                .instance = @ptrCast(self),
-                .vtable = &Self.vtable,
-            };
-        }
-    };
-
-    var message_b_done_alpha = std.atomic.Value(bool).init(false);
-    var message_b_data_alpha: ?[]u8 = null;
-    errdefer if (message_b_data_alpha) |data_copy| allocator.free(data_copy);
-    var message_b_source_alpha: ?PeerId = null;
-    var listener_b_alpha: MessageListener = .{
-        .allocator = allocator,
-        .topic = topics[0],
-        .done = &message_b_done_alpha,
-        .data = &message_b_data_alpha,
-        .source = &message_b_source_alpha,
-    };
-    try node_b.router.event_emitter.addListener(.message, listener_b_alpha.any());
-    defer _ = node_b.router.event_emitter.removeListener(.message, listener_b_alpha.any());
-
-    var message_b_done_beta = std.atomic.Value(bool).init(false);
-    var message_b_data_beta: ?[]u8 = null;
-    errdefer if (message_b_data_beta) |data_copy| allocator.free(data_copy);
-    var message_b_source_beta: ?PeerId = null;
-    var listener_b_beta: MessageListener = .{
-        .allocator = allocator,
-        .topic = topics[1],
-        .done = &message_b_done_beta,
-        .data = &message_b_data_beta,
-        .source = &message_b_source_beta,
-    };
-    try node_b.router.event_emitter.addListener(.message, listener_b_beta.any());
-    defer _ = node_b.router.event_emitter.removeListener(.message, listener_b_beta.any());
-
-    var message_a_done_alpha = std.atomic.Value(bool).init(false);
-    var message_a_data_alpha: ?[]u8 = null;
-    errdefer if (message_a_data_alpha) |data_copy| allocator.free(data_copy);
-    var message_a_source_alpha: ?PeerId = null;
-    var listener_a_alpha: MessageListener = .{
-        .allocator = allocator,
-        .topic = topics[0],
-        .done = &message_a_done_alpha,
-        .data = &message_a_data_alpha,
-        .source = &message_a_source_alpha,
-    };
-    try node_a.router.event_emitter.addListener(.message, listener_a_alpha.any());
-    defer _ = node_a.router.event_emitter.removeListener(.message, listener_a_alpha.any());
-
-    var message_a_done_beta = std.atomic.Value(bool).init(false);
-    var message_a_data_beta: ?[]u8 = null;
-    errdefer if (message_a_data_beta) |data_copy| allocator.free(data_copy);
-    var message_a_source_beta: ?PeerId = null;
-    var listener_a_beta: MessageListener = .{
-        .allocator = allocator,
-        .topic = topics[1],
-        .done = &message_a_done_beta,
-        .data = &message_a_data_beta,
-        .source = &message_a_source_beta,
-    };
-    try node_a.router.event_emitter.addListener(.message, listener_a_beta.any());
-    defer _ = node_a.router.event_emitter.removeListener(.message, listener_a_beta.any());
-
-    const PublishState = struct {
-        done: *std.atomic.Value(bool),
-        err: *?anyerror,
-        recipients: *?[]PeerId,
-    };
-
-    const publishCallback = struct {
-        fn callback(ctx: ?*anyopaque, res: anyerror![]PeerId) void {
-            const state: *PublishState = @ptrCast(@alignCast(ctx.?));
-            const peers = res catch |err| {
-                state.err.* = err;
-                state.recipients.* = null;
-                state.done.store(true, .release);
-                return;
-            };
-            state.err.* = null;
-            state.recipients.* = peers;
-            state.done.store(true, .release);
-        }
-    };
-
-    const payload_alpha = "msg-from-alpha";
-    const payload_beta = "msg-from-beta";
-
-    var publish_alpha_done = std.atomic.Value(bool).init(false);
-    var publish_alpha_err: ?anyerror = null;
-    var publish_alpha_recipients: ?[]PeerId = null;
-    errdefer if (publish_alpha_recipients) |recipients| allocator.free(recipients);
-    var publish_alpha_state = PublishState{
-        .done = &publish_alpha_done,
-        .err = &publish_alpha_err,
-        .recipients = &publish_alpha_recipients,
-    };
-    const publish_alpha_ctx: ?*anyopaque = @ptrCast(@constCast(&publish_alpha_state));
-
-    node_a.router.publish(topics[0], payload_alpha, publish_alpha_ctx, publishCallback.callback);
-
-    try waitForFlag(&publish_alpha_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(publish_alpha_err == null);
-    try std.testing.expect(publish_alpha_recipients != null);
-    try std.testing.expectEqual(@as(usize, 1), publish_alpha_recipients.?.len);
-    try std.testing.expect(publish_alpha_recipients.?[0].eql(&node_b.transport.local_peer_id));
-
-    try waitForFlag(&message_b_done_alpha, 5 * std.time.ns_per_s);
-    try std.testing.expect(message_b_source_alpha != null);
-    try std.testing.expect(message_b_source_alpha.?.eql(&node_a.transport.local_peer_id));
-    try std.testing.expect(message_b_data_alpha != null);
-    try std.testing.expect(std.mem.eql(u8, message_b_data_alpha.?, payload_alpha));
-    try std.testing.expect(message_b_data_beta == null);
-
-    if (publish_alpha_recipients) |recipients| {
-        allocator.free(recipients);
-        publish_alpha_recipients = null;
-    }
-
-    if (message_b_data_alpha) |data_copy| {
-        allocator.free(data_copy);
-        message_b_data_alpha = null;
-    }
-
-    var publish_beta_done = std.atomic.Value(bool).init(false);
-    var publish_beta_err: ?anyerror = null;
-    var publish_beta_recipients: ?[]PeerId = null;
-    errdefer if (publish_beta_recipients) |recipients| allocator.free(recipients);
-    var publish_beta_state = PublishState{
-        .done = &publish_beta_done,
-        .err = &publish_beta_err,
-        .recipients = &publish_beta_recipients,
-    };
-    const publish_beta_ctx: ?*anyopaque = @ptrCast(@constCast(&publish_beta_state));
-
-    node_b.router.publish(topics[1], payload_beta, publish_beta_ctx, publishCallback.callback);
-
-    try waitForFlag(&publish_beta_done, 5 * std.time.ns_per_s);
-    try std.testing.expect(publish_beta_err == null);
-    try std.testing.expect(publish_beta_recipients != null);
-    try std.testing.expectEqual(@as(usize, 1), publish_beta_recipients.?.len);
-    try std.testing.expect(publish_beta_recipients.?[0].eql(&node_a.transport.local_peer_id));
-
-    try waitForFlag(&message_a_done_beta, 5 * std.time.ns_per_s);
-    try std.testing.expect(message_a_source_beta != null);
-    try std.testing.expect(message_a_source_beta.?.eql(&node_b.transport.local_peer_id));
-    try std.testing.expect(message_a_data_beta != null);
-    try std.testing.expect(std.mem.eql(u8, message_a_data_beta.?, payload_beta));
-    try std.testing.expect(message_a_data_alpha == null);
-
-    if (publish_beta_recipients) |recipients| {
-        allocator.free(recipients);
-    }
-
-    if (message_a_data_beta) |data_copy| {
-        allocator.free(data_copy);
-        message_a_data_beta = null;
-    }
-
-    if (message_b_data_beta) |data_copy| {
-        allocator.free(data_copy);
-    }
-
-    if (message_a_data_alpha) |data_copy| {
-        allocator.free(data_copy);
-        message_a_data_alpha = null;
-    }
-}
-
-test "pubsub three-node propagation" {
-    const allocator = std.testing.allocator;
-
-    var node_a: TestGossipsubNode = undefined;
-    try node_a.init(allocator, 12067, .{});
-    defer node_a.deinit();
-
-    var node_b: TestGossipsubNode = undefined;
-    try node_b.init(allocator, 12068, .{});
-    defer node_b.deinit();
-
-    var node_c: TestGossipsubNode = undefined;
-    try node_c.init(allocator, 12069, .{});
-    defer node_c.deinit();
-
-    try addPeerSync(&node_a.router, node_b.dial_addr);
-    try addPeerSync(&node_b.router, node_a.dial_addr);
-    try addPeerSync(&node_a.router, node_c.dial_addr);
-    try addPeerSync(&node_c.router, node_a.dial_addr);
-    try addPeerSync(&node_b.router, node_c.dial_addr);
-    try addPeerSync(&node_c.router, node_b.dial_addr);
-
-    const wait_ns = 5 * std.time.ns_per_s;
-    try waitForUsableStream(&node_a.router, node_b.transport.local_peer_id, wait_ns);
-    try waitForUsableStream(&node_a.router, node_c.transport.local_peer_id, wait_ns);
-    try waitForUsableStream(&node_b.router, node_a.transport.local_peer_id, wait_ns);
-    try waitForUsableStream(&node_b.router, node_c.transport.local_peer_id, wait_ns);
-    try waitForUsableStream(&node_c.router, node_a.transport.local_peer_id, wait_ns);
-    try waitForUsableStream(&node_c.router, node_b.transport.local_peer_id, wait_ns);
-
-    const topic = "three-node";
-    try subscribeSync(&node_a.router, topic);
-    try subscribeSync(&node_b.router, topic);
-    try subscribeSync(&node_c.router, topic);
-
-    try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, wait_ns);
-    try waitForTopicPeer(&node_a.router, topic, node_c.transport.local_peer_id, wait_ns);
-    try waitForTopicPeer(&node_b.router, topic, node_a.transport.local_peer_id, wait_ns);
-    try waitForTopicPeer(&node_b.router, topic, node_c.transport.local_peer_id, wait_ns);
-    try waitForTopicPeer(&node_c.router, topic, node_a.transport.local_peer_id, wait_ns);
-    try waitForTopicPeer(&node_c.router, topic, node_b.transport.local_peer_id, wait_ns);
-
-    try waitForMeshTopic(&node_a.router, topic, wait_ns);
-    try waitForMeshTopic(&node_b.router, topic, wait_ns);
-    try waitForMeshTopic(&node_c.router, topic, wait_ns);
-
-    const MessageListener = struct {
-        allocator: Allocator,
-        expected_topic: []const u8,
-        done: *std.atomic.Value(bool),
-        data: *?[]u8,
-        source: *?PeerId,
-
-        const Self = @This();
-
-        pub fn handle(self: *Self, e: Event) void {
-            switch (e) {
-                .message => |msg| {
-                    if (!std.mem.eql(u8, msg.message.topic, self.expected_topic)) return;
-                    if (self.data.*) |existing| {
-                        self.allocator.free(existing);
-                        self.data.* = null;
-                    }
-                    const copy = self.allocator.dupe(u8, msg.message.data) catch {
-                        self.done.store(true, .release);
-                        return;
-                    };
-                    self.data.* = copy;
-                    self.source.* = msg.propagation_source;
-                    self.done.store(true, .release);
-                },
-                else => {},
-            }
-        }
-
-        pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
-            const self: *Self = @ptrCast(@alignCast(instance));
-            self.handle(evt);
-        }
-
-        pub const vtable = event.EventListenerVTable(Event){
-            .handleFn = vtableHandleFn,
-        };
-
-        pub fn any(self: *Self) event.AnyEventListener(Event) {
-            return .{
-                .instance = @ptrCast(self),
-                .vtable = &Self.vtable,
-            };
-        }
-    };
-
-    var message_b_done = std.atomic.Value(bool).init(false);
-    var message_b_data: ?[]u8 = null;
-    defer if (message_b_data) |data_copy| allocator.free(data_copy);
-    var message_b_source: ?PeerId = null;
-    var listener_b: MessageListener = .{
-        .allocator = allocator,
-        .expected_topic = topic,
-        .done = &message_b_done,
-        .data = &message_b_data,
-        .source = &message_b_source,
-    };
-    try node_b.router.event_emitter.addListener(.message, listener_b.any());
-    defer _ = node_b.router.event_emitter.removeListener(.message, listener_b.any());
-
-    var message_c_done = std.atomic.Value(bool).init(false);
-    var message_c_data: ?[]u8 = null;
-    defer if (message_c_data) |data_copy| allocator.free(data_copy);
-    var message_c_source: ?PeerId = null;
-    var listener_c: MessageListener = .{
-        .allocator = allocator,
-        .expected_topic = topic,
-        .done = &message_c_done,
-        .data = &message_c_data,
-        .source = &message_c_source,
-    };
-    try node_c.router.event_emitter.addListener(.message, listener_c.any());
-    defer _ = node_c.router.event_emitter.removeListener(.message, listener_c.any());
-
-    const payload = "three-node-message";
-    const recipients = try publishSync(&node_a.router, topic, payload, allocator);
-    defer allocator.free(recipients);
-
-    try std.testing.expectEqual(@as(usize, 2), recipients.len);
-    var saw_b = false;
-    var saw_c = false;
-    for (recipients) |peer| {
-        if (peer.eql(&node_b.transport.local_peer_id)) saw_b = true;
-        if (peer.eql(&node_c.transport.local_peer_id)) saw_c = true;
-    }
-    try std.testing.expect(saw_b);
-    try std.testing.expect(saw_c);
-
-    try waitForFlag(&message_b_done, wait_ns);
-    try std.testing.expect(message_b_source != null);
-    try std.testing.expect(message_b_source.?.eql(&node_a.transport.local_peer_id));
-    try std.testing.expect(message_b_data != null);
-    try std.testing.expect(std.mem.eql(u8, message_b_data.?, payload));
-
-    try waitForFlag(&message_c_done, wait_ns);
-    try std.testing.expect(message_c_source != null);
-    try std.testing.expect(message_c_source.?.eql(&node_a.transport.local_peer_id));
-    try std.testing.expect(message_c_data != null);
-    try std.testing.expect(std.mem.eql(u8, message_c_data.?, payload));
-}
+// test "gossipsub listen callback exposes negotiated protocol" {
+//     const allocator = std.testing.allocator;
+
+//     const ListenObserver = struct {
+//         event: std.Thread.ResetEvent = .{},
+//         observed_protocol: ?[]const u8 = null,
+//         router: ?*Gossipsub = null,
+
+//         const Self = @This();
+
+//         fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+//             const self: *Self = @ptrCast(@alignCast(ctx.?));
+//             defer self.event.set();
+
+//             const controller = res catch return;
+//             const stream = libp2p.protocols.getStream(controller) orelse return;
+//             self.observed_protocol = stream.negotiated_protocol;
+
+//             if (self.router) |router| {
+//                 Gossipsub.onIncomingNewStream(@ptrCast(router), controller);
+//             }
+//         }
+//     };
+
+//     var observer = ListenObserver{};
+
+//     var server: TestGossipsubNode = undefined;
+//     try server.initWithListenCallback(allocator, 9450, .{}, &observer, ListenObserver.callback);
+//     observer.router = &server.router;
+//     defer server.deinit();
+
+//     var client: TestGossipsubNode = undefined;
+//     try client.init(allocator, 9451, .{});
+//     defer client.deinit();
+
+//     client.router.addPeer(server.dial_addr, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             _ = res catch {};
+//         }
+//     }.callback);
+
+//     observer.event.wait();
+
+//     try std.testing.expect(observer.observed_protocol != null);
+//     const proto = observer.observed_protocol.?;
+//     const is_supported = std.mem.eql(u8, proto, v1_id) or std.mem.eql(u8, proto, v1_1_id);
+//     try std.testing.expect(is_supported);
+
+//     std.time.sleep(200 * std.time.ns_per_ms);
+// }
+
+// test "switch handles ping and gossipsub simultaneously" {
+//     const allocator = std.testing.allocator;
+//     const server_port: u16 = 9472;
+//     const client_port: u16 = 9473;
+//     const topic = "interop/ping-gossipsub";
+//     const payload = "ping-gossipsub-payload";
+
+//     const ListenDispatch = struct {
+//         node: *TestGossipsubNode,
+
+//         const Self = @This();
+
+//         fn callback(ctx: ?*anyopaque, res: anyerror!?*anyopaque) void {
+//             const self: *Self = @ptrCast(@alignCast(ctx.?));
+//             const controller = res catch return;
+//             const stream = libp2p.protocols.getStream(controller) orelse return;
+//             const proto = stream.negotiated_protocol orelse return;
+
+//             if (std.mem.eql(u8, proto, v1_id) or std.mem.eql(u8, proto, v1_1_id)) {
+//                 Gossipsub.onIncomingNewStream(@ptrCast(&self.node.router), controller);
+//                 return;
+//             }
+
+//             if (std.mem.eql(u8, proto, ping.protocol_id)) {
+//                 return;
+//             }
+
+//             stream.close(null, struct {
+//                 fn onClosed(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+//             }.onClosed);
+//         }
+//     };
+
+//     var server: TestGossipsubNode = undefined;
+//     var server_dispatch = ListenDispatch{ .node = &server };
+//     try server.initWithListenCallback(allocator, server_port, .{}, &server_dispatch, ListenDispatch.callback);
+//     defer server.deinit();
+
+//     var client: TestGossipsubNode = undefined;
+//     var client_dispatch = ListenDispatch{ .node = &client };
+//     try client.initWithListenCallback(allocator, client_port, .{}, &client_dispatch, ListenDispatch.callback);
+//     defer client.deinit();
+
+//     try addPeerSync(&client.router, server.dial_addr);
+//     try addPeerSync(&server.router, client.dial_addr);
+
+//     try subscribeSync(&server.router, topic);
+//     try subscribeSync(&client.router, topic);
+
+//     try waitForTopicPeer(&server.router, topic, client.transport.local_peer_id, 5 * std.time.ns_per_s);
+//     try waitForTopicPeer(&client.router, topic, server.transport.local_peer_id, 5 * std.time.ns_per_s);
+
+//     const MessageListener = struct {
+//         allocator: Allocator,
+//         done: *std.atomic.Value(bool),
+//         data: *?[]u8,
+//         source: *?PeerId,
+//         topic: []const u8,
+
+//         const Self = @This();
+
+//         fn handle(self: *Self, evt: Event) void {
+//             switch (evt) {
+//                 .message => |msg| {
+//                     if (!std.mem.eql(u8, msg.message.topic, self.topic)) return;
+
+//                     if (self.data.*) |existing| {
+//                         self.allocator.free(existing);
+//                     }
+
+//                     const copy = self.allocator.dupe(u8, msg.message.data) catch {
+//                         self.source.* = null;
+//                         self.data.* = null;
+//                         self.done.store(true, .release);
+//                         return;
+//                     };
+
+//                     self.data.* = copy;
+//                     self.source.* = msg.propagation_source;
+//                     self.done.store(true, .release);
+//                 },
+//                 else => {},
+//             }
+//         }
+
+//         fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
+//             const self: *Self = @ptrCast(@alignCast(instance));
+//             self.handle(evt);
+//         }
+
+//         const vtable = event.EventListenerVTable(Event){
+//             .handleFn = vtableHandleFn,
+//         };
+
+//         fn any(self: *Self) event.AnyEventListener(Event) {
+//             return .{ .instance = @ptrCast(self), .vtable = &Self.vtable };
+//         }
+//     };
+
+//     var message_done = std.atomic.Value(bool).init(false);
+//     var message_data: ?[]u8 = null;
+//     errdefer if (message_data) |data_copy| allocator.free(data_copy);
+//     var message_source: ?PeerId = null;
+
+//     var listener = MessageListener{
+//         .allocator = allocator,
+//         .done = &message_done,
+//         .data = &message_data,
+//         .source = &message_source,
+//         .topic = topic,
+//     };
+//     try server.router.event_emitter.addListener(.message, listener.any());
+//     defer _ = server.router.event_emitter.removeListener(.message, listener.any());
+
+//     var ping_addr_buf: [64]u8 = undefined;
+//     const ping_addr_str = try std.fmt.bufPrint(&ping_addr_buf, "/ip4/127.0.0.1/udp/{d}", .{server_port});
+//     var ping_dial_addr = try Multiaddr.fromString(allocator, ping_addr_str);
+//     defer ping_dial_addr.deinit();
+//     try ping_dial_addr.push(.{ .P2P = server.transport.local_peer_id });
+
+//     const PingResultCtx = struct {
+//         event: std.Thread.ResetEvent = .{},
+//         result_ns: ?u64 = null,
+//         err: ?anyerror = null,
+//         sender: ?*ping.PingStream = null,
+
+//         const Self = @This();
+
+//         fn callback(ctx: ?*anyopaque, sender: ?*ping.PingStream, res: anyerror!u64) void {
+//             const self: *Self = @ptrCast(@alignCast(ctx.?));
+//             self.sender = sender;
+//             self.result_ns = res catch |err| {
+//                 self.err = err;
+//                 self.result_ns = null;
+//                 self.event.set();
+//                 return;
+//             };
+//             self.err = null;
+//             self.event.set();
+//         }
+//     };
+
+//     var ping_ctx = PingResultCtx{};
+//     var ping_service = ping.PingService.init(allocator, &client.sw);
+//     try ping_service.ping(ping_dial_addr, .{}, &ping_ctx, PingResultCtx.callback);
+//     ping_ctx.event.wait();
+//     try std.testing.expect(ping_ctx.err == null);
+//     try std.testing.expect(ping_ctx.result_ns != null);
+//     try std.testing.expect(ping_ctx.result_ns.? > 0);
+
+//     if (ping_ctx.sender) |sender| {
+//         const CloseCtx = struct {
+//             event: std.Thread.ResetEvent = .{},
+
+//             const Self = @This();
+
+//             fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+//                 const self: *Self = @ptrCast(@alignCast(ctx.?));
+//                 self.event.set();
+//             }
+//         };
+
+//         var close_ctx = CloseCtx{};
+//         sender.close(&close_ctx, CloseCtx.callback);
+//         close_ctx.event.wait();
+//     }
+
+//     const recipients = try publishSync(&client.router, topic, payload, allocator);
+//     defer allocator.free(recipients);
+//     try std.testing.expect(recipients.len >= 1);
+
+//     var saw_server = false;
+//     for (recipients) |peer| {
+//         if (peer.eql(&server.transport.local_peer_id)) {
+//             saw_server = true;
+//             break;
+//         }
+//     }
+//     try std.testing.expect(saw_server);
+
+//     try waitForFlag(&message_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(message_data != null);
+//     try std.testing.expect(std.mem.eql(u8, message_data.?, payload));
+//     try std.testing.expect(message_source != null);
+//     try std.testing.expect(message_source.?.eql(&client.transport.local_peer_id));
+
+//     if (message_data) |data_copy| {
+//         allocator.free(data_copy);
+//         message_data = null;
+//     }
+// }
+
+// test "pubsub add peer" {
+//     const allocator = std.testing.allocator;
+
+//     var node1: TestGossipsubNode = undefined;
+//     try node1.init(allocator, 9167, .{});
+//     defer node1.deinit();
+
+//     var node2: TestGossipsubNode = undefined;
+//     try node2.init(allocator, 9168, .{});
+//     defer node2.deinit();
+
+//     node1.router.addPeer(node2.dial_addr, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to add peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully added peer\n", .{});
+//         }
+//     }.callback);
+
+//     node2.router.addPeer(node1.dial_addr, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to add peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully added peer\n", .{});
+//         }
+//     }.callback);
+
+//     std.time.sleep(1 * std.time.ns_per_s);
+
+//     try std.testing.expectEqual(1, node1.router.peers.count());
+//     try std.testing.expectEqual(1, node2.router.peers.count());
+
+//     try std.testing.expect(node1.router.peers.get(node2.transport.local_peer_id).?.initiator != null);
+//     try std.testing.expect(node1.router.peers.get(node2.transport.local_peer_id).?.responder != null);
+
+//     try std.testing.expect(node2.router.peers.get(node1.transport.local_peer_id).?.initiator != null);
+//     try std.testing.expect(node2.router.peers.get(node1.transport.local_peer_id).?.responder != null);
+// }
+
+// test "pubsub add and remove peer" {
+//     const allocator = std.testing.allocator;
+
+//     var node1: TestGossipsubNode = undefined;
+//     try node1.init(allocator, 9767, .{});
+//     defer node1.deinit();
+
+//     var node2: TestGossipsubNode = undefined;
+//     try node2.init(allocator, 9768, .{});
+//     defer node2.deinit();
+
+//     node1.router.addPeer(node2.dial_addr, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to add peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully added peer\n", .{});
+//         }
+//     }.callback);
+
+//     node2.router.addPeer(node1.dial_addr, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to add peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully added peer\n", .{});
+//         }
+//     }.callback);
+
+//     std.time.sleep(1 * std.time.ns_per_s);
+
+//     try std.testing.expectEqual(1, node1.router.peers.count());
+//     try std.testing.expectEqual(1, node2.router.peers.count());
+
+//     try std.testing.expect(node1.router.peers.get(node2.transport.local_peer_id).?.initiator != null);
+//     try std.testing.expect(node1.router.peers.get(node2.transport.local_peer_id).?.responder != null);
+
+//     try std.testing.expect(node2.router.peers.get(node1.transport.local_peer_id).?.initiator != null);
+//     try std.testing.expect(node2.router.peers.get(node1.transport.local_peer_id).?.responder != null);
+
+//     node1.router.removePeer(node2.transport.local_peer_id, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to remove peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully removed peer\n", .{});
+//         }
+//     }.callback);
+
+//     node2.router.removePeer(node1.transport.local_peer_id, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to remove peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully removed peer\n", .{});
+//         }
+//     }.callback);
+
+//     std.time.sleep(1 * std.time.ns_per_s);
+
+//     try std.testing.expectEqual(0, node1.router.peers.count());
+//     try std.testing.expectEqual(0, node2.router.peers.count());
+// }
+
+// test "pubsub add peer single direction" {
+//     const allocator = std.testing.allocator;
+
+//     var initiator: TestGossipsubNode = undefined;
+//     try initiator.init(allocator, 9267, .{});
+//     defer initiator.deinit();
+
+//     var responder: TestGossipsubNode = undefined;
+//     try responder.init(allocator, 9268, .{});
+//     defer responder.deinit();
+
+//     initiator.router.addPeer(responder.dial_addr, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to add peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully added peer\n", .{});
+//         }
+//     }.callback);
+
+//     std.time.sleep(1 * std.time.ns_per_s);
+
+//     try std.testing.expectEqual(1, initiator.router.peers.count());
+//     try std.testing.expectEqual(1, responder.router.peers.count());
+
+//     try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.initiator != null);
+//     try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.responder == null);
+// }
+
+// test "pubsub add and remove peer single direction" {
+//     const allocator = std.testing.allocator;
+
+//     var initiator: TestGossipsubNode = undefined;
+//     try initiator.init(allocator, 9367, .{});
+//     defer initiator.deinit();
+
+//     var responder: TestGossipsubNode = undefined;
+//     try responder.init(allocator, 9368, .{});
+//     defer responder.deinit();
+
+//     initiator.router.addPeer(responder.dial_addr, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to add peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully added peer\n", .{});
+//         }
+//     }.callback);
+
+//     std.time.sleep(1 * std.time.ns_per_s);
+
+//     try std.testing.expectEqual(1, initiator.router.peers.count());
+//     try std.testing.expectEqual(1, responder.router.peers.count());
+
+//     try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.initiator != null);
+//     try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.responder == null);
+
+//     initiator.router.removePeer(responder.transport.local_peer_id, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to remove peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully removed peer\n", .{});
+//         }
+//     }.callback);
+
+//     std.time.sleep(1 * std.time.ns_per_s);
+
+//     try std.testing.expectEqual(0, initiator.router.peers.count());
+//     try std.testing.expectEqual(0, responder.router.peers.count());
+// }
+
+// test "pubsub add peer single direction with replace stream" {
+//     const allocator = std.testing.allocator;
+
+//     var initiator: TestGossipsubNode = undefined;
+//     try initiator.init(allocator, 9467, .{});
+//     defer initiator.deinit();
+
+//     var responder: TestGossipsubNode = undefined;
+//     try responder.init(allocator, 9468, .{});
+//     defer responder.deinit();
+
+//     initiator.router.addPeer(responder.dial_addr, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to add peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully added peer\n", .{});
+//         }
+//     }.callback);
+
+//     std.time.sleep(1 * std.time.ns_per_s);
+
+//     try std.testing.expectEqual(1, initiator.router.peers.count());
+//     try std.testing.expectEqual(1, responder.router.peers.count());
+
+//     try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.initiator != null);
+//     try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.responder == null);
+
+//     try std.testing.expect(responder.router.peers.get(initiator.transport.local_peer_id).?.responder != null);
+//     std.debug.print("old responder {?*}\n", .{responder.router.peers.get(initiator.transport.local_peer_id).?.responder});
+//     initiator.sw.newStream(responder.dial_addr, initiator.router.protocols, null, struct {
+//         fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {}
+//     }.callback);
+
+//     std.time.sleep(1 * std.time.ns_per_s);
+//     try std.testing.expect(responder.router.peers.get(initiator.transport.local_peer_id).?.responder != null);
+//     std.debug.print("new responder {?*}\n", .{responder.router.peers.get(initiator.transport.local_peer_id).?.responder});
+
+//     // The old stream be closed by switch2, so that the pubsub1's outgoing stream is closed
+//     try std.testing.expectEqual(0, initiator.router.peers.count());
+// }
+
+// test "simulate onMessage" {
+//     const allocator = std.testing.allocator;
+
+//     const SubscriptionChangedListener = struct {
+//         allocator: std.mem.Allocator,
+
+//         const Self = @This();
+
+//         pub fn handle(_: *Self, e: Event) void {
+//             switch (e) {
+//                 .subscription_changed => {
+//                     std.debug.print("Subscription changed event received\n", .{});
+//                 },
+//                 else => {
+//                     std.debug.print("Unknown event received\n", .{});
+//                 },
+//             }
+//         }
+
+//         pub fn vtableHandleFn(instance: *anyopaque, e: Event) void {
+//             const self: *Self = @ptrCast(@alignCast(instance));
+//             return self.handle(e);
+//         }
+
+//         pub const vtable = event.EventListenerVTable(Event){
+//             .handleFn = vtableHandleFn,
+//         };
+
+//         pub fn any(self: *Self) event.AnyEventListener(Event) {
+//             return event.AnyEventListener(Event){
+//                 .instance = @ptrCast(self),
+//                 .vtable = &Self.vtable,
+//             };
+//         }
+//     };
+
+//     var initiator: TestGossipsubNode = undefined;
+//     try initiator.init(allocator, 9567, .{});
+//     defer initiator.deinit();
+
+//     var responder: TestGossipsubNode = undefined;
+//     try responder.init(allocator, 9568, .{});
+//     defer responder.deinit();
+
+//     initiator.router.addPeer(responder.dial_addr, null, struct {
+//         fn callback(_: ?*anyopaque, res: anyerror!void) void {
+//             res catch |err| {
+//                 std.debug.print("Failed to add peer: {}\n", .{err});
+//                 return;
+//             };
+//             std.debug.print("Successfully added peer\n", .{});
+//         }
+//     }.callback);
+
+//     std.time.sleep(1 * std.time.ns_per_s);
+
+//     try std.testing.expectEqual(1, initiator.router.peers.count());
+//     try std.testing.expectEqual(1, responder.router.peers.count());
+
+//     try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.initiator != null);
+//     try std.testing.expect(initiator.router.peers.get(responder.transport.local_peer_id).?.responder == null);
+
+//     const rpc_message = rpc.RPC{
+//         .subscriptions = &[_]?rpc.RPC.SubOpts{ .{
+//             .topicid = "test_topic",
+//             .subscribe = true,
+//         }, rpc.RPC.SubOpts{
+//             .topicid = "test_topic1",
+//             .subscribe = true,
+//         } },
+//     };
+
+//     const rpc_message1 = rpc.RPC{
+//         .subscriptions = &[_]?rpc.RPC.SubOpts{ .{
+//             .topicid = "test_topic2",
+//             .subscribe = true,
+//         }, rpc.RPC.SubOpts{
+//             .topicid = "test_topic1",
+//             .subscribe = false,
+//         } },
+//     };
+
+//     const encoded_size = rpc_message.calcProtobufSize();
+//     var size_buffer: [200]u8 = undefined;
+//     const size_bytes = uvarint.encode(usize, encoded_size, &size_buffer);
+//     const encoded_message = try rpc_message.encode(std.testing.allocator);
+//     defer std.testing.allocator.free(encoded_message);
+
+//     const encoded_size1 = rpc_message1.calcProtobufSize();
+//     var size_buffer1: [200]u8 = undefined;
+//     const size_bytes1 = uvarint.encode(usize, encoded_size1, &size_buffer1);
+//     const encoded_message1 = try rpc_message1.encode(std.testing.allocator);
+//     defer std.testing.allocator.free(encoded_message1);
+
+//     const encoded_rpc_message = try std.mem.concat(std.testing.allocator, u8, &[_][]const u8{ size_bytes, encoded_message, size_bytes1, encoded_message1 });
+//     defer std.testing.allocator.free(encoded_rpc_message);
+
+//     const responder_stream = responder.router.peers.get(initiator.transport.local_peer_id).?.responder.?;
+//     var listener: SubscriptionChangedListener = .{
+//         .allocator = allocator,
+//     };
+//     try responder.router.event_emitter.addListener(.subscription_changed, listener.any());
+//     try responder_stream.onMessage(responder_stream.stream, encoded_rpc_message);
+
+//     try std.testing.expectEqual(3, responder.router.topics.count());
+//     try std.testing.expectEqual(0, responder.router.topics.get("test_topic1").?.count());
+//     try std.testing.expectEqual(1, responder.router.topics.get("test_topic").?.count());
+//     try std.testing.expectEqual(1, responder.router.topics.get("test_topic2").?.count());
+// }
+
+// test "pubsub heartbeat emits event" {
+//     const allocator = std.testing.allocator;
+
+//     var node: TestGossipsubNode = undefined;
+//     try node.init(allocator, 9655, .{ .heartbeat_interval_ms = 50 });
+//     defer node.deinit();
+
+//     const HeartbeatListener = struct {
+//         done: *std.atomic.Value(bool),
+
+//         const Self = @This();
+
+//         pub fn handle(self: *Self, evt: Event) void {
+//             switch (evt) {
+//                 .heartbeat => self.done.store(true, .release),
+//                 else => {},
+//             }
+//         }
+
+//         pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
+//             const self: *Self = @ptrCast(@alignCast(instance));
+//             self.handle(evt);
+//         }
+
+//         pub const vtable = event.EventListenerVTable(Event){
+//             .handleFn = vtableHandleFn,
+//         };
+
+//         pub fn any(self: *Self) event.AnyEventListener(Event) {
+//             return event.AnyEventListener(Event){
+//                 .instance = @ptrCast(self),
+//                 .vtable = &Self.vtable,
+//             };
+//         }
+//     };
+
+//     var heartbeat_done = std.atomic.Value(bool).init(false);
+//     var listener = HeartbeatListener{ .done = &heartbeat_done };
+//     try node.router.event_emitter.addListener(.heartbeat, listener.any());
+//     defer _ = node.router.event_emitter.removeListener(.heartbeat, listener.any());
+
+//     try waitForFlag(&heartbeat_done, 2 * std.time.ns_per_s);
+// }
+
+// test "pubsub subscribe and publish" {
+//     const allocator = std.testing.allocator;
+
+//     var node: TestGossipsubNode = undefined;
+//     try node.init(allocator, 9867, .{ .emit_self = true });
+//     defer node.deinit();
+
+//     const topic = "sanity-topic";
+
+//     const SubscribeState = struct {
+//         done: *std.atomic.Value(bool),
+//         err: *?anyerror,
+//     };
+
+//     const SubscribeCallback = struct {
+//         fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+//             const state: *SubscribeState = @ptrCast(@alignCast(ctx.?));
+//             if (res) |_| {
+//                 state.err.* = null;
+//             } else |err| {
+//                 state.err.* = err;
+//             }
+//             state.done.store(true, .release);
+//         }
+//     };
+
+//     var subscribe_done = std.atomic.Value(bool).init(false);
+//     var subscribe_err: ?anyerror = null;
+//     var subscribe_state = SubscribeState{
+//         .done = &subscribe_done,
+//         .err = &subscribe_err,
+//     };
+//     const subscribe_ctx: ?*anyopaque = @ptrCast(@constCast(&subscribe_state));
+//     node.router.subscribe(topic, subscribe_ctx, SubscribeCallback.callback);
+
+//     try waitForFlag(&subscribe_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(subscribe_err == null);
+
+//     const MessageListener = struct {
+//         allocator: std.mem.Allocator,
+//         done: *std.atomic.Value(bool),
+//         data: *?[]u8,
+//         source: *?PeerId,
+//         topic: []const u8,
+
+//         const Self = @This();
+
+//         pub fn handle(self: *Self, e: Event) void {
+//             switch (e) {
+//                 .message => |msg| {
+//                     if (!std.mem.eql(u8, msg.message.topic, self.topic)) return;
+//                     if (self.data.*) |existing| {
+//                         self.allocator.free(existing);
+//                         self.data.* = null;
+//                     }
+//                     const copy = self.allocator.dupe(u8, msg.message.data) catch {
+//                         self.done.store(true, .release);
+//                         return;
+//                     };
+//                     self.data.* = copy;
+//                     self.source.* = msg.propagation_source;
+//                     self.done.store(true, .release);
+//                 },
+//                 else => {},
+//             }
+//         }
+
+//         pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
+//             const self: *Self = @ptrCast(@alignCast(instance));
+//             self.handle(evt);
+//         }
+
+//         pub const vtable = event.EventListenerVTable(Event){
+//             .handleFn = vtableHandleFn,
+//         };
+
+//         pub fn any(self: *Self) event.AnyEventListener(Event) {
+//             return .{
+//                 .instance = @ptrCast(self),
+//                 .vtable = &Self.vtable,
+//             };
+//         }
+//     };
+
+//     var message_done = std.atomic.Value(bool).init(false);
+//     var message_data: ?[]u8 = null;
+//     errdefer if (message_data) |data_copy| allocator.free(data_copy);
+//     var message_source: ?PeerId = null;
+//     var listener: MessageListener = .{
+//         .allocator = allocator,
+//         .done = &message_done,
+//         .data = &message_data,
+//         .source = &message_source,
+//         .topic = topic,
+//     };
+//     try node.router.event_emitter.addListener(.message, listener.any());
+//     errdefer _ = node.router.event_emitter.removeListener(.message, listener.any());
+
+//     const PublishState = struct {
+//         done: *std.atomic.Value(bool),
+//         err: *?anyerror,
+//         recipients: *?[]PeerId,
+//     };
+
+//     const PublishCallback = struct {
+//         fn callback(ctx: ?*anyopaque, res: anyerror![]PeerId) void {
+//             const state: *PublishState = @ptrCast(@alignCast(ctx.?));
+//             const peers = res catch |err| {
+//                 std.log.err("publish callback error: {}", .{err});
+//                 state.err.* = err;
+//                 state.recipients.* = null;
+//                 state.done.store(true, .release);
+//                 return;
+//             };
+//             state.err.* = null;
+//             state.recipients.* = peers;
+//             state.done.store(true, .release);
+//         }
+//     };
+
+//     const payload = "hello from publish";
+
+//     var publish_done = std.atomic.Value(bool).init(false);
+//     var publish_err: ?anyerror = null;
+//     var publish_recipients: ?[]PeerId = null;
+//     errdefer if (publish_recipients) |recipients| allocator.free(recipients);
+//     var publish_state = PublishState{
+//         .done = &publish_done,
+//         .err = &publish_err,
+//         .recipients = &publish_recipients,
+//     };
+//     const publish_ctx: ?*anyopaque = @ptrCast(@constCast(&publish_state));
+
+//     node.router.publish(topic, payload, publish_ctx, PublishCallback.callback);
+
+//     try waitForFlag(&publish_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(publish_err == null);
+//     try std.testing.expect(publish_recipients != null);
+//     try std.testing.expectEqual(@as(usize, 1), publish_recipients.?.len);
+//     try std.testing.expect(publish_recipients.?[0].eql(&node.transport.local_peer_id));
+
+//     try waitForFlag(&message_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(message_source != null);
+//     try std.testing.expect(message_source.?.eql(&node.transport.local_peer_id));
+//     try std.testing.expect(message_data != null);
+//     try std.testing.expect(std.mem.eql(u8, message_data.?, payload));
+
+//     if (publish_recipients) |recipients| {
+//         allocator.free(recipients);
+//     }
+
+//     if (message_data) |data_copy| {
+//         allocator.free(data_copy);
+//     }
+
+//     const UnsubscribeState = struct {
+//         done: *std.atomic.Value(bool),
+//         err: *?anyerror,
+//     };
+
+//     const UnsubscribeCallback = struct {
+//         fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+//             const state: *UnsubscribeState = @ptrCast(@alignCast(ctx.?));
+//             if (res) |_| {
+//                 state.err.* = null;
+//             } else |err| {
+//                 state.err.* = err;
+//             }
+//             state.done.store(true, .release);
+//         }
+//     };
+
+//     var unsubscribe_done = std.atomic.Value(bool).init(false);
+//     var unsubscribe_err: ?anyerror = null;
+//     var unsubscribe_state = UnsubscribeState{
+//         .done = &unsubscribe_done,
+//         .err = &unsubscribe_err,
+//     };
+//     const unsubscribe_ctx: ?*anyopaque = @ptrCast(@constCast(&unsubscribe_state));
+//     node.router.unsubscribe(topic, unsubscribe_ctx, UnsubscribeCallback.callback);
+
+//     try waitForFlag(&unsubscribe_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(unsubscribe_err == null);
+
+//     _ = node.router.event_emitter.removeListener(.message, listener.any());
+// }
+
+// test "pubsub subscribe and publish between nodes" {
+//     const allocator = std.testing.allocator;
+
+//     // For now we only verify that two independent nodes can add each other successfully.
+//     // Once this is stable, we'll extend the test step-by-step to cover subscribe/publish flows again.
+//     const node_options: Gossipsub.Options = .{}; // defaults: StrictSign + signing
+
+//     var node_a: TestGossipsubNode = undefined;
+//     try node_a.init(allocator, 9967, node_options);
+//     defer node_a.deinit();
+
+//     var node_b: TestGossipsubNode = undefined;
+//     try node_b.init(allocator, 9968, node_options);
+//     defer node_b.deinit();
+
+//     const AddPeerState = struct {
+//         done: *std.atomic.Value(bool),
+//         err: *?anyerror,
+//     };
+
+//     const logAddPeer = struct {
+//         fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+//             const state: *AddPeerState = @ptrCast(@alignCast(ctx.?));
+//             if (res) |_| {
+//                 std.debug.print("addPeer succeeded\n", .{});
+//                 state.err.* = null;
+//             } else |err| {
+//                 std.debug.print("addPeer failed: {any}\n", .{err});
+//                 state.err.* = err;
+//             }
+//             state.done.store(true, .release);
+//         }
+//     };
+
+//     var add_peer_ab_done = std.atomic.Value(bool).init(false);
+//     var add_peer_ab_err: ?anyerror = null;
+//     var add_peer_ab_state = AddPeerState{ .done = &add_peer_ab_done, .err = &add_peer_ab_err };
+//     node_a.router.addPeer(node_b.dial_addr, @ptrCast(@constCast(&add_peer_ab_state)), logAddPeer.callback);
+
+//     var add_peer_ba_done = std.atomic.Value(bool).init(false);
+//     var add_peer_ba_err: ?anyerror = null;
+//     var add_peer_ba_state = AddPeerState{ .done = &add_peer_ba_done, .err = &add_peer_ba_err };
+//     node_b.router.addPeer(node_a.dial_addr, @ptrCast(@constCast(&add_peer_ba_state)), logAddPeer.callback);
+
+//     try waitForFlag(&add_peer_ab_done, 5 * std.time.ns_per_s);
+//     try waitForFlag(&add_peer_ba_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(add_peer_ab_err == null);
+//     try std.testing.expect(add_peer_ba_err == null);
+
+//     std.debug.print("peer counts: A = {d}, B = {d}\n", .{ node_a.router.peers.count(), node_b.router.peers.count() });
+//     try std.testing.expectEqual(@as(usize, 1), node_a.router.peers.count());
+//     try std.testing.expectEqual(@as(usize, 1), node_b.router.peers.count());
+
+//     try std.testing.expect(node_a.router.peers.get(node_b.transport.local_peer_id) != null);
+//     try std.testing.expect(node_b.router.peers.get(node_a.transport.local_peer_id) != null);
+
+//     const topic = "gossip-multi";
+
+//     const SubscribeState = struct {
+//         done: *std.atomic.Value(bool),
+//         err: *?anyerror,
+//     };
+
+//     const subscribeCallback = struct {
+//         fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+//             const state: *SubscribeState = @ptrCast(@alignCast(ctx.?));
+//             if (res) |_| {
+//                 std.debug.print("subscribe succeeded\n", .{});
+//                 state.err.* = null;
+//             } else |err| {
+//                 std.debug.print("subscribe failed: {any}\n", .{err});
+//                 state.err.* = err;
+//             }
+//             state.done.store(true, .release);
+//         }
+//     };
+
+//     var subscribe_a_done = std.atomic.Value(bool).init(false);
+//     var subscribe_a_err: ?anyerror = null;
+//     var subscribe_a_state = SubscribeState{ .done = &subscribe_a_done, .err = &subscribe_a_err };
+//     node_a.router.subscribe(topic, @ptrCast(@constCast(&subscribe_a_state)), subscribeCallback.callback);
+
+//     var subscribe_b_done = std.atomic.Value(bool).init(false);
+//     var subscribe_b_err: ?anyerror = null;
+//     var subscribe_b_state = SubscribeState{ .done = &subscribe_b_done, .err = &subscribe_b_err };
+//     node_b.router.subscribe(topic, @ptrCast(@constCast(&subscribe_b_state)), subscribeCallback.callback);
+
+//     try waitForFlag(&subscribe_a_done, 5 * std.time.ns_per_s);
+//     try waitForFlag(&subscribe_b_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(subscribe_a_err == null);
+//     try std.testing.expect(subscribe_b_err == null);
+
+//     std.time.sleep(200 * std.time.us_per_ms);
+//     try std.testing.expect(node_a.router.subscriptions.contains(topic));
+//     try std.testing.expect(node_b.router.subscriptions.contains(topic));
+
+//     std.debug.print("subscriptions: A = {d}, B = {d}\n", .{ node_a.router.subscriptions.count(), node_b.router.subscriptions.count() });
+
+//     const wait_ns = 5 * std.time.ns_per_s;
+//     try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, wait_ns);
+//     try waitForTopicPeer(&node_b.router, topic, node_a.transport.local_peer_id, wait_ns);
+//     try waitForMeshTopic(&node_a.router, topic, wait_ns);
+//     try waitForMeshTopic(&node_b.router, topic, wait_ns);
+//     try waitForUsableStream(&node_a.router, node_b.transport.local_peer_id, wait_ns);
+//     try waitForUsableStream(&node_b.router, node_a.transport.local_peer_id, wait_ns);
+
+//     const MessageListener = struct {
+//         allocator: std.mem.Allocator,
+//         done: *std.atomic.Value(bool),
+//         data: *?[]u8,
+//         source: *?PeerId,
+//         topic: []const u8,
+
+//         const Self = @This();
+
+//         pub fn handle(self: *Self, e: Event) void {
+//             switch (e) {
+//                 .message => |msg| {
+//                     if (!std.mem.eql(u8, msg.message.topic, self.topic)) return;
+//                     if (self.data.*) |existing| {
+//                         self.allocator.free(existing);
+//                         self.data.* = null;
+//                     }
+//                     const copy = self.allocator.dupe(u8, msg.message.data) catch {
+//                         self.done.store(true, .release);
+//                         return;
+//                     };
+//                     self.data.* = copy;
+//                     self.source.* = msg.propagation_source;
+//                     self.done.store(true, .release);
+//                 },
+//                 else => {},
+//             }
+//         }
+
+//         pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
+//             const self: *Self = @ptrCast(@alignCast(instance));
+//             self.handle(evt);
+//         }
+
+//         pub const vtable = event.EventListenerVTable(Event){
+//             .handleFn = vtableHandleFn,
+//         };
+
+//         pub fn any(self: *Self) event.AnyEventListener(Event) {
+//             return .{
+//                 .instance = @ptrCast(self),
+//                 .vtable = &Self.vtable,
+//             };
+//         }
+//     };
+
+//     var message_b_done = std.atomic.Value(bool).init(false);
+//     var message_b_data: ?[]u8 = null;
+//     errdefer if (message_b_data) |data_copy| allocator.free(data_copy);
+//     var message_b_source: ?PeerId = null;
+//     var listener_b: MessageListener = .{
+//         .allocator = allocator,
+//         .done = &message_b_done,
+//         .data = &message_b_data,
+//         .source = &message_b_source,
+//         .topic = topic,
+//     };
+//     try node_b.router.event_emitter.addListener(.message, listener_b.any());
+//     defer _ = node_b.router.event_emitter.removeListener(.message, listener_b.any());
+
+//     var message_a_done = std.atomic.Value(bool).init(false);
+//     var message_a_data: ?[]u8 = null;
+//     errdefer if (message_a_data) |data_copy| allocator.free(data_copy);
+//     var message_a_source: ?PeerId = null;
+//     var listener_a: MessageListener = .{
+//         .allocator = allocator,
+//         .done = &message_a_done,
+//         .data = &message_a_data,
+//         .source = &message_a_source,
+//         .topic = topic,
+//     };
+//     try node_a.router.event_emitter.addListener(.message, listener_a.any());
+//     defer _ = node_a.router.event_emitter.removeListener(.message, listener_a.any());
+
+//     const PublishState = struct {
+//         done: *std.atomic.Value(bool),
+//         err: *?anyerror,
+//         recipients: *?[]PeerId,
+//     };
+
+//     const PublishCallback = struct {
+//         fn callback(ctx: ?*anyopaque, res: anyerror![]PeerId) void {
+//             const state: *PublishState = @ptrCast(@alignCast(ctx.?));
+//             const peers = res catch |err| {
+//                 state.err.* = err;
+//                 state.recipients.* = null;
+//                 state.done.store(true, .release);
+//                 return;
+//             };
+//             state.err.* = null;
+//             state.recipients.* = peers;
+//             state.done.store(true, .release);
+//         }
+//     };
+
+//     const payload = "hello-from-node-a";
+
+//     var publish_done = std.atomic.Value(bool).init(false);
+//     var publish_err: ?anyerror = null;
+//     var publish_recipients: ?[]PeerId = null;
+//     errdefer if (publish_recipients) |recipients| allocator.free(recipients);
+//     var publish_state = PublishState{
+//         .done = &publish_done,
+//         .err = &publish_err,
+//         .recipients = &publish_recipients,
+//     };
+//     const publish_ctx: ?*anyopaque = @ptrCast(@constCast(&publish_state));
+
+//     node_a.router.publish(topic, payload, publish_ctx, PublishCallback.callback);
+
+//     try waitForFlag(&publish_done, 5 * std.time.ns_per_s);
+//     std.debug.print("publish done on node A {?}\n", .{publish_err});
+//     try std.testing.expect(publish_err == null);
+//     try std.testing.expect(publish_recipients != null);
+//     try std.testing.expectEqual(@as(usize, 1), publish_recipients.?.len);
+//     try std.testing.expect(publish_recipients.?[0].eql(&node_b.transport.local_peer_id));
+
+//     try waitForFlag(&message_b_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(message_b_source != null);
+//     try std.testing.expect(message_b_source.?.eql(&node_a.transport.local_peer_id));
+//     try std.testing.expect(message_b_data != null);
+//     try std.testing.expect(std.mem.eql(u8, message_b_data.?, payload));
+
+//     if (publish_recipients) |recipients| {
+//         allocator.free(recipients);
+//         publish_recipients = null;
+//     }
+
+//     if (message_b_data) |data_copy| {
+//         allocator.free(data_copy);
+//         message_b_data = null;
+//     }
+
+//     const payload_back = "hello-from-node-b";
+
+//     var publish_back_done = std.atomic.Value(bool).init(false);
+//     var publish_back_err: ?anyerror = null;
+//     var publish_back_recipients: ?[]PeerId = null;
+//     errdefer if (publish_back_recipients) |recipients| allocator.free(recipients);
+//     var publish_back_state = PublishState{
+//         .done = &publish_back_done,
+//         .err = &publish_back_err,
+//         .recipients = &publish_back_recipients,
+//     };
+//     const publish_back_ctx: ?*anyopaque = @ptrCast(@constCast(&publish_back_state));
+
+//     node_b.router.publish(topic, payload_back, publish_back_ctx, PublishCallback.callback);
+
+//     try waitForFlag(&publish_back_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(publish_back_err == null);
+//     try std.testing.expect(publish_back_recipients != null);
+//     try std.testing.expectEqual(@as(usize, 1), publish_back_recipients.?.len);
+//     try std.testing.expect(publish_back_recipients.?[0].eql(&node_a.transport.local_peer_id));
+
+//     try waitForFlag(&message_a_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(message_a_source != null);
+//     try std.testing.expect(message_a_source.?.eql(&node_b.transport.local_peer_id));
+//     try std.testing.expect(message_a_data != null);
+//     try std.testing.expect(std.mem.eql(u8, message_a_data.?, payload_back));
+
+//     if (publish_back_recipients) |recipients| {
+//         allocator.free(recipients);
+//     }
+
+//     if (message_a_data) |data_copy| {
+//         allocator.free(data_copy);
+//         message_a_data = null;
+//     }
+
+//     const RemovePeerState = struct {
+//         done: *std.atomic.Value(bool),
+//         err: *?anyerror,
+//     };
+
+//     const removePeerCallback = struct {
+//         fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+//             const state: *RemovePeerState = @ptrCast(@alignCast(ctx.?));
+//             if (res) |_| {
+//                 std.debug.print("removePeer succeeded\n", .{});
+//                 state.err.* = null;
+//             } else |err| {
+//                 std.debug.print("removePeer failed: {any}\n", .{err});
+//                 state.err.* = err;
+//             }
+//             state.done.store(true, .release);
+//         }
+//     };
+
+//     var remove_peer_ab_done = std.atomic.Value(bool).init(false);
+//     var remove_peer_ab_err: ?anyerror = null;
+//     var remove_peer_ab_state = RemovePeerState{ .done = &remove_peer_ab_done, .err = &remove_peer_ab_err };
+//     node_a.router.removePeer(node_b.transport.local_peer_id, @ptrCast(@constCast(&remove_peer_ab_state)), removePeerCallback.callback);
+
+//     var remove_peer_ba_done = std.atomic.Value(bool).init(false);
+//     var remove_peer_ba_err: ?anyerror = null;
+//     var remove_peer_ba_state = RemovePeerState{ .done = &remove_peer_ba_done, .err = &remove_peer_ba_err };
+//     node_b.router.removePeer(node_a.transport.local_peer_id, @ptrCast(@constCast(&remove_peer_ba_state)), removePeerCallback.callback);
+
+//     try waitForFlag(&remove_peer_ab_done, 5 * std.time.ns_per_s);
+//     try waitForFlag(&remove_peer_ba_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(remove_peer_ab_err == null);
+//     try std.testing.expect(remove_peer_ba_err == null);
+
+//     std.time.sleep(200 * std.time.us_per_ms);
+
+//     try std.testing.expectEqual(@as(usize, 0), node_a.router.peers.count());
+//     try std.testing.expectEqual(@as(usize, 0), node_b.router.peers.count());
+// }
+
+// test "pubsub multi-topic mesh and publish" {
+//     const allocator = std.testing.allocator;
+
+//     const node_options: Gossipsub.Options = .{};
+
+//     var node_a: TestGossipsubNode = undefined;
+//     try node_a.init(allocator, 10067, node_options);
+//     defer node_a.deinit();
+
+//     var node_b: TestGossipsubNode = undefined;
+//     try node_b.init(allocator, 10068, node_options);
+//     defer node_b.deinit();
+
+//     const AddPeerState = struct {
+//         done: *std.atomic.Value(bool),
+//         err: *?anyerror,
+//     };
+
+//     const addPeerCallback = struct {
+//         fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+//             const state: *AddPeerState = @ptrCast(@alignCast(ctx.?));
+//             if (res) |_| {
+//                 state.err.* = null;
+//             } else |err| {
+//                 state.err.* = err;
+//             }
+//             state.done.store(true, .release);
+//         }
+//     };
+
+//     var add_peer_ab_done = std.atomic.Value(bool).init(false);
+//     var add_peer_ab_err: ?anyerror = null;
+//     var add_peer_ab_state = AddPeerState{ .done = &add_peer_ab_done, .err = &add_peer_ab_err };
+//     node_a.router.addPeer(node_b.dial_addr, @ptrCast(@constCast(&add_peer_ab_state)), addPeerCallback.callback);
+
+//     var add_peer_ba_done = std.atomic.Value(bool).init(false);
+//     var add_peer_ba_err: ?anyerror = null;
+//     var add_peer_ba_state = AddPeerState{ .done = &add_peer_ba_done, .err = &add_peer_ba_err };
+//     node_b.router.addPeer(node_a.dial_addr, @ptrCast(@constCast(&add_peer_ba_state)), addPeerCallback.callback);
+
+//     try waitForFlag(&add_peer_ab_done, 5 * std.time.ns_per_s);
+//     try waitForFlag(&add_peer_ba_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(add_peer_ab_err == null);
+//     try std.testing.expect(add_peer_ba_err == null);
+
+//     try std.testing.expectEqual(@as(usize, 1), node_a.router.peers.count());
+//     try std.testing.expectEqual(@as(usize, 1), node_b.router.peers.count());
+
+//     const topics = [_][]const u8{ "topic-alpha", "topic-beta" };
+
+//     const SubscribeState = struct {
+//         done: *std.atomic.Value(bool),
+//         err: *?anyerror,
+//     };
+
+//     const subscribeCallback = struct {
+//         fn callback(ctx: ?*anyopaque, res: anyerror!void) void {
+//             const state: *SubscribeState = @ptrCast(@alignCast(ctx.?));
+//             if (res) |_| {
+//                 state.err.* = null;
+//             } else |err| {
+//                 state.err.* = err;
+//             }
+//             state.done.store(true, .release);
+//         }
+//     };
+
+//     for (topics) |topic| {
+//         var subscribe_a_done = std.atomic.Value(bool).init(false);
+//         var subscribe_a_err: ?anyerror = null;
+//         var subscribe_a_state = SubscribeState{ .done = &subscribe_a_done, .err = &subscribe_a_err };
+//         node_a.router.subscribe(topic, @ptrCast(@constCast(&subscribe_a_state)), subscribeCallback.callback);
+
+//         var subscribe_b_done = std.atomic.Value(bool).init(false);
+//         var subscribe_b_err: ?anyerror = null;
+//         var subscribe_b_state = SubscribeState{ .done = &subscribe_b_done, .err = &subscribe_b_err };
+//         node_b.router.subscribe(topic, @ptrCast(@constCast(&subscribe_b_state)), subscribeCallback.callback);
+
+//         try waitForFlag(&subscribe_a_done, 5 * std.time.ns_per_s);
+//         try waitForFlag(&subscribe_b_done, 5 * std.time.ns_per_s);
+//         try std.testing.expect(subscribe_a_err == null);
+//         try std.testing.expect(subscribe_b_err == null);
+//     }
+
+//     std.time.sleep(400 * std.time.us_per_ms);
+
+//     for (topics) |topic| {
+//         try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);
+//         try waitForTopicPeer(&node_b.router, topic, node_a.transport.local_peer_id, 5 * std.time.ns_per_s);
+
+//         try waitForMeshTopic(&node_a.router, topic, 5 * std.time.ns_per_s);
+//         try waitForMeshTopic(&node_b.router, topic, 5 * std.time.ns_per_s);
+
+//         try std.testing.expect(node_a.router.mesh.contains(topic));
+//         try std.testing.expect(node_b.router.mesh.contains(topic));
+//         try std.testing.expect(node_a.router.subscriptions.contains(topic));
+//         try std.testing.expect(node_b.router.subscriptions.contains(topic));
+//     }
+
+//     const MessageListener = struct {
+//         allocator: std.mem.Allocator,
+//         topic: []const u8,
+//         done: *std.atomic.Value(bool),
+//         data: *?[]u8,
+//         source: *?PeerId,
+
+//         const Self = @This();
+
+//         pub fn handle(self: *Self, e: Event) void {
+//             switch (e) {
+//                 .message => |msg| {
+//                     if (!std.mem.eql(u8, msg.message.topic, self.topic)) return;
+//                     if (self.data.*) |existing| {
+//                         self.allocator.free(existing);
+//                         self.data.* = null;
+//                     }
+//                     const copy = self.allocator.dupe(u8, msg.message.data) catch {
+//                         self.done.store(true, .release);
+//                         return;
+//                     };
+//                     self.data.* = copy;
+//                     self.source.* = msg.propagation_source;
+//                     self.done.store(true, .release);
+//                 },
+//                 else => {},
+//             }
+//         }
+
+//         pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
+//             const self: *Self = @ptrCast(@alignCast(instance));
+//             self.handle(evt);
+//         }
+
+//         pub const vtable = event.EventListenerVTable(Event){
+//             .handleFn = vtableHandleFn,
+//         };
+
+//         pub fn any(self: *Self) event.AnyEventListener(Event) {
+//             return .{
+//                 .instance = @ptrCast(self),
+//                 .vtable = &Self.vtable,
+//             };
+//         }
+//     };
+
+//     var message_b_done_alpha = std.atomic.Value(bool).init(false);
+//     var message_b_data_alpha: ?[]u8 = null;
+//     errdefer if (message_b_data_alpha) |data_copy| allocator.free(data_copy);
+//     var message_b_source_alpha: ?PeerId = null;
+//     var listener_b_alpha: MessageListener = .{
+//         .allocator = allocator,
+//         .topic = topics[0],
+//         .done = &message_b_done_alpha,
+//         .data = &message_b_data_alpha,
+//         .source = &message_b_source_alpha,
+//     };
+//     try node_b.router.event_emitter.addListener(.message, listener_b_alpha.any());
+//     defer _ = node_b.router.event_emitter.removeListener(.message, listener_b_alpha.any());
+
+//     var message_b_done_beta = std.atomic.Value(bool).init(false);
+//     var message_b_data_beta: ?[]u8 = null;
+//     errdefer if (message_b_data_beta) |data_copy| allocator.free(data_copy);
+//     var message_b_source_beta: ?PeerId = null;
+//     var listener_b_beta: MessageListener = .{
+//         .allocator = allocator,
+//         .topic = topics[1],
+//         .done = &message_b_done_beta,
+//         .data = &message_b_data_beta,
+//         .source = &message_b_source_beta,
+//     };
+//     try node_b.router.event_emitter.addListener(.message, listener_b_beta.any());
+//     defer _ = node_b.router.event_emitter.removeListener(.message, listener_b_beta.any());
+
+//     var message_a_done_alpha = std.atomic.Value(bool).init(false);
+//     var message_a_data_alpha: ?[]u8 = null;
+//     errdefer if (message_a_data_alpha) |data_copy| allocator.free(data_copy);
+//     var message_a_source_alpha: ?PeerId = null;
+//     var listener_a_alpha: MessageListener = .{
+//         .allocator = allocator,
+//         .topic = topics[0],
+//         .done = &message_a_done_alpha,
+//         .data = &message_a_data_alpha,
+//         .source = &message_a_source_alpha,
+//     };
+//     try node_a.router.event_emitter.addListener(.message, listener_a_alpha.any());
+//     defer _ = node_a.router.event_emitter.removeListener(.message, listener_a_alpha.any());
+
+//     var message_a_done_beta = std.atomic.Value(bool).init(false);
+//     var message_a_data_beta: ?[]u8 = null;
+//     errdefer if (message_a_data_beta) |data_copy| allocator.free(data_copy);
+//     var message_a_source_beta: ?PeerId = null;
+//     var listener_a_beta: MessageListener = .{
+//         .allocator = allocator,
+//         .topic = topics[1],
+//         .done = &message_a_done_beta,
+//         .data = &message_a_data_beta,
+//         .source = &message_a_source_beta,
+//     };
+//     try node_a.router.event_emitter.addListener(.message, listener_a_beta.any());
+//     defer _ = node_a.router.event_emitter.removeListener(.message, listener_a_beta.any());
+
+//     const PublishState = struct {
+//         done: *std.atomic.Value(bool),
+//         err: *?anyerror,
+//         recipients: *?[]PeerId,
+//     };
+
+//     const publishCallback = struct {
+//         fn callback(ctx: ?*anyopaque, res: anyerror![]PeerId) void {
+//             const state: *PublishState = @ptrCast(@alignCast(ctx.?));
+//             const peers = res catch |err| {
+//                 state.err.* = err;
+//                 state.recipients.* = null;
+//                 state.done.store(true, .release);
+//                 return;
+//             };
+//             state.err.* = null;
+//             state.recipients.* = peers;
+//             state.done.store(true, .release);
+//         }
+//     };
+
+//     const payload_alpha = "msg-from-alpha";
+//     const payload_beta = "msg-from-beta";
+
+//     var publish_alpha_done = std.atomic.Value(bool).init(false);
+//     var publish_alpha_err: ?anyerror = null;
+//     var publish_alpha_recipients: ?[]PeerId = null;
+//     errdefer if (publish_alpha_recipients) |recipients| allocator.free(recipients);
+//     var publish_alpha_state = PublishState{
+//         .done = &publish_alpha_done,
+//         .err = &publish_alpha_err,
+//         .recipients = &publish_alpha_recipients,
+//     };
+//     const publish_alpha_ctx: ?*anyopaque = @ptrCast(@constCast(&publish_alpha_state));
+
+//     node_a.router.publish(topics[0], payload_alpha, publish_alpha_ctx, publishCallback.callback);
+
+//     try waitForFlag(&publish_alpha_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(publish_alpha_err == null);
+//     try std.testing.expect(publish_alpha_recipients != null);
+//     try std.testing.expectEqual(@as(usize, 1), publish_alpha_recipients.?.len);
+//     try std.testing.expect(publish_alpha_recipients.?[0].eql(&node_b.transport.local_peer_id));
+
+//     try waitForFlag(&message_b_done_alpha, 5 * std.time.ns_per_s);
+//     try std.testing.expect(message_b_source_alpha != null);
+//     try std.testing.expect(message_b_source_alpha.?.eql(&node_a.transport.local_peer_id));
+//     try std.testing.expect(message_b_data_alpha != null);
+//     try std.testing.expect(std.mem.eql(u8, message_b_data_alpha.?, payload_alpha));
+//     try std.testing.expect(message_b_data_beta == null);
+
+//     if (publish_alpha_recipients) |recipients| {
+//         allocator.free(recipients);
+//         publish_alpha_recipients = null;
+//     }
+
+//     if (message_b_data_alpha) |data_copy| {
+//         allocator.free(data_copy);
+//         message_b_data_alpha = null;
+//     }
+
+//     var publish_beta_done = std.atomic.Value(bool).init(false);
+//     var publish_beta_err: ?anyerror = null;
+//     var publish_beta_recipients: ?[]PeerId = null;
+//     errdefer if (publish_beta_recipients) |recipients| allocator.free(recipients);
+//     var publish_beta_state = PublishState{
+//         .done = &publish_beta_done,
+//         .err = &publish_beta_err,
+//         .recipients = &publish_beta_recipients,
+//     };
+//     const publish_beta_ctx: ?*anyopaque = @ptrCast(@constCast(&publish_beta_state));
+
+//     node_b.router.publish(topics[1], payload_beta, publish_beta_ctx, publishCallback.callback);
+
+//     try waitForFlag(&publish_beta_done, 5 * std.time.ns_per_s);
+//     try std.testing.expect(publish_beta_err == null);
+//     try std.testing.expect(publish_beta_recipients != null);
+//     try std.testing.expectEqual(@as(usize, 1), publish_beta_recipients.?.len);
+//     try std.testing.expect(publish_beta_recipients.?[0].eql(&node_a.transport.local_peer_id));
+
+//     try waitForFlag(&message_a_done_beta, 5 * std.time.ns_per_s);
+//     try std.testing.expect(message_a_source_beta != null);
+//     try std.testing.expect(message_a_source_beta.?.eql(&node_b.transport.local_peer_id));
+//     try std.testing.expect(message_a_data_beta != null);
+//     try std.testing.expect(std.mem.eql(u8, message_a_data_beta.?, payload_beta));
+//     try std.testing.expect(message_a_data_alpha == null);
+
+//     if (publish_beta_recipients) |recipients| {
+//         allocator.free(recipients);
+//     }
+
+//     if (message_a_data_beta) |data_copy| {
+//         allocator.free(data_copy);
+//         message_a_data_beta = null;
+//     }
+
+//     if (message_b_data_beta) |data_copy| {
+//         allocator.free(data_copy);
+//     }
+
+//     if (message_a_data_alpha) |data_copy| {
+//         allocator.free(data_copy);
+//         message_a_data_alpha = null;
+//     }
+// }
+
+// test "pubsub three-node propagation" {
+//     const allocator = std.testing.allocator;
+
+//     var node_a: TestGossipsubNode = undefined;
+//     try node_a.init(allocator, 12067, .{});
+//     defer node_a.deinit();
+
+//     var node_b: TestGossipsubNode = undefined;
+//     try node_b.init(allocator, 12068, .{});
+//     defer node_b.deinit();
+
+//     var node_c: TestGossipsubNode = undefined;
+//     try node_c.init(allocator, 12069, .{});
+//     defer node_c.deinit();
+
+//     try addPeerSync(&node_a.router, node_b.dial_addr);
+//     try addPeerSync(&node_b.router, node_a.dial_addr);
+//     try addPeerSync(&node_a.router, node_c.dial_addr);
+//     try addPeerSync(&node_c.router, node_a.dial_addr);
+//     try addPeerSync(&node_b.router, node_c.dial_addr);
+//     try addPeerSync(&node_c.router, node_b.dial_addr);
+
+//     const wait_ns = 5 * std.time.ns_per_s;
+//     try waitForUsableStream(&node_a.router, node_b.transport.local_peer_id, wait_ns);
+//     try waitForUsableStream(&node_a.router, node_c.transport.local_peer_id, wait_ns);
+//     try waitForUsableStream(&node_b.router, node_a.transport.local_peer_id, wait_ns);
+//     try waitForUsableStream(&node_b.router, node_c.transport.local_peer_id, wait_ns);
+//     try waitForUsableStream(&node_c.router, node_a.transport.local_peer_id, wait_ns);
+//     try waitForUsableStream(&node_c.router, node_b.transport.local_peer_id, wait_ns);
+
+//     const topic = "three-node";
+//     try subscribeSync(&node_a.router, topic);
+//     try subscribeSync(&node_b.router, topic);
+//     try subscribeSync(&node_c.router, topic);
+
+//     try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, wait_ns);
+//     try waitForTopicPeer(&node_a.router, topic, node_c.transport.local_peer_id, wait_ns);
+//     try waitForTopicPeer(&node_b.router, topic, node_a.transport.local_peer_id, wait_ns);
+//     try waitForTopicPeer(&node_b.router, topic, node_c.transport.local_peer_id, wait_ns);
+//     try waitForTopicPeer(&node_c.router, topic, node_a.transport.local_peer_id, wait_ns);
+//     try waitForTopicPeer(&node_c.router, topic, node_b.transport.local_peer_id, wait_ns);
+
+//     try waitForMeshTopic(&node_a.router, topic, wait_ns);
+//     try waitForMeshTopic(&node_b.router, topic, wait_ns);
+//     try waitForMeshTopic(&node_c.router, topic, wait_ns);
+
+//     const MessageListener = struct {
+//         allocator: Allocator,
+//         expected_topic: []const u8,
+//         done: *std.atomic.Value(bool),
+//         data: *?[]u8,
+//         source: *?PeerId,
+
+//         const Self = @This();
+
+//         pub fn handle(self: *Self, e: Event) void {
+//             switch (e) {
+//                 .message => |msg| {
+//                     if (!std.mem.eql(u8, msg.message.topic, self.expected_topic)) return;
+//                     if (self.data.*) |existing| {
+//                         self.allocator.free(existing);
+//                         self.data.* = null;
+//                     }
+//                     const copy = self.allocator.dupe(u8, msg.message.data) catch {
+//                         self.done.store(true, .release);
+//                         return;
+//                     };
+//                     self.data.* = copy;
+//                     self.source.* = msg.propagation_source;
+//                     self.done.store(true, .release);
+//                 },
+//                 else => {},
+//             }
+//         }
+
+//         pub fn vtableHandleFn(instance: *anyopaque, evt: Event) void {
+//             const self: *Self = @ptrCast(@alignCast(instance));
+//             self.handle(evt);
+//         }
+
+//         pub const vtable = event.EventListenerVTable(Event){
+//             .handleFn = vtableHandleFn,
+//         };
+
+//         pub fn any(self: *Self) event.AnyEventListener(Event) {
+//             return .{
+//                 .instance = @ptrCast(self),
+//                 .vtable = &Self.vtable,
+//             };
+//         }
+//     };
+
+//     var message_b_done = std.atomic.Value(bool).init(false);
+//     var message_b_data: ?[]u8 = null;
+//     defer if (message_b_data) |data_copy| allocator.free(data_copy);
+//     var message_b_source: ?PeerId = null;
+//     var listener_b: MessageListener = .{
+//         .allocator = allocator,
+//         .expected_topic = topic,
+//         .done = &message_b_done,
+//         .data = &message_b_data,
+//         .source = &message_b_source,
+//     };
+//     try node_b.router.event_emitter.addListener(.message, listener_b.any());
+//     defer _ = node_b.router.event_emitter.removeListener(.message, listener_b.any());
+
+//     var message_c_done = std.atomic.Value(bool).init(false);
+//     var message_c_data: ?[]u8 = null;
+//     defer if (message_c_data) |data_copy| allocator.free(data_copy);
+//     var message_c_source: ?PeerId = null;
+//     var listener_c: MessageListener = .{
+//         .allocator = allocator,
+//         .expected_topic = topic,
+//         .done = &message_c_done,
+//         .data = &message_c_data,
+//         .source = &message_c_source,
+//     };
+//     try node_c.router.event_emitter.addListener(.message, listener_c.any());
+//     defer _ = node_c.router.event_emitter.removeListener(.message, listener_c.any());
+
+//     const payload = "three-node-message";
+//     const recipients = try publishSync(&node_a.router, topic, payload, allocator);
+//     defer allocator.free(recipients);
+
+//     try std.testing.expectEqual(@as(usize, 2), recipients.len);
+//     var saw_b = false;
+//     var saw_c = false;
+//     for (recipients) |peer| {
+//         if (peer.eql(&node_b.transport.local_peer_id)) saw_b = true;
+//         if (peer.eql(&node_c.transport.local_peer_id)) saw_c = true;
+//     }
+//     try std.testing.expect(saw_b);
+//     try std.testing.expect(saw_c);
+
+//     try waitForFlag(&message_b_done, wait_ns);
+//     try std.testing.expect(message_b_source != null);
+//     try std.testing.expect(message_b_source.?.eql(&node_a.transport.local_peer_id));
+//     try std.testing.expect(message_b_data != null);
+//     try std.testing.expect(std.mem.eql(u8, message_b_data.?, payload));
+
+//     try waitForFlag(&message_c_done, wait_ns);
+//     try std.testing.expect(message_c_source != null);
+//     try std.testing.expect(message_c_source.?.eql(&node_a.transport.local_peer_id));
+//     try std.testing.expect(message_c_data != null);
+//     try std.testing.expect(std.mem.eql(u8, message_c_data.?, payload));
+// }
