@@ -80,7 +80,6 @@ pub const IdentifyProtocolHandler = struct {
             .allocator = self.allocator,
             .callback_ctx = callback_ctx,
             .callback = callback,
-            .handler = self,
             .response_buffer = std.ArrayList(u8).init(self.allocator),
             .response_received = false,
         };
@@ -145,81 +144,31 @@ pub const IdentifyProtocolHandler = struct {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 
-    /// Builds an Identify message with current peer information.
-    pub fn buildIdentifyMessage(self: *Self, stream: *quic.QuicStream, allocator: Allocator) !identify_pb.Identify {
-        var identify_msg = identify_pb.Identify{};
+    /// Gets the public key bytes. Abstracts away transport access.
+    pub fn getPublicKeyBytes(self: *Self, allocator: Allocator) ![]const u8 {
+        return try self.transport.host_keypair.publicKeyBytes(allocator);
+    }
 
-        // Set protocol version if configured
-        if (self.config.protocol_version) |pv| {
-            identify_msg.protocol_version = pv;
-        }
+    /// Gets listen addresses. Abstracts away Swarm access.
+    pub fn getListenMultiaddrs(self: *Self, allocator: Allocator) !std.ArrayList([]u8) {
+        return try self.network_switch.listenMultiaddrs(allocator);
+    }
 
-        // Set agent version if configured
-        if (self.config.agent_version) |av| {
-            identify_msg.agent_version = av;
-        }
+    /// Gets supported protocols. Abstracts away Swarm access.
+    pub fn getSupportedProtocols(self: *Self, allocator: Allocator) !std.ArrayList([]const u8) {
+        var protocols_list = std.ArrayList([]const u8).init(allocator);
+        errdefer protocols_list.deinit();
 
-        // Get public key from transport
-        const public_key_bytes = try self.transport.host_keypair.publicKeyBytes(allocator);
-        errdefer allocator.free(public_key_bytes);
-        identify_msg.public_key = public_key_bytes;
-
-        // Get listen addresses
-        var listen_addrs = try self.network_switch.listenMultiaddrs(allocator);
-        defer swarm.Switch.freeListenMultiaddrs(allocator, &listen_addrs);
-
-        if (listen_addrs.items.len > 0) {
-            var addr_bytes_list = try allocator.alloc(?[]const u8, listen_addrs.items.len);
-            errdefer allocator.free(addr_bytes_list);
-            for (listen_addrs.items, 0..) |addr_str, i| {
-                // Convert multiaddr string to bytes
-                // The identify spec expects raw multiaddr bytes, but for now we'll use the string bytes
-                // A proper implementation would serialize the multiaddr according to the multiformats spec
-                const bytes = try allocator.dupe(u8, addr_str);
-                addr_bytes_list[i] = bytes;
-            }
-            identify_msg.listen_addrs = addr_bytes_list;
-        }
-
-        // Get observed address from stream
-        if (stream.conn.security_session) |session| {
-            // For now, we'll try to extract from the connection
-            // The observed address is the source address of the initiator as seen by the responder
-            // This is a simplified version - in a full implementation, we'd extract from the connection
-            // For QUIC, we might need to get this from the connection's remote address
-            // For now, we'll leave it as null and let the caller handle it if needed
-            _ = session;
-        }
-
-        // Get supported protocols
-        if (self.config.supported_protocols) |protocols_list| {
-            var protocols_array = try allocator.alloc(?[]const u8, protocols_list.len);
-            errdefer allocator.free(protocols_array);
-            for (protocols_list, 0..) |proto, i| {
-                protocols_array[i] = proto;
-            }
-            identify_msg.protocols = protocols_array;
+        if (self.config.supported_protocols) |config_protocols| {
+            try protocols_list.appendSlice(config_protocols);
         } else {
-            // Get from switch's mss handler
-            var protocols_list = std.ArrayList([]const u8).init(allocator);
-            errdefer protocols_list.deinit();
-
             var iter = self.network_switch.mss_handler.supported_protocols.iterator();
             while (iter.next()) |entry| {
                 try protocols_list.append(entry.key_ptr.*);
             }
-
-            if (protocols_list.items.len > 0) {
-                var protocols_array = try allocator.alloc(?[]const u8, protocols_list.items.len);
-                errdefer allocator.free(protocols_array);
-                for (protocols_list.items, 0..) |proto, i| {
-                    protocols_array[i] = proto;
-                }
-                identify_msg.protocols = protocols_array;
-            }
         }
 
-        return identify_msg;
+        return protocols_list;
     }
 };
 
@@ -229,7 +178,6 @@ const IdentifyInitiator = struct {
     allocator: std.mem.Allocator,
     callback_ctx: ?*anyopaque,
     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
-    handler: *IdentifyProtocolHandler,
     response_buffer: std.ArrayList(u8),
     response_received: bool,
     service_callback: ?*const fn (callback_ctx: ?*anyopaque, result: anyerror!IdentifyResult) void = null,
@@ -380,9 +328,71 @@ const IdentifyResponder = struct {
 
     const Self = @This();
 
+    /// Builds an Identify message with current peer information.
+    fn buildIdentifyMessage(self: *Self, stream: *quic.QuicStream, allocator: Allocator) !identify_pb.Identify {
+        var identify_msg = identify_pb.Identify{};
+
+        // Set protocol version if configured
+        if (self.handler.config.protocol_version) |pv| {
+            identify_msg.protocol_version = pv;
+        }
+
+        // Set agent version if configured
+        if (self.handler.config.agent_version) |av| {
+            identify_msg.agent_version = av;
+        }
+
+        // Get public key from handler (abstracts away transport access)
+        const public_key_bytes = try self.handler.getPublicKeyBytes(allocator);
+        errdefer allocator.free(public_key_bytes);
+        identify_msg.public_key = public_key_bytes;
+
+        // Get listen addresses from handler (abstracts away Swarm access)
+        var listen_addrs = try self.handler.getListenMultiaddrs(allocator);
+        defer swarm.Switch.freeListenMultiaddrs(allocator, &listen_addrs);
+
+        if (listen_addrs.items.len > 0) {
+            var addr_bytes_list = try allocator.alloc(?[]const u8, listen_addrs.items.len);
+            errdefer allocator.free(addr_bytes_list);
+            for (listen_addrs.items, 0..) |addr_str, i| {
+                // Convert multiaddr string to bytes
+                // The identify spec expects raw multiaddr bytes, but for now we'll use the string bytes
+                // A proper implementation would serialize the multiaddr according to the multiformats spec
+                const bytes = try allocator.dupe(u8, addr_str);
+                addr_bytes_list[i] = bytes;
+            }
+            identify_msg.listen_addrs = addr_bytes_list;
+        }
+
+        // Get observed address from stream
+        if (stream.conn.security_session) |session| {
+            // For now, we'll try to extract from the connection
+            // The observed address is the source address of the initiator as seen by the responder
+            // This is a simplified version - in a full implementation, we'd extract from the connection
+            // For QUIC, we might need to get this from the connection's remote address
+            // For now, we'll leave it as null and let the caller handle it if needed
+            _ = session;
+        }
+
+        // Get supported protocols from handler (abstracts away Swarm access)
+        var protocols_list = try self.handler.getSupportedProtocols(allocator);
+        defer protocols_list.deinit();
+
+        if (protocols_list.items.len > 0) {
+            var protocols_array = try allocator.alloc(?[]const u8, protocols_list.items.len);
+            errdefer allocator.free(protocols_array);
+            for (protocols_list.items, 0..) |proto, i| {
+                protocols_array[i] = proto;
+            }
+            identify_msg.protocols = protocols_array;
+        }
+
+        return identify_msg;
+    }
+
     fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
         // Build and send Identify message immediately
-        const identify_msg = try self.handler.buildIdentifyMessage(stream, self.allocator);
+        const identify_msg = try self.buildIdentifyMessage(stream, self.allocator);
         errdefer {
             // Cleanup on error
             if (identify_msg.public_key) |pk| self.allocator.free(pk);
@@ -626,7 +636,6 @@ pub const IdentifyPushHandler = struct {
             .allocator = self.allocator,
             .callback_ctx = callback_ctx,
             .callback = callback,
-            .handler = self,
             .response_buffer = std.ArrayList(u8).init(self.allocator),
             .response_received = false,
         };
@@ -667,27 +676,66 @@ pub const IdentifyPushHandler = struct {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 
+    /// Gets the public key bytes. Abstracts away transport access.
+    pub fn getPublicKeyBytes(self: *Self, allocator: Allocator) ![]const u8 {
+        return try self.transport.host_keypair.publicKeyBytes(allocator);
+    }
+
+    /// Gets listen addresses. Abstracts away Swarm access.
+    pub fn getListenMultiaddrs(self: *Self, allocator: Allocator) !std.ArrayList([]u8) {
+        return try self.network_switch.listenMultiaddrs(allocator);
+    }
+
+    /// Gets supported protocols. Abstracts away Swarm access.
+    pub fn getSupportedProtocols(self: *Self, allocator: Allocator) !std.ArrayList([]const u8) {
+        var protocols_list = std.ArrayList([]const u8).init(allocator);
+        errdefer protocols_list.deinit();
+
+        if (self.config.supported_protocols) |config_protocols| {
+            try protocols_list.appendSlice(config_protocols);
+        } else {
+            var iter = self.network_switch.mss_handler.supported_protocols.iterator();
+            while (iter.next()) |entry| {
+                try protocols_list.append(entry.key_ptr.*);
+            }
+        }
+
+        return protocols_list;
+    }
+};
+
+/// Handles identify push messages on the initiator side (sending push update).
+const IdentifyPushInitiator = struct {
+    stream: *quic.QuicStream,
+    allocator: std.mem.Allocator,
+    callback_ctx: ?*anyopaque,
+    callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
+    handler: *IdentifyPushHandler,
+    message_sent: bool = false,
+
+    const Self = @This();
+
     /// Builds an Identify message with current peer information.
-    pub fn buildIdentifyMessage(self: *Self, stream: *quic.QuicStream, allocator: Allocator) !identify_pb.Identify {
+    fn buildIdentifyMessage(self: *Self, stream: *quic.QuicStream, allocator: Allocator) !identify_pb.Identify {
         var identify_msg = identify_pb.Identify{};
 
         // Set protocol version if configured
-        if (self.config.protocol_version) |pv| {
+        if (self.handler.config.protocol_version) |pv| {
             identify_msg.protocol_version = pv;
         }
 
         // Set agent version if configured
-        if (self.config.agent_version) |av| {
+        if (self.handler.config.agent_version) |av| {
             identify_msg.agent_version = av;
         }
 
-        // Get public key from transport
-        const public_key_bytes = try self.transport.host_keypair.publicKeyBytes(allocator);
+        // Get public key from handler (abstracts away transport access)
+        const public_key_bytes = try self.handler.getPublicKeyBytes(allocator);
         errdefer allocator.free(public_key_bytes);
         identify_msg.public_key = public_key_bytes;
 
-        // Get listen addresses
-        var listen_addrs = try self.network_switch.listenMultiaddrs(allocator);
+        // Get listen addresses from handler (abstracts away Swarm access)
+        var listen_addrs = try self.handler.getListenMultiaddrs(allocator);
         defer swarm.Switch.freeListenMultiaddrs(allocator, &listen_addrs);
 
         if (listen_addrs.items.len > 0) {
@@ -713,52 +761,25 @@ pub const IdentifyPushHandler = struct {
             _ = session;
         }
 
-        // Get supported protocols
-        if (self.config.supported_protocols) |protocols_list| {
-            var protocols_array = try allocator.alloc(?[]const u8, protocols_list.len);
+        // Get supported protocols from handler (abstracts away Swarm access)
+        var protocols_list = try self.handler.getSupportedProtocols(allocator);
+        defer protocols_list.deinit();
+
+        if (protocols_list.items.len > 0) {
+            var protocols_array = try allocator.alloc(?[]const u8, protocols_list.items.len);
             errdefer allocator.free(protocols_array);
-            for (protocols_list, 0..) |proto, i| {
+            for (protocols_list.items, 0..) |proto, i| {
                 protocols_array[i] = proto;
             }
             identify_msg.protocols = protocols_array;
-        } else {
-            // Get from switch's mss handler
-            var protocols_list = std.ArrayList([]const u8).init(allocator);
-            errdefer protocols_list.deinit();
-
-            var iter = self.network_switch.mss_handler.supported_protocols.iterator();
-            while (iter.next()) |entry| {
-                try protocols_list.append(entry.key_ptr.*);
-            }
-
-            if (protocols_list.items.len > 0) {
-                var protocols_array = try allocator.alloc(?[]const u8, protocols_list.items.len);
-                errdefer allocator.free(protocols_array);
-                for (protocols_list.items, 0..) |proto, i| {
-                    protocols_array[i] = proto;
-                }
-                identify_msg.protocols = protocols_array;
-            }
         }
 
         return identify_msg;
     }
-};
-
-/// Handles identify push messages on the initiator side (sending push update).
-const IdentifyPushInitiator = struct {
-    stream: *quic.QuicStream,
-    allocator: std.mem.Allocator,
-    callback_ctx: ?*anyopaque,
-    callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
-    handler: *IdentifyPushHandler,
-    message_sent: bool = false,
-
-    const Self = @This();
 
     fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
         // Build and send Identify message immediately
-        const identify_msg = try self.handler.buildIdentifyMessage(stream, self.allocator);
+        const identify_msg = try self.buildIdentifyMessage(stream, self.allocator);
         errdefer {
             if (identify_msg.public_key) |pk| self.allocator.free(pk);
             if (identify_msg.listen_addrs) |addrs| {
@@ -867,7 +888,6 @@ const IdentifyPushResponder = struct {
     allocator: std.mem.Allocator,
     callback_ctx: ?*anyopaque,
     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
-    handler: *IdentifyPushHandler,
     response_buffer: std.ArrayList(u8),
     response_received: bool,
 
