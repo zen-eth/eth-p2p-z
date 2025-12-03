@@ -14,7 +14,7 @@ pub const RPC = struct {
         const SUBSCRIBE_WIRE: gremlin.ProtoWireNumber = 1;
         const TOPICID_WIRE: gremlin.ProtoWireNumber = 2;
     };
-
+    
     pub const SubOpts = struct {
         // fields
         subscribe: bool = false,
@@ -22,9 +22,7 @@ pub const RPC = struct {
 
         pub fn calcProtobufSize(self: *const SubOpts) usize {
             var res: usize = 0;
-            if (self.subscribe != false) {
-                res += gremlin.sizes.sizeWireNumber(RPC.SubOptsWire.SUBSCRIBE_WIRE) + gremlin.sizes.sizeBool(self.subscribe);
-            }
+            if (self.subscribe != false) { res += gremlin.sizes.sizeWireNumber(RPC.SubOptsWire.SUBSCRIBE_WIRE) + gremlin.sizes.sizeBool(self.subscribe); }
             if (self.topicid) |v| {
                 if (v.len > 0) {
                     res += gremlin.sizes.sizeWireNumber(RPC.SubOptsWire.TOPICID_WIRE) + gremlin.sizes.sizeUsize(v.len) + v.len;
@@ -44,10 +42,9 @@ pub const RPC = struct {
             return buf;
         }
 
+
         pub fn encodeTo(self: *const SubOpts, target: *gremlin.Writer) void {
-            if (self.subscribe != false) {
-                target.appendBool(RPC.SubOptsWire.SUBSCRIBE_WIRE, self.subscribe);
-            }
+            if (self.subscribe != false) { target.appendBool(RPC.SubOptsWire.SUBSCRIBE_WIRE, self.subscribe); }
             if (self.topicid) |v| {
                 if (v.len > 0) {
                     target.appendBytes(RPC.SubOptsWire.TOPICID_WIRE, v);
@@ -55,7 +52,7 @@ pub const RPC = struct {
             }
         }
     };
-
+    
     pub const SubOptsReader = struct {
         _subscribe: bool = false,
         _topicid: ?[]const u8 = null,
@@ -72,32 +69,28 @@ pub const RPC = struct {
                 offset += tag.size;
                 switch (tag.number) {
                     RPC.SubOptsWire.SUBSCRIBE_WIRE => {
-                        const result = try buf.readBool(offset);
-                        offset += result.size;
-                        res._subscribe = result.value;
+                      const result = try buf.readBool(offset);
+                      offset += result.size;
+                      res._subscribe = result.value;
                     },
                     RPC.SubOptsWire.TOPICID_WIRE => {
-                        const result = try buf.readBytes(offset);
-                        offset += result.size;
-                        res._topicid = result.value;
+                      const result = try buf.readBytes(offset);
+                      offset += result.size;
+                      res._topicid = result.value;
                     },
                     else => {
                         offset = try buf.skipData(offset, tag.wire);
-                    },
+                    }
                 }
             }
             return res;
         }
-        pub fn deinit(_: *const SubOptsReader) void {}
-
-        pub inline fn getSubscribe(self: *const SubOptsReader) bool {
-            return self._subscribe;
-        }
-        pub inline fn getTopicid(self: *const SubOptsReader) []const u8 {
-            return self._topicid orelse &[_]u8{};
-        }
+        pub fn deinit(_: *const SubOptsReader) void { }
+        
+        pub inline fn getSubscribe(self: *const SubOptsReader) bool { return self._subscribe; }
+        pub inline fn getTopicid(self: *const SubOptsReader) []const u8 { return self._topicid orelse &[_]u8{}; }
     };
-
+    
     // fields
     subscriptions: ?[]const ?RPC.SubOpts = null,
     publish: ?[]const ?Message = null,
@@ -147,6 +140,7 @@ pub const RPC = struct {
         return buf;
     }
 
+
     pub fn encodeTo(self: *const RPC, target: *gremlin.Writer) void {
         if (self.subscriptions) |arr| {
             for (arr) |maybe_v| {
@@ -189,7 +183,7 @@ pub const RPCReader = struct {
 
     pub fn init(allocator: std.mem.Allocator, src: []const u8) gremlin.Error!RPCReader {
         var buf = gremlin.Reader.init(src);
-        var res = RPCReader{ .allocator = allocator, .buf = buf };
+        var res = RPCReader{.allocator = allocator, .buf = buf};
         if (buf.buf.len == 0) {
             return res;
         }
@@ -215,13 +209,13 @@ pub const RPCReader = struct {
                     try res._publish_bufs.?.append(result.value);
                 },
                 RPCWire.CONTROL_WIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._control_buf = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._control_buf = result.value;
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
-                },
+                }
             }
         }
         return res;
@@ -326,6 +320,7 @@ pub const Message = struct {
         return buf;
     }
 
+
     pub fn encodeTo(self: *const Message, target: *gremlin.Writer) void {
         if (self.from) |v| {
             if (v.len > 0) {
@@ -380,62 +375,50 @@ pub const MessageReader = struct {
             offset += tag.size;
             switch (tag.number) {
                 MessageWire.FROM_WIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._from = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._from = result.value;
                 },
                 MessageWire.DATA_WIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._data = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._data = result.value;
                 },
                 MessageWire.SEQNO_WIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._seqno = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._seqno = result.value;
                 },
                 MessageWire.TOPIC_WIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._topic = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._topic = result.value;
                 },
                 MessageWire.SIGNATURE_WIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._signature = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._signature = result.value;
                 },
                 MessageWire.KEY_WIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._key = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._key = result.value;
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
-                },
+                }
             }
         }
         return res;
     }
-    pub fn deinit(_: *const MessageReader) void {}
-
-    pub inline fn getFrom(self: *const MessageReader) []const u8 {
-        return self._from orelse &[_]u8{};
-    }
-    pub inline fn getData(self: *const MessageReader) []const u8 {
-        return self._data orelse &[_]u8{};
-    }
-    pub inline fn getSeqno(self: *const MessageReader) []const u8 {
-        return self._seqno orelse &[_]u8{};
-    }
-    pub inline fn getTopic(self: *const MessageReader) []const u8 {
-        return self._topic orelse &[_]u8{};
-    }
-    pub inline fn getSignature(self: *const MessageReader) []const u8 {
-        return self._signature orelse &[_]u8{};
-    }
-    pub inline fn getKey(self: *const MessageReader) []const u8 {
-        return self._key orelse &[_]u8{};
-    }
+    pub fn deinit(_: *const MessageReader) void { }
+    
+    pub inline fn getFrom(self: *const MessageReader) []const u8 { return self._from orelse &[_]u8{}; }
+    pub inline fn getData(self: *const MessageReader) []const u8 { return self._data orelse &[_]u8{}; }
+    pub inline fn getSeqno(self: *const MessageReader) []const u8 { return self._seqno orelse &[_]u8{}; }
+    pub inline fn getTopic(self: *const MessageReader) []const u8 { return self._topic orelse &[_]u8{}; }
+    pub inline fn getSignature(self: *const MessageReader) []const u8 { return self._signature orelse &[_]u8{}; }
+    pub inline fn getKey(self: *const MessageReader) []const u8 { return self._key orelse &[_]u8{}; }
 };
 
 const ControlMessageWire = struct {
@@ -525,6 +508,7 @@ pub const ControlMessage = struct {
         return buf;
     }
 
+
     pub fn encodeTo(self: *const ControlMessage, target: *gremlin.Writer) void {
         if (self.ihave) |arr| {
             for (arr) |maybe_v| {
@@ -595,7 +579,7 @@ pub const ControlMessageReader = struct {
 
     pub fn init(allocator: std.mem.Allocator, src: []const u8) gremlin.Error!ControlMessageReader {
         var buf = gremlin.Reader.init(src);
-        var res = ControlMessageReader{ .allocator = allocator, .buf = buf };
+        var res = ControlMessageReader{.allocator = allocator, .buf = buf};
         if (buf.buf.len == 0) {
             return res;
         }
@@ -646,7 +630,7 @@ pub const ControlMessageReader = struct {
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
-                },
+                }
             }
         }
         return res;
@@ -761,6 +745,7 @@ pub const ControlIHave = struct {
         return buf;
     }
 
+
     pub fn encodeTo(self: *const ControlIHave, target: *gremlin.Writer) void {
         if (self.topic_i_d) |v| {
             if (v.len > 0) {
@@ -787,7 +772,7 @@ pub const ControlIHaveReader = struct {
 
     pub fn init(allocator: std.mem.Allocator, src: []const u8) gremlin.Error!ControlIHaveReader {
         var buf = gremlin.Reader.init(src);
-        var res = ControlIHaveReader{ .allocator = allocator, .buf = buf };
+        var res = ControlIHaveReader{.allocator = allocator, .buf = buf};
         if (buf.buf.len == 0) {
             return res;
         }
@@ -797,9 +782,9 @@ pub const ControlIHaveReader = struct {
             offset += tag.size;
             switch (tag.number) {
                 ControlIHaveWire.TOPIC_IDWIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._topic_i_d = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._topic_i_d = result.value;
                 },
                 ControlIHaveWire.MESSAGE_IDS_WIRE => {
                     const result = try buf.readBytes(offset);
@@ -811,7 +796,7 @@ pub const ControlIHaveReader = struct {
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
-                },
+                }
             }
         }
         return res;
@@ -821,9 +806,7 @@ pub const ControlIHaveReader = struct {
             arr.deinit();
         }
     }
-    pub inline fn getTopicID(self: *const ControlIHaveReader) []const u8 {
-        return self._topic_i_d orelse &[_]u8{};
-    }
+    pub inline fn getTopicID(self: *const ControlIHaveReader) []const u8 { return self._topic_i_d orelse &[_]u8{}; }
     pub fn getMessageIDs(self: *const ControlIHaveReader) []const []const u8 {
         if (self._message_i_ds) |arr| {
             return arr.items;
@@ -866,6 +849,7 @@ pub const ControlIWant = struct {
         return buf;
     }
 
+
     pub fn encodeTo(self: *const ControlIWant, target: *gremlin.Writer) void {
         if (self.message_i_ds) |arr| {
             for (arr) |maybe_v| {
@@ -886,7 +870,7 @@ pub const ControlIWantReader = struct {
 
     pub fn init(allocator: std.mem.Allocator, src: []const u8) gremlin.Error!ControlIWantReader {
         var buf = gremlin.Reader.init(src);
-        var res = ControlIWantReader{ .allocator = allocator, .buf = buf };
+        var res = ControlIWantReader{.allocator = allocator, .buf = buf};
         if (buf.buf.len == 0) {
             return res;
         }
@@ -905,7 +889,7 @@ pub const ControlIWantReader = struct {
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
-                },
+                }
             }
         }
         return res;
@@ -952,6 +936,7 @@ pub const ControlGraft = struct {
         return buf;
     }
 
+
     pub fn encodeTo(self: *const ControlGraft, target: *gremlin.Writer) void {
         if (self.topic_i_d) |v| {
             if (v.len > 0) {
@@ -976,22 +961,20 @@ pub const ControlGraftReader = struct {
             offset += tag.size;
             switch (tag.number) {
                 ControlGraftWire.TOPIC_IDWIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._topic_i_d = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._topic_i_d = result.value;
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
-                },
+                }
             }
         }
         return res;
     }
-    pub fn deinit(_: *const ControlGraftReader) void {}
-
-    pub inline fn getTopicID(self: *const ControlGraftReader) []const u8 {
-        return self._topic_i_d orelse &[_]u8{};
-    }
+    pub fn deinit(_: *const ControlGraftReader) void { }
+    
+    pub inline fn getTopicID(self: *const ControlGraftReader) []const u8 { return self._topic_i_d orelse &[_]u8{}; }
 };
 
 const ControlPruneWire = struct {
@@ -1024,9 +1007,7 @@ pub const ControlPrune = struct {
                 }
             }
         }
-        if (self.backoff != 0) {
-            res += gremlin.sizes.sizeWireNumber(ControlPruneWire.BACKOFF_WIRE) + gremlin.sizes.sizeU64(self.backoff);
-        }
+        if (self.backoff != 0) { res += gremlin.sizes.sizeWireNumber(ControlPruneWire.BACKOFF_WIRE) + gremlin.sizes.sizeU64(self.backoff); }
         return res;
     }
 
@@ -1040,6 +1021,7 @@ pub const ControlPrune = struct {
         self.encodeTo(&writer);
         return buf;
     }
+
 
     pub fn encodeTo(self: *const ControlPrune, target: *gremlin.Writer) void {
         if (self.topic_i_d) |v| {
@@ -1058,9 +1040,7 @@ pub const ControlPrune = struct {
                 }
             }
         }
-        if (self.backoff != 0) {
-            target.appendUint64(ControlPruneWire.BACKOFF_WIRE, self.backoff);
-        }
+        if (self.backoff != 0) { target.appendUint64(ControlPruneWire.BACKOFF_WIRE, self.backoff); }
     }
 };
 
@@ -1073,7 +1053,7 @@ pub const ControlPruneReader = struct {
 
     pub fn init(allocator: std.mem.Allocator, src: []const u8) gremlin.Error!ControlPruneReader {
         var buf = gremlin.Reader.init(src);
-        var res = ControlPruneReader{ .allocator = allocator, .buf = buf };
+        var res = ControlPruneReader{.allocator = allocator, .buf = buf};
         if (buf.buf.len == 0) {
             return res;
         }
@@ -1083,9 +1063,9 @@ pub const ControlPruneReader = struct {
             offset += tag.size;
             switch (tag.number) {
                 ControlPruneWire.TOPIC_IDWIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._topic_i_d = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._topic_i_d = result.value;
                 },
                 ControlPruneWire.PEERS_WIRE => {
                     const result = try buf.readBytes(offset);
@@ -1096,13 +1076,13 @@ pub const ControlPruneReader = struct {
                     try res._peers_bufs.?.append(result.value);
                 },
                 ControlPruneWire.BACKOFF_WIRE => {
-                    const result = try buf.readUInt64(offset);
-                    offset += result.size;
-                    res._backoff = result.value;
+                  const result = try buf.readUInt64(offset);
+                  offset += result.size;
+                  res._backoff = result.value;
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
-                },
+                }
             }
         }
         return res;
@@ -1112,9 +1092,7 @@ pub const ControlPruneReader = struct {
             arr.deinit();
         }
     }
-    pub inline fn getTopicID(self: *const ControlPruneReader) []const u8 {
-        return self._topic_i_d orelse &[_]u8{};
-    }
+    pub inline fn getTopicID(self: *const ControlPruneReader) []const u8 { return self._topic_i_d orelse &[_]u8{}; }
     pub fn getPeers(self: *const ControlPruneReader, allocator: std.mem.Allocator) gremlin.Error![]PeerInfoReader {
         if (self._peers_bufs) |bufs| {
             var result = try std.ArrayList(PeerInfoReader).initCapacity(allocator, bufs.items.len);
@@ -1125,9 +1103,7 @@ pub const ControlPruneReader = struct {
         }
         return &[_]PeerInfoReader{};
     }
-    pub inline fn getBackoff(self: *const ControlPruneReader) u64 {
-        return self._backoff;
-    }
+    pub inline fn getBackoff(self: *const ControlPruneReader) u64 { return self._backoff; }
 };
 
 const ControlIDontWantWire = struct {
@@ -1164,6 +1140,7 @@ pub const ControlIDontWant = struct {
         return buf;
     }
 
+
     pub fn encodeTo(self: *const ControlIDontWant, target: *gremlin.Writer) void {
         if (self.message_i_ds) |arr| {
             for (arr) |maybe_v| {
@@ -1184,7 +1161,7 @@ pub const ControlIDontWantReader = struct {
 
     pub fn init(allocator: std.mem.Allocator, src: []const u8) gremlin.Error!ControlIDontWantReader {
         var buf = gremlin.Reader.init(src);
-        var res = ControlIDontWantReader{ .allocator = allocator, .buf = buf };
+        var res = ControlIDontWantReader{.allocator = allocator, .buf = buf};
         if (buf.buf.len == 0) {
             return res;
         }
@@ -1203,7 +1180,7 @@ pub const ControlIDontWantReader = struct {
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
-                },
+                }
             }
         }
         return res;
@@ -1257,6 +1234,7 @@ pub const PeerInfo = struct {
         return buf;
     }
 
+
     pub fn encodeTo(self: *const PeerInfo, target: *gremlin.Writer) void {
         if (self.peer_i_d) |v| {
             if (v.len > 0) {
@@ -1287,30 +1265,26 @@ pub const PeerInfoReader = struct {
             offset += tag.size;
             switch (tag.number) {
                 PeerInfoWire.PEER_IDWIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._peer_i_d = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._peer_i_d = result.value;
                 },
                 PeerInfoWire.SIGNED_PEER_RECORD_WIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._signed_peer_record = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._signed_peer_record = result.value;
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
-                },
+                }
             }
         }
         return res;
     }
-    pub fn deinit(_: *const PeerInfoReader) void {}
-
-    pub inline fn getPeerID(self: *const PeerInfoReader) []const u8 {
-        return self._peer_i_d orelse &[_]u8{};
-    }
-    pub inline fn getSignedPeerRecord(self: *const PeerInfoReader) []const u8 {
-        return self._signed_peer_record orelse &[_]u8{};
-    }
+    pub fn deinit(_: *const PeerInfoReader) void { }
+    
+    pub inline fn getPeerID(self: *const PeerInfoReader) []const u8 { return self._peer_i_d orelse &[_]u8{}; }
+    pub inline fn getSignedPeerRecord(self: *const PeerInfoReader) []const u8 { return self._signed_peer_record orelse &[_]u8{}; }
 };
 
 const TopicDescriptorWire = struct {
@@ -1325,7 +1299,7 @@ pub const TopicDescriptor = struct {
         const MODE_WIRE: gremlin.ProtoWireNumber = 1;
         const KEYS_WIRE: gremlin.ProtoWireNumber = 2;
     };
-
+    
     pub const AuthOpts = struct {
         // nested enums
         pub const AuthMode = enum(i32) {
@@ -1333,16 +1307,14 @@ pub const TopicDescriptor = struct {
             KEY = 1,
             WOT = 2,
         };
-
+        
         // fields
         mode: TopicDescriptor.AuthOpts.AuthMode = @enumFromInt(0),
         keys: ?[]const ?[]const u8 = null,
 
         pub fn calcProtobufSize(self: *const AuthOpts) usize {
             var res: usize = 0;
-            if (@intFromEnum(self.mode) != 0) {
-                res += gremlin.sizes.sizeWireNumber(TopicDescriptor.AuthOptsWire.MODE_WIRE) + gremlin.sizes.sizeI32(@intFromEnum(self.mode));
-            }
+            if (@intFromEnum(self.mode) != 0) { res += gremlin.sizes.sizeWireNumber(TopicDescriptor.AuthOptsWire.MODE_WIRE) + gremlin.sizes.sizeI32(@intFromEnum(self.mode)); }
             if (self.keys) |arr| {
                 for (arr) |maybe_v| {
                     res += gremlin.sizes.sizeWireNumber(TopicDescriptor.AuthOptsWire.KEYS_WIRE);
@@ -1367,10 +1339,9 @@ pub const TopicDescriptor = struct {
             return buf;
         }
 
+
         pub fn encodeTo(self: *const AuthOpts, target: *gremlin.Writer) void {
-            if (@intFromEnum(self.mode) != 0) {
-                target.appendInt32(TopicDescriptor.AuthOptsWire.MODE_WIRE, @intFromEnum(self.mode));
-            }
+            if (@intFromEnum(self.mode) != 0) { target.appendInt32(TopicDescriptor.AuthOptsWire.MODE_WIRE, @intFromEnum(self.mode)); }
             if (self.keys) |arr| {
                 for (arr) |maybe_v| {
                     if (maybe_v) |v| {
@@ -1382,7 +1353,7 @@ pub const TopicDescriptor = struct {
             }
         }
     };
-
+    
     pub const AuthOptsReader = struct {
         allocator: std.mem.Allocator,
         buf: gremlin.Reader,
@@ -1391,7 +1362,7 @@ pub const TopicDescriptor = struct {
 
         pub fn init(allocator: std.mem.Allocator, src: []const u8) gremlin.Error!AuthOptsReader {
             var buf = gremlin.Reader.init(src);
-            var res = AuthOptsReader{ .allocator = allocator, .buf = buf };
+            var res = AuthOptsReader{.allocator = allocator, .buf = buf};
             if (buf.buf.len == 0) {
                 return res;
             }
@@ -1401,9 +1372,9 @@ pub const TopicDescriptor = struct {
                 offset += tag.size;
                 switch (tag.number) {
                     TopicDescriptor.AuthOptsWire.MODE_WIRE => {
-                        const result = try buf.readInt32(offset);
-                        offset += result.size;
-                        res._mode = @enumFromInt(result.value);
+                      const result = try buf.readInt32(offset);
+                      offset += result.size;
+                      res._mode = @enumFromInt(result.value);
                     },
                     TopicDescriptor.AuthOptsWire.KEYS_WIRE => {
                         const result = try buf.readBytes(offset);
@@ -1415,7 +1386,7 @@ pub const TopicDescriptor = struct {
                     },
                     else => {
                         offset = try buf.skipData(offset, tag.wire);
-                    },
+                    }
                 }
             }
             return res;
@@ -1425,9 +1396,7 @@ pub const TopicDescriptor = struct {
                 arr.deinit();
             }
         }
-        pub inline fn getMode(self: *const AuthOptsReader) TopicDescriptor.AuthOpts.AuthMode {
-            return self._mode;
-        }
+        pub inline fn getMode(self: *const AuthOptsReader) TopicDescriptor.AuthOpts.AuthMode { return self._mode; }
         pub fn getKeys(self: *const AuthOptsReader) []const []const u8 {
             if (self._keys) |arr| {
                 return arr.items;
@@ -1435,12 +1404,12 @@ pub const TopicDescriptor = struct {
             return &[_][]u8{};
         }
     };
-
+    
     const EncOptsWire = struct {
         const MODE_WIRE: gremlin.ProtoWireNumber = 1;
         const KEY_HASHES_WIRE: gremlin.ProtoWireNumber = 2;
     };
-
+    
     pub const EncOpts = struct {
         // nested enums
         pub const EncMode = enum(i32) {
@@ -1448,16 +1417,14 @@ pub const TopicDescriptor = struct {
             SHAREDKEY = 1,
             WOT = 2,
         };
-
+        
         // fields
         mode: TopicDescriptor.EncOpts.EncMode = @enumFromInt(0),
         key_hashes: ?[]const ?[]const u8 = null,
 
         pub fn calcProtobufSize(self: *const EncOpts) usize {
             var res: usize = 0;
-            if (@intFromEnum(self.mode) != 0) {
-                res += gremlin.sizes.sizeWireNumber(TopicDescriptor.EncOptsWire.MODE_WIRE) + gremlin.sizes.sizeI32(@intFromEnum(self.mode));
-            }
+            if (@intFromEnum(self.mode) != 0) { res += gremlin.sizes.sizeWireNumber(TopicDescriptor.EncOptsWire.MODE_WIRE) + gremlin.sizes.sizeI32(@intFromEnum(self.mode)); }
             if (self.key_hashes) |arr| {
                 for (arr) |maybe_v| {
                     res += gremlin.sizes.sizeWireNumber(TopicDescriptor.EncOptsWire.KEY_HASHES_WIRE);
@@ -1482,10 +1449,9 @@ pub const TopicDescriptor = struct {
             return buf;
         }
 
+
         pub fn encodeTo(self: *const EncOpts, target: *gremlin.Writer) void {
-            if (@intFromEnum(self.mode) != 0) {
-                target.appendInt32(TopicDescriptor.EncOptsWire.MODE_WIRE, @intFromEnum(self.mode));
-            }
+            if (@intFromEnum(self.mode) != 0) { target.appendInt32(TopicDescriptor.EncOptsWire.MODE_WIRE, @intFromEnum(self.mode)); }
             if (self.key_hashes) |arr| {
                 for (arr) |maybe_v| {
                     if (maybe_v) |v| {
@@ -1497,7 +1463,7 @@ pub const TopicDescriptor = struct {
             }
         }
     };
-
+    
     pub const EncOptsReader = struct {
         allocator: std.mem.Allocator,
         buf: gremlin.Reader,
@@ -1506,7 +1472,7 @@ pub const TopicDescriptor = struct {
 
         pub fn init(allocator: std.mem.Allocator, src: []const u8) gremlin.Error!EncOptsReader {
             var buf = gremlin.Reader.init(src);
-            var res = EncOptsReader{ .allocator = allocator, .buf = buf };
+            var res = EncOptsReader{.allocator = allocator, .buf = buf};
             if (buf.buf.len == 0) {
                 return res;
             }
@@ -1516,9 +1482,9 @@ pub const TopicDescriptor = struct {
                 offset += tag.size;
                 switch (tag.number) {
                     TopicDescriptor.EncOptsWire.MODE_WIRE => {
-                        const result = try buf.readInt32(offset);
-                        offset += result.size;
-                        res._mode = @enumFromInt(result.value);
+                      const result = try buf.readInt32(offset);
+                      offset += result.size;
+                      res._mode = @enumFromInt(result.value);
                     },
                     TopicDescriptor.EncOptsWire.KEY_HASHES_WIRE => {
                         const result = try buf.readBytes(offset);
@@ -1530,7 +1496,7 @@ pub const TopicDescriptor = struct {
                     },
                     else => {
                         offset = try buf.skipData(offset, tag.wire);
-                    },
+                    }
                 }
             }
             return res;
@@ -1540,9 +1506,7 @@ pub const TopicDescriptor = struct {
                 arr.deinit();
             }
         }
-        pub inline fn getMode(self: *const EncOptsReader) TopicDescriptor.EncOpts.EncMode {
-            return self._mode;
-        }
+        pub inline fn getMode(self: *const EncOptsReader) TopicDescriptor.EncOpts.EncMode { return self._mode; }
         pub fn getKeyHashes(self: *const EncOptsReader) []const []const u8 {
             if (self._key_hashes) |arr| {
                 return arr.items;
@@ -1550,7 +1514,7 @@ pub const TopicDescriptor = struct {
             return &[_][]u8{};
         }
     };
-
+    
     // fields
     name: ?[]const u8 = null,
     auth: ?TopicDescriptor.AuthOpts = null,
@@ -1588,6 +1552,7 @@ pub const TopicDescriptor = struct {
         self.encodeTo(&writer);
         return buf;
     }
+
 
     pub fn encodeTo(self: *const TopicDescriptor, target: *gremlin.Writer) void {
         if (self.name) |v| {
@@ -1629,32 +1594,30 @@ pub const TopicDescriptorReader = struct {
             offset += tag.size;
             switch (tag.number) {
                 TopicDescriptorWire.NAME_WIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._name = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._name = result.value;
                 },
                 TopicDescriptorWire.AUTH_WIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._auth_buf = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._auth_buf = result.value;
                 },
                 TopicDescriptorWire.ENC_WIRE => {
-                    const result = try buf.readBytes(offset);
-                    offset += result.size;
-                    res._enc_buf = result.value;
+                  const result = try buf.readBytes(offset);
+                  offset += result.size;
+                  res._enc_buf = result.value;
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
-                },
+                }
             }
         }
         return res;
     }
-    pub fn deinit(_: *const TopicDescriptorReader) void {}
-
-    pub inline fn getName(self: *const TopicDescriptorReader) []const u8 {
-        return self._name orelse &[_]u8{};
-    }
+    pub fn deinit(_: *const TopicDescriptorReader) void { }
+    
+    pub inline fn getName(self: *const TopicDescriptorReader) []const u8 { return self._name orelse &[_]u8{}; }
     pub fn getAuth(self: *const TopicDescriptorReader, allocator: std.mem.Allocator) gremlin.Error!TopicDescriptor.AuthOptsReader {
         if (self._auth_buf) |buf| {
             return try TopicDescriptor.AuthOptsReader.init(allocator, buf);
@@ -1668,3 +1631,4 @@ pub const TopicDescriptorReader = struct {
         return try TopicDescriptor.EncOptsReader.init(allocator, &[_]u8{});
     }
 };
+
