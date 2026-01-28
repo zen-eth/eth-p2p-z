@@ -267,6 +267,7 @@ pub const PingStream = struct {
     stream: ?*quic.QuicStream = null,
     initiator: ?*PingInitiator = null,
     allocator: Allocator,
+    caller_managed: bool = false,
 
     const Self = @This();
 
@@ -305,6 +306,14 @@ pub const PingStream = struct {
         } else {
             callback(callback_ctx, error.NoActiveStream);
         }
+    }
+
+    /// Frees the PingStream allocation. Call this after the stream has been
+    /// closed (or after receiving an error indicating the stream is no longer
+    /// usable) to release memory. The caller must not use this PingStream
+    /// after calling deinit.
+    pub fn deinit(self: *Self) void {
+        self.allocator.destroy(self);
     }
 };
 
@@ -350,6 +359,22 @@ pub const PingService = struct {
         };
 
         self.network_switch.newStream(address, &.{protocol_id}, ctx, ServicePingRequestCtx.streamOpened);
+    }
+
+    /// Sends a ping on an already-open PingStream, reusing the existing QUIC stream
+    /// instead of opening a new one. This is more efficient for repeated pings to the
+    /// same peer, matching how Go and Python libp2p implementations reuse streams.
+    pub fn pingOnStream(
+        _: *Self,
+        stream: *PingStream,
+        options: PingOptions,
+        callback_ctx: ?*anyopaque,
+        callback: PingStream.ResultCallback,
+    ) !void {
+        stream.caller_managed = true;
+        const initiator = stream.initiator orelse return error.MissingPingInitiator;
+        const timeout = if (options.timeout_ns == 0) default_timeout_ns else options.timeout_ns;
+        try initiator.beginPing(timeout, callback_ctx, callback);
     }
 
     fn requirePeerComponent(address: *Multiaddr) !void {
@@ -754,7 +779,17 @@ const PingInitiator = struct {
         self.failPending(error.StreamClosed);
 
         if (self.sender) |sender| {
-            self.allocator.destroy(sender);
+            if (sender.caller_managed) {
+                // The caller has taken ownership via pingOnStream(). Null out
+                // pointers so the handle is safely inert — pingOnStream will
+                // return error.MissingPingInitiator. The caller is responsible
+                // for calling sender.deinit() to free memory.
+                sender.initiator = null;
+                sender.stream = null;
+            } else {
+                // No caller holds a reference — free the PingStream now.
+                self.allocator.destroy(sender);
+            }
             self.sender = null;
         }
         self.handler.releaseOutboundSlot(self.peer_key);
@@ -1528,6 +1563,144 @@ test "ping protocol periodic pings" {
 
         std.time.sleep(100 * std.time.ns_per_ms);
     }
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+}
+
+test "ping protocol stream reuse" {
+    const allocator = std.testing.allocator;
+    const quic_transport = libp2p.transport.quic;
+
+    var server_loop: io_loop.ThreadEventLoop = undefined;
+    try server_loop.init(allocator);
+    defer {
+        server_loop.close();
+        server_loop.deinit();
+    }
+
+    var server_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer server_key.deinit();
+
+    var server_transport: quic_transport.QuicTransport = undefined;
+    try server_transport.init(&server_loop, &server_key, keys.KeyType.ED25519, allocator);
+
+    var server_switch: swarm.Switch = undefined;
+    server_switch.init(allocator, &server_transport);
+    defer {
+        server_switch.stop();
+        server_switch.deinit();
+    }
+
+    var server_ping = PingProtocolHandler.init(allocator, &server_switch);
+    defer server_ping.deinit();
+
+    try server_switch.addProtocolHandler(protocol_id, server_ping.any());
+
+    var server_pubkey = try server_key.publicKey(allocator);
+    defer allocator.free(server_pubkey.data.?);
+    const server_peer_id = try PeerId.fromPublicKey(allocator, &server_pubkey);
+
+    const listen_addr = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/9415");
+    defer listen_addr.deinit();
+
+    try server_switch.listen(listen_addr, null, struct {
+        fn onStream(_: ?*anyopaque, res: anyerror!?*anyopaque) void {
+            _ = res catch {};
+        }
+    }.onStream);
+
+    std.time.sleep(200 * std.time.ns_per_ms);
+
+    var client_loop: io_loop.ThreadEventLoop = undefined;
+    try client_loop.init(allocator);
+    defer {
+        client_loop.close();
+        client_loop.deinit();
+    }
+
+    var client_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
+    defer client_key.deinit();
+
+    var client_transport: quic_transport.QuicTransport = undefined;
+    try client_transport.init(&client_loop, &client_key, keys.KeyType.ED25519, allocator);
+
+    var client_switch: swarm.Switch = undefined;
+    client_switch.init(allocator, &client_transport);
+    defer {
+        client_switch.stop();
+        client_switch.deinit();
+    }
+
+    var client_ping = PingProtocolHandler.init(allocator, &client_switch);
+    defer client_ping.deinit();
+
+    try client_switch.addProtocolHandler(protocol_id, client_ping.any());
+
+    var dial_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9415");
+    defer dial_addr.deinit();
+    try dial_addr.push(.{ .P2P = server_peer_id });
+
+    const PingResultCtx = struct {
+        event: std.Thread.ResetEvent,
+        result_ns: ?u64 = null,
+        sender: ?*PingStream = null,
+
+        const Self = @This();
+
+        fn callback(ctx: ?*anyopaque, sender: ?*PingStream, res: anyerror!u64) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            self.sender = sender;
+            self.result_ns = res catch |err| {
+                self.result_ns = null;
+                std.log.warn("ping stream reuse failed: {any}", .{err});
+                self.event.set();
+                return;
+            };
+            self.event.set();
+        }
+    };
+
+    var ping_service = PingService.init(allocator, &client_switch);
+
+    // First ping: opens a new stream
+    var first_ctx = PingResultCtx{ .event = .{} };
+    try ping_service.ping(dial_addr, .{}, &first_ctx, PingResultCtx.callback);
+    first_ctx.event.wait();
+
+    const first_rtt = first_ctx.result_ns orelse return error.PingFailed;
+    try std.testing.expect(first_rtt > 0);
+
+    const sender = first_ctx.sender orelse return error.MissingSender;
+
+    // Subsequent pings: reuse the same stream via pingOnStream
+    const reuse_iterations = 4;
+    for (0..reuse_iterations) |_| {
+        std.time.sleep(100 * std.time.ns_per_ms);
+
+        var reuse_ctx = PingResultCtx{ .event = .{} };
+        try ping_service.pingOnStream(sender, .{}, &reuse_ctx, PingResultCtx.callback);
+        reuse_ctx.event.wait();
+
+        const rtt = reuse_ctx.result_ns orelse return error.PingFailed;
+        try std.testing.expect(rtt > 0);
+    }
+
+    // Close the stream once, at the end
+    const CloseCtx = struct {
+        event: std.Thread.ResetEvent = .{},
+
+        const Self = @This();
+
+        fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            self.event.set();
+        }
+    };
+
+    var close_ctx = CloseCtx{};
+    sender.close(&close_ctx, CloseCtx.callback);
+    close_ctx.event.wait();
+    sender.deinit();
 
     std.time.sleep(200 * std.time.ns_per_ms);
 }
