@@ -281,14 +281,11 @@ pub const QuicEngine = struct {
         return switch (addr.any.family) {
             posix.AF.INET => blk: {
                 const bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
-                break :blk std.mem.eql(u8, bytes, &[4]u8{ 0, 0, 0, 0 });
+                break :blk std.mem.allEqual(u8, bytes, 0);
             },
             posix.AF.INET6 => blk: {
                 const bytes = @as(*const [16]u8, @ptrCast(&addr.in6.sa.addr));
-                for (bytes) |b| {
-                    if (b != 0) break :blk false;
-                }
-                break :blk true;
+                break :blk std.mem.allEqual(u8, bytes, 0);
             },
             else => false,
         };

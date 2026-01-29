@@ -371,10 +371,11 @@ pub const PingService = struct {
         callback_ctx: ?*anyopaque,
         callback: PingStream.ResultCallback,
     ) !void {
-        stream.caller_managed = true;
         const initiator = stream.initiator orelse return error.MissingPingInitiator;
         const timeout = if (options.timeout_ns == 0) default_timeout_ns else options.timeout_ns;
         try initiator.beginPing(timeout, callback_ctx, callback);
+        // Only transfer ownership after ping is successfully initiated
+        stream.caller_managed = true;
     }
 
     fn requirePeerComponent(address: *Multiaddr) !void {
@@ -745,34 +746,51 @@ const PingInitiator = struct {
     }
 
     fn onMessage(self: *Self, _: *quic.QuicStream, message: []const u8) anyerror!void {
-        if (self.pending_request == null) {
-            return error.UnexpectedPingResponse;
-        }
-
         if (message.len == 0) return;
 
-        if (self.recv_len + message.len > payload_length) {
-            self.failPending(error.InvalidPingResponse);
-            return error.InvalidPingResponse;
+        var offset: usize = 0;
+        while (offset < message.len) {
+            const remaining_space = payload_length - self.recv_len;
+            const to_copy = @min(remaining_space, message.len - offset);
+
+            std.mem.copyForwards(
+                u8,
+                self.recv_buffer[self.recv_len .. self.recv_len + to_copy],
+                message[offset .. offset + to_copy],
+            );
+            self.recv_len += to_copy;
+            offset += to_copy;
+
+            if (self.recv_len < payload_length) {
+                return;
+            }
+
+            // We have a full 32-byte payload - process it
+            try self.processPayload();
+        }
+    }
+
+    fn processPayload(self: *Self) !void {
+        const received = self.recv_buffer[0..payload_length];
+
+        if (self.pending_request) |request| {
+            if (std.mem.eql(u8, &request.payload, received)) {
+                // It's our pong - measure RTT
+                const elapsed_ns = request.timer.read();
+                self.recv_len = 0;
+                self.succeedPending(elapsed_ns);
+                return;
+            }
         }
 
-        std.mem.copyForwards(u8, self.recv_buffer[self.recv_len .. self.recv_len + message.len], message);
-        self.recv_len += message.len;
-
-        if (self.recv_len < payload_length) {
-            return;
-        }
-
-        const request = self.pending_request.?;
-        if (!std.mem.eql(u8, &request.payload, self.recv_buffer[0..payload_length])) {
-            self.failPending(error.InvalidPingResponse);
-            return error.InvalidPingResponse;
-        }
-
-        const elapsed_ns = request.timer.read();
+        // It's an incoming ping from the other side (bidirectional ping protocol).
+        // Echo it back and reset to wait for our actual response.
+        var echo_payload: [payload_length]u8 = undefined;
+        @memcpy(&echo_payload, received);
         self.recv_len = 0;
-
-        self.succeedPending(elapsed_ns);
+        self.stream.write(&echo_payload, null, struct {
+            fn callback(_: ?*anyopaque, _: anyerror!usize) void {}
+        }.callback);
     }
 
     fn onClose(self: *Self, _: *quic.QuicStream) anyerror!void {
