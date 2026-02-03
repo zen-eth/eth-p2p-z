@@ -213,6 +213,12 @@ pub const QuicEngine = struct {
 
     stopped: std.Thread.ResetEvent,
 
+    // Resolved local address for wildcard-bound sockets (0.0.0.0 or ::).
+    // When the socket is bound to a wildcard address, lsquic needs the actual
+    // local IP to correctly handle QUIC path validation. This is resolved on
+    // the first incoming packet using the "connect trick" and cached.
+    resolved_local_addr: ?std.net.Address,
+
     pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, transport: *QuicTransport, is_client_mode: bool) !void {
         var flags: c_uint = 0;
         if (!is_client_mode) {
@@ -266,7 +272,45 @@ pub const QuicEngine = struct {
             .connect_ctx = null,
             .stop_flag = false,
             .stopped = .{},
+            .resolved_local_addr = null,
         };
+    }
+
+    /// Returns true if the given address is a wildcard (0.0.0.0 or ::).
+    fn isWildcard(addr: std.net.Address) bool {
+        return switch (addr.any.family) {
+            posix.AF.INET => blk: {
+                const bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
+                break :blk std.mem.allEqual(u8, bytes, 0);
+            },
+            posix.AF.INET6 => blk: {
+                const bytes = @as(*const [16]u8, @ptrCast(&addr.in6.sa.addr));
+                break :blk std.mem.allEqual(u8, bytes, 0);
+            },
+            else => false,
+        };
+    }
+
+    /// Resolves the actual local IP address when the socket is bound to a wildcard
+    /// address (0.0.0.0 or ::). Uses the POSIX "connect trick": creates a temporary
+    /// UDP socket, connects it to the remote address (which sets the route without
+    /// sending data), then reads back the local address via getsockname.
+    /// Returns the original address unchanged if it is not a wildcard.
+    fn resolveLocalAddress(local: std.net.Address, remote: std.net.Address) std.net.Address {
+        if (!isWildcard(local)) return local;
+
+        const sock = posix.socket(remote.any.family, posix.SOCK.DGRAM, 0) catch return local;
+        defer posix.close(sock);
+
+        posix.connect(sock, &remote.any, remote.getOsSockLen()) catch return local;
+
+        var resolved: std.net.Address = undefined;
+        var len: posix.socklen_t = @sizeOf(std.net.Address);
+        posix.getsockname(sock, &resolved.any, &len) catch return local;
+
+        // Preserve the original port from the bound socket
+        resolved.setPort(local.getPort());
+        return resolved;
     }
 
     /// doStop is a private method that stops the QUIC engine by setting the stop flag.
@@ -506,11 +550,28 @@ pub const QuicEngine = struct {
             }
             return .rearm;
         }
+        // Resolve the actual local address for wildcard-bound server sockets.
+        // When a server socket is bound to 0.0.0.0, lsquic needs the real
+        // interface IP for correct QUIC path handling. Only apply this to
+        // server engines — client engines must keep using the address from
+        // lsquic_engine_connect to avoid path migration mismatches.
+        const local_addr_ptr: *const std.posix.sockaddr = blk: {
+            if (!self.is_client_mode and isWildcard(self.local_address)) {
+                if (self.resolved_local_addr == null) {
+                    self.resolved_local_addr = resolveLocalAddress(self.local_address, address);
+                }
+                if (self.resolved_local_addr) |*resolved| {
+                    break :blk &resolved.any;
+                }
+            }
+            break :blk &self.local_address.any;
+        };
+
         _ = lsquic.lsquic_engine_packet_in(
             self.engine,
             b.slice[0..n].ptr,
             n,
-            @ptrCast(&self.local_address.any),
+            @ptrCast(local_addr_ptr),
             @ptrCast(&address.any),
             self,
             0,
