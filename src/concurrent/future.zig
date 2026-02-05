@@ -95,7 +95,7 @@ test "Future - basic functionality" {
     // Test setting value and waiting
     var thread = try std.Thread.spawn(.{}, struct {
         fn run(comp: *TestCompletion) void {
-            std.time.sleep(10 * std.time.ns_per_ms);
+            std.Thread.sleep(10 * std.time.ns_per_ms);
             comp.setValue(42);
         }
     }.run, .{&completion});
@@ -168,7 +168,7 @@ test "Future - timed wait success" {
     // Test timed wait with completion occurring before timeout
     var thread = try std.Thread.spawn(.{}, struct {
         fn run(comp: *TestCompletion) void {
-            std.time.sleep(10 * std.time.ns_per_ms);
+            std.Thread.sleep(10 * std.time.ns_per_ms);
             comp.setValue(42);
         }
     }.run, .{&completion});
@@ -210,7 +210,7 @@ test "Future - concurrent access" {
         threads[i] = try std.Thread.spawn(.{}, struct {
             fn run(comp: *TestCompletion, id: usize) void {
                 if (id == 0) {
-                    std.time.sleep(5 * std.time.ns_per_ms); // Slight delay for first thread
+                    std.Thread.sleep(5 * std.time.ns_per_ms); // Slight delay for first thread
                 }
 
                 if (id % 2 == 0) {

@@ -1,7 +1,8 @@
 const std = @import("std");
+const linear_fifo = @import("../../linear_fifo.zig");
 const libp2p = @import("../../root.zig");
 const protocols = libp2p.protocols;
-const PeerId = @import("peer-id").PeerId;
+const PeerId = @import("peer_id").PeerId;
 const quic = libp2p.transport.quic;
 const rpc = libp2p.protobuf.rpc;
 const pubsub = @import("pubsub.zig");
@@ -103,7 +104,7 @@ pub const PubSubPeerProtocolHandler = struct {
             .callback_ctx = callback_ctx,
             .callback = callback,
             .allocator = self.allocator,
-            .received_buffer = std.fifo.LinearFifo(u8, .Dynamic).init(self.allocator),
+            .received_buffer = linear_fifo.LinearFifo(u8, .Dynamic).init(self.allocator),
         };
         stream.setProtoMsgHandler(handler.any());
     }
@@ -223,7 +224,7 @@ pub const PubSubPeerResponder = struct {
 
     pubsub: PubSub,
 
-    received_buffer: std.fifo.LinearFifo(u8, .Dynamic),
+    received_buffer: linear_fifo.LinearFifo(u8, .Dynamic),
 
     const Self = @This();
 
@@ -277,7 +278,7 @@ pub const PubSubPeerResponder = struct {
             const bytes_read = self.received_buffer.read(copied_message);
             std.debug.assert(bytes_read == msg_len);
 
-            const rpc_reader = try rpc.RPCReader.init(arena_allocator, copied_message);
+            const rpc_reader = try rpc.RPCReader.init(copied_message);
             var rpc_message: pubsub.RPC = .{
                 .rpc_reader = rpc_reader,
                 .from = stream.conn.security_session.?.remote_id,

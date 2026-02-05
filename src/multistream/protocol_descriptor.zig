@@ -15,13 +15,13 @@ pub const ProtocolDescriptor = struct {
         initial_announce_protocols: []const ProtocolId,
         matcher: ProtocolMatcher,
     ) !void {
-        var announce_list = std.ArrayList(ProtocolId).init(allocator);
-        errdefer announce_list.deinit();
+        var announce_list: std.ArrayList(ProtocolId) = .empty;
+        errdefer announce_list.deinit(allocator);
 
         for (initial_announce_protocols) |p_id| {
             const owned_pid = try allocator.dupe(u8, p_id);
             errdefer allocator.free(owned_pid);
-            try announce_list.append(owned_pid);
+            try announce_list.append(allocator, owned_pid);
         }
 
         self.* = ProtocolDescriptor{
@@ -35,7 +35,7 @@ pub const ProtocolDescriptor = struct {
         for (self.announce_protocols.items) |p_id| {
             self.allocator.free(p_id);
         }
-        self.announce_protocols.deinit();
+        self.announce_protocols.deinit(self.allocator);
         self.protocol_matcher.deinit();
     }
 

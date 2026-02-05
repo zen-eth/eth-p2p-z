@@ -10,7 +10,8 @@ const ProtoMatcher = @import("protocol_matcher.zig").ProtocolMatcher;
 const multiformats = @import("multiformats");
 const uvarint = multiformats.uvarint;
 const Allocator = std.mem.Allocator;
-const LinearFifo = std.fifo.LinearFifo;
+const linear_fifo = @import("../linear_fifo.zig");
+const LinearFifo = linear_fifo.LinearFifo;
 const io_loop = @import("../thread_event_loop.zig");
 const Upgrader = @import("../transport/upgrader.zig").ConnUpgrader;
 const insecure = @import("../security/insecure.zig");
@@ -175,24 +176,24 @@ pub const Negotiator = struct {
 
         switch (direction) {
             .OUTBOUND => {
-                var protos = ArrayList(*const ProtocolId).init(allocator);
-                errdefer protos.deinit();
+                var protos: ArrayList(*const ProtocolId) = .empty;
+                errdefer protos.deinit(allocator);
 
                 for (bindings) |binding| {
                     const proto_desc = binding.protoDesc();
                     for (proto_desc.announce_protocols.items) |*proto_id| {
-                        try protos.append(proto_id);
+                        try protos.append(allocator, proto_id);
                     }
                 }
                 self.protocols = protos;
             },
             .INBOUND => {
-                var matchers = ArrayList(*const ProtoMatcher).init(allocator);
-                errdefer matchers.deinit();
+                var matchers: ArrayList(*const ProtoMatcher) = .empty;
+                errdefer matchers.deinit(allocator);
                 for (bindings) |binding| {
                     const proto_desc = binding.protoDesc();
                     const matcher = &proto_desc.protocol_matcher;
-                    try matchers.append(matcher);
+                    try matchers.append(allocator, matcher);
                 }
                 self.matchers = matchers;
             },
@@ -201,10 +202,10 @@ pub const Negotiator = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.protocols) |*protos| {
-            protos.deinit();
+            protos.deinit(self.allocator);
         }
         if (self.matchers) |*matchers| {
-            matchers.deinit();
+            matchers.deinit(self.allocator);
         }
         self.allocator.free(self.buffer.buf);
     }
@@ -591,7 +592,7 @@ test "Multistream Negotiator with Insecure Protocol" {
     accept_thread.join();
     // temporary sleep to ensure the multistream negotiation completes
     // will make it more robust later
-    std.time.sleep(std.time.ns_per_s * 4);
+    std.Thread.sleep(std.time.ns_per_s * 4);
 
     try std.testing.expectEqualStrings(conn_holder.channel.?.securitySession().?.local_id, "mock_local_id");
     try std.testing.expectEqualStrings(conn_holder.channel.?.securitySession().?.remote_id, "mock_remote_id");

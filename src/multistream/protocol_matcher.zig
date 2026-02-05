@@ -58,23 +58,23 @@ const ListMatcherData = struct {
         for (self.protocols.items) |p| {
             self.allocator.free(p);
         }
-        self.protocols.deinit();
+        self.protocols.deinit(self.allocator);
     }
 
     fn init(self: *ListMatcherData, allocator_arg: Allocator, protocols_to_match: []const ProtocolId) !void {
         self.allocator = allocator_arg;
-        self.protocols = ArrayList([]u8).init(allocator_arg);
+        self.protocols = .empty;
 
         var success = false;
         defer {
             if (!success) {
                 for (self.protocols.items) |p_created| self.allocator.free(p_created);
-                self.protocols.deinit();
+                self.protocols.deinit(self.allocator);
             }
         }
 
         for (protocols_to_match) |p_const| {
-            try self.protocols.append(try self.allocator.dupe(u8, p_const));
+            try self.protocols.append(self.allocator, try self.allocator.dupe(u8, p_const));
         }
         success = true;
     }

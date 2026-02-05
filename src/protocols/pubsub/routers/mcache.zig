@@ -134,16 +134,16 @@ pub const MessageCache = struct {
             .allocator = allocator,
             .msgs = std.StringHashMap(rpc.Message).init(allocator),
             .peertx = std.StringHashMap(PeerTransmissionMap).init(allocator),
-            .history = std.ArrayList(?std.ArrayList(CacheEntry)).init(allocator),
+            .history = .empty,
             .gossip = gossip,
             .msg_id_fn = msg_id_fn,
         };
 
-        try cache.history.resize(history_size);
+        try cache.history.resize(allocator, history_size);
 
         @memset(cache.history.items, null);
         // Initialize history window 0
-        cache.history.items[0] = std.ArrayList(CacheEntry).init(allocator);
+        cache.history.items[0] = .empty;
 
         return cache;
     }
@@ -168,12 +168,13 @@ pub const MessageCache = struct {
         self.peertx.deinit();
 
         // Clean up history
-        for (self.history.items) |window| {
-            if (window) |*entry| {
-                entry.deinit();
+        for (self.history.items) |maybe_window| {
+            if (maybe_window) |w| {
+                var window = w;
+                window.deinit(self.allocator);
             }
         }
-        self.history.deinit();
+        self.history.deinit(self.allocator);
     }
 
     pub fn put(self: *Self, msg: *const rpc.Message) !void {
@@ -192,7 +193,7 @@ pub const MessageCache = struct {
             .mid = mid,
             .topic = cloned_msg.topic orelse return error.MissingTopic,
         };
-        try self.history.items[0].?.append(entry);
+        try self.history.items[0].?.append(self.allocator, entry);
     }
 
     pub fn putWithId(self: *Self, mid: []const u8, msg: *const rpc.Message) !void {
@@ -214,7 +215,7 @@ pub const MessageCache = struct {
             .mid = mid,
             .topic = cloned_msg.topic orelse return error.MissingTopic,
         };
-        try self.history.items[0].?.append(entry);
+        try self.history.items[0].?.append(self.allocator, entry);
     }
 
     pub fn get(self: *Self, mid: []const u8) ?*rpc.Message {
@@ -241,20 +242,20 @@ pub const MessageCache = struct {
     }
 
     pub fn getGossipIDs(self: *Self, topic: []const u8) ![][]const u8 {
-        var mids = std.ArrayList([]const u8).init(self.allocator);
+        var mids: std.ArrayList([]const u8) = .empty;
 
         // Iterate through gossip windows (first 'gossip' windows)
         for (0..self.gossip) |i| {
             if (self.history.items[i]) |*window| {
                 for (window.items) |entry| {
                     if (std.mem.eql(u8, entry.topic, topic)) {
-                        try mids.append(entry.mid);
+                        try mids.append(self.allocator, entry.mid);
                     }
                 }
             }
         }
 
-        return mids.toOwnedSlice();
+        return mids.toOwnedSlice(self.allocator);
     }
 
     pub fn shift(self: *Self) void {
@@ -274,7 +275,7 @@ pub const MessageCache = struct {
                     peer_map.deinit();
                 }
             }
-            last_window.deinit();
+            last_window.deinit(self.allocator);
         }
 
         // Shift history windows right
@@ -282,7 +283,7 @@ pub const MessageCache = struct {
             std.mem.copyBackwards(?std.ArrayList(CacheEntry), self.history.items[1..], self.history.items[0 .. history_len - 1]);
         }
 
-        self.history.items[0] = std.ArrayList(CacheEntry).init(self.allocator);
+        self.history.items[0] = .empty;
     }
 
     fn freeMessage(self: *Self, msg: *const rpc.Message) void {

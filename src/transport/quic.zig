@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 const UDP = xev.UDP;
 const posix = std.posix;
 const protoMsgHandler = libp2p.protocols.AnyProtocolMessageHandler;
-const multiaddr = @import("multiformats").multiaddr;
+const multiaddr = @import("multiaddr");
 const Multiaddr = multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 const keys = @import("peer_id").keys;
@@ -830,7 +830,7 @@ pub const QuicStream = struct {
         self.* = .{
             .stream = stream,
             .conn = conn,
-            .pending_writes = std.ArrayList(WriteRequest).init(conn.engine.allocator),
+            .pending_writes = .empty,
             .active_write = null,
             .proto_msg_handler = null,
             .proposed_protocols = null,
@@ -842,16 +842,16 @@ pub const QuicStream = struct {
     pub fn deinit(self: *QuicStream) void {
         if (self.active_write) |*req| {
             req.callback(req.callback_ctx, error.StreamClosed);
-            req.data.deinit();
+            req.data.deinit(self.conn.engine.allocator);
             self.active_write = null;
         }
 
         while (self.pending_writes.items.len > 0) {
             var req = self.pending_writes.pop().?;
             req.callback(req.callback_ctx, error.StreamClosed);
-            req.data.deinit();
+            req.data.deinit(self.conn.engine.allocator);
         }
-        self.pending_writes.deinit();
+        self.pending_writes.deinit(self.conn.engine.allocator);
     }
 
     pub fn setProtoMsgHandler(self: *QuicStream, handler: protoMsgHandler) void {
@@ -860,16 +860,17 @@ pub const QuicStream = struct {
     }
 
     pub fn write(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
-        var data_copy = std.ArrayList(u8).init(self.conn.engine.allocator);
-        errdefer data_copy.deinit();
-        data_copy.appendSlice(data) catch |err| {
+        var data_copy: std.ArrayList(u8) = .empty;
+        const alloc = self.conn.engine.allocator;
+        errdefer data_copy.deinit(alloc);
+        data_copy.appendSlice(alloc, data) catch |err| {
             callback(callback_ctx, err);
             return;
         };
         if (self.conn.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doWrite(data_copy, callback_ctx, callback);
         } else {
-            io_loop.ThreadEventLoop.QuicTasks.queueQuicWriteStream(self.conn.engine.transport.io_event_loop, self, data_copy, callback_ctx, callback) catch |err| {
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicWriteStream(self.conn.engine.transport.io_event_loop, self, data_copy, alloc, callback_ctx, callback) catch |err| {
                 callback(callback_ctx, err);
                 return;
             };
@@ -932,7 +933,7 @@ pub const QuicStream = struct {
             .callback = callback,
         };
 
-        self.pending_writes.append(write_req) catch |err| {
+        self.pending_writes.append(self.conn.engine.allocator, write_req) catch |err| {
             callback(callback_ctx, err);
             return;
         };
@@ -1429,7 +1430,7 @@ pub fn onStreamWrite(
 
             std.log.warn("lsquic_stream_write failed with error: {}", .{err});
             active_req.callback(active_req.callback_ctx, error.WriteFailed);
-            active_req.data.deinit();
+            active_req.data.deinit(self.conn.engine.allocator);
             self.active_write = null;
             return;
         } else if (n_written == 0) {
@@ -1440,11 +1441,11 @@ pub fn onStreamWrite(
             _ = lsquic.lsquic_stream_flush(stream.?);
             const written_usize: usize = @intCast(n_written);
             active_req.total_written += written_usize;
-            active_req.data.replaceRange(0, written_usize, &.{}) catch unreachable;
+            active_req.data.replaceRange(self.conn.engine.allocator, 0, written_usize, &.{}) catch unreachable;
 
             if (active_req.data.items.len == 0) {
                 active_req.callback(active_req.callback_ctx, active_req.total_written);
-                active_req.data.deinit();
+                active_req.data.deinit(self.conn.engine.allocator);
                 self.active_write = null;
 
                 if (self.pending_writes.items.len > 0) {
@@ -1592,5 +1593,5 @@ test "lsquic engine initialization" {
         }
     }.callback);
 
-    std.time.sleep(std.time.ns_per_ms * 200); // Wait for the dial to complete
+    std.Thread.sleep(std.time.ns_per_ms * 200); // Wait for the dial to complete
 }

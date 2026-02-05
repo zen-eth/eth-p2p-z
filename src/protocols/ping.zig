@@ -3,7 +3,7 @@ const libp2p = @import("../root.zig");
 const protocols = libp2p.protocols;
 const quic = libp2p.transport.quic;
 const swarm = libp2p.swarm;
-const multiaddr = @import("multiformats").multiaddr;
+const multiaddr = @import("multiaddr");
 const Multiaddr = multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 const io_loop = libp2p.thread_event_loop;
@@ -994,7 +994,7 @@ test "ping listen callback exposes negotiated protocol" {
     var listen_ctx = ListenCtx{};
     try server_switch.listen(listen_addr, &listen_ctx, ListenCtx.callback);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     var server_pubkey = try server_key.publicKey(allocator);
     defer allocator.free(server_pubkey.data.?);
@@ -1080,7 +1080,7 @@ test "ping listen callback exposes negotiated protocol" {
     try std.testing.expect(listen_ctx.protocol != null);
     try std.testing.expect(std.mem.eql(u8, listen_ctx.protocol.?, protocol_id));
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 }
 
 test "ping protocol round trip" {
@@ -1132,7 +1132,7 @@ test "ping protocol round trip" {
         }
     }.onStream);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     var client_loop: io_loop.ThreadEventLoop = undefined;
     try client_loop.init(allocator);
@@ -1211,7 +1211,7 @@ test "ping protocol round trip" {
         close_ctx.event.wait();
     }
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 }
 
 test "ping multiaddr round trip" {
@@ -1256,7 +1256,7 @@ test "ping multiaddr round trip" {
         }
     }.onStream);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     var client_loop: io_loop.ThreadEventLoop = undefined;
     try client_loop.init(allocator);
@@ -1332,7 +1332,7 @@ test "ping multiaddr round trip" {
         close_ctx.event.wait();
     }
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 }
 
 test "ping protocol timeout" {
@@ -1377,7 +1377,7 @@ test "ping protocol timeout" {
         }
     }.onStream);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     var client_loop: io_loop.ThreadEventLoop = undefined;
     try client_loop.init(allocator);
@@ -1457,7 +1457,7 @@ test "ping protocol timeout" {
         close_ctx.event.wait();
     }
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 }
 
 test "ping protocol periodic pings" {
@@ -1502,7 +1502,7 @@ test "ping protocol periodic pings" {
         }
     }.onStream);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     var client_loop: io_loop.ThreadEventLoop = undefined;
     try client_loop.init(allocator);
@@ -1579,10 +1579,10 @@ test "ping protocol periodic pings" {
             close_ctx.event.wait();
         }
 
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 }
 
 test "ping protocol stream reuse" {
@@ -1627,7 +1627,7 @@ test "ping protocol stream reuse" {
         }
     }.onStream);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     var client_loop: io_loop.ThreadEventLoop = undefined;
     try client_loop.init(allocator);
@@ -1693,7 +1693,7 @@ test "ping protocol stream reuse" {
     // Subsequent pings: reuse the same stream via pingOnStream
     const reuse_iterations = 4;
     for (0..reuse_iterations) |_| {
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
 
         var reuse_ctx = PingResultCtx{ .event = .{} };
         try ping_service.pingOnStream(sender, .{}, &reuse_ctx, PingResultCtx.callback);
@@ -1720,5 +1720,5 @@ test "ping protocol stream reuse" {
     close_ctx.event.wait();
     sender.deinit();
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 }

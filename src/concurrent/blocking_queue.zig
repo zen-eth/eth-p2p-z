@@ -356,7 +356,7 @@ test "blockingPop with producer thread" {
     const thread = try std.Thread.spawn(.{}, struct {
         fn run(queue: *Q) void {
             // Wait a bit before pushing
-            std.time.sleep(20 * std.time.ns_per_ms);
+            std.Thread.sleep(20 * std.time.ns_per_ms);
             _ = queue.push(99, .{ .instant = {} });
         }
     }.run, .{q});
@@ -389,13 +389,13 @@ test "blockingPop notification when queue becomes non-empty" {
     }.run, .{ q, &value_received });
 
     // Give the consumer thread time to start waiting
-    std.time.sleep(10 * std.time.ns_per_ms);
+    std.Thread.sleep(10 * std.time.ns_per_ms);
 
     // Push a value that should wake up the consumer
     _ = q.push(123, .{ .instant = {} });
 
     // Give the consumer time to process
-    std.time.sleep(10 * std.time.ns_per_ms);
+    std.Thread.sleep(10 * std.time.ns_per_ms);
 
     try testing.expect(value_received.load(.acquire));
     consumer.join();
@@ -526,7 +526,7 @@ test "drain with waiting producer" {
     }.run, .{ q, &push_done });
 
     // Give the producer time to start waiting
-    std.time.sleep(10 * std.time.ns_per_ms);
+    std.Thread.sleep(10 * std.time.ns_per_ms);
 
     // At this point, producer should be waiting
     try testing.expect(!push_done.load(.acquire));
@@ -538,7 +538,7 @@ test "drain with waiting producer" {
     it.deinit();
 
     // Give the producer time to complete
-    std.time.sleep(10 * std.time.ns_per_ms);
+    std.Thread.sleep(10 * std.time.ns_per_ms);
 
     try testing.expect(push_done.load(.acquire));
     producer.join();

@@ -26,28 +26,32 @@
     // internet connectivity.
     .dependencies = .{
         .libxev = .{
-            .url = "git+https://github.com/zen-eth/libxev#fe9928d11540b723aa131fe097c2c4b5359bb073",
-            .hash = "libxev-0.0.0-86vtc5gdEwBLKZucNlSW_tEfwaN9l4z6kqRegMdaux4-",
+            .url = "git+https://github.com/mitchellh/libxev#42d4ead52667e03619dcd5b1a3ca8ef7d5dd24ed",
+            .hash = "libxev-0.0.0-86vtc0IbEwBzMSXa-ZPZ8JpcV4Mw1SrsTuvtJmFAQ7Uu",
         },
         .zmultiformats = .{
-            .url = "git+https://github.com/zen-eth/multiformats-zig#1359ac3ab12a6af173c2b7f13ae9c4f5ff34e11e",
-            .hash = "zmultiformats-0.1.0-yjvchlEaBQCuIiXU5ScwglKjcfv9KxWERFPuriP7ReZs",
+            .url = "git+https://github.com/zen-eth/multiformats-zig#ddf4f0af34ce8f87c2dc7df73a261738c3868093",
+            .hash = "zmultiformats-0.1.0-yjvchohoBADALnCylBLeQF7Vn0SKULmQ_sFOrhzgmvQO",
         },
         .gremlin = .{
-            .url = "git+https://github.com/octopus-foundation/gremlin.zig#fccfe2659f24497199d86404e0ef7dbc79e033d2",
-            .hash = "gremlin-0.0.0-E2s91bN4DgDYbb4QNxl4ZT5nEEhNBkk5ngfVasDbsnNF",
+            .url = "git+https://github.com/norma-core/gremlin.zig#bdfcf36c2f4b22bdbd96a5ef5385ff0b940cffc2",
+            .hash = "gremlin-0.1.0-E2s91WkYEQCC1_KteI5rN9EU_tuyyZftimIOI4S4f8Fc",
         },
         .lsquic = .{
-            .url = "git+https://github.com/zen-eth/lsquic.git#59bee4ce57e35dab8c28415d4a5dfb2c26089c84",
-            .hash = "lsquic-0.0.0-jO7gdhAfAABVzSIdOXi13ePKeV-C6EMJ7KVosCgbTmOk",
+            .url = "git+https://github.com/zen-eth/lsquic.git?ref=anshalshukla/zig-0.15.2-upgrade#87391b162a9d05053bd256fadf716bc7ced1ce63",
+            .hash = "lsquic-0.0.0-jO7gdogfAAD9odKzV7c3R5ewa2LrX-73Kh6B5GJgS7Rh",
         },
         .cache = .{
             .url = "git+https://github.com/karlseguin/cache.zig#9f3329b05b3e98da928fe9988d74971da70328b4",
             .hash = "cache-0.0.0-winRwKaSAAAKIcUzY8IXwcbH050imeWPFMbPW_sCdPLF",
         },
         .secp256k1 = .{
-            .url = "git+https://github.com/zig-bitcoin/libsecp256k1-zig#b96922b375a601f3303bf43be1dceb3d101df6c6",
-            .hash = "secp256k1-0.0.0-AAAAAPPgAAADPOkS7brnO1B26LjbhZsxwz6Kx8a6jCwB",
+            .url = "git+https://github.com/blockblaz/libsecp256k1-zig#518a1370b66c6b575b4831c4a1a182f5b30b3d75",
+            .hash = "secp256k1-0.0.3-vtxi58DhAABoPpDgG3wagaDXiHHIDezLOPE0BI4V0bDS",
+        },
+        .multiaddr = .{
+            .url = "git+https://github.com/zen-eth/multiaddr-zig#1f2493ad75870e98befe64fd54f642b023c82190",
+            .hash = "multiaddr-0.1.0-Cjayds-5AAArNw0ghMgquaRygVf7-kEWQJlQGjVpZzZ0",
         },
     },
     .paths = .{

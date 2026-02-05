@@ -9,56 +9,70 @@ const swarm = libp2p.swarm;
 const protocols = libp2p.protocols;
 const ping = libp2p.protocols.ping;
 const keys = @import("peer_id").keys;
-const multiaddr = @import("multiformats").multiaddr;
-const Multiaddr = multiaddr.Multiaddr;
+const Multiaddr = @import("multiaddr").Multiaddr;
 
 const RedisClient = struct {
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
-    reader: std.io.BufferedReader(4096, std.net.Stream.Reader),
-    writer: std.io.BufferedWriter(4096, std.net.Stream.Writer),
+    reader: std.net.Stream.Reader,
+    writer: std.net.Stream.Writer,
+    read_buf: [4096]u8,
+    write_buf: [4096]u8,
 
     pub fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16) !RedisClient {
-        var stream = try std.net.tcpConnectToHost(allocator, host, port);
+        const stream = try std.net.tcpConnectToHost(allocator, host, port);
         errdefer stream.close();
-        const reader = std.io.bufferedReader(stream.reader());
-        const writer = std.io.bufferedWriter(stream.writer());
 
-        return RedisClient{
+        var client = RedisClient{
             .allocator = allocator,
             .stream = stream,
-            .reader = reader,
-            .writer = writer,
+            .reader = undefined,
+            .writer = undefined,
+            .read_buf = undefined,
+            .write_buf = undefined,
         };
+        client.reader = stream.reader(&client.read_buf);
+        client.writer = stream.writer(&client.write_buf);
+
+        return client;
     }
 
     pub fn deinit(self: *RedisClient) void {
-        self.writer.flush() catch {};
+        self.writer.interface.flush() catch {};
         self.stream.close();
     }
 
     fn writeCommand(self: *RedisClient, parts: []const []const u8) !void {
-        var writer = self.writer.writer();
+        const writer = &self.writer.interface;
         try writer.print("*{d}\r\n", .{parts.len});
         for (parts) |part| {
             try writer.print("${d}\r\n", .{part.len});
             try writer.writeAll(part);
             try writer.writeAll("\r\n");
         }
-        try self.writer.flush();
+        try self.writer.interface.flush();
+    }
+
+    fn readOneByte(self: *RedisClient) !u8 {
+        var buf: [1]u8 = undefined;
+        try self.reader.interface().readSliceAll(&buf);
+        return buf[0];
+    }
+
+    fn readExact(self: *RedisClient, buffer: []u8) !void {
+        try self.reader.interface().readSliceAll(buffer);
     }
 
     fn readLine(self: *RedisClient, buffer: *std.ArrayList(u8)) !void {
         buffer.clearRetainingCapacity();
-        var reader = self.reader.reader();
         while (true) {
-            const byte = try reader.readByte();
+            const byte = try self.readOneByte();
             if (byte == '\r') {
-                const next = try reader.readByte();
+                const next = try self.readOneByte();
                 if (next != '\n') return error.InvalidResponse;
                 break;
             }
-            try buffer.append(byte);
+            try buffer.append(self.allocator, byte);
         }
     }
 
@@ -68,27 +82,24 @@ const RedisClient = struct {
     }
 
     fn readBulkString(self: *RedisClient, scratch: *std.ArrayList(u8)) !?[]u8 {
-        var reader = self.reader.reader();
-        const prefix = try reader.readByte();
+        const prefix = try self.readOneByte();
         if (prefix != '$') return error.InvalidResponse;
-        return self.readBulkStringAfterPrefix(scratch, reader);
+        return self.readBulkStringBody(scratch);
     }
 
-    fn readBulkStringAfterPrefix(
+    fn readBulkStringBody(
         self: *RedisClient,
         scratch: *std.ArrayList(u8),
-        reader_any: anytype,
     ) !?[]u8 {
-        var reader = reader_any;
         scratch.clearRetainingCapacity();
         while (true) {
-            const byte = try reader.readByte();
+            const byte = try self.readOneByte();
             if (byte == '\r') {
-                const next = try reader.readByte();
+                const next = try self.readOneByte();
                 if (next != '\n') return error.InvalidResponse;
                 break;
             }
-            try scratch.append(byte);
+            try scratch.append(self.allocator, byte);
         }
         const length = std.fmt.parseInt(i64, scratch.items, 10) catch {
             std.log.err("invalid bulk length line: {s}", .{scratch.items});
@@ -101,9 +112,9 @@ const RedisClient = struct {
         const data = try self.allocator.alloc(u8, usize_len);
         errdefer self.allocator.free(data);
 
-        try reader.readNoEof(data);
-        const cr = try reader.readByte();
-        const lf = try reader.readByte();
+        try self.readExact(data);
+        const cr = try self.readOneByte();
+        const lf = try self.readOneByte();
         if (cr != '\r' or lf != '\n') {
             return error.InvalidResponse;
         }
@@ -113,8 +124,7 @@ const RedisClient = struct {
     pub fn rpush(self: *RedisClient, key: []const u8, value: []const u8, scratch: *std.ArrayList(u8)) !void {
         const cmd = [_][]const u8{ "RPUSH", key, value };
         try self.writeCommand(&cmd);
-        const reader = self.reader.reader();
-        const prefix = try reader.readByte();
+        const prefix = try self.readOneByte();
         if (prefix != ':') return error.InvalidResponse;
         _ = try self.readInteger(scratch);
     }
@@ -122,8 +132,7 @@ const RedisClient = struct {
     pub fn del(self: *RedisClient, key: []const u8, scratch: *std.ArrayList(u8)) !void {
         const cmd = [_][]const u8{ "DEL", key };
         try self.writeCommand(&cmd);
-        const reader = self.reader.reader();
-        const prefix = try reader.readByte();
+        const prefix = try self.readOneByte();
         if (prefix != ':') return error.InvalidResponse;
         _ = try self.readInteger(scratch);
     }
@@ -131,11 +140,10 @@ const RedisClient = struct {
     pub fn blpop(self: *RedisClient, key: []const u8, timeout_secs: u32, scratch: *std.ArrayList(u8)) !?[]u8 {
         var timeout_buf: [16]u8 = undefined;
         const timeout_slice = try std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs});
-        const cmd = [_][]const u8{ "BLPOP", key, timeout_slice }; // lifetime tied to stack
+        const cmd = [_][]const u8{ "BLPOP", key, timeout_slice };
         try self.writeCommand(&cmd);
 
-        var reader = self.reader.reader();
-        const prefix = try reader.readByte();
+        const prefix = try self.readOneByte();
         switch (prefix) {
             '*' => {
                 const count = try self.readInteger(scratch);
@@ -146,7 +154,7 @@ const RedisClient = struct {
                 return self.readBulkString(scratch);
             },
             '$' => {
-                const value = try self.readBulkStringAfterPrefix(scratch, reader);
+                const value = try self.readBulkStringBody(scratch);
                 return value;
             },
             '-' => {
@@ -333,8 +341,7 @@ pub fn main() !void {
     defer env.deinit(allocator);
 
     {
-        var stderr_writer = std.io.getStdErr().writer();
-        stderr_writer.print("env redis host: {s}:{d}\n", .{ env.redis_host, env.redis_port }) catch {};
+        std.debug.print("env redis host: {s}:{d}\n", .{ env.redis_host, env.redis_port });
     }
 
     if (!std.mem.eql(u8, env.transport, "quic") and !std.mem.eql(u8, env.transport, "quic-v1")) {
@@ -397,8 +404,8 @@ fn runListener(
     env: *const Env,
     transport: *quic.QuicTransport,
 ) !void {
-    var scratch = std.ArrayList(u8).init(allocator);
-    defer scratch.deinit();
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
 
     const listen_addr_str = try std.fmt.allocPrint(allocator, "/ip4/{s}/udp/{d}/{s}", .{ env.bind_ip, env.listen_port, env.transport });
     defer allocator.free(listen_addr_str);
@@ -463,7 +470,7 @@ fn runListener(
     try redis.rpush("listenerAddr", published_addr, &scratch);
 
     const sleep_ns = std.math.clamp(@as(u64, env.timeout_seconds) * std.time.ns_per_s, std.time.ns_per_s, std.math.maxInt(u64));
-    std.time.sleep(sleep_ns);
+    std.Thread.sleep(sleep_ns);
 }
 
 fn buildBaseMultiaddrString(allocator: std.mem.Allocator, host: []const u8, port: u16, transport: []const u8) ![]u8 {
@@ -518,8 +525,8 @@ fn runDialer(
     transport: *quic.QuicTransport,
 ) !void {
     _ = transport;
-    var scratch = std.ArrayList(u8).init(allocator);
-    defer scratch.deinit();
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
 
     std.log.info("waiting for listener address", .{});
     const blpop_res = try redis.blpop("listenerAddr", env.timeout_seconds, &scratch);
@@ -577,7 +584,10 @@ fn runDialer(
         pingRTTMilllis: f64,
     }{ .handshakePlusOneRTTMillis = handshake_ms, .pingRTTMilllis = ping_ms };
 
-    var stdout = std.io.getStdOut().writer();
-    try std.json.stringify(metrics, .{}, stdout);
-    try stdout.writeByte('\n');
+    const stdout_file: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer = stdout_file.writer(&stdout_buf);
+    try std.json.Stringify.value(metrics, .{}, &stdout_writer.interface);
+    try stdout_writer.interface.writeAll("\n");
+    try stdout_writer.interface.flush();
 }
