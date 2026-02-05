@@ -1,7 +1,7 @@
 const std = @import("std");
 const libp2p = @import("../../../root.zig");
 const multiformats = @import("multiformats");
-const Multiaddr = multiformats.multiaddr.Multiaddr;
+const Multiaddr = @import("multiaddr").Multiaddr;
 const Switch = libp2p.swarm.Switch;
 const quic = libp2p.transport.quic;
 const ProtocolId = libp2p.protocols.ProtocolId;
@@ -114,7 +114,7 @@ fn deinitControlIHaveOptional(allocator: Allocator, ihave_opt: ?rpc.ControlIHave
     }
 }
 
-fn deinitControlIHaveList(allocator: Allocator, list: *std.ArrayListUnmanaged(?rpc.ControlIHave)) void {
+fn deinitControlIHaveList(allocator: Allocator, list: *std.ArrayList(?rpc.ControlIHave)) void {
     for (list.items) |item| {
         deinitControlIHaveOptional(allocator, item);
     }
@@ -124,7 +124,7 @@ fn deinitControlIHaveList(allocator: Allocator, list: *std.ArrayListUnmanaged(?r
 pub const SendingRPCContext = struct {
     gossipsub: *Gossipsub,
     control: ?rpc.ControlMessage,
-    ihave: ?std.ArrayListUnmanaged(?rpc.ControlIHave),
+    ihave: ?std.ArrayList(?rpc.ControlIHave),
     to: PeerId,
 
     pub fn callback(ctx: ?*anyopaque, res: anyerror!usize) void {
@@ -378,7 +378,7 @@ pub const Gossipsub = struct {
 
     peer_have: std.AutoHashMapUnmanaged(PeerId, usize),
 
-    gossip: std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged(?rpc.ControlIHave)),
+    gossip: std.AutoHashMapUnmanaged(PeerId, std.ArrayList(?rpc.ControlIHave)),
 
     control: std.AutoHashMapUnmanaged(PeerId, ?rpc.ControlMessage),
 
@@ -529,7 +529,7 @@ pub const Gossipsub = struct {
             .fanout = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, void)).empty,
             .fanout_last_pub = std.StringHashMapUnmanaged(i64).empty,
             .peer_have = std.AutoHashMapUnmanaged(PeerId, usize).empty,
-            .gossip = std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged(?rpc.ControlIHave)).empty,
+            .gossip = std.AutoHashMapUnmanaged(PeerId, std.ArrayList(?rpc.ControlIHave)).empty,
             .control = std.AutoHashMapUnmanaged(PeerId, ?rpc.ControlMessage).empty,
             .iasked = std.AutoArrayHashMapUnmanaged(PeerId, usize).empty,
             .event_emitter = event.EventEmitter(Event).init(allocator),
@@ -722,13 +722,13 @@ pub const Gossipsub = struct {
             return;
         }
 
-        const subs = try rpc_message.rpc_reader.getSubscriptions(arena);
+        var reader = rpc_message.rpc_reader;
 
         //TODO:Implement subscription filtering
 
-        var subscriptions = std.ArrayListUnmanaged(Subscription).empty;
+        var subscriptions = std.ArrayList(Subscription).empty;
 
-        for (subs) |sub| {
+        while (reader.subscriptionsNext()) |sub| {
             const topic_id = sub.getTopicid();
             const subscribe_msg = sub.getSubscribe();
 
@@ -743,20 +743,22 @@ pub const Gossipsub = struct {
         } });
 
         // Handle publish
-        const msgs = try rpc_message.rpc_reader.getPublish(arena);
+        var publish_msgs = std.ArrayList(rpc.MessageReader).empty;
+        while (reader.publishNext()) |msg| {
+            try publish_msgs.append(arena, msg);
+        }
 
-        if (self.opts.max_messages_per_rpc) |max| if (msgs.len > max) {
-            std.log.warn("Received {} messages, exceeding limit of {}", .{ msgs.len, max });
+        if (self.opts.max_messages_per_rpc) |max| if (publish_msgs.items.len > max) {
+            std.log.warn("Received {} messages, exceeding limit of {}", .{ publish_msgs.items.len, max });
             return;
         };
 
-        for (msgs) |*msg| {
+        for (publish_msgs.items) |*msg| {
             try self.handleMessage(arena, &rpc_message.from, msg);
         }
 
-        const control = try rpc_message.rpc_reader.getControl(arena);
-        defer control.deinit();
-        if (control.buf.bytes().len > 0) {
+        var control = try reader.getControl();
+        if (control.sourceBytes().len > 0) {
             try self.handleControl(arena, &control, &rpc_message.from);
         }
     }
@@ -976,7 +978,7 @@ pub const Gossipsub = struct {
 
         // TODO: should we support batch publish?
         // rust-libp2p send idontwant if the message is large enough
-        var receipents = std.ArrayListUnmanaged(PeerId).empty;
+        var receipents = std.ArrayList(PeerId).empty;
         errdefer receipents.deinit(self.allocator);
         for (selected_result.to_send) |*to| {
             const rpc_msg = rpc.RPC{
@@ -1131,7 +1133,7 @@ pub const Gossipsub = struct {
     }
 
     fn selectPeersToForward(self: *Self, arena: Allocator, topic: []const u8, propagation_source: ?PeerId, exclude: ?[]PeerId) ![]PeerId {
-        var selected_peers = std.ArrayListUnmanaged(PeerId).empty;
+        var selected_peers = std.ArrayList(PeerId).empty;
 
         if (self.topics.getPtr(topic)) |peers_map| {
             _ = peers_map;
@@ -1162,7 +1164,7 @@ pub const Gossipsub = struct {
     }
 
     fn selectPeersToPublish(self: *Self, arena: Allocator, topic: []const u8) !SelectPeersResult {
-        var selected_peers = std.ArrayListUnmanaged(PeerId).empty;
+        var selected_peers = std.ArrayList(PeerId).empty;
 
         var to_send_count: SelectPeersResult.SelectPeersCounts = .{
             .direct = 0,
@@ -1489,7 +1491,7 @@ pub const Gossipsub = struct {
     }
 
     fn piggybackControl(self: *Self, arena: Allocator, to: *const PeerId, rpc_msg: *rpc.RPC, ctrl: *const rpc.ControlMessage) !void {
-        var graft_list: std.ArrayListUnmanaged(?rpc.ControlGraft) = .empty;
+        var graft_list: std.ArrayList(?rpc.ControlGraft) = .empty;
         if (ctrl.graft) |grafts| {
             for (grafts) |graft_opt| {
                 const graft = graft_opt orelse continue;
@@ -1502,7 +1504,7 @@ pub const Gossipsub = struct {
             }
         }
 
-        var prune_list: std.ArrayListUnmanaged(?rpc.ControlPrune) = .empty;
+        var prune_list: std.ArrayList(?rpc.ControlPrune) = .empty;
         if (ctrl.prune) |prunes| {
             for (prunes) |prune_opt| {
                 const prune = prune_opt orelse continue;
@@ -1532,7 +1534,7 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn piggybackGossip(rpc_msg: *rpc.RPC, ihave: *const std.ArrayListUnmanaged(?rpc.ControlIHave)) !void {
+    fn piggybackGossip(rpc_msg: *rpc.RPC, ihave: *const std.ArrayList(?rpc.ControlIHave)) !void {
         if (rpc_msg.control == null) {
             rpc_msg.control = .{};
         }
@@ -1610,7 +1612,7 @@ pub const Gossipsub = struct {
                     return error.InvalidPeerId;
                 })[2..];
                 // This actually no allocates, just use the slice directly
-                const proto_pubkey_reader = keys.PublicKeyReader.init(self.allocator, pubkey_bytes) catch {
+                const proto_pubkey_reader = keys.PublicKeyReader.init(pubkey_bytes) catch {
                     return error.InvalidPeerId;
                 };
 
@@ -1805,8 +1807,13 @@ pub const Gossipsub = struct {
         }
     }
 
-    fn handleControl(self: *Self, arena: Allocator, control: *const rpc.ControlMessageReader, from: *const PeerId) !void {
-        const ihave_messages = try control.getIhave(arena);
+    fn handleControl(self: *Self, arena: Allocator, control: *rpc.ControlMessageReader, from: *const PeerId) !void {
+        // Collect ihave messages from iterator into arena-allocated slice
+        var ihave_list = std.ArrayList(rpc.ControlIHaveReader).empty;
+        while (control.ihaveNext()) |msg| {
+            try ihave_list.append(arena, msg);
+        }
+        const ihave_messages = ihave_list.items;
 
         const iwant = if (ihave_messages.len > 0) blk: {
             const result = try self.handleIHave(arena, from, ihave_messages);
@@ -1817,7 +1824,12 @@ pub const Gossipsub = struct {
 
         std.log.debug("Sending IWANT with {d} message IDs to peer {}", .{ iwant.len, from.* });
 
-        const iwant_messages = try control.getIwant(arena);
+        // Collect iwant messages from iterator into arena-allocated slice
+        var iwant_list = std.ArrayList(rpc.ControlIWantReader).empty;
+        while (control.iwantNext()) |msg| {
+            try iwant_list.append(arena, msg);
+        }
+        const iwant_messages = iwant_list.items;
 
         const ihave = if (iwant_messages.len > 0) blk: {
             const result = try self.handleIWant(arena, from, iwant_messages);
@@ -1827,7 +1839,12 @@ pub const Gossipsub = struct {
         };
         std.log.debug("Sending {d} messages to peer {}", .{ ihave.len, from.* });
 
-        const graft_messages = try control.getGraft(arena);
+        // Collect graft messages from iterator into arena-allocated slice
+        var graft_list = std.ArrayList(rpc.ControlGraftReader).empty;
+        while (control.graftNext()) |msg| {
+            try graft_list.append(arena, msg);
+        }
+        const graft_messages = graft_list.items;
 
         const prune = if (graft_messages.len > 0) blk: {
             const result = try self.handleGraft(arena, from, graft_messages);
@@ -1837,22 +1854,26 @@ pub const Gossipsub = struct {
         };
         std.log.debug("Sending {d} PRUNE messages to peer {}", .{ prune.len, from.* });
 
-        const prune_messages = try control.getPrune(self.allocator);
-        defer if (prune_messages.len > 0) self.allocator.free(prune_messages);
+        // Collect prune messages from iterator into arena-allocated slice
+        var prune_list = std.ArrayList(rpc.ControlPruneReader).empty;
+        while (control.pruneNext()) |msg| {
+            try prune_list.append(arena, msg);
+        }
+        const prune_messages = prune_list.items;
 
         if (prune_messages.len > 0) {
             try self.handlePrune(arena, from, prune_messages);
         }
     }
 
-    fn handleIWant(self: *Self, arena: Allocator, from: *const PeerId, iwant: []const rpc.ControlIWantReader) ![]*rpc.Message {
+    fn handleIWant(self: *Self, arena: Allocator, from: *const PeerId, iwant: []rpc.ControlIWantReader) ![]*rpc.Message {
         var ihave: std.StringHashMapUnmanaged(*rpc.Message) = .empty;
 
         var iwant_by_topic: std.StringHashMapUnmanaged(usize) = .empty;
         var iwant_dont_have: usize = 0;
 
         for (iwant) |*iwant_msg| {
-            for (iwant_msg.getMessageIDs()) |msg_id| {
+            while (iwant_msg.messageIDsNext()) |msg_id| {
                 const cached = try self.mcache.getForPeer(msg_id, from.*) orelse {
                     iwant_dont_have += 1;
                     continue;
@@ -1874,7 +1895,7 @@ pub const Gossipsub = struct {
             return &.{};
         }
 
-        var ihave_list = try std.ArrayListUnmanaged(*rpc.Message).initCapacity(arena, ihave.count());
+        var ihave_list = try std.ArrayList(*rpc.Message).initCapacity(arena, ihave.count());
 
         var it = ihave.valueIterator();
         while (it.next()) |msg| {
@@ -1886,7 +1907,7 @@ pub const Gossipsub = struct {
         return try ihave_list.toOwnedSlice(arena);
     }
 
-    fn handleIHave(self: *Self, arena: Allocator, from: *const PeerId, ihave: []const rpc.ControlIHaveReader) ![]const rpc.ControlIWant {
+    fn handleIHave(self: *Self, arena: Allocator, from: *const PeerId, ihave: []rpc.ControlIHaveReader) ![]const rpc.ControlIWant {
         const peer_have = (self.peer_have.get(from.*) orelse 0) + 1;
         try self.peer_have.put(self.allocator, from.*, peer_have);
         if (peer_have > self.opts.max_ihave_messages) {
@@ -1903,12 +1924,12 @@ pub const Gossipsub = struct {
         var iwant: std.StringHashMapUnmanaged(void) = .empty;
 
         for (ihave) |*ihave_msg| {
-            if (ihave_msg.getTopicID().len == 0 or ihave_msg.getMessageIDs().len == 0 or !self.mesh.contains(ihave_msg.getTopicID())) {
+            if (ihave_msg.getTopicID().len == 0 or ihave_msg.messageIDsCount() == 0 or !self.mesh.contains(ihave_msg.getTopicID())) {
                 continue;
             }
 
             var idonthave: usize = 0;
-            for (ihave_msg.getMessageIDs()) |msg_id| {
+            while (ihave_msg.messageIDsNext()) |msg_id| {
                 if (!self.seen_cache.contains(msg_id)) {
                     try iwant.put(arena, msg_id, {});
                     idonthave += 1;
@@ -1927,7 +1948,7 @@ pub const Gossipsub = struct {
 
         std.log.debug("Asking for {d} out of {d} messages from peer {}", .{ iask, iwant.count(), from.* });
 
-        var iwant_list = try std.ArrayListUnmanaged([]const u8).initCapacity(arena, iwant.count());
+        var iwant_list = try std.ArrayList([]const u8).initCapacity(arena, iwant.count());
 
         var it = iwant.keyIterator();
         while (it.next()) |id| {
@@ -1953,7 +1974,7 @@ pub const Gossipsub = struct {
         return result;
     }
 
-    fn handleGraft(self: *Self, arena: Allocator, from: *const PeerId, graft: []const rpc.ControlGraftReader) ![]rpc.ControlPrune {
+    fn handleGraft(self: *Self, arena: Allocator, from: *const PeerId, graft: []rpc.ControlGraftReader) ![]rpc.ControlPrune {
         var prune: std.StringHashMapUnmanaged(void) = .empty;
 
         for (graft) |graft_msg| {
@@ -1983,7 +2004,7 @@ pub const Gossipsub = struct {
             return &.{};
         }
 
-        var prune_list = try std.ArrayListUnmanaged(rpc.ControlPrune).initCapacity(arena, prune.count());
+        var prune_list = try std.ArrayList(rpc.ControlPrune).initCapacity(arena, prune.count());
 
         var it = prune.keyIterator();
         // TODO: only support v1.0 now, need to support v1.1 later
@@ -1994,7 +2015,7 @@ pub const Gossipsub = struct {
         return prune_list.toOwnedSlice(arena);
     }
 
-    fn handlePrune(self: *Self, arena: Allocator, from: *const PeerId, prune: []const rpc.ControlPruneReader) !void {
+    fn handlePrune(self: *Self, arena: Allocator, from: *const PeerId, prune: []rpc.ControlPruneReader) !void {
         _ = arena;
         for (prune) |prune_msg| {
             const topic = prune_msg.getTopicID();
@@ -2029,7 +2050,7 @@ pub const Gossipsub = struct {
     fn pushGossip(self: *Self, peer: PeerId, control_ihave: *const rpc.ControlIHave) !void {
         var gossip_entry = try self.gossip.getOrPut(self.allocator, peer);
         if (!gossip_entry.found_existing) {
-            gossip_entry.value_ptr.* = std.ArrayListUnmanaged(?rpc.ControlIHave).empty;
+            gossip_entry.value_ptr.* = std.ArrayList(?rpc.ControlIHave).empty;
         }
         try gossip_entry.value_ptr.append(self.allocator, control_ihave.*);
     }
@@ -2102,13 +2123,13 @@ pub const Gossipsub = struct {
         try self.pushGossip(peer, &control_msg);
     }
 
-    fn getRandomGossipPeers(self: *Self, topic: []const u8, count: usize, filter_ctx: ?*anyopaque, filter: *const fn (ctx: ?*anyopaque, peer: PeerId) bool) !std.ArrayListUnmanaged(PeerId) {
-        const peers = self.topics.get(topic) orelse return std.ArrayListUnmanaged(PeerId).empty;
+    fn getRandomGossipPeers(self: *Self, topic: []const u8, count: usize, filter_ctx: ?*anyopaque, filter: *const fn (ctx: ?*anyopaque, peer: PeerId) bool) !std.ArrayList(PeerId) {
+        const peers = self.topics.get(topic) orelse return std.ArrayList(PeerId).empty;
         if (peers.count() == 0) {
-            return std.ArrayListUnmanaged(PeerId).empty;
+            return std.ArrayList(PeerId).empty;
         }
 
-        var candidate_peers = try std.ArrayListUnmanaged(PeerId).initCapacity(self.allocator, peers.count());
+        var candidate_peers = try std.ArrayList(PeerId).initCapacity(self.allocator, peers.count());
         errdefer candidate_peers.deinit(self.allocator);
 
         var it = peers.keyIterator();
@@ -2154,8 +2175,8 @@ pub const Gossipsub = struct {
         topic: []const u8,
         exclude_a: ?*std.AutoHashMapUnmanaged(PeerId, void),
         exclude_b: ?*std.AutoHashMapUnmanaged(PeerId, void),
-    ) !std.ArrayListUnmanaged(PeerId) {
-        var result = std.ArrayListUnmanaged(PeerId).empty;
+    ) !std.ArrayList(PeerId) {
+        var result = std.ArrayList(PeerId).empty;
 
         if (self.topics.getPtr(topic)) |topic_peers| {
             var it = topic_peers.keyIterator();
@@ -2217,7 +2238,7 @@ pub const Gossipsub = struct {
     fn queueControlTopic(
         self: *Self,
         allocator: Allocator,
-        map: *std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)),
+        map: *std.AutoHashMapUnmanaged(PeerId, std.ArrayList([]const u8)),
         peer: PeerId,
         topic: []const u8,
         kind: ControlKind,
@@ -2241,7 +2262,7 @@ pub const Gossipsub = struct {
     fn queueGraftTopic(
         self: *Self,
         allocator: Allocator,
-        map: *std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)),
+        map: *std.AutoHashMapUnmanaged(PeerId, std.ArrayList([]const u8)),
         peer: PeerId,
         topic: []const u8,
     ) void {
@@ -2251,7 +2272,7 @@ pub const Gossipsub = struct {
     fn queuePruneTopic(
         self: *Self,
         allocator: Allocator,
-        map: *std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)),
+        map: *std.AutoHashMapUnmanaged(PeerId, std.ArrayList([]const u8)),
         peer: PeerId,
         topic: []const u8,
     ) void {
@@ -2332,8 +2353,8 @@ pub const Gossipsub = struct {
 
     fn sendGraftPrune(
         self: *Self,
-        to_graft: *std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)),
-        to_prune: *std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)),
+        to_graft: *std.AutoHashMapUnmanaged(PeerId, std.ArrayList([]const u8)),
+        to_prune: *std.AutoHashMapUnmanaged(PeerId, std.ArrayList([]const u8)),
         no_px: *std.AutoHashMapUnmanaged(PeerId, bool),
     ) void {
         _ = no_px; // PX is not supported in v1.0 implementation yet
@@ -2378,7 +2399,7 @@ pub const Gossipsub = struct {
         defer arena.deinit();
         const arena_allocator = arena.allocator();
 
-        var topic_list = std.ArrayListUnmanaged([]const u8).empty;
+        var topic_list = std.ArrayList([]const u8).empty;
 
         var it = self.subscriptions.keyIterator();
         while (it.next()) |topic_ptr| {
@@ -2389,7 +2410,7 @@ pub const Gossipsub = struct {
     }
 
     fn sendSubscriptions(self: *Self, arena: Allocator, to: *const PeerId, topics: []const []const u8, subscribe_flag: bool) !void {
-        var sub_opts: std.ArrayListUnmanaged(?rpc.RPC.SubOpts) = .empty;
+        var sub_opts: std.ArrayList(?rpc.RPC.SubOpts) = .empty;
 
         for (topics) |topic| {
             const sub: rpc.RPC.SubOpts = .{
@@ -2429,9 +2450,9 @@ pub const Gossipsub = struct {
         var prng = std.Random.DefaultPrng.init(seed);
         const random = prng.random();
 
-        var tograft = std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)).empty;
+        var tograft = std.AutoHashMapUnmanaged(PeerId, std.ArrayList([]const u8)).empty;
         defer tograft.deinit(arena_allocator);
-        var toprune = std.AutoHashMapUnmanaged(PeerId, std.ArrayListUnmanaged([]const u8)).empty;
+        var toprune = std.AutoHashMapUnmanaged(PeerId, std.ArrayList([]const u8)).empty;
         defer toprune.deinit(arena_allocator);
         var no_px = std.AutoHashMapUnmanaged(PeerId, bool).empty;
         defer no_px.deinit(arena_allocator);
@@ -2441,7 +2462,7 @@ pub const Gossipsub = struct {
             const topic = entry.key_ptr.*;
             var peers = entry.value_ptr;
 
-            var stale = std.ArrayListUnmanaged(PeerId).empty;
+            var stale = std.ArrayList(PeerId).empty;
             defer stale.deinit(arena_allocator);
             var peer_it = peers.keyIterator();
             while (peer_it.next()) |peer_id_ptr| {
@@ -2476,7 +2497,7 @@ pub const Gossipsub = struct {
             }
 
             if (peers.count() > self.opts.D_hi) {
-                var peer_list = std.ArrayListUnmanaged(PeerId).empty;
+                var peer_list = std.ArrayList(PeerId).empty;
                 defer peer_list.deinit(arena_allocator);
                 var it = peers.keyIterator();
                 while (it.next()) |peer_id_ptr| {
@@ -2531,7 +2552,7 @@ pub const Gossipsub = struct {
             }
         }
 
-        var expired = std.ArrayListUnmanaged([]const u8).empty;
+        var expired = std.ArrayList([]const u8).empty;
         defer expired.deinit(arena_allocator);
         var fanout_last_iter = self.fanout_last_pub.iterator();
         while (fanout_last_iter.next()) |entry| {
@@ -2556,7 +2577,7 @@ pub const Gossipsub = struct {
             const topic = entry.key_ptr.*;
             var peers_map = entry.value_ptr;
 
-            var removal = std.ArrayListUnmanaged(PeerId).empty;
+            var removal = std.ArrayList(PeerId).empty;
             defer removal.deinit(arena_allocator);
             var it = peers_map.keyIterator();
             while (it.next()) |peer_id_ptr| {
@@ -2904,7 +2925,7 @@ fn waitForFlag(flag: *std.atomic.Value(bool), timeout_ns: u64) WaitError!void {
 
     while (!flag.load(.acquire)) {
         if (waited >= timeout_ns) return error.Timeout;
-        std.time.sleep(step);
+        std.Thread.sleep(step);
         waited += step;
     }
 }
@@ -2917,7 +2938,7 @@ fn waitForMeshTopic(router: *Gossipsub, topic: []const u8, timeout_ns: u64) Wait
         if (router.mesh.contains(topic)) return;
 
         if (waited >= timeout_ns) return error.Timeout;
-        std.time.sleep(step);
+        std.Thread.sleep(step);
         waited += step;
     }
 }
@@ -2932,7 +2953,7 @@ fn waitForTopicPeer(router: *Gossipsub, topic: []const u8, peer: PeerId, timeout
         }
 
         if (waited >= timeout_ns) return error.Timeout;
-        std.time.sleep(step);
+        std.Thread.sleep(step);
         waited += step;
     }
 }
@@ -2945,7 +2966,7 @@ fn waitForUsableStream(router: *Gossipsub, peer: PeerId, timeout_ns: u64) WaitEr
         if (router.hasUsableStream(peer)) return;
 
         if (waited >= timeout_ns) return error.Timeout;
-        std.time.sleep(step);
+        std.Thread.sleep(step);
         waited += step;
     }
 }
@@ -3027,7 +3048,7 @@ test "gossipsub heartbeat timer increments ticks" {
     const deadline = std.time.nanoTimestamp() + wait_timeout_ns;
     while (node.router.heartbeat_ticks == initial_ticks) {
         if (std.time.nanoTimestamp() >= deadline) break;
-        std.time.sleep(10 * std.time.us_per_ms);
+        std.Thread.sleep(10 * std.time.us_per_ms);
     }
 
     try std.testing.expect(node.router.heartbeat_ticks > initial_ticks);
@@ -3332,7 +3353,7 @@ const TestGossipsubNode = struct {
 
         const effective_ctx: ?*anyopaque = listen_ctx orelse @ptrCast(&self.router);
         try self.sw.listen(self.listen_addr, effective_ctx, listen_callback);
-        std.time.sleep(300 * std.time.us_per_ms);
+        std.Thread.sleep(300 * std.time.us_per_ms);
     }
 
     pub fn deinit(self: *TestGossipsubNode) void {
@@ -3397,7 +3418,7 @@ test "gossipsub listen callback exposes negotiated protocol" {
     const is_supported = std.mem.eql(u8, proto, v1_id) or std.mem.eql(u8, proto, v1_1_id);
     try std.testing.expect(is_supported);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 }
 
 test "switch handles ping and gossipsub simultaneously" {
@@ -3623,7 +3644,7 @@ test "pubsub add peer" {
         }
     }.callback);
 
-    std.time.sleep(1 * std.time.ns_per_s);
+    std.Thread.sleep(1 * std.time.ns_per_s);
 
     try std.testing.expectEqual(1, node1.router.peers.count());
     try std.testing.expectEqual(1, node2.router.peers.count());
@@ -3666,7 +3687,7 @@ test "pubsub add and remove peer" {
         }
     }.callback);
 
-    std.time.sleep(1 * std.time.ns_per_s);
+    std.Thread.sleep(1 * std.time.ns_per_s);
 
     try std.testing.expectEqual(1, node1.router.peers.count());
     try std.testing.expectEqual(1, node2.router.peers.count());
@@ -3697,7 +3718,7 @@ test "pubsub add and remove peer" {
         }
     }.callback);
 
-    std.time.sleep(1 * std.time.ns_per_s);
+    std.Thread.sleep(1 * std.time.ns_per_s);
 
     try std.testing.expectEqual(0, node1.router.peers.count());
     try std.testing.expectEqual(0, node2.router.peers.count());
@@ -3724,7 +3745,7 @@ test "pubsub add peer single direction" {
         }
     }.callback);
 
-    std.time.sleep(1 * std.time.ns_per_s);
+    std.Thread.sleep(1 * std.time.ns_per_s);
 
     try std.testing.expectEqual(1, initiator.router.peers.count());
     try std.testing.expectEqual(1, responder.router.peers.count());
@@ -3754,7 +3775,7 @@ test "pubsub add and remove peer single direction" {
         }
     }.callback);
 
-    std.time.sleep(1 * std.time.ns_per_s);
+    std.Thread.sleep(1 * std.time.ns_per_s);
 
     try std.testing.expectEqual(1, initiator.router.peers.count());
     try std.testing.expectEqual(1, responder.router.peers.count());
@@ -3772,7 +3793,7 @@ test "pubsub add and remove peer single direction" {
         }
     }.callback);
 
-    std.time.sleep(1 * std.time.ns_per_s);
+    std.Thread.sleep(1 * std.time.ns_per_s);
 
     try std.testing.expectEqual(0, initiator.router.peers.count());
     try std.testing.expectEqual(0, responder.router.peers.count());
@@ -3799,7 +3820,7 @@ test "pubsub add peer single direction with replace stream" {
         }
     }.callback);
 
-    std.time.sleep(1 * std.time.ns_per_s);
+    std.Thread.sleep(1 * std.time.ns_per_s);
 
     try std.testing.expectEqual(1, initiator.router.peers.count());
     try std.testing.expectEqual(1, responder.router.peers.count());
@@ -3813,7 +3834,7 @@ test "pubsub add peer single direction with replace stream" {
         fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {}
     }.callback);
 
-    std.time.sleep(1 * std.time.ns_per_s);
+    std.Thread.sleep(1 * std.time.ns_per_s);
     try std.testing.expect(responder.router.peers.get(initiator.transport.local_peer_id).?.responder != null);
     std.debug.print("new responder {?*}\n", .{responder.router.peers.get(initiator.transport.local_peer_id).?.responder});
 
@@ -3875,7 +3896,7 @@ test "simulate onMessage" {
         }
     }.callback);
 
-    std.time.sleep(1 * std.time.ns_per_s);
+    std.Thread.sleep(1 * std.time.ns_per_s);
 
     try std.testing.expectEqual(1, initiator.router.peers.count());
     try std.testing.expectEqual(1, responder.router.peers.count());
@@ -4254,7 +4275,7 @@ test "pubsub subscribe and publish between nodes" {
     try std.testing.expect(subscribe_a_err == null);
     try std.testing.expect(subscribe_b_err == null);
 
-    std.time.sleep(200 * std.time.us_per_ms);
+    std.Thread.sleep(200 * std.time.us_per_ms);
     try std.testing.expect(node_a.router.subscriptions.contains(topic));
     try std.testing.expect(node_b.router.subscriptions.contains(topic));
 
@@ -4471,7 +4492,7 @@ test "pubsub subscribe and publish between nodes" {
     try std.testing.expect(remove_peer_ab_err == null);
     try std.testing.expect(remove_peer_ba_err == null);
 
-    std.time.sleep(200 * std.time.us_per_ms);
+    std.Thread.sleep(200 * std.time.us_per_ms);
 
     try std.testing.expectEqual(@as(usize, 0), node_a.router.peers.count());
     try std.testing.expectEqual(@as(usize, 0), node_b.router.peers.count());
@@ -4561,7 +4582,7 @@ test "pubsub multi-topic mesh and publish" {
         try std.testing.expect(subscribe_b_err == null);
     }
 
-    std.time.sleep(400 * std.time.us_per_ms);
+    std.Thread.sleep(400 * std.time.us_per_ms);
 
     for (topics) |topic| {
         try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, 5 * std.time.ns_per_s);

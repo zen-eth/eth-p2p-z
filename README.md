@@ -8,13 +8,13 @@ Zig implementation of the Ethereum peer-to-peer stack, built on top of the [libp
 
 - Transport: QUIC (lsquic-backed) is the only supported transport. TCP, WebRTC, WebTransport, and other stacks are intentionally out of scope.
 - PubSub: Gossipsub v1.0 router is available today; additional Ethereum networking protocols will be layered on top in subsequent milestones.
-- Platform: Zig 0.14.1 toolchain targeting modern desktop/server environments. Browser runtimes are not supported.
+- Platform: Zig 0.15.2 toolchain targeting modern desktop/server environments. Browser runtimes are not supported.
 
 If you are looking for a general-purpose libp2p implementation with multiple transports and protocol stacks, this project is not a drop-in replacement.
 
 ## Prerequisites
 
-- Zig 0.14.1
+- Zig 0.15.2
 
 ## Building
 

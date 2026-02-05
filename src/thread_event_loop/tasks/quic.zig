@@ -1,6 +1,6 @@
 const std = @import("std");
 const libp2p = @import("../../root.zig");
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const Multiaddr = @import("multiaddr").Multiaddr;
 
 const quic = libp2p.transport.quic;
 
@@ -120,6 +120,7 @@ pub fn extend(comptime Loop: type) type {
         const QuicWriteStreamTask = struct {
             stream: *quic.QuicStream,
             data: std.ArrayList(u8),
+            data_allocator: std.mem.Allocator,
             callback_ctx: ?*anyopaque,
             callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void,
         };
@@ -132,6 +133,7 @@ pub fn extend(comptime Loop: type) type {
             self: *Loop,
             stream: *quic.QuicStream,
             data: std.ArrayList(u8),
+            data_allocator: std.mem.Allocator,
             callback_ctx: ?*anyopaque,
             callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void,
         ) !void {
@@ -139,11 +141,12 @@ pub fn extend(comptime Loop: type) type {
             task.* = .{
                 .stream = stream,
                 .data = data,
+                .data_allocator = data_allocator,
                 .callback_ctx = callback_ctx,
                 .callback = callback,
             };
             errdefer self.allocator.destroy(task);
-            errdefer task.data.deinit();
+            errdefer task.data.deinit(data_allocator);
             try self.queueCallWithDeinit(QuicWriteStreamTask, task, runQuicWriteStream, Loop.makeDestroyTask(QuicWriteStreamTask));
         }
 

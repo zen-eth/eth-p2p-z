@@ -6,7 +6,7 @@ const swarm = libp2p.swarm;
 const io_loop = libp2p.thread_event_loop;
 const identity = libp2p.identity;
 const tls = libp2p.security.tls;
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const Multiaddr = @import("multiaddr").Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 const keys = @import("peer_id").keys;
 
@@ -298,7 +298,7 @@ fn spawnSwitch3Test(allocator: std.mem.Allocator, switch3: *swarm.Switch, server
         }
     }.callback_);
 
-    std.time.sleep(3000 * std.time.ns_per_ms);
+    std.Thread.sleep(3000 * std.time.ns_per_ms);
 }
 
 fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId, client_id: u32) !void {
@@ -325,7 +325,7 @@ fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId
     defer discard_handler.deinit();
     try client_switch.addProtocolHandler("discard", discard_handler.any());
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     var callback: TestNewStreamCallback = .{ .mutex = .{}, .sender = undefined };
 
@@ -356,10 +356,10 @@ fn spawnMultipleClientsTest(allocator: std.mem.Allocator, server_peer_id: PeerId
             }
         }.callback_);
 
-        std.time.sleep(200 * std.time.ns_per_ms);
+        std.Thread.sleep(200 * std.time.ns_per_ms);
     }
 
-    std.time.sleep(3000 * std.time.ns_per_ms);
+    std.Thread.sleep(3000 * std.time.ns_per_ms);
 }
 
 test "discard protocol using switch" {
@@ -410,7 +410,7 @@ test "discard protocol using switch" {
     }.callback);
 
     // Wait for the switch to start listening.
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     const switch2_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/8768");
     defer switch2_listen_address.deinit();
@@ -545,12 +545,12 @@ test "discard protocol using switch" {
     callback2.mutex.wait();
     try std.testing.expect(callback2.sender.stream.conn.security_session.?.remote_id.eql(&server_peer_id1));
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     const thread = try std.Thread.spawn(.{}, spawnSwitch3Test, .{ allocator, &switch3, server_peer_id });
     defer thread.join();
 
-    std.time.sleep(2000 * std.time.ns_per_ms);
+    std.Thread.sleep(2000 * std.time.ns_per_ms);
 }
 
 test "discard protocol using switch with secp256k1 identities" {
@@ -599,7 +599,7 @@ test "discard protocol using switch with secp256k1 identities" {
         pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {}
     }.callback);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     const switch2_listen_address = try Multiaddr.fromString(allocator, "/ip4/0.0.0.0/udp/8768");
     defer switch2_listen_address.deinit();
@@ -708,12 +708,12 @@ test "discard protocol using switch with secp256k1 identities" {
     callback2.mutex.wait();
     try std.testing.expect(callback2.sender.stream.conn.security_session.?.remote_id.eql(&server_peer_id1));
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     const thread = try std.Thread.spawn(.{}, spawnSwitch3Test, .{ allocator, &switch3, server_peer_id });
     defer thread.join();
 
-    std.time.sleep(2000 * std.time.ns_per_ms);
+    std.Thread.sleep(2000 * std.time.ns_per_ms);
 }
 
 test "discard transport rejects secp256k1 certificate key" {
@@ -852,7 +852,7 @@ test "switch newStream connects to multiple peers" {
     defer allocator.free(pubkey_c.data.?);
     const peer_id_c = try PeerId.fromPublicKey(allocator, &pubkey_c);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     var dial_b = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/9101");
     defer dial_b.deinit();
@@ -900,7 +900,7 @@ test "switch newStream connects to multiple peers" {
             failure.store(true, .seq_cst);
             break;
         }
-        std.time.sleep(50 * std.time.ns_per_ms);
+        std.Thread.sleep(50 * std.time.ns_per_ms);
     }
 
     try std.testing.expect(!failure.load(.seq_cst));
@@ -919,7 +919,7 @@ test "switch newStream connects to multiple peers" {
     try std.testing.expect(found_b);
     try std.testing.expect(found_c);
 
-    std.time.sleep(500 * std.time.ns_per_ms);
+    std.Thread.sleep(500 * std.time.ns_per_ms);
 }
 
 test "discard protocol using switch with 1MB data" {
@@ -958,7 +958,7 @@ test "discard protocol using switch with 1MB data" {
         pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {}
     }.callback);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
@@ -1036,7 +1036,7 @@ test "discard protocol using switch with 1MB data" {
     try std.testing.expectEqual(TARGET_TOTAL_SIZE, total_sent);
 
     // Give some time for the responder to process all messages
-    std.time.sleep(2000 * std.time.ns_per_ms);
+    std.Thread.sleep(2000 * std.time.ns_per_ms);
 }
 
 test "no supported protocols error" {
@@ -1077,7 +1077,7 @@ test "no supported protocols error" {
     }.callback);
 
     // Wait for the switch to start listening.
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     var cl_loop: io_loop.ThreadEventLoop = undefined;
     try cl_loop.init(allocator);
@@ -1118,7 +1118,7 @@ test "no supported protocols error" {
 
     callback.mutex.wait();
 
-    std.time.sleep(2000 * std.time.ns_per_ms);
+    std.Thread.sleep(2000 * std.time.ns_per_ms);
 }
 
 test "discard protocol with 5 concurrent clients" {
@@ -1165,7 +1165,7 @@ test "discard protocol with 5 concurrent clients" {
         pub fn callback(_: ?*anyopaque, _: anyerror!?*anyopaque) void {}
     }.callback);
 
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     const NUM_CLIENTS = 5;
     var threads: [NUM_CLIENTS]std.Thread = undefined;
@@ -1178,5 +1178,5 @@ test "discard protocol with 5 concurrent clients" {
         threads[i].join();
     }
 
-    std.time.sleep(2000 * std.time.ns_per_ms);
+    std.Thread.sleep(2000 * std.time.ns_per_ms);
 }

@@ -1,6 +1,6 @@
 const std = @import("std");
 const libp2p = @import("../../root.zig");
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const Multiaddr = @import("multiaddr").Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 
 const pubsub = libp2p.protocols.pubsub;

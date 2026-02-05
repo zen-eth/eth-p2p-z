@@ -3,7 +3,7 @@ const std = @import("std");
 const libp2p = @import("../../root.zig");
 const rpc = libp2p.protobuf.rpc;
 const PeerId = @import("peer_id").PeerId;
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const Multiaddr = @import("multiaddr").Multiaddr;
 
 pub fn deinitRPCMessage(message: *rpc.RPC, allocator: std.mem.Allocator) void {
     if (message.subscriptions) |subs| {
@@ -156,9 +156,7 @@ pub const RPC = struct {
     rpc_reader: rpc.RPCReader,
     from: PeerId,
 
-    pub fn deinit(self: *RPC) void {
-        self.rpc_reader.deinit();
-    }
+    pub fn deinit(_: *RPC) void {}
 };
 
 pub const PubSubVTable = struct {
