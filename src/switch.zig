@@ -418,9 +418,11 @@ pub const Switch = struct {
                         );
                         continue;
                     };
-                    errdefer allocator.free(addr_str);
                     if (!containsString(results.items, addr_str)) {
-                        try results.append(allocator, addr_str);
+                        results.append(allocator, addr_str) catch |err| {
+                            allocator.free(addr_str);
+                            return err;
+                        };
                     } else {
                         allocator.free(addr_str);
                     }

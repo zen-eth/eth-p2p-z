@@ -93,7 +93,9 @@ pub fn LinearFifo(comptime T: type, comptime buffer_type: BufferType) type {
             if (self.buf.len >= needed) return;
             var new_cap = if (self.buf.len == 0) @as(usize, 64) else self.buf.len;
             while (new_cap < needed) {
-                new_cap *= 2;
+                new_cap = std.math.mul(usize, new_cap, 2) catch return {
+                    break;
+                };
             }
             const new_buf = try self.allocator.alloc(T, new_cap);
             if (self.count > 0) {
