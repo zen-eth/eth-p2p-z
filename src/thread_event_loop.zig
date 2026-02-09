@@ -7,7 +7,7 @@ const Future = @import("concurrent/future.zig").Future;
 const conn = @import("conn.zig");
 const xev_tcp = libp2p.transport.tcp;
 const quic = libp2p.transport.quic;
-const Multiaddr = @import("multiformats").multiaddr.Multiaddr;
+const Multiaddr = @import("multiaddr").Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 
 /// Memory pool for managing completion objects in the event loop.

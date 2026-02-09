@@ -5,6 +5,7 @@ const quic = libp2p.transport.quic;
 const Allocator = std.mem.Allocator;
 const p2p_conn = libp2p.conn;
 const uvarint = @import("multiformats").uvarint;
+const linear_fifo = @import("../linear_fifo.zig");
 
 /// The Multistream Negotiator is responsible for negotiating the protocol to use
 /// for a given connection/stream. It handles the multistream handshake process and
@@ -48,7 +49,7 @@ pub const Negotiator = struct {
 
     allocator: Allocator,
 
-    buffer: *std.fifo.LinearFifo(u8, .Slice),
+    buffer: *linear_fifo.LinearFifo(u8, .Slice),
 
     // Current proposed protocol by the initiator.
     proposed_protocol_index: usize,
@@ -96,7 +97,7 @@ pub const Negotiator = struct {
         negotiation_timeout: u64,
         proposed_protocols: ?[]const []const u8,
         supported_protocols: *std.StringHashMap(protocols.AnyProtocolHandler),
-        buffer: *std.fifo.LinearFifo(u8, .Slice),
+        buffer: *linear_fifo.LinearFifo(u8, .Slice),
         is_initiator: bool,
         on_selected_ctx: ?*anyopaque,
         on_selected: *const fn (instance: ?*anyopaque, proto_id: protocols.ProtocolId, selected_handler: *protocols.AnyProtocolHandler) void,
@@ -315,7 +316,7 @@ pub const MultistreamSelectHandler = struct {
 
         is_initiator: bool,
 
-        buffer: std.fifo.LinearFifo(u8, .Slice),
+        buffer: linear_fifo.LinearFifo(u8, .Slice),
 
         fn init(
             self: *NegotiationSession,
@@ -333,7 +334,7 @@ pub const MultistreamSelectHandler = struct {
             self.* = .{
                 .allocator = allocator,
                 .stream = stream,
-                .buffer = std.fifo.LinearFifo(u8, .Slice).init(buffer),
+                .buffer = linear_fifo.LinearFifo(u8, .Slice).init(buffer),
                 .user_callback_ctx = user_callback_ctx,
                 .user_callback = user_callback,
                 .negotiator = undefined, // Will be initialized below

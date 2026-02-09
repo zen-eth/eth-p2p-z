@@ -423,7 +423,7 @@ pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !st
         allocator.free(ext_data.signature);
     }
 
-    const host_pubkey_reader = try keys.PublicKeyReader.init(allocator, ext_data.host_pubkey);
+    const host_pubkey_reader = try keys.PublicKeyReader.init(ext_data.host_pubkey);
 
     var host_pubkey = keys.PublicKey{
         .type = host_pubkey_reader.getType(),

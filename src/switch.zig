@@ -10,7 +10,7 @@ const quic = libp2p.transport.quic;
 const protocols = libp2p.protocols;
 const Allocator = std.mem.Allocator;
 const mss = protocols.mss;
-const multiaddr = @import("multiformats").multiaddr;
+const multiaddr = @import("multiaddr").multiaddr;
 const Multiaddr = multiaddr.Multiaddr;
 const MultiaddrProtocol = multiaddr.Protocol;
 const io_loop = libp2p.thread_event_loop;
@@ -39,14 +39,14 @@ else
     opaque {};
 
 const getifaddrs_fn = if (has_getifaddrs)
-    @extern(*const fn (*?*IfAddrs) callconv(.C) i32, .{ .name = "getifaddrs" })
+    @extern(*const fn (*?*IfAddrs) callconv(.c) i32, .{ .name = "getifaddrs" })
 else
-    @as(*const fn (*?*IfAddrs) callconv(.C) i32, undefined);
+    @as(*const fn (*?*IfAddrs) callconv(.c) i32, undefined);
 
 const freeifaddrs_fn = if (has_getifaddrs)
-    @extern(*const fn (?*IfAddrs) callconv(.C) void, .{ .name = "freeifaddrs" })
+    @extern(*const fn (?*IfAddrs) callconv(.c) void, .{ .name = "freeifaddrs" })
 else
-    @as(*const fn (?*IfAddrs) callconv(.C) void, undefined);
+    @as(*const fn (?*IfAddrs) callconv(.c) void, undefined);
 
 /// The Switch struct is the main entry point for managing connections and protocol handlers.
 /// It acts as a central hub for handling incoming and outgoing connections,
@@ -82,7 +82,7 @@ pub const Switch = struct {
             .outgoing_connections = std.StringArrayHashMap(*quic.QuicConnection).init(allocator),
             .allocator = allocator,
             .listeners = std.StringArrayHashMap(quic.QuicListener).init(allocator),
-            .incoming_connections = std.ArrayList(*quic.QuicConnection).init(allocator),
+            .incoming_connections = .empty,
             .is_stopping = std.atomic.Value(bool).init(false),
             .mss_handler = mss.MultistreamSelectHandler.init(allocator),
             .stopped_notify = .{},
@@ -135,7 +135,7 @@ pub const Switch = struct {
                 .active_callback_ctx = null,
                 .active_callback = null,
             };
-            self.network_switch.incoming_connections.append(conn) catch unreachable;
+            self.network_switch.incoming_connections.append(self.network_switch.allocator, conn) catch unreachable;
         }
 
         fn newStreamCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
@@ -383,11 +383,11 @@ pub const Switch = struct {
     pub const ListenAddressError = Allocator.Error || posix.GetHostNameError || multiaddr.Error || error{ AddressResolutionFailed, NoUsableAddress };
 
     pub fn listenMultiaddrs(self: *Switch, allocator: Allocator) ListenAddressError!std.ArrayList([]u8) {
-        var results = std.ArrayList([]u8).init(allocator);
+        var results: std.ArrayList([]u8) = .empty;
         errdefer Switch.freeListenMultiaddrs(allocator, &results);
 
         var host_addrs = try collectHostAddrs(allocator);
-        defer host_addrs.deinit();
+        defer host_addrs.deinit(allocator);
 
         var listener_iter = self.listeners.iterator();
         while (listener_iter.next()) |entry| {
@@ -418,9 +418,11 @@ pub const Switch = struct {
                         );
                         continue;
                     };
-                    errdefer allocator.free(addr_str);
                     if (!containsString(results.items, addr_str)) {
-                        try results.append(addr_str);
+                        results.append(allocator, addr_str) catch |err| {
+                            allocator.free(addr_str);
+                            return err;
+                        };
                     } else {
                         allocator.free(addr_str);
                     }
@@ -439,7 +441,7 @@ pub const Switch = struct {
         for (list.items) |addr| {
             allocator.free(addr);
         }
-        list.deinit();
+        list.deinit(allocator);
     }
 
     const HostAddr = union(enum) {
@@ -473,8 +475,8 @@ pub const Switch = struct {
             if (!has_getifaddrs) @compileError("collectHostAddrsFromInterfaces is unavailable on this target");
         }
 
-        var result = std.ArrayList(HostAddr).init(allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(HostAddr) = .empty;
+        errdefer result.deinit(allocator);
 
         var ifaddrs_head: ?*IfAddrs = null;
         if (getifaddrs_fn(&ifaddrs_head) != 0) {
@@ -495,7 +497,7 @@ pub const Switch = struct {
                     if (ip_bytes[0] == 127 or ip_bytes[0] == 0) continue;
                     const candidate = HostAddr{ .ipv4 = ip_bytes };
                     if (!containsHostAddr(result.items, candidate)) {
-                        try result.append(candidate);
+                        try result.append(allocator, candidate);
                     }
                 },
                 posix.AF.INET6 => {
@@ -507,7 +509,7 @@ pub const Switch = struct {
                     }
                     const candidate = HostAddr{ .ipv6 = ip_bytes };
                     if (!containsHostAddr(result.items, candidate)) {
-                        try result.append(candidate);
+                        try result.append(allocator, candidate);
                     }
                 },
                 else => continue,
@@ -522,8 +524,8 @@ pub const Switch = struct {
     }
 
     fn collectHostAddrsFromHostname(allocator: Allocator) ListenAddressError!std.ArrayList(HostAddr) {
-        var result = std.ArrayList(HostAddr).init(allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(HostAddr) = .empty;
+        errdefer result.deinit(allocator);
 
         var hostname_buf: [posix.HOST_NAME_MAX]u8 = undefined;
         const hostname = try posix.gethostname(&hostname_buf);
@@ -543,7 +545,7 @@ pub const Switch = struct {
                     if (ip_bytes[0] == 127 or ip_bytes[0] == 0) continue;
                     const candidate = HostAddr{ .ipv4 = ip_bytes };
                     if (!containsHostAddr(result.items, candidate)) {
-                        try result.append(candidate);
+                        try result.append(allocator, candidate);
                     }
                 },
                 posix.AF.INET6 => {
@@ -553,7 +555,7 @@ pub const Switch = struct {
                     }
                     const candidate = HostAddr{ .ipv6 = ip_bytes };
                     if (!containsHostAddr(result.items, candidate)) {
-                        try result.append(candidate);
+                        try result.append(allocator, candidate);
                     }
                 },
                 else => {},
@@ -709,7 +711,7 @@ pub const Switch = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.outgoing_connections.deinit();
-        self.incoming_connections.deinit();
+        self.incoming_connections.deinit(self.allocator);
 
         self.finalCleanup();
     }

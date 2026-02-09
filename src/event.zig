@@ -42,7 +42,7 @@ pub fn EventEmitter(comptime T: type) type {
     return struct {
         allocator: std.mem.Allocator,
         // Use the union's tag enum as the key type
-        listeners: std.HashMapUnmanaged(std.meta.Tag(T), std.ArrayListUnmanaged(AnyEventListener(T)), std.hash_map.AutoContext(std.meta.Tag(T)), std.hash_map.default_max_load_percentage),
+        listeners: std.HashMapUnmanaged(std.meta.Tag(T), std.ArrayList(AnyEventListener(T)), std.hash_map.AutoContext(std.meta.Tag(T)), std.hash_map.default_max_load_percentage),
 
         const Self = @This();
         const TagType = std.meta.Tag(T);
@@ -50,7 +50,7 @@ pub fn EventEmitter(comptime T: type) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             return Self{
                 .allocator = allocator,
-                .listeners = std.HashMapUnmanaged(TagType, std.ArrayListUnmanaged(AnyEventListener(T)), std.hash_map.AutoContext(TagType), std.hash_map.default_max_load_percentage).empty,
+                .listeners = std.HashMapUnmanaged(TagType, std.ArrayList(AnyEventListener(T)), std.hash_map.AutoContext(TagType), std.hash_map.default_max_load_percentage).empty,
             };
         }
 
@@ -66,7 +66,7 @@ pub fn EventEmitter(comptime T: type) type {
         pub fn addListener(self: *Self, event_tag: TagType, listener: AnyEventListener(T)) !void {
             const gop = try self.listeners.getOrPut(self.allocator, event_tag);
             if (!gop.found_existing) {
-                gop.value_ptr.* = std.ArrayListUnmanaged(AnyEventListener(T)).empty;
+                gop.value_ptr.* = std.ArrayList(AnyEventListener(T)).empty;
             }
             try gop.value_ptr.append(self.allocator, listener);
         }

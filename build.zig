@@ -45,6 +45,12 @@ pub fn build(b: *std.Build) void {
     });
     const ssl_module = ssl_dep.module("ssl");
 
+    const multiaddr_dep = b.dependency("multiaddr", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const multiaddr_module = multiaddr_dep.module("multiaddr");
+
     const gremlin_dep = b.dependency("gremlin", .{
         .target = target,
         .optimize = optimize,
@@ -71,7 +77,7 @@ pub fn build(b: *std.Build) void {
         },
     );
 
-    const peer_id_dep = zmultiformats_dep.builder.dependency("peer_id", .{
+    const peer_id_dep = multiaddr_dep.builder.dependency("peer_id", .{
         .target = target,
         .optimize = optimize,
     });
@@ -85,6 +91,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("xev", libxev_module);
     root_module.addOptions("build_options", build_options);
     root_module.addImport("multiformats", zmultiformats_module);
+    root_module.addImport("multiaddr", multiaddr_module);
     root_module.addImport("ssl", ssl_module);
     root_module.addIncludePath(lsquic_dep.path("include"));
     root_module.addImport("gremlin", gremlin_module);
@@ -107,43 +114,53 @@ pub fn build(b: *std.Build) void {
     libp2p_lib.linkSystemLibrary(zlib_system_name);
     b.installArtifact(libp2p_lib);
 
-    const libp2p_exe = b.addExecutable(.{
-        .name = "zig-libp2p",
+    const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    libp2p_exe.root_module.addIncludePath(lsquic_dep.path("include"));
-    libp2p_exe.root_module.addImport("xev", libxev_module);
-    libp2p_exe.root_module.addOptions("build_options", build_options);
-    libp2p_exe.root_module.addImport("multiformats", zmultiformats_module);
-    libp2p_exe.root_module.addImport("ssl", ssl_module);
-    libp2p_exe.root_module.addImport("gremlin", gremlin_module);
-    libp2p_exe.root_module.addImport("peer_id", peer_id_module);
-    libp2p_exe.root_module.addImport("cache", cache_module);
-    libp2p_exe.root_module.addImport("secp256k1", secp_module);
+    exe_module.addIncludePath(lsquic_dep.path("include"));
+    exe_module.addImport("xev", libxev_module);
+    exe_module.addOptions("build_options", build_options);
+    exe_module.addImport("multiformats", zmultiformats_module);
+    exe_module.addImport("multiaddr", multiaddr_module);
+    exe_module.addImport("ssl", ssl_module);
+    exe_module.addImport("gremlin", gremlin_module);
+    exe_module.addImport("peer_id", peer_id_module);
+    exe_module.addImport("cache", cache_module);
+    exe_module.addImport("secp256k1", secp_module);
+
+    const libp2p_exe = b.addExecutable(.{
+        .name = "zig-libp2p",
+        .root_module = exe_module,
+    });
     libp2p_exe.step.dependOn(&protobuf.step);
 
     libp2p_exe.linkLibrary(lsquic_artifact);
     libp2p_exe.linkSystemLibrary(zlib_system_name);
     b.installArtifact(libp2p_exe);
 
-    const transport_interop_exe = b.addExecutable(.{
-        .name = "libp2p-transport-interop",
+    const interop_module = b.createModule(.{
         .root_source_file = b.path("interop/transport/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    transport_interop_exe.root_module.addIncludePath(lsquic_dep.path("include"));
-    transport_interop_exe.root_module.addImport("xev", libxev_module);
-    transport_interop_exe.root_module.addOptions("build_options", build_options);
-    transport_interop_exe.root_module.addImport("multiformats", zmultiformats_module);
-    transport_interop_exe.root_module.addImport("ssl", ssl_module);
-    transport_interop_exe.root_module.addImport("gremlin", gremlin_module);
-    transport_interop_exe.root_module.addImport("peer_id", peer_id_module);
-    transport_interop_exe.root_module.addImport("cache", cache_module);
-    transport_interop_exe.root_module.addImport("zig-libp2p", root_module);
-    transport_interop_exe.root_module.addImport("secp256k1", secp_module);
+    interop_module.addIncludePath(lsquic_dep.path("include"));
+    interop_module.addImport("xev", libxev_module);
+    interop_module.addOptions("build_options", build_options);
+    interop_module.addImport("multiformats", zmultiformats_module);
+    interop_module.addImport("multiaddr", multiaddr_module);
+    interop_module.addImport("ssl", ssl_module);
+    interop_module.addImport("gremlin", gremlin_module);
+    interop_module.addImport("peer_id", peer_id_module);
+    interop_module.addImport("cache", cache_module);
+    interop_module.addImport("zig-libp2p", root_module);
+    interop_module.addImport("secp256k1", secp_module);
+
+    const transport_interop_exe = b.addExecutable(.{
+        .name = "libp2p-transport-interop",
+        .root_module = interop_module,
+    });
     transport_interop_exe.step.dependOn(&protobuf.step);
     transport_interop_exe.linkLibrary(lsquic_artifact);
     transport_interop_exe.linkSystemLibrary(zlib_system_name);
@@ -186,8 +203,6 @@ pub fn build(b: *std.Build) void {
     // but does not run it.
     const libp2p_lib_unit_tests = b.addTest(.{
         .root_module = root_module,
-        .target = target,
-        .optimize = optimize,
         .filters = filters orelse &.{},
     });
 
@@ -197,21 +212,25 @@ pub fn build(b: *std.Build) void {
     libp2p_lib_unit_tests.step.dependOn(&protobuf.step);
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
 
-    const libp2p_exe_unit_tests = b.addTest(.{
+    const exe_test_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    exe_test_module.addIncludePath(lsquic_dep.path("include"));
+    exe_test_module.addImport("xev", libxev_module);
+    exe_test_module.addOptions("build_options", build_options);
+    exe_test_module.addImport("multiformats", zmultiformats_module);
+    exe_test_module.addImport("multiaddr", multiaddr_module);
+    exe_test_module.addImport("gremlin", gremlin_module);
+    exe_test_module.addImport("peer_id", peer_id_module);
+    exe_test_module.addImport("ssl", ssl_module);
+    exe_test_module.addImport("cache", cache_module);
+    exe_test_module.addImport("secp256k1", secp_module);
 
-    libp2p_exe_unit_tests.root_module.addIncludePath(lsquic_dep.path("include"));
-    libp2p_exe_unit_tests.root_module.addImport("xev", libxev_module);
-    libp2p_exe_unit_tests.root_module.addOptions("build_options", build_options);
-    libp2p_exe_unit_tests.root_module.addImport("multiformats", zmultiformats_module);
-    libp2p_exe_unit_tests.root_module.addImport("gremlin", gremlin_module);
-    libp2p_exe_unit_tests.root_module.addImport("peer_id", peer_id_module);
-    libp2p_exe_unit_tests.root_module.addImport("ssl", ssl_module);
-    libp2p_exe_unit_tests.root_module.addImport("cache", cache_module);
-    libp2p_exe_unit_tests.root_module.addImport("secp256k1", secp_module);
+    const libp2p_exe_unit_tests = b.addTest(.{
+        .root_module = exe_test_module,
+    });
     libp2p_exe_unit_tests.step.dependOn(&protobuf.step);
 
     libp2p_exe_unit_tests.linkLibrary(lsquic_artifact);
