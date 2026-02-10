@@ -2077,7 +2077,9 @@ pub const Gossipsub = struct {
             if (self.opts.gossipsub_v1_1) {
                 const backoff_s = prune_msg.getBackoff();
                 // Use the backoff from the message, or fall back to our default
-                const effective_backoff_s = if (backoff_s > 0) backoff_s else self.opts.prune_backoff_s;
+                // Bound by max to prevent integer overflow (max 1 hour is reasonable per spec)
+                const max_backoff_s: u64 = 60 * 60;
+                const effective_backoff_s = if (backoff_s > 0) @min(backoff_s, max_backoff_s) else self.opts.prune_backoff_s;
                 const backoff_until_ms = now_ms + @as(i64, @intCast(effective_backoff_s * 1000));
 
                 self.addBackoff(topic, from.*, backoff_until_ms) catch |err| {
@@ -2166,10 +2168,9 @@ pub const Gossipsub = struct {
 
         // Remove empty topic entries and unref the topic strings
         for (topics_to_remove.items) |topic_to_remove| {
-            if (self.backoff.getPtr(topic_to_remove)) |peer_map| {
-                peer_map.deinit(self.allocator);
-            }
             if (self.backoff.fetchRemove(topic_to_remove)) |kv| {
+                var peer_map = kv.value;
+                peer_map.deinit(self.allocator);
                 self.unrefTopic(kv.key);
             }
         }
@@ -2360,29 +2361,10 @@ pub const Gossipsub = struct {
             return;
         };
 
-        // GossipSub v1.1: Include backoff duration in PRUNE message
-        if (self.opts.gossipsub_v1_1) {
-            prune_msg[0] = .{
-                .topic_i_d = topic,
-                .backoff = self.opts.prune_backoff_s,
-                .peers = null, // TODO: Implement peer exchange (PX)
-            };
-
-            // Also add backoff for ourselves (both sides must respect backoff per spec)
-            const now_ms = std.time.milliTimestamp();
-            const backoff_until_ms = now_ms + @as(i64, @intCast(self.opts.prune_backoff_s * 1000));
-            self.addBackoff(topic, to.*, backoff_until_ms) catch |err| {
-                std.log.warn("failed to add backoff when pruning peer {} on topic {s}: {}", .{ to.*, topic, err });
-            };
-        } else {
-            prune_msg[0] = .{
-                .topic_i_d = topic,
-            };
-        }
+        prune_msg[0] = self.makeControlMessage(rpc.ControlPrune, topic, to.*);
 
         const rpc_msg: rpc.RPC = .{ .control = .{ .prune = prune_msg } };
         _ = self.sendRPC(arena, to, &rpc_msg);
-        // TODO: free rpc_msg
     }
 
     const ControlKind = enum { graft, prune };
