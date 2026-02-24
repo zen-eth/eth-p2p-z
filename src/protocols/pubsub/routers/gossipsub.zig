@@ -408,6 +408,10 @@ pub const Gossipsub = struct {
 
     protocols: []const ProtocolId = &.{ v1_id, v1_1_id },
 
+    /// Backoff tracking: topic -> (peer -> backoff_until_timestamp_ms)
+    /// Used to prevent peers from re-grafting too quickly after being pruned
+    backoff: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, i64)) = .empty,
+
     const Options = struct {
         seen_ttl_s: u32 = 120,
         max_messages_per_rpc: ?usize = null,
@@ -431,6 +435,14 @@ pub const Gossipsub = struct {
         heartbeat_interval_ms: u64 = 1_000,
         fanout_ttl_ms: i64 = 60_000,
         gossip_factor: f32 = 0.25,
+        /// Backoff duration after pruning (in seconds). Per GossipSub v1.1 spec, recommended is 60 seconds.
+        prune_backoff_s: u64 = 60,
+        /// Backoff duration after unsubscribing (in seconds). Shorter than prune backoff.
+        unsubscribe_backoff_s: u64 = 10,
+        /// Grace period added to backoff to account for heartbeat timing (in seconds)
+        backoff_slack_s: u64 = 2,
+        /// Enable GossipSub v1.1 backoff behavior
+        gossipsub_v1_1: bool = true,
     };
 
     const AddPeerCtx = struct {
@@ -597,6 +609,15 @@ pub const Gossipsub = struct {
             deinitControlIHaveList(self.allocator, entry.value_ptr);
         }
         self.gossip.deinit(self.allocator);
+
+        // Clean up backoff tracking
+        var backoff_iter = self.backoff.iterator();
+        while (backoff_iter.next()) |entry| {
+            self.unrefTopic(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.backoff.deinit(self.allocator);
+
         self.iasked.deinit(self.allocator);
         self.event_emitter.deinit();
         self.seen_cache.deinit();
@@ -1976,10 +1997,28 @@ pub const Gossipsub = struct {
 
     fn handleGraft(self: *Self, arena: Allocator, from: *const PeerId, graft: []rpc.ControlGraftReader) ![]rpc.ControlPrune {
         var prune: std.StringHashMapUnmanaged(void) = .empty;
+        const now_ms = std.time.milliTimestamp();
 
         for (graft) |graft_msg| {
             const topic = graft_msg.getTopicID();
             if (topic.len == 0) continue;
+
+            // GossipSub v1.1: Check if peer is in backoff period
+            if (self.opts.gossipsub_v1_1 and self.inBackoff(topic, from.*)) {
+                // Peer tried to regraft too early - reject with PRUNE and extend backoff
+                std.log.debug("rejecting GRAFT from {} for topic {s}: peer is in backoff", .{ from.*, topic });
+                try prune.put(arena, topic, {});
+
+                // Extend the backoff period (per spec: "immediately prune a GRAFT within the backoff period and extend it")
+                const backoff_until_ms = now_ms + @as(i64, @intCast(self.opts.prune_backoff_s * 1000));
+                self.addBackoff(topic, from.*, backoff_until_ms) catch |err| {
+                    std.log.warn("failed to extend backoff for peer {} on topic {s}: {}", .{ from.*, topic, err });
+                };
+
+                // TODO: Apply P7 behavioral penalty once peer scoring is implemented
+                // "the pruning peer may apply a behavioural penalty for the action"
+                continue;
+            }
 
             const peers = self.mesh.getPtr(topic) orelse continue;
             // This should use `self.allocator` because `self.mesh` is long-lived.
@@ -2007,9 +2046,17 @@ pub const Gossipsub = struct {
         var prune_list = try std.ArrayList(rpc.ControlPrune).initCapacity(arena, prune.count());
 
         var it = prune.keyIterator();
-        // TODO: only support v1.0 now, need to support v1.1 later
         while (it.next()) |topic| {
-            try prune_list.append(arena, .{ .topic_i_d = topic.* });
+            // GossipSub v1.1: Include backoff duration in PRUNE message
+            if (self.opts.gossipsub_v1_1) {
+                try prune_list.append(arena, .{
+                    .topic_i_d = topic.*,
+                    .backoff = self.opts.prune_backoff_s,
+                    .peers = null, // TODO: Implement peer exchange (PX)
+                });
+            } else {
+                try prune_list.append(arena, .{ .topic_i_d = topic.* });
+            }
         }
 
         return prune_list.toOwnedSlice(arena);
@@ -2017,6 +2064,8 @@ pub const Gossipsub = struct {
 
     fn handlePrune(self: *Self, arena: Allocator, from: *const PeerId, prune: []rpc.ControlPruneReader) !void {
         _ = arena;
+        const now_ms = std.time.milliTimestamp();
+
         for (prune) |prune_msg| {
             const topic = prune_msg.getTopicID();
             if (topic.len == 0) continue;
@@ -2024,11 +2073,106 @@ pub const Gossipsub = struct {
             var peer_set = self.mesh.getPtr(topic) orelse continue;
             _ = peer_set.remove(from.*);
 
+            // GossipSub v1.1: Store backoff period
+            if (self.opts.gossipsub_v1_1) {
+                const backoff_s = prune_msg.getBackoff();
+                // Use the backoff from the message, or fall back to our default
+                // Bound by max to prevent integer overflow (max 1 hour is reasonable per spec)
+                const max_backoff_s: u64 = 60 * 60;
+                const effective_backoff_s = if (backoff_s > 0) @min(backoff_s, max_backoff_s) else self.opts.prune_backoff_s;
+                const backoff_until_ms = now_ms + @as(i64, @intCast(effective_backoff_s * 1000));
+
+                self.addBackoff(topic, from.*, backoff_until_ms) catch |err| {
+                    std.log.warn("failed to add backoff for peer {} on topic {s}: {}", .{ from.*, topic, err });
+                };
+            }
+
             self.event_emitter.emit(.{ .gossipsub_prune = .{
                 .peer = from.*,
                 .topic = topic,
                 .direction = .INBOUND,
             } });
+        }
+    }
+
+    /// Adds a backoff entry for a peer on a topic, preventing regraft until the specified time.
+    fn addBackoff(self: *Self, topic: []const u8, peer: PeerId, backoff_until_ms: i64) !void {
+        var topic_backoffs = self.backoff.getPtr(topic);
+        if (topic_backoffs == null) {
+            // Need to create new entry for this topic
+            const topic_ref = try self.refTopic(topic);
+            try self.backoff.put(self.allocator, topic_ref, .empty);
+            topic_backoffs = self.backoff.getPtr(topic_ref);
+        }
+
+        try topic_backoffs.?.put(self.allocator, peer, backoff_until_ms);
+    }
+
+    /// Checks if a peer is in backoff for a topic
+    fn inBackoff(self: *Self, topic: []const u8, peer: PeerId) bool {
+        const topic_backoffs = self.backoff.getPtr(topic) orelse return false;
+        const backoff_until = topic_backoffs.get(peer) orelse return false;
+        const now_ms = std.time.milliTimestamp();
+        return now_ms < backoff_until;
+    }
+
+    /// Removes expired backoff entries for a topic
+    fn cleanupBackoffForTopic(self: *Self, topic: []const u8) void {
+        const topic_backoffs = self.backoff.getPtr(topic) orelse return;
+        const now_ms = std.time.milliTimestamp();
+
+        var to_remove = std.ArrayList(PeerId).init(self.allocator);
+        defer to_remove.deinit();
+
+        var iter = topic_backoffs.iterator();
+        while (iter.next()) |entry| {
+            if (now_ms >= entry.value_ptr.*) {
+                to_remove.append(entry.key_ptr.*) catch continue;
+            }
+        }
+
+        for (to_remove.items) |peer| {
+            _ = topic_backoffs.remove(peer);
+        }
+    }
+
+    /// Removes all expired backoff entries across all topics
+    fn cleanupExpiredBackoffs(self: *Self, now_ms: i64) void {
+        var topics_to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer topics_to_remove.deinit(self.allocator);
+
+        var topic_iter = self.backoff.iterator();
+        while (topic_iter.next()) |topic_entry| {
+            const topic = topic_entry.key_ptr.*;
+            var peer_backoffs = topic_entry.value_ptr;
+
+            var peers_to_remove: std.ArrayListUnmanaged(PeerId) = .empty;
+            defer peers_to_remove.deinit(self.allocator);
+
+            var peer_iter = peer_backoffs.iterator();
+            while (peer_iter.next()) |peer_entry| {
+                if (now_ms >= peer_entry.value_ptr.*) {
+                    peers_to_remove.append(self.allocator, peer_entry.key_ptr.*) catch continue;
+                }
+            }
+
+            for (peers_to_remove.items) |peer| {
+                _ = peer_backoffs.remove(peer);
+            }
+
+            // If no more peers in backoff for this topic, mark topic for removal
+            if (peer_backoffs.count() == 0) {
+                topics_to_remove.append(self.allocator, topic) catch continue;
+            }
+        }
+
+        // Remove empty topic entries and unref the topic strings
+        for (topics_to_remove.items) |topic_to_remove| {
+            if (self.backoff.fetchRemove(topic_to_remove)) |kv| {
+                var peer_map = kv.value;
+                peer_map.deinit(self.allocator);
+                self.unrefTopic(kv.key);
+            }
         }
     }
 
@@ -2216,14 +2360,11 @@ pub const Gossipsub = struct {
             std.log.warn("Failed to allocate PRUNE message for peer {}: {}", .{ to, err });
             return;
         };
-        // Note: right now only implement gossipsub v1.0
-        prune_msg[0] = .{
-            .topic_i_d = topic,
-        };
+
+        prune_msg[0] = self.makeControlMessage(rpc.ControlPrune, topic, to.*);
 
         const rpc_msg: rpc.RPC = .{ .control = .{ .prune = prune_msg } };
         _ = self.sendRPC(arena, to, &rpc_msg);
-        // TODO: free rpc_msg
     }
 
     const ControlKind = enum { graft, prune };
@@ -2331,7 +2472,8 @@ pub const Gossipsub = struct {
                 return;
             };
 
-            new_arr[old_len] = .{ .topic_i_d = topic_copy };
+            // GossipSub v1.1: Include backoff for PRUNE messages
+            new_arr[old_len] = self.makeControlMessage(T, topic_copy, peer);
             self.allocator.free(@constCast(existing));
             list_ptr.* = new_arr;
         } else {
@@ -2346,8 +2488,29 @@ pub const Gossipsub = struct {
                 return;
             };
 
-            arr[0] = .{ .topic_i_d = topic_copy };
+            // GossipSub v1.1: Include backoff for PRUNE messages
+            arr[0] = self.makeControlMessage(T, topic_copy, peer);
             list_ptr.* = arr;
+        }
+    }
+
+    /// Creates a control message (GRAFT or PRUNE) with appropriate v1.1 fields
+    fn makeControlMessage(self: *Self, comptime T: type, topic: []const u8, peer: PeerId) T {
+        if (T == rpc.ControlPrune and self.opts.gossipsub_v1_1) {
+            // For PRUNE messages in v1.1 mode, include backoff and track it
+            const now_ms = std.time.milliTimestamp();
+            const backoff_until_ms = now_ms + @as(i64, @intCast(self.opts.prune_backoff_s * 1000));
+            self.addBackoff(topic, peer, backoff_until_ms) catch |err| {
+                std.log.warn("failed to add backoff when pruning peer {} on topic {s}: {}", .{ peer, topic, err });
+            };
+
+            return .{
+                .topic_i_d = topic,
+                .backoff = self.opts.prune_backoff_s,
+                .peers = null, // TODO: Implement peer exchange (PX)
+            };
+        } else {
+            return .{ .topic_i_d = topic };
         }
     }
 
@@ -2446,6 +2609,11 @@ pub const Gossipsub = struct {
         self.iasked.deinit(self.allocator);
         self.iasked = std.AutoArrayHashMapUnmanaged(PeerId, usize).empty;
 
+        // GossipSub v1.1: Clean up expired backoff entries
+        if (self.opts.gossipsub_v1_1) {
+            self.cleanupExpiredBackoffs(now_ms);
+        }
+
         const seed = heartbeatSeed(now_ms, self.heartbeat_ticks);
         var prng = std.Random.DefaultPrng.init(seed);
         const random = prng.random();
@@ -2487,6 +2655,13 @@ pub const Gossipsub = struct {
 
                     for (new_peers.items) |peer_id| {
                         if (peers.contains(peer_id)) continue;
+
+                        // GossipSub v1.1: Don't graft peers that are in backoff
+                        if (self.opts.gossipsub_v1_1 and self.inBackoff(topic, peer_id)) {
+                            std.log.debug("heartbeat: skipping GRAFT to peer {} for topic {s}: peer is in backoff", .{ peer_id, topic });
+                            continue;
+                        }
+
                         peers.put(self.allocator, peer_id, {}) catch |err| {
                             std.log.warn("heartbeat: failed to add mesh peer {} for topic {s}: {}", .{ peer_id, topic, err });
                             continue;
