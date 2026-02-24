@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG ZIG_VERSION=0.14.1
+ARG ZIG_VERSION=0.15.2
 ARG ZIG_LOG_LEVEL=info
 
 FROM debian:bookworm-slim AS build
