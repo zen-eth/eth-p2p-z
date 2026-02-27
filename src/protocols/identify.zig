@@ -3,7 +3,7 @@ const libp2p = @import("../root.zig");
 const protocols = libp2p.protocols;
 const quic = libp2p.transport.quic;
 const swarm = libp2p.swarm;
-const multiaddr = @import("multiformats").multiaddr;
+const multiaddr = @import("multiaddr");
 const Multiaddr = multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 const identity = libp2p.identity;
@@ -80,11 +80,11 @@ pub const IdentifyProtocolHandler = struct {
             .allocator = self.allocator,
             .callback_ctx = callback_ctx,
             .callback = callback,
-            .response_buffer = std.ArrayList(u8).init(self.allocator),
+            .response_buffer = .empty,
             .response_received = false,
         };
         errdefer {
-            handler.response_buffer.deinit();
+            handler.response_buffer.deinit(self.allocator);
             self.allocator.destroy(handler);
         }
 
@@ -156,15 +156,15 @@ pub const IdentifyProtocolHandler = struct {
 
     /// Gets supported protocols. Abstracts away Swarm access.
     pub fn getSupportedProtocols(self: *Self, allocator: Allocator) !std.ArrayList([]const u8) {
-        var protocols_list = std.ArrayList([]const u8).init(allocator);
-        errdefer protocols_list.deinit();
+        var protocols_list: std.ArrayList([]const u8) = .empty;
+        errdefer protocols_list.deinit(allocator);
 
         if (self.config.supported_protocols) |config_protocols| {
-            try protocols_list.appendSlice(config_protocols);
+            try protocols_list.appendSlice(allocator, config_protocols);
         } else {
             var iter = self.network_switch.mss_handler.supported_protocols.iterator();
             while (iter.next()) |entry| {
-                try protocols_list.append(entry.key_ptr.*);
+                try protocols_list.append(allocator, entry.key_ptr.*);
             }
         }
 
@@ -195,7 +195,7 @@ const IdentifyInitiator = struct {
         if (message.len == 0) return;
 
         // Accumulate protobuf bytes
-        self.response_buffer.appendSlice(message) catch |err| {
+        self.response_buffer.appendSlice(self.allocator, message) catch |err| {
             self.fail(err);
             return err;
         };
@@ -256,7 +256,7 @@ const IdentifyInitiator = struct {
             .protocols = protocols_list,
         };
 
-        self.response_buffer.deinit();
+        self.response_buffer.deinit(self.allocator);
 
         // Check if callback_ctx is an IdentifyRequestCtx (from IdentifyService)
         // We use a type tag approach: if callback_ctx points to a struct that starts with a service pointer,
@@ -286,7 +286,7 @@ const IdentifyInitiator = struct {
     fn fail(self: *Self, err: anyerror) void {
         if (self.response_received) return;
         self.response_received = true;
-        self.response_buffer.deinit();
+        self.response_buffer.deinit(self.allocator);
         self.allocator.destroy(self);
         self.callback(self.callback_ctx, err);
     }
@@ -376,7 +376,7 @@ const IdentifyResponder = struct {
 
         // Get supported protocols from handler (abstracts away Swarm access)
         var protocols_list = try self.handler.getSupportedProtocols(allocator);
-        defer protocols_list.deinit();
+        defer protocols_list.deinit(allocator);
 
         if (protocols_list.items.len > 0) {
             var protocols_array = try allocator.alloc(?[]const u8, protocols_list.items.len);
@@ -636,11 +636,11 @@ pub const IdentifyPushHandler = struct {
             .allocator = self.allocator,
             .callback_ctx = callback_ctx,
             .callback = callback,
-            .response_buffer = std.ArrayList(u8).init(self.allocator),
+            .response_buffer = .empty,
             .response_received = false,
         };
         errdefer {
-            handler.response_buffer.deinit();
+            handler.response_buffer.deinit(self.allocator);
             self.allocator.destroy(handler);
         }
 
@@ -688,15 +688,15 @@ pub const IdentifyPushHandler = struct {
 
     /// Gets supported protocols. Abstracts away Swarm access.
     pub fn getSupportedProtocols(self: *Self, allocator: Allocator) !std.ArrayList([]const u8) {
-        var protocols_list = std.ArrayList([]const u8).init(allocator);
-        errdefer protocols_list.deinit();
+        var protocols_list: std.ArrayList([]const u8) = .empty;
+        errdefer protocols_list.deinit(allocator);
 
         if (self.config.supported_protocols) |config_protocols| {
-            try protocols_list.appendSlice(config_protocols);
+            try protocols_list.appendSlice(allocator, config_protocols);
         } else {
             var iter = self.network_switch.mss_handler.supported_protocols.iterator();
             while (iter.next()) |entry| {
-                try protocols_list.append(entry.key_ptr.*);
+                try protocols_list.append(allocator, entry.key_ptr.*);
             }
         }
 
@@ -763,7 +763,7 @@ const IdentifyPushInitiator = struct {
 
         // Get supported protocols from handler (abstracts away Swarm access)
         var protocols_list = try self.handler.getSupportedProtocols(allocator);
-        defer protocols_list.deinit();
+        defer protocols_list.deinit(allocator);
 
         if (protocols_list.items.len > 0) {
             var protocols_array = try allocator.alloc(?[]const u8, protocols_list.items.len);
@@ -903,7 +903,7 @@ const IdentifyPushResponder = struct {
         if (message.len == 0) return;
 
         // Accumulate protobuf bytes
-        self.response_buffer.appendSlice(message) catch |err| {
+        self.response_buffer.appendSlice(self.allocator, message) catch |err| {
             self.fail(err);
             return err;
         };
@@ -965,7 +965,7 @@ const IdentifyPushResponder = struct {
             .protocols = protocols_list,
         };
 
-        self.response_buffer.deinit();
+        self.response_buffer.deinit(self.allocator);
 
         // Check if callback_ctx is an IdentifyRequestCtx (from IdentifyService)
         if (self.callback_ctx) |ctx| {
@@ -989,7 +989,7 @@ const IdentifyPushResponder = struct {
     fn fail(self: *Self, err: anyerror) void {
         if (self.response_received) return;
         self.response_received = true;
-        self.response_buffer.deinit();
+        self.response_buffer.deinit(self.allocator);
         self.allocator.destroy(self);
         self.callback(self.callback_ctx, err);
     }
