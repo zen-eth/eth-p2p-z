@@ -1,5 +1,5 @@
 const std = @import("std");
-const linear_fifo = @import("../../linear_fifo.zig");
+const byte_buffer = @import("../../byte_buffer.zig");
 const libp2p = @import("../../root.zig");
 const protocols = libp2p.protocols;
 const PeerId = @import("peer_id").PeerId;
@@ -104,7 +104,7 @@ pub const PubSubPeerProtocolHandler = struct {
             .callback_ctx = callback_ctx,
             .callback = callback,
             .allocator = self.allocator,
-            .received_buffer = linear_fifo.LinearFifo(u8, .Dynamic).init(self.allocator),
+            .received_buffer = byte_buffer.DynamicBuffer.init(self.allocator),
         };
         stream.setProtoMsgHandler(handler.any());
     }
@@ -224,7 +224,7 @@ pub const PubSubPeerResponder = struct {
 
     pubsub: PubSub,
 
-    received_buffer: linear_fifo.LinearFifo(u8, .Dynamic),
+    received_buffer: byte_buffer.DynamicBuffer,
 
     const Self = @This();
 
