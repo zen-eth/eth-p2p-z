@@ -146,9 +146,7 @@ pub const DynamicBuffer = struct {
                 @memcpy(new_buf[data.len .. data.len + readable], self.list.items[self.head .. self.head + readable]);
             }
             self.list.deinit(self.allocator);
-            self.list.items.ptr = new_buf.ptr;
-            self.list.items.len = new_len;
-            self.list.capacity = new_len;
+            self.list = std.ArrayList(u8).fromOwnedSlice(new_buf);
             self.head = 0;
         }
     }
@@ -159,17 +157,15 @@ pub const DynamicBuffer = struct {
     }
 
     pub fn reset(self: *Self) void {
-        self.list.items.len = 0;
+        self.list.clearRetainingCapacity();
         self.head = 0;
     }
 
     fn maybeCompact(self: *Self) void {
         if (self.head > self.list.items.len / 2 and self.head > compaction_threshold) {
-            const readable = self.readableLength();
-            if (readable > 0) {
-                std.mem.copyForwards(u8, self.list.items[0..readable], self.list.items[self.head..]);
-            }
-            self.list.items.len = readable;
+            // Use replaceRange to remove consumed bytes from the front
+            // This never allocates (shrinking), so error is unreachable
+            self.list.replaceRange(self.allocator, 0, self.head, &.{}) catch unreachable;
             self.head = 0;
         }
     }
