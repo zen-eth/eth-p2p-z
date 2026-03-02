@@ -36,7 +36,7 @@ WORKDIR /app
 
 COPY . .
 
-RUN zig build -Doptimize=ReleaseFast -Dlibxev-backend=epoll -Dlog-level=${ZIG_LOG_LEVEL} -Dtarget=x86_64-linux-gnu
+RUN zig build -Doptimize=ReleaseFast -Dlibxev-backend=epoll -Dlog-level=${ZIG_LOG_LEVEL}
 
 FROM debian:bookworm-slim AS runtime
 
