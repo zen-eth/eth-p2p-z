@@ -205,16 +205,20 @@ const IdentifyInitiator = struct {
             self.deliverErrorAndCleanup(err);
             return err;
         };
-        self.response_buffer.deinit(self.allocator);
 
-        // Deliver result via appropriate callback
+        // Deliver result FIRST, then cleanup. This ensures the cloned data in result
+        // is fully delivered before we free response_buffer, avoiding any potential
+        // race conditions with allocator behavior on different platforms.
         if (IdentifyRequestCtx.isValidCtx(self.callback_ctx)) {
             const request_ctx: *IdentifyRequestCtx = @ptrCast(@alignCast(self.callback_ctx.?));
-            self.allocator.destroy(self);
             request_ctx.deliverResult(result);
+            // Cleanup after callback completes
+            self.response_buffer.deinit(self.allocator);
+            self.allocator.destroy(self);
         } else {
             // Direct protocol usage - not supported, free result and report error
             freeIdentifyResult(self.allocator, result);
+            self.response_buffer.deinit(self.allocator);
             const cb = self.callback;
             const cb_ctx = self.callback_ctx;
             self.allocator.destroy(self);
@@ -998,16 +1002,20 @@ const IdentifyPushResponder = struct {
             self.deliverErrorAndCleanup(err);
             return err;
         };
-        self.response_buffer.deinit(self.allocator);
 
-        // Deliver result via appropriate callback
+        // Deliver result FIRST, then cleanup. This ensures the cloned data in result
+        // is fully delivered before we free response_buffer, avoiding any potential
+        // race conditions with allocator behavior on different platforms.
         if (IdentifyRequestCtx.isValidCtx(self.callback_ctx)) {
             const request_ctx: *IdentifyRequestCtx = @ptrCast(@alignCast(self.callback_ctx.?));
-            self.allocator.destroy(self);
             request_ctx.deliverResult(result);
+            // Cleanup after callback completes
+            self.response_buffer.deinit(self.allocator);
+            self.allocator.destroy(self);
         } else {
             // Direct protocol usage - not supported, free result and report error
             freeIdentifyResult(self.allocator, result);
+            self.response_buffer.deinit(self.allocator);
             const cb = self.callback;
             const cb_ctx = self.callback_ctx;
             self.allocator.destroy(self);
