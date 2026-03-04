@@ -197,119 +197,50 @@ const IdentifyInitiator = struct {
     fn onClose(self: *Self, stream: *quic.QuicStream) anyerror!void {
         _ = stream;
         if (self.response_received) return;
-
         self.response_received = true;
 
-        // Parse the accumulated protobuf message
-        // Note: After setting response_received = true, we cannot call fail() as it
-        // will return early. Handle errors inline with deliverErrorAndDestroy.
-        var reader = identify_pb.IdentifyReader.init(self.response_buffer.items) catch |err| {
-            self.deliverErrorAndDestroy(err);
+        // Parse and clone all data from the response buffer
+        const result = parseIdentifyResult(self.allocator, self.response_buffer.items) catch |err| {
+            self.response_buffer.deinit(self.allocator);
+            self.deliverErrorAndCleanup(err);
             return err;
         };
-
-        // Collect listen addresses from iterator
-        var listen_addrs: ?[]const []const u8 = null;
-        const listen_addrs_count = reader.listenAddrsCount();
-        if (listen_addrs_count > 0) {
-            var addrs = self.allocator.alloc([]const u8, listen_addrs_count) catch |err| {
-                self.deliverErrorAndDestroy(err);
-                return err;
-            };
-            var i: usize = 0;
-            while (reader.listenAddrsNext()) |addr| {
-                addrs[i] = addr;
-                i += 1;
-            }
-            listen_addrs = addrs;
-        }
-
-        // Collect protocols from iterator
-        var protocols_list: ?[]const []const u8 = null;
-        const protocols_count = reader.protocolsCount();
-        if (protocols_count > 0) {
-            var prots = self.allocator.alloc([]const u8, protocols_count) catch |err| {
-                if (listen_addrs) |addrs| self.allocator.free(addrs);
-                self.deliverErrorAndDestroy(err);
-                return err;
-            };
-            var j: usize = 0;
-            while (reader.protocolsNext()) |proto| {
-                prots[j] = proto;
-                j += 1;
-            }
-            protocols_list = prots;
-        }
-
-        // Create result structure
-        const result = IdentifyResult{
-            .protocol_version = reader.getProtocolVersion(),
-            .agent_version = reader.getAgentVersion(),
-            .public_key = reader.getPublicKey(),
-            .listen_addrs = listen_addrs,
-            .observed_addr = reader.getObservedAddr(),
-            .protocols = protocols_list,
-        };
-
         self.response_buffer.deinit(self.allocator);
 
-        // Check if callback_ctx is an IdentifyRequestCtx (from IdentifyService)
-        // using the type tag for safe identification
+        // Deliver result via appropriate callback
         if (IdentifyRequestCtx.isValidCtx(self.callback_ctx)) {
             const request_ctx: *IdentifyRequestCtx = @ptrCast(@alignCast(self.callback_ctx.?));
             self.allocator.destroy(self);
             request_ctx.deliverResult(result);
-            return;
+        } else {
+            // Direct protocol usage - not supported, free result and report error
+            freeIdentifyResult(self.allocator, result);
+            const cb = self.callback;
+            const cb_ctx = self.callback_ctx;
+            self.allocator.destroy(self);
+            cb(cb_ctx, error.UnexpectedResultType);
         }
-
-        // Direct protocol usage (not via IdentifyService) - this is an error
-        // because the protocol callback signature doesn't support IdentifyResult
-        const callback_fn = self.callback;
-        const callback_ctx_val = self.callback_ctx;
-        self.allocator.destroy(self);
-        callback_fn(callback_ctx_val, error.UnexpectedResultType);
     }
 
-    /// Delivers an error and destroys self. Used in onClose after response_received
-    /// is set, where calling fail() would return early without cleanup.
-    fn deliverErrorAndDestroy(self: *Self, err: anyerror) void {
-        self.response_buffer.deinit(self.allocator);
-
-        // Check if callback_ctx is an IdentifyRequestCtx
+    /// Delivers an error and cleans up self.
+    fn deliverErrorAndCleanup(self: *Self, err: anyerror) void {
         if (IdentifyRequestCtx.isValidCtx(self.callback_ctx)) {
             const request_ctx: *IdentifyRequestCtx = @ptrCast(@alignCast(self.callback_ctx.?));
             self.allocator.destroy(self);
             request_ctx.deliverError(err);
-            return;
+        } else {
+            const cb = self.callback;
+            const cb_ctx = self.callback_ctx;
+            self.allocator.destroy(self);
+            cb(cb_ctx, err);
         }
-
-        // Direct protocol usage - use protocol callback
-        const alloc = self.allocator;
-        const cb = self.callback;
-        const cb_ctx = self.callback_ctx;
-        alloc.destroy(self);
-        cb(cb_ctx, err);
     }
 
     fn fail(self: *Self, err: anyerror) void {
         if (self.response_received) return;
         self.response_received = true;
         self.response_buffer.deinit(self.allocator);
-
-        // Check if callback_ctx is an IdentifyRequestCtx
-        if (IdentifyRequestCtx.isValidCtx(self.callback_ctx)) {
-            const request_ctx: *IdentifyRequestCtx = @ptrCast(@alignCast(self.callback_ctx.?));
-            self.allocator.destroy(self);
-            request_ctx.deliverError(err);
-            return;
-        }
-
-        // Direct protocol usage - use protocol callback
-        const alloc = self.allocator;
-        const cb = self.callback;
-        const cb_ctx = self.callback_ctx;
-        alloc.destroy(self);
-        cb(cb_ctx, err);
+        self.deliverErrorAndCleanup(err);
     }
 
     fn vtableOnActivatedFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
@@ -526,6 +457,8 @@ const IdentifyResponder = struct {
 };
 
 /// Result structure containing parsed Identify message fields.
+/// **Ownership**: All fields are allocated by the parser and owned by the caller.
+/// Use `freeIdentifyResult` to release all memory.
 pub const IdentifyResult = struct {
     protocol_version: ?[]const u8,
     agent_version: ?[]const u8,
@@ -534,6 +467,89 @@ pub const IdentifyResult = struct {
     observed_addr: ?[]const u8,
     protocols: ?[]const []const u8,
 };
+
+/// Frees all memory owned by an IdentifyResult.
+pub fn freeIdentifyResult(allocator: Allocator, result: IdentifyResult) void {
+    if (result.protocol_version) |pv| allocator.free(pv);
+    if (result.agent_version) |av| allocator.free(av);
+    if (result.public_key) |pk| allocator.free(pk);
+    if (result.observed_addr) |oa| allocator.free(oa);
+    if (result.listen_addrs) |addrs| {
+        for (addrs) |a| allocator.free(a);
+        allocator.free(addrs);
+    }
+    if (result.protocols) |prots| {
+        for (prots) |p| allocator.free(p);
+        allocator.free(prots);
+    }
+}
+
+/// Parses an Identify protobuf message and returns an owned IdentifyResult.
+/// All strings are cloned from the buffer, so the buffer can be freed after this returns.
+/// On error, no memory is leaked. On success, caller must call freeIdentifyResult.
+fn parseIdentifyResult(allocator: Allocator, buffer: []const u8) anyerror!IdentifyResult {
+    var reader = try identify_pb.IdentifyReader.init(buffer);
+
+    // Clone simple string fields
+    const pv_raw = reader.getProtocolVersion();
+    const protocol_version: ?[]const u8 = if (pv_raw.len > 0) try allocator.dupe(u8, pv_raw) else null;
+    errdefer if (protocol_version) |pv| allocator.free(pv);
+
+    const av_raw = reader.getAgentVersion();
+    const agent_version: ?[]const u8 = if (av_raw.len > 0) try allocator.dupe(u8, av_raw) else null;
+    errdefer if (agent_version) |av| allocator.free(av);
+
+    const pk_raw = reader.getPublicKey();
+    const public_key: ?[]const u8 = if (pk_raw.len > 0) try allocator.dupe(u8, pk_raw) else null;
+    errdefer if (public_key) |pk| allocator.free(pk);
+
+    const oa_raw = reader.getObservedAddr();
+    const observed_addr: ?[]const u8 = if (oa_raw.len > 0) try allocator.dupe(u8, oa_raw) else null;
+    errdefer if (observed_addr) |oa| allocator.free(oa);
+
+    // Clone listen addresses
+    var listen_addrs: ?[][]const u8 = null;
+    const listen_addrs_count = reader.listenAddrsCount();
+    if (listen_addrs_count > 0) {
+        const addrs = try allocator.alloc([]const u8, listen_addrs_count);
+        errdefer allocator.free(addrs);
+        var i: usize = 0;
+        errdefer for (addrs[0..i]) |a| allocator.free(a);
+        while (reader.listenAddrsNext()) |addr| {
+            addrs[i] = try allocator.dupe(u8, addr);
+            i += 1;
+        }
+        listen_addrs = addrs;
+    }
+    errdefer if (listen_addrs) |addrs| {
+        for (addrs) |a| allocator.free(a);
+        allocator.free(addrs);
+    };
+
+    // Clone protocols
+    var protocols_list: ?[][]const u8 = null;
+    const protocols_count = reader.protocolsCount();
+    if (protocols_count > 0) {
+        const prots = try allocator.alloc([]const u8, protocols_count);
+        errdefer allocator.free(prots);
+        var j: usize = 0;
+        errdefer for (prots[0..j]) |p| allocator.free(p);
+        while (reader.protocolsNext()) |proto| {
+            prots[j] = try allocator.dupe(u8, proto);
+            j += 1;
+        }
+        protocols_list = prots;
+    }
+
+    return IdentifyResult{
+        .protocol_version = protocol_version,
+        .agent_version = agent_version,
+        .public_key = public_key,
+        .listen_addrs = listen_addrs,
+        .observed_addr = observed_addr,
+        .protocols = protocols_list,
+    };
+}
 
 /// Service facade responsible for querying peer information.
 pub const IdentifyService = struct {
@@ -974,119 +990,50 @@ const IdentifyPushResponder = struct {
     fn onClose(self: *Self, stream: *quic.QuicStream) anyerror!void {
         _ = stream;
         if (self.response_received) return;
-
         self.response_received = true;
 
-        // Parse the accumulated protobuf message
-        // Note: After setting response_received = true, we cannot call fail() as it
-        // will return early. Handle errors inline with deliverErrorAndDestroy.
-        var reader = identify_pb.IdentifyReader.init(self.response_buffer.items) catch |err| {
-            self.deliverErrorAndDestroy(err);
+        // Parse and clone all data from the response buffer
+        const result = parseIdentifyResult(self.allocator, self.response_buffer.items) catch |err| {
+            self.response_buffer.deinit(self.allocator);
+            self.deliverErrorAndCleanup(err);
             return err;
         };
-
-        // Collect listen addresses from iterator
-        var listen_addrs: ?[]const []const u8 = null;
-        const listen_addrs_count = reader.listenAddrsCount();
-        if (listen_addrs_count > 0) {
-            var addrs = self.allocator.alloc([]const u8, listen_addrs_count) catch |err| {
-                self.deliverErrorAndDestroy(err);
-                return err;
-            };
-            var i: usize = 0;
-            while (reader.listenAddrsNext()) |addr| {
-                addrs[i] = addr;
-                i += 1;
-            }
-            listen_addrs = addrs;
-        }
-
-        // Collect protocols from iterator
-        var protocols_list: ?[]const []const u8 = null;
-        const protocols_count = reader.protocolsCount();
-        if (protocols_count > 0) {
-            var prots = self.allocator.alloc([]const u8, protocols_count) catch |err| {
-                if (listen_addrs) |addrs| self.allocator.free(addrs);
-                self.deliverErrorAndDestroy(err);
-                return err;
-            };
-            var j: usize = 0;
-            while (reader.protocolsNext()) |proto| {
-                prots[j] = proto;
-                j += 1;
-            }
-            protocols_list = prots;
-        }
-
-        // Update local peer store with the received information
-        // For now, we just parse it - the caller can handle the update
-        const result = IdentifyResult{
-            .protocol_version = reader.getProtocolVersion(),
-            .agent_version = reader.getAgentVersion(),
-            .public_key = reader.getPublicKey(),
-            .listen_addrs = listen_addrs,
-            .observed_addr = reader.getObservedAddr(),
-            .protocols = protocols_list,
-        };
-
         self.response_buffer.deinit(self.allocator);
 
-        // Check if callback_ctx is an IdentifyRequestCtx (from IdentifyService)
-        // using the type tag for safe identification
+        // Deliver result via appropriate callback
         if (IdentifyRequestCtx.isValidCtx(self.callback_ctx)) {
             const request_ctx: *IdentifyRequestCtx = @ptrCast(@alignCast(self.callback_ctx.?));
             self.allocator.destroy(self);
             request_ctx.deliverResult(result);
-            return;
+        } else {
+            // Direct protocol usage - not supported, free result and report error
+            freeIdentifyResult(self.allocator, result);
+            const cb = self.callback;
+            const cb_ctx = self.callback_ctx;
+            self.allocator.destroy(self);
+            cb(cb_ctx, error.UnexpectedResultType);
         }
-
-        // Otherwise, use the protocol callback (expects controller, not result)
-        const callback_fn = self.callback;
-        const callback_ctx_val = self.callback_ctx;
-        self.allocator.destroy(self);
-        callback_fn(callback_ctx_val, error.UnexpectedResultType);
     }
 
-    /// Delivers an error and destroys self. Used in onClose after response_received
-    /// is set, where calling fail() would return early without cleanup.
-    fn deliverErrorAndDestroy(self: *Self, err: anyerror) void {
-        self.response_buffer.deinit(self.allocator);
-
-        // Check if callback_ctx is an IdentifyRequestCtx
+    /// Delivers an error and cleans up self.
+    fn deliverErrorAndCleanup(self: *Self, err: anyerror) void {
         if (IdentifyRequestCtx.isValidCtx(self.callback_ctx)) {
             const request_ctx: *IdentifyRequestCtx = @ptrCast(@alignCast(self.callback_ctx.?));
             self.allocator.destroy(self);
             request_ctx.deliverError(err);
-            return;
+        } else {
+            const cb = self.callback;
+            const cb_ctx = self.callback_ctx;
+            self.allocator.destroy(self);
+            cb(cb_ctx, err);
         }
-
-        // Direct protocol usage - use protocol callback
-        const alloc = self.allocator;
-        const cb = self.callback;
-        const cb_ctx = self.callback_ctx;
-        alloc.destroy(self);
-        cb(cb_ctx, err);
     }
 
     fn fail(self: *Self, err: anyerror) void {
         if (self.response_received) return;
         self.response_received = true;
         self.response_buffer.deinit(self.allocator);
-
-        // Check if callback_ctx is an IdentifyRequestCtx
-        if (IdentifyRequestCtx.isValidCtx(self.callback_ctx)) {
-            const request_ctx: *IdentifyRequestCtx = @ptrCast(@alignCast(self.callback_ctx.?));
-            self.allocator.destroy(self);
-            request_ctx.deliverError(err);
-            return;
-        }
-
-        // Direct protocol usage - use protocol callback
-        const alloc = self.allocator;
-        const cb = self.callback;
-        const cb_ctx = self.callback_ctx;
-        alloc.destroy(self);
-        cb(cb_ctx, err);
+        self.deliverErrorAndCleanup(err);
     }
 
     fn vtableOnActivatedFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
@@ -1243,8 +1190,7 @@ const IdentifyResultCtx = struct {
 
     fn freeResult(self: *Self) void {
         if (self.result) |result| {
-            if (result.listen_addrs) |addrs| self.allocator.free(addrs);
-            if (result.protocols) |prots| self.allocator.free(prots);
+            freeIdentifyResult(self.allocator, result);
         }
     }
 };
