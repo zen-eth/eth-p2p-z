@@ -179,33 +179,33 @@ const Env = struct {
     listen_port: u16,
 
     fn load(allocator: std.mem.Allocator) !Env {
-        const transport_owned = try getRequiredOwned(allocator, "transport");
+        const transport_owned = try getRequiredOwned(allocator, "TRANSPORT");
         errdefer allocator.free(transport_owned);
 
-        const is_dialer_raw = try getRequiredOwned(allocator, "is_dialer");
+        const is_dialer_raw = try getRequiredOwned(allocator, "IS_DIALER");
         defer allocator.free(is_dialer_raw);
         const is_dialer = try parseBool(is_dialer_raw);
 
-        const bind_ip_owned = try getOptionalOwnedOrDefault(allocator, "ip", "0.0.0.0");
+        const bind_ip_owned = try getOptionalOwnedOrDefault(allocator, "IP", "0.0.0.0");
         errdefer allocator.free(bind_ip_owned);
 
         const default_publish = if (is_dialer) "dialer" else "listener";
         const publish_host_owned = try getOptionalOwnedOrDefault(allocator, "PUBLISH_HOST", default_publish);
         errdefer allocator.free(publish_host_owned);
 
-        const muxer_owned = try getOptionalOwned(allocator, "muxer");
+        const muxer_owned = try getOptionalOwned(allocator, "MUXER");
         errdefer if (muxer_owned) |value| allocator.free(value);
 
-        const security_owned = try getOptionalOwned(allocator, "security");
+        const security_owned = try getOptionalOwned(allocator, "SECURITY");
         errdefer if (security_owned) |value| allocator.free(value);
 
-        const redis_addr_owned = try getOptionalOwnedOrDefault(allocator, "redis_addr", "redis:6379");
+        const redis_addr_owned = try getOptionalOwnedOrDefault(allocator, "REDIS_ADDR", "redis:6379");
         errdefer allocator.free(redis_addr_owned);
         const parsed = try parseHostPort(allocator, redis_addr_owned);
         const redis_host_owned = parsed.host;
         allocator.free(redis_addr_owned);
 
-        const timeout_secs = try getOptionalUint(allocator, "test_timeout_seconds", 180);
+        const timeout_secs = try getOptionalUint(allocator, "TEST_TIMEOUT_SECONDS", 180);
         const listen_port_value = try getOptionalUint(allocator, "LISTEN_PORT", 4001);
         if (listen_port_value > std.math.maxInt(u16)) return error.InvalidPort;
         const listen_port = @as(u16, @intCast(listen_port_value));
