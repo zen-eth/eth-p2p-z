@@ -18,37 +18,116 @@ pub const protocol_id = "/ipfs/id/1.0.0";
 pub const protocol_push_id = "/ipfs/id/push/1.0.0";
 
 /// Configuration for the Identify protocol handler.
+/// Identity information is pre-built at construction time (following jvm-libp2p pattern).
 pub const IdentifyConfig = struct {
     protocol_version: ?[]const u8 = null,
     agent_version: ?[]const u8 = null,
+    /// Pre-built public key bytes (required for responder)
+    public_key: ?[]const u8 = null,
+    /// Pre-built listen addresses
+    listen_addrs: ?[]const []const u8 = null,
+    /// Pre-built supported protocols
     supported_protocols: ?[]const []const u8 = null,
 };
 
+/// Shared builder for constructing Identify protocol messages.
+/// Eliminates duplication between IdentifyProtocolHandler and IdentifyPushHandler.
+pub const IdentifyMessageBuilder = struct {
+    config: IdentifyConfig,
+
+    const Self = @This();
+
+    /// Returns the pre-built public key bytes (borrowed, no allocation).
+    pub fn getPublicKey(self: *const Self) ?[]const u8 {
+        return self.config.public_key;
+    }
+
+    /// Returns the pre-built listen addresses (borrowed, no allocation).
+    pub fn getListenAddrs(self: *const Self) []const []const u8 {
+        return self.config.listen_addrs orelse &.{};
+    }
+
+    /// Returns the pre-built supported protocols (borrowed, no allocation).
+    pub fn getSupportedProtocols(self: *const Self) []const []const u8 {
+        return self.config.supported_protocols orelse &.{};
+    }
+
+    /// Builds an Identify message. Caller owns all allocated memory in the returned message.
+    /// Use freeIdentifyMessage() to clean up.
+    pub fn build(self: *const Self, allocator: Allocator) !identify_pb.Identify {
+        var identify_msg = identify_pb.Identify{};
+        errdefer self.freeMessage(allocator, &identify_msg);
+
+        // Set protocol version if configured
+        if (self.config.protocol_version) |pv| {
+            identify_msg.protocol_version = pv;
+        }
+
+        // Set agent version if configured
+        if (self.config.agent_version) |av| {
+            identify_msg.agent_version = av;
+        }
+
+        // Copy public key (single allocation)
+        if (self.config.public_key) |pk| {
+            identify_msg.public_key = try allocator.dupe(u8, pk);
+        }
+
+        // Copy listen addresses (single allocation per address)
+        const listen_addrs = self.getListenAddrs();
+        if (listen_addrs.len > 0) {
+            var addr_bytes_list = try allocator.alloc(?[]const u8, listen_addrs.len);
+            errdefer allocator.free(addr_bytes_list);
+
+            for (listen_addrs, 0..) |addr, i| {
+                addr_bytes_list[i] = try allocator.dupe(u8, addr);
+            }
+            identify_msg.listen_addrs = addr_bytes_list;
+        }
+
+        // Copy protocols array (protocols are string slices, just copy the pointers)
+        const protocols_list = self.getSupportedProtocols();
+        if (protocols_list.len > 0) {
+            var protocols_array = try allocator.alloc(?[]const u8, protocols_list.len);
+            for (protocols_list, 0..) |proto, i| {
+                protocols_array[i] = proto;
+            }
+            identify_msg.protocols = protocols_array;
+        }
+
+        return identify_msg;
+    }
+
+    /// Frees all memory allocated by build().
+    pub fn freeMessage(_: *const Self, allocator: Allocator, msg: *identify_pb.Identify) void {
+        if (msg.public_key) |pk| allocator.free(pk);
+        if (msg.listen_addrs) |addrs| {
+            for (addrs) |maybe_addr| {
+                if (maybe_addr) |addr| allocator.free(addr);
+            }
+            allocator.free(addrs);
+        }
+        if (msg.protocols) |prots| {
+            // Protocols are borrowed slices, only free the array
+            allocator.free(prots);
+        }
+    }
+};
+
 /// Identify protocol handler that can be registered with the multistream-select handler.
+/// Handlers only use stream abstraction - identity info is pre-built at construction.
 pub const IdentifyProtocolHandler = struct {
     allocator: std.mem.Allocator,
-    network_switch: *swarm.Switch,
-    config: IdentifyConfig,
+    builder: IdentifyMessageBuilder,
     shutting_down: bool = false,
 
     const Self = @This();
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        network_switch: *swarm.Switch,
-    ) Self {
-        return Self.initWithConfig(allocator, network_switch, .{});
-    }
-
-    pub fn initWithConfig(
-        allocator: std.mem.Allocator,
-        network_switch: *swarm.Switch,
-        config: IdentifyConfig,
-    ) Self {
+    /// Initialize with pre-built identity configuration.
+    pub fn init(allocator: std.mem.Allocator, config: IdentifyConfig) Self {
         return .{
             .allocator = allocator,
-            .network_switch = network_switch,
-            .config = config,
+            .builder = .{ .config = config },
             .shutting_down = false,
         };
     }
@@ -139,31 +218,9 @@ pub const IdentifyProtocolHandler = struct {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 
-    /// Gets the public key bytes from the network switch's transport.
-    pub fn getPublicKeyBytes(self: *Self, allocator: Allocator) ![]const u8 {
-        return try self.network_switch.transport.host_keypair.publicKeyBytes(allocator);
-    }
-
-    /// Gets listen addresses from the network switch.
-    pub fn getListenMultiaddrs(self: *Self, allocator: Allocator) !std.ArrayList([]u8) {
-        return try self.network_switch.listenMultiaddrs(allocator);
-    }
-
-    /// Gets supported protocols from the network switch.
-    pub fn getSupportedProtocols(self: *Self, allocator: Allocator) !std.ArrayList([]const u8) {
-        var protocols_list: std.ArrayList([]const u8) = .empty;
-        errdefer protocols_list.deinit(allocator);
-
-        if (self.config.supported_protocols) |config_protocols| {
-            try protocols_list.appendSlice(allocator, config_protocols);
-        } else {
-            var iter = self.network_switch.mss_handler.supported_protocols.iterator();
-            while (iter.next()) |entry| {
-                try protocols_list.append(allocator, entry.key_ptr.*);
-            }
-        }
-
-        return protocols_list;
+    /// Access the message builder for building identify messages.
+    pub fn messageBuilder(self: *Self) *const IdentifyMessageBuilder {
+        return &self.builder;
     }
 };
 
@@ -285,102 +342,20 @@ const IdentifyResponder = struct {
 
     const Self = @This();
 
-    /// Builds an Identify message with current peer information.
-    fn buildIdentifyMessage(self: *Self, stream: *quic.QuicStream, allocator: Allocator) !identify_pb.Identify {
-        var identify_msg = identify_pb.Identify{};
-
-        // Set protocol version if configured
-        if (self.handler.config.protocol_version) |pv| {
-            identify_msg.protocol_version = pv;
-        }
-
-        // Set agent version if configured
-        if (self.handler.config.agent_version) |av| {
-            identify_msg.agent_version = av;
-        }
-
-        // Get public key from handler (abstracts away transport access)
-        const public_key_bytes = try self.handler.getPublicKeyBytes(allocator);
-        errdefer allocator.free(public_key_bytes);
-        identify_msg.public_key = public_key_bytes;
-
-        // Get listen addresses from handler (abstracts away Swarm access)
-        var listen_addrs = try self.handler.getListenMultiaddrs(allocator);
-        defer swarm.Switch.freeListenMultiaddrs(allocator, &listen_addrs);
-
-        if (listen_addrs.items.len > 0) {
-            var addr_bytes_list = try allocator.alloc(?[]const u8, listen_addrs.items.len);
-            errdefer allocator.free(addr_bytes_list);
-            for (listen_addrs.items, 0..) |addr_str, i| {
-                // Convert multiaddr string to bytes
-                // The identify spec expects raw multiaddr bytes, but for now we'll use the string bytes
-                // A proper implementation would serialize the multiaddr according to the multiformats spec
-                const bytes = try allocator.dupe(u8, addr_str);
-                addr_bytes_list[i] = bytes;
-            }
-            identify_msg.listen_addrs = addr_bytes_list;
-        }
-
-        // TODO: Extract observed_addr from QUIC connection's remote address.
-        // The observed address should be the initiator's source address as seen by the responder.
-        // For now, we leave it as null - identify_msg.observed_addr defaults to null.
-        _ = stream.conn.security_session;
-
-        // Get supported protocols from handler (abstracts away Swarm access)
-        var protocols_list = try self.handler.getSupportedProtocols(allocator);
-        defer protocols_list.deinit(allocator);
-
-        if (protocols_list.items.len > 0) {
-            var protocols_array = try allocator.alloc(?[]const u8, protocols_list.items.len);
-            errdefer allocator.free(protocols_array);
-            for (protocols_list.items, 0..) |proto, i| {
-                protocols_array[i] = proto;
-            }
-            identify_msg.protocols = protocols_array;
-        }
-
-        return identify_msg;
-    }
-
-    fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
-        // Build and send Identify message immediately
-        const identify_msg = try self.buildIdentifyMessage(stream, self.allocator);
-        errdefer {
-            // Cleanup on error
-            if (identify_msg.public_key) |pk| self.allocator.free(pk);
-            if (identify_msg.listen_addrs) |addrs| {
-                for (addrs) |maybe_addr| {
-                    if (maybe_addr) |addr| self.allocator.free(addr);
-                }
-                self.allocator.free(addrs);
-            }
-            if (identify_msg.protocols) |prots| {
-                for (prots) |maybe_proto| {
-                    if (maybe_proto) |_| {} // Protocols are not allocated, they're just slices
-                }
-                self.allocator.free(prots);
-            }
-        }
+    fn onActivated(self: *Self, _: *quic.QuicStream) anyerror!void {
+        // Build identify message using shared builder
+        var identify_msg = try self.handler.builder.build(self.allocator);
+        errdefer self.handler.builder.freeMessage(self.allocator, &identify_msg);
 
         const encoded = try identify_msg.encode(self.allocator);
         errdefer self.allocator.free(encoded);
 
-        // Cleanup identify message
-        if (identify_msg.public_key) |pk| self.allocator.free(pk);
-        if (identify_msg.listen_addrs) |addrs| {
-            for (addrs) |maybe_addr| {
-                if (maybe_addr) |addr| self.allocator.free(addr);
-            }
-            self.allocator.free(addrs);
-        }
-        if (identify_msg.protocols) |prots| {
-            // Protocols are just string slices, not allocated, so we only free the array
-            self.allocator.free(prots);
-        }
+        // Free message after encoding
+        self.handler.builder.freeMessage(self.allocator, &identify_msg);
 
         self.message_sent = true;
         self.encoded_message = encoded; // Store until write completes
-        stream.write(encoded, self, writeCompleteCallback);
+        self.stream.write(encoded, self, writeCompleteCallback);
     }
 
     fn writeCompleteCallback(ctx: ?*anyopaque, res: anyerror!usize) void {
@@ -637,30 +612,19 @@ const IdentifyRequestCtx = struct {
 };
 
 /// Identify push protocol handler.
+/// Handlers only use stream abstraction - identity info is pre-built at construction.
 pub const IdentifyPushHandler = struct {
     allocator: std.mem.Allocator,
-    network_switch: *swarm.Switch,
-    config: IdentifyConfig,
+    builder: IdentifyMessageBuilder,
     shutting_down: bool = false,
 
     const Self = @This();
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        network_switch: *swarm.Switch,
-    ) Self {
-        return Self.initWithConfig(allocator, network_switch, .{});
-    }
-
-    pub fn initWithConfig(
-        allocator: std.mem.Allocator,
-        network_switch: *swarm.Switch,
-        config: IdentifyConfig,
-    ) Self {
+    /// Initialize with pre-built identity configuration.
+    pub fn init(allocator: std.mem.Allocator, config: IdentifyConfig) Self {
         return .{
             .allocator = allocator,
-            .network_switch = network_switch,
-            .config = config,
+            .builder = .{ .config = config },
             .shutting_down = false,
         };
     }
@@ -751,31 +715,9 @@ pub const IdentifyPushHandler = struct {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 
-    /// Gets the public key bytes from the network switch's transport.
-    pub fn getPublicKeyBytes(self: *Self, allocator: Allocator) ![]const u8 {
-        return try self.network_switch.transport.host_keypair.publicKeyBytes(allocator);
-    }
-
-    /// Gets listen addresses from the network switch.
-    pub fn getListenMultiaddrs(self: *Self, allocator: Allocator) !std.ArrayList([]u8) {
-        return try self.network_switch.listenMultiaddrs(allocator);
-    }
-
-    /// Gets supported protocols from the network switch.
-    pub fn getSupportedProtocols(self: *Self, allocator: Allocator) !std.ArrayList([]const u8) {
-        var protocols_list: std.ArrayList([]const u8) = .empty;
-        errdefer protocols_list.deinit(allocator);
-
-        if (self.config.supported_protocols) |config_protocols| {
-            try protocols_list.appendSlice(allocator, config_protocols);
-        } else {
-            var iter = self.network_switch.mss_handler.supported_protocols.iterator();
-            while (iter.next()) |entry| {
-                try protocols_list.append(allocator, entry.key_ptr.*);
-            }
-        }
-
-        return protocols_list;
+    /// Access the message builder for building identify messages.
+    pub fn messageBuilder(self: *Self) *const IdentifyMessageBuilder {
+        return &self.builder;
     }
 };
 
@@ -791,101 +733,20 @@ const IdentifyPushInitiator = struct {
 
     const Self = @This();
 
-    /// Builds an Identify message with current peer information.
-    fn buildIdentifyMessage(self: *Self, stream: *quic.QuicStream, allocator: Allocator) !identify_pb.Identify {
-        var identify_msg = identify_pb.Identify{};
-
-        // Set protocol version if configured
-        if (self.handler.config.protocol_version) |pv| {
-            identify_msg.protocol_version = pv;
-        }
-
-        // Set agent version if configured
-        if (self.handler.config.agent_version) |av| {
-            identify_msg.agent_version = av;
-        }
-
-        // Get public key from handler (abstracts away transport access)
-        const public_key_bytes = try self.handler.getPublicKeyBytes(allocator);
-        errdefer allocator.free(public_key_bytes);
-        identify_msg.public_key = public_key_bytes;
-
-        // Get listen addresses from handler (abstracts away Swarm access)
-        var listen_addrs = try self.handler.getListenMultiaddrs(allocator);
-        defer swarm.Switch.freeListenMultiaddrs(allocator, &listen_addrs);
-
-        if (listen_addrs.items.len > 0) {
-            var addr_bytes_list = try allocator.alloc(?[]const u8, listen_addrs.items.len);
-            errdefer allocator.free(addr_bytes_list);
-            for (listen_addrs.items, 0..) |addr_str, i| {
-                // Convert multiaddr string to bytes
-                // The identify spec expects raw multiaddr bytes, but for now we'll use the string bytes
-                // A proper implementation would serialize the multiaddr according to the multiformats spec
-                const bytes = try allocator.dupe(u8, addr_str);
-                addr_bytes_list[i] = bytes;
-            }
-            identify_msg.listen_addrs = addr_bytes_list;
-        }
-
-        // TODO: Extract observed_addr from QUIC connection's remote address.
-        // The observed address should be the initiator's source address as seen by the responder.
-        // For now, we leave it as null - identify_msg.observed_addr defaults to null.
-        _ = stream.conn.security_session;
-
-        // Get supported protocols from handler (abstracts away Swarm access)
-        var protocols_list = try self.handler.getSupportedProtocols(allocator);
-        defer protocols_list.deinit(allocator);
-
-        if (protocols_list.items.len > 0) {
-            var protocols_array = try allocator.alloc(?[]const u8, protocols_list.items.len);
-            errdefer allocator.free(protocols_array);
-            for (protocols_list.items, 0..) |proto, i| {
-                protocols_array[i] = proto;
-            }
-            identify_msg.protocols = protocols_array;
-        }
-
-        return identify_msg;
-    }
-
-    fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
-        // Build and send Identify message immediately
-        const identify_msg = try self.buildIdentifyMessage(stream, self.allocator);
-        errdefer {
-            if (identify_msg.public_key) |pk| self.allocator.free(pk);
-            if (identify_msg.listen_addrs) |addrs| {
-                for (addrs) |maybe_addr| {
-                    if (maybe_addr) |addr| self.allocator.free(addr);
-                }
-                self.allocator.free(addrs);
-            }
-            if (identify_msg.protocols) |prots| {
-                for (prots) |maybe_proto| {
-                    if (maybe_proto) |_| {} // Protocols are not allocated, they're just slices
-                }
-                self.allocator.free(prots);
-            }
-        }
+    fn onActivated(self: *Self, _: *quic.QuicStream) anyerror!void {
+        // Build identify message using shared builder
+        var identify_msg = try self.handler.builder.build(self.allocator);
+        errdefer self.handler.builder.freeMessage(self.allocator, &identify_msg);
 
         const encoded = try identify_msg.encode(self.allocator);
         errdefer self.allocator.free(encoded);
 
-        // Cleanup identify message
-        if (identify_msg.public_key) |pk| self.allocator.free(pk);
-        if (identify_msg.listen_addrs) |addrs| {
-            for (addrs) |maybe_addr| {
-                if (maybe_addr) |addr| self.allocator.free(addr);
-            }
-            self.allocator.free(addrs);
-        }
-        if (identify_msg.protocols) |prots| {
-            // Protocols are just string slices, not allocated, so we only free the array
-            self.allocator.free(prots);
-        }
+        // Free message after encoding
+        self.handler.builder.freeMessage(self.allocator, &identify_msg);
 
         self.message_sent = true;
         self.encoded_message = encoded; // Store until write completes
-        stream.write(encoded, self, writeCompleteCallback);
+        self.stream.write(encoded, self, writeCompleteCallback);
     }
 
     fn writeCompleteCallback(ctx: ?*anyopaque, res: anyerror!usize) void {
@@ -1168,6 +1029,22 @@ const TestContext = struct {
         try addr.push(.{ .P2P = self.server_peer_id });
         return addr;
     }
+
+    /// Build identify config with pre-built identity info from server transport.
+    fn serverIdentifyConfig(self: *Self) !IdentifyConfig {
+        const public_key = try self.server_transport.host_keypair.publicKeyBytes(self.allocator);
+        return .{
+            .public_key = public_key,
+        };
+    }
+
+    /// Build identify config with pre-built identity info from client transport.
+    fn clientIdentifyConfig(self: *Self) !IdentifyConfig {
+        const public_key = try self.client_transport.host_keypair.publicKeyBytes(self.allocator);
+        return .{
+            .public_key = public_key,
+        };
+    }
 };
 
 /// Callback context for identify results with timeout support.
@@ -1211,17 +1088,22 @@ test "identify protocol exchanges peer info with config values and protocols" {
 
     const expected_protocols = &[_][]const u8{ "/ipfs/ping/1.0.0", "/ipfs/id/1.0.0", "/custom/test/1.0" };
 
+    // Build pre-built identity config from transport (like service-level code would do)
+    const server_public_key = try ctx.server_transport.host_keypair.publicKeyBytes(allocator);
+    defer allocator.free(server_public_key);
+
     // Server: configure with all identify fields including supported protocols
-    var server_identify = IdentifyProtocolHandler.initWithConfig(allocator, &ctx.server_switch, .{
+    var server_identify = IdentifyProtocolHandler.init(allocator, .{
         .protocol_version = "libp2p/1.0.0",
         .agent_version = "zig-libp2p/0.1.0",
+        .public_key = server_public_key,
         .supported_protocols = expected_protocols,
     });
     defer server_identify.deinit();
     try ctx.server_switch.addProtocolHandler(protocol_id, server_identify.any());
 
-    // Client: minimal config
-    var client_identify = IdentifyProtocolHandler.init(allocator, &ctx.client_switch);
+    // Client: minimal config (client doesn't need public key for initiator role)
+    var client_identify = IdentifyProtocolHandler.init(allocator, .{});
     defer client_identify.deinit();
     try ctx.client_switch.addProtocolHandler(protocol_id, client_identify.any());
 
@@ -1270,10 +1152,10 @@ test "identify protocol exchanges peer info with config values and protocols" {
     }
 }
 
-test "identify handler accesses transport through switch" {
-    // This test validates the architectural change: handlers access transport
-    // through network_switch.transport instead of storing transport directly.
-    // Requires minimal infrastructure since we only test sync methods.
+test "identify handler uses pre-built identity config" {
+    // This test validates the architectural change: handlers use pre-built
+    // identity config instead of accessing transport/switch directly.
+    // Identity info is injected at construction time.
 
     const allocator = std.testing.allocator;
     const quic_transport = libp2p.transport.quic;
@@ -1292,125 +1174,79 @@ test "identify handler accesses transport through switch" {
     var transport: quic_transport.QuicTransport = undefined;
     try transport.init(&loop, &host_key, keys.KeyType.ED25519, allocator);
 
-    var network_switch: swarm.Switch = undefined;
-    network_switch.init(allocator, &transport);
-    defer {
-        network_switch.stop();
-        network_switch.deinit();
-    }
+    // Pre-build identity info from transport (service-level code would do this)
+    const public_key = try transport.host_keypair.publicKeyBytes(allocator);
+    defer allocator.free(public_key);
 
-    // Create both handler types - validates init works without transport param
-    var identify_handler = IdentifyProtocolHandler.init(allocator, &network_switch);
+    // Create handlers with pre-built config
+    var identify_handler = IdentifyProtocolHandler.init(allocator, .{
+        .public_key = public_key,
+    });
     defer identify_handler.deinit();
 
-    var push_handler = IdentifyPushHandler.init(allocator, &network_switch);
+    var push_handler = IdentifyPushHandler.init(allocator, .{
+        .public_key = public_key,
+    });
     defer push_handler.deinit();
 
-    // Both should access the same public key through switch.transport
-    const id_pub_key = try identify_handler.getPublicKeyBytes(allocator);
-    defer allocator.free(id_pub_key);
+    // Both should return the same public key from config
+    const id_pub_key = identify_handler.builder.getPublicKey();
+    const push_pub_key = push_handler.builder.getPublicKey();
 
-    const push_pub_key = try push_handler.getPublicKeyBytes(allocator);
-    defer allocator.free(push_pub_key);
+    try std.testing.expect(id_pub_key != null);
+    try std.testing.expect(id_pub_key.?.len > 0);
+    try std.testing.expectEqualSlices(u8, id_pub_key.?, push_pub_key.?);
 
-    try std.testing.expect(id_pub_key.len > 0);
-    try std.testing.expectEqualSlices(u8, id_pub_key, push_pub_key);
-
-    // Verify matches direct transport access
-    const direct_pub_key = try transport.host_keypair.publicKeyBytes(allocator);
-    defer allocator.free(direct_pub_key);
-    try std.testing.expectEqualSlices(u8, id_pub_key, direct_pub_key);
+    // Verify matches the original public key
+    try std.testing.expectEqualSlices(u8, id_pub_key.?, public_key);
 }
 
-test "identify handler getSupportedProtocols uses config when provided" {
+test "identify handler getSupportedProtocols uses config" {
     const allocator = std.testing.allocator;
-    const quic_transport = libp2p.transport.quic;
 
-    // Minimal setup for sync method test
-    var loop: io_loop.ThreadEventLoop = undefined;
-    try loop.init(allocator);
-    defer {
-        loop.close();
-        loop.deinit();
-    }
-
-    var host_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
-    defer host_key.deinit();
-
-    var transport: quic_transport.QuicTransport = undefined;
-    try transport.init(&loop, &host_key, keys.KeyType.ED25519, allocator);
-
-    var network_switch: swarm.Switch = undefined;
-    network_switch.init(allocator, &transport);
-    defer {
-        network_switch.stop();
-        network_switch.deinit();
-    }
-
-    // Handler with explicit protocols in config
+    // Handler with explicit protocols in config (no transport/switch needed)
     const expected_protocols = &[_][]const u8{ "/test/proto/1.0", "/test/proto/2.0" };
-    var handler = IdentifyProtocolHandler.initWithConfig(allocator, &network_switch, .{
+    var handler = IdentifyProtocolHandler.init(allocator, .{
         .supported_protocols = expected_protocols,
     });
     defer handler.deinit();
 
-    var protocols_list = try handler.getSupportedProtocols(allocator);
-    defer protocols_list.deinit(allocator);
+    const protocols_list = handler.builder.getSupportedProtocols();
 
     // Verify count AND content
-    try std.testing.expectEqual(@as(usize, 2), protocols_list.items.len);
-    try std.testing.expectEqualStrings("/test/proto/1.0", protocols_list.items[0]);
-    try std.testing.expectEqualStrings("/test/proto/2.0", protocols_list.items[1]);
+    try std.testing.expectEqual(@as(usize, 2), protocols_list.len);
+    try std.testing.expectEqualStrings("/test/proto/1.0", protocols_list[0]);
+    try std.testing.expectEqualStrings("/test/proto/2.0", protocols_list[1]);
 }
 
 test "identify push handler initialization and config" {
     // Tests IdentifyPushHandler can be initialized and configured correctly.
     // This is a unit test - no network traffic involved.
     const allocator = std.testing.allocator;
-    const quic_transport = libp2p.transport.quic;
-
-    // Minimal setup for unit test
-    var loop: io_loop.ThreadEventLoop = undefined;
-    try loop.init(allocator);
-    defer {
-        loop.close();
-        loop.deinit();
-    }
-
-    var host_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
-    defer host_key.deinit();
-
-    var transport: quic_transport.QuicTransport = undefined;
-    try transport.init(&loop, &host_key, keys.KeyType.ED25519, allocator);
-
-    var network_switch: swarm.Switch = undefined;
-    network_switch.init(allocator, &transport);
-    defer {
-        network_switch.stop();
-        network_switch.deinit();
-    }
 
     // Verify protocol ID constant is correct
     try std.testing.expectEqualStrings("/ipfs/id/push/1.0.0", protocol_push_id);
 
-    // Test handler with config
+    // Test handler with pre-built config (no transport/switch needed)
     const expected_protocols = &[_][]const u8{ "/push/proto/1.0", "/push/proto/2.0" };
-    var handler = IdentifyPushHandler.initWithConfig(allocator, &network_switch, .{
+    const test_public_key = "test-public-key-bytes";
+    var handler = IdentifyPushHandler.init(allocator, .{
         .protocol_version = "push/1.0.0",
         .agent_version = "zig-push/0.1.0",
+        .public_key = test_public_key,
         .supported_protocols = expected_protocols,
     });
     defer handler.deinit();
 
-    // Verify handler can access public key through switch
-    const pub_key = try handler.getPublicKeyBytes(allocator);
-    defer allocator.free(pub_key);
-    try std.testing.expect(pub_key.len > 0);
+    // Verify handler returns public key from config
+    const pub_key = handler.builder.getPublicKey();
+    try std.testing.expect(pub_key != null);
+    try std.testing.expect(pub_key.?.len > 0);
+    try std.testing.expectEqualSlices(u8, test_public_key, pub_key.?);
 
     // Verify config protocols are returned
-    var protocols_list = try handler.getSupportedProtocols(allocator);
-    defer protocols_list.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), protocols_list.items.len);
-    try std.testing.expectEqualStrings("/push/proto/1.0", protocols_list.items[0]);
-    try std.testing.expectEqualStrings("/push/proto/2.0", protocols_list.items[1]);
+    const protocols_list = handler.builder.getSupportedProtocols();
+    try std.testing.expectEqual(@as(usize, 2), protocols_list.len);
+    try std.testing.expectEqualStrings("/push/proto/1.0", protocols_list[0]);
+    try std.testing.expectEqualStrings("/push/proto/2.0", protocols_list[1]);
 }
