@@ -383,7 +383,7 @@ pub fn main() !void {
         switcher.deinit();
     }
 
-    var ping_handler = ping.PingProtocolHandler.init(allocator, &switcher);
+    var ping_handler = ping.PingProtocolHandler.init(allocator, &loop);
     defer ping_handler.deinit();
     try switcher.addProtocolHandler(ping.protocol_id, ping_handler.any());
 
