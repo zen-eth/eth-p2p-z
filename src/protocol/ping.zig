@@ -1,10 +1,14 @@
 const std = @import("std");
+const stream_util = @import("../util/stream.zig");
+
+const readExact = stream_util.readExact;
+const writeAll = stream_util.writeAll;
 
 /// Protocol identifier for libp2p ping.
 pub const id = "/ipfs/ping/1.0.0";
 
 /// Length of a ping payload in bytes.
-pub const payload_length: usize = 32;
+pub const payload_length: u32 = 32;
 
 pub const Error = error{
     UnexpectedEof,
@@ -31,58 +35,9 @@ pub fn handleOutbound(stream: anytype, payload: *const [payload_length]u8) Error
     }
 }
 
-fn readExact(stream: anytype, buf: []u8) !void {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = try stream.read(buf[total..]);
-        if (n == 0) return error.UnexpectedEof;
-        total += n;
-    }
-}
-
-fn writeAll(stream: anytype, data: []const u8) !void {
-    var total: usize = 0;
-    while (total < data.len) {
-        const n = try stream.write(data[total..]);
-        if (n == 0) return error.BrokenPipe;
-        total += n;
-    }
-}
-
 // --- Tests ---
 
-const MockStream = struct {
-    read_buf: []const u8,
-    read_pos: usize = 0,
-    write_buf: std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-
-    fn init(allocator: std.mem.Allocator, read_data: []const u8) MockStream {
-        return .{
-            .read_buf = read_data,
-            .write_buf = .empty,
-            .allocator = allocator,
-        };
-    }
-
-    fn deinit(self: *MockStream) void {
-        self.write_buf.deinit(self.allocator);
-    }
-
-    pub fn read(self: *MockStream, buf: []u8) !usize {
-        if (self.read_pos >= self.read_buf.len) return 0;
-        const available = self.read_buf.len - self.read_pos;
-        const to_read = @min(buf.len, available);
-        @memcpy(buf[0..to_read], self.read_buf[self.read_pos..][0..to_read]);
-        self.read_pos += to_read;
-        return to_read;
-    }
-
-    pub fn write(self: *MockStream, data: []const u8) !usize {
-        try self.write_buf.appendSlice(self.allocator, data);
-        return data.len;
-    }
-};
+const MockStream = stream_util.MockStream;
 
 test "handleInbound echoes payload" {
     const allocator = std.testing.allocator;
@@ -100,7 +55,7 @@ test "handleInbound echoes payload" {
 test "handleInbound returns error on short read" {
     const allocator = std.testing.allocator;
 
-    const short_payload = [_]u8{0x42} ** 16; // Only 16 bytes, need 32
+    const short_payload = [_]u8{0x42} ** 16;
     var stream = MockStream.init(allocator, &short_payload);
     defer stream.deinit();
 
@@ -122,7 +77,6 @@ test "handleOutbound succeeds with matching echo" {
 test "handleOutbound detects payload mismatch" {
     const allocator = std.testing.allocator;
 
-    // Respond with wrong data
     const wrong_response = [_]u8{0x00} ** payload_length;
     var stream = MockStream.init(allocator, &wrong_response);
     defer stream.deinit();

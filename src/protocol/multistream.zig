@@ -1,10 +1,13 @@
 const std = @import("std");
+const stream_util = @import("../util/stream.zig");
+
+const writeAll = stream_util.writeAll;
 
 pub const protocol_id = "/multistream/1.0.0";
 const message_suffix = "\n";
 const na_response = "na";
-const max_message_length = 1024;
-const max_varint_bytes = 9;
+const max_message_length: u32 = 1024;
+const max_varint_bytes: u32 = 9;
 
 pub const Error = error{
     ProtocolIdTooLong,
@@ -17,12 +20,12 @@ pub const Error = error{
 };
 
 /// Write a multistream-select message: length-prefixed, newline-terminated.
-fn writeMessage(stream: anytype, msg: []const u8) !void {
-    var len_buf: [10]u8 = undefined;
+fn writeMessage(stream: anytype, msg: []const u8) Error!void {
+    var len_buf: [max_varint_bytes + 1]u8 = undefined;
     const len_bytes = encodeUvarint(msg.len + 1, &len_buf);
-    try writeAllGeneric(stream, len_buf[0..len_bytes]);
-    try writeAllGeneric(stream, msg);
-    try writeAllGeneric(stream, message_suffix);
+    writeAll(stream, len_buf[0..len_bytes]) catch return Error.UnexpectedEof;
+    writeAll(stream, msg) catch return Error.UnexpectedEof;
+    writeAll(stream, message_suffix) catch return Error.UnexpectedEof;
 }
 
 /// Read a multistream-select message: length-prefixed, newline-terminated.
@@ -62,7 +65,7 @@ pub fn negotiateOutbound(
 ) Error![]const u8 {
     var buf: [max_message_length]u8 = undefined;
 
-    writeMessage(stream, protocol_id) catch return Error.UnexpectedEof;
+    try writeMessage(stream, protocol_id);
 
     const header = try readMessage(stream, &buf);
     if (!std.mem.eql(u8, header, protocol_id)) {
@@ -70,7 +73,7 @@ pub fn negotiateOutbound(
     }
 
     for (proposed_protocols) |proto| {
-        writeMessage(stream, proto) catch return Error.UnexpectedEof;
+        try writeMessage(stream, proto);
         const response = try readMessage(stream, &buf);
         if (std.mem.eql(u8, response, proto)) {
             return proto;
@@ -92,23 +95,24 @@ pub fn negotiateInbound(
         return Error.FirstLineShouldBeMultistream;
     }
 
-    writeMessage(stream, protocol_id) catch return Error.UnexpectedEof;
+    try writeMessage(stream, protocol_id);
 
     while (true) {
         const proposal = try readMessage(stream, &buf);
 
         for (supported_protocols) |supported| {
             if (std.mem.eql(u8, proposal, supported)) {
-                writeMessage(stream, supported) catch return Error.UnexpectedEof;
+                try writeMessage(stream, supported);
                 return supported;
             }
         }
 
-        writeMessage(stream, na_response) catch return Error.UnexpectedEof;
+        try writeMessage(stream, na_response);
     }
 }
 
 fn encodeUvarint(value: usize, buf: []u8) usize {
+    std.debug.assert(buf.len >= max_varint_bytes + 1);
     var v = value;
     var i: usize = 0;
     while (v >= 0x80) : (i += 1) {
@@ -119,19 +123,12 @@ fn encodeUvarint(value: usize, buf: []u8) usize {
     return i + 1;
 }
 
-fn writeAllGeneric(stream: anytype, data: []const u8) !void {
-    var total: usize = 0;
-    while (total < data.len) {
-        const n = try stream.write(data[total..]);
-        if (n == 0) return error.BrokenPipe;
-        total += n;
-    }
-}
-
 // --- Tests ---
 
-test "encodeUvarint" {
-    var buf: [10]u8 = undefined;
+const MockStream = stream_util.MockStream;
+
+test "encodeUvarint multi-byte" {
+    var buf: [max_varint_bytes + 1]u8 = undefined;
     const n = encodeUvarint(300, &buf);
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqual(@as(u8, 0xAC), buf[0]);
@@ -139,50 +136,17 @@ test "encodeUvarint" {
 }
 
 test "encodeUvarint single byte" {
-    var buf: [10]u8 = undefined;
+    var buf: [max_varint_bytes + 1]u8 = undefined;
     const n = encodeUvarint(21, &buf);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u8, 21), buf[0]);
 }
 
-const MockStream = struct {
-    read_buf: []const u8,
-    read_pos: usize = 0,
-    write_buf: std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-
-    fn init(allocator: std.mem.Allocator, read_data: []const u8) MockStream {
-        return .{
-            .read_buf = read_data,
-            .write_buf = .empty,
-            .allocator = allocator,
-        };
-    }
-
-    fn deinit(self: *MockStream) void {
-        self.write_buf.deinit(self.allocator);
-    }
-
-    pub fn read(self: *MockStream, buf: []u8) !usize {
-        if (self.read_pos >= self.read_buf.len) return 0;
-        const available = self.read_buf.len - self.read_pos;
-        const to_read = @min(buf.len, available);
-        @memcpy(buf[0..to_read], self.read_buf[self.read_pos..][0..to_read]);
-        self.read_pos += to_read;
-        return to_read;
-    }
-
-    pub fn write(self: *MockStream, data: []const u8) !usize {
-        try self.write_buf.appendSlice(self.allocator, data);
-        return data.len;
-    }
-};
-
 fn encodeMessage(allocator: std.mem.Allocator, msg: []const u8) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
-    var len_buf: [10]u8 = undefined;
+    var len_buf: [max_varint_bytes + 1]u8 = undefined;
     const len_bytes = encodeUvarint(msg.len + 1, &len_buf);
     try out.appendSlice(allocator, len_buf[0..len_bytes]);
     try out.appendSlice(allocator, msg);
