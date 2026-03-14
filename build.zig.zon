@@ -1,61 +1,11 @@
 .{
-    // This is the default name used by packages depending on this one. For
-    // example, when a user runs `zig fetch --save <url>`, this field is used
-    // as the key in the `dependencies` table. Although the user can choose a
-    // different name, most users will stick with this provided value.
-    //
-    // It is redundant to include "zig" in this name because it is already
-    // within the Zig package namespace.
     .name = .libp2p,
-
-    // This is a [Semantic Version](https://semver.org/).
-    // In a future version of Zig it will be used for package deduplication.
     .version = "0.1.0",
-
     .fingerprint = 0x227d092b880b3d4a,
-
-    // This field is optional.
-    // This is currently advisory only; Zig does not yet do anything
-    // with this value.
-    //.minimum_zig_version = "0.11.0",
-
-    // This field is optional.
-    // Each dependency must either provide a `url` and `hash`, or a `path`.
-    // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
-    // Once all dependencies are fetched, `zig build` no longer requires
-    // internet connectivity.
-    .dependencies = .{
-        .zmultiformats = .{
-            .url = "git+https://github.com/zen-eth/multiformats-zig#ddf4f0af34ce8f87c2dc7df73a261738c3868093",
-            .hash = "zmultiformats-0.1.0-yjvchohoBADALnCylBLeQF7Vn0SKULmQ_sFOrhzgmvQO",
-        },
-        .gremlin = .{
-            .url = "git+https://github.com/norma-core/gremlin.zig#4f6922f66b191b145dc3146dfc344c2498a57ea0",
-            .hash = "gremlin-0.1.0-E2s91STHEQAvlGGPBw_vUYNiA_YkGanSINVKpc2oqJw1",
-        },
-        .lsquic = .{
-            .url = "git+https://github.com/zen-eth/lsquic.git?ref=anshalshukla/zig-0.15.2-upgrade#87391b162a9d05053bd256fadf716bc7ced1ce63",
-            .hash = "lsquic-0.0.0-jO7gdogfAAD9odKzV7c3R5ewa2LrX-73Kh6B5GJgS7Rh",
-        },
-        .cache = .{
-            .url = "git+https://github.com/karlseguin/cache.zig#9f3329b05b3e98da928fe9988d74971da70328b4",
-            .hash = "cache-0.0.0-winRwKaSAAAKIcUzY8IXwcbH050imeWPFMbPW_sCdPLF",
-        },
-        .secp256k1 = .{
-            .url = "git+https://github.com/blockblaz/libsecp256k1-zig#518a1370b66c6b575b4831c4a1a182f5b30b3d75",
-            .hash = "secp256k1-0.0.3-vtxi58DhAABoPpDgG3wagaDXiHHIDezLOPE0BI4V0bDS",
-        },
-        .multiaddr = .{
-            .url = "git+https://github.com/zen-eth/multiaddr-zig#1f2493ad75870e98befe64fd54f642b023c82190",
-            .hash = "multiaddr-0.1.0-Cjayds-5AAArNw0ghMgquaRygVf7-kEWQJlQGjVpZzZ0",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
     },
 }
