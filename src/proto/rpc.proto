@@ -29,6 +29,14 @@ message ControlMessage {
 	repeated ControlGraft graft = 3;
 	repeated ControlPrune prune = 4;
 	repeated ControlIDontWant idontwant = 5;
+	optional ControlExtensions extensions = 6;
+}
+
+// v1.3: Extensions control message.
+// Sent as the first message on a new stream to declare supported extensions.
+// MUST NOT be sent more than once per stream. Peers MUST ignore unknown extensions.
+message ControlExtensions {
+	optional bool partialMessages = 10;
 }
 
 message ControlIHave {

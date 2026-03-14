@@ -465,6 +465,7 @@ const ControlMessageWire = struct {
     const GRAFT_WIRE: gremlin.ProtoWireNumber = 3;
     const PRUNE_WIRE: gremlin.ProtoWireNumber = 4;
     const IDONTWANT_WIRE: gremlin.ProtoWireNumber = 5;
+    const EXTENSIONS_WIRE: gremlin.ProtoWireNumber = 6;
 };
 pub const ControlMessage = struct {
     // fields
@@ -473,6 +474,7 @@ pub const ControlMessage = struct {
     graft: ?[]const ?ControlGraft = null,
     prune: ?[]const ?ControlPrune = null,
     idontwant: ?[]const ?ControlIDontWant = null,
+    extensions: ?ControlExtensions = null,
     pub fn calcProtobufSize(self: *const ControlMessage) usize {
         var res: usize = 0;
         if (self.ihave) |arr| {
@@ -528,6 +530,12 @@ pub const ControlMessage = struct {
                 } else {
                     res += gremlin.sizes.sizeUsize(0);
                 }
+            }
+        }
+        if (self.extensions) |v| {
+            const size = v.calcProtobufSize();
+            if (size > 0) {
+                res += gremlin.sizes.sizeWireNumber(ControlMessageWire.EXTENSIONS_WIRE) + gremlin.sizes.sizeUsize(size) + size;
             }
         }
         return res;
@@ -598,6 +606,13 @@ pub const ControlMessage = struct {
                 }
             }
         }
+        if (self.extensions) |v| {
+            const size = v.calcProtobufSize();
+            if (size > 0) {
+                target.appendBytesTag(ControlMessageWire.EXTENSIONS_WIRE, size);
+                v.encodeTo(target);
+            }
+        }
     }
 };
 pub const ControlMessageReader = struct {
@@ -617,6 +632,7 @@ pub const ControlMessageReader = struct {
     _idontwant_offset: ?usize = null,
     _idontwant_last_offset: ?usize = null,
     _idontwant_cnt: usize = 0,
+    _extensions_buf: ?[]const u8 = null,
     pub fn init(src: []const u8) gremlin.Error!ControlMessageReader {
         const buf = gremlin.Reader.init(src);
         var res = ControlMessageReader{ .buf = buf };
@@ -672,6 +688,11 @@ pub const ControlMessageReader = struct {
                     }
                     res._idontwant_last_offset = offset;
                     res._idontwant_cnt += 1;
+                },
+                ControlMessageWire.EXTENSIONS_WIRE => {
+                    const result = try buf.readBytes(offset);
+                    offset += result.size;
+                    res._extensions_buf = result.value;
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
@@ -822,6 +843,74 @@ pub const ControlMessageReader = struct {
         }
         self._idontwant_offset = null;
         return msg;
+    }
+    pub fn getExtensions(self: *const ControlMessageReader) gremlin.Error!ControlExtensionsReader {
+        if (self._extensions_buf) |buf| {
+            return try ControlExtensionsReader.init(buf);
+        }
+        return try ControlExtensionsReader.init(&[_]u8{});
+    }
+};
+const ControlExtensionsWire = struct {
+    const PARTIAL_MESSAGES_WIRE: gremlin.ProtoWireNumber = 10;
+};
+pub const ControlExtensions = struct {
+    // fields
+    partial_messages: bool = false,
+    pub fn calcProtobufSize(self: *const ControlExtensions) usize {
+        var res: usize = 0;
+        if (self.partial_messages != false) {
+            res += gremlin.sizes.sizeWireNumber(ControlExtensionsWire.PARTIAL_MESSAGES_WIRE) + gremlin.sizes.sizeBool(self.partial_messages);
+        }
+        return res;
+    }
+    pub fn encode(self: *const ControlExtensions, allocator: std.mem.Allocator) gremlin.Error![]const u8 {
+        const size = self.calcProtobufSize();
+        if (size == 0) {
+            return &[_]u8{};
+        }
+        const buf = try allocator.alloc(u8, self.calcProtobufSize());
+        var writer = gremlin.Writer.init(buf);
+        self.encodeTo(&writer);
+        return buf;
+    }
+    pub fn encodeTo(self: *const ControlExtensions, target: *gremlin.Writer) void {
+        if (self.partial_messages != false) {
+            target.appendBool(ControlExtensionsWire.PARTIAL_MESSAGES_WIRE, self.partial_messages);
+        }
+    }
+};
+pub const ControlExtensionsReader = struct {
+    buf: gremlin.Reader,
+    _partial_messages: bool = false,
+    pub fn init(src: []const u8) gremlin.Error!ControlExtensionsReader {
+        const buf = gremlin.Reader.init(src);
+        var res = ControlExtensionsReader{ .buf = buf };
+        if (buf.buf.len == 0) {
+            return res;
+        }
+        var offset: usize = 0;
+        while (buf.hasNext(offset, 0)) {
+            const tag = try buf.readTagAt(offset);
+            offset += tag.size;
+            switch (tag.number) {
+                ControlExtensionsWire.PARTIAL_MESSAGES_WIRE => {
+                    const result = try buf.readBool(offset);
+                    offset += result.size;
+                    res._partial_messages = result.value;
+                },
+                else => {
+                    offset = try buf.skipData(offset, tag.wire);
+                },
+            }
+        }
+        return res;
+    }
+    pub fn sourceBytes(self: *const @This()) []const u8 {
+        return self.buf.buf;
+    }
+    pub inline fn getPartialMessages(self: *const ControlExtensionsReader) bool {
+        return self._partial_messages;
     }
 };
 const ControlIHaveWire = struct {
