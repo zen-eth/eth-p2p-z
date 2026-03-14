@@ -16,17 +16,9 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    const libxev_backend_opt = b.option([]const u8, "libxev-backend", "Select libxev backend (io_uring, epoll, kqueue, wasi_poll, iocp)");
     const log_level_opt = b.option([]const u8, "log-level", "Set std.log level (debug, info, warn, err)");
     const build_options = b.addOptions();
-    build_options.addOption(?[]const u8, "libxev_backend", libxev_backend_opt);
     build_options.addOption(?[]const u8, "log_level", log_level_opt);
-
-    const libxev_dep = b.dependency("libxev", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const libxev_module = libxev_dep.module("xev");
 
     const zmultiformats_dep = b.dependency("zmultiformats", .{
         .target = target,
@@ -88,7 +80,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    root_module.addImport("xev", libxev_module);
     root_module.addOptions("build_options", build_options);
     root_module.addImport("multiformats", zmultiformats_module);
     root_module.addImport("multiaddr", multiaddr_module);
@@ -120,7 +111,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_module.addIncludePath(lsquic_dep.path("include"));
-    exe_module.addImport("xev", libxev_module);
     exe_module.addOptions("build_options", build_options);
     exe_module.addImport("multiformats", zmultiformats_module);
     exe_module.addImport("multiaddr", multiaddr_module);
@@ -146,7 +136,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     interop_module.addIncludePath(lsquic_dep.path("include"));
-    interop_module.addImport("xev", libxev_module);
     interop_module.addOptions("build_options", build_options);
     interop_module.addImport("multiformats", zmultiformats_module);
     interop_module.addImport("multiaddr", multiaddr_module);
@@ -218,7 +207,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_test_module.addIncludePath(lsquic_dep.path("include"));
-    exe_test_module.addImport("xev", libxev_module);
     exe_test_module.addOptions("build_options", build_options);
     exe_test_module.addImport("multiformats", zmultiformats_module);
     exe_test_module.addImport("multiaddr", multiaddr_module);
