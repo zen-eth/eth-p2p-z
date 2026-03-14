@@ -4,15 +4,13 @@ const std = @import("std");
 /// Supports both .Slice (fixed-size, externally owned buffer) and .Dynamic (allocator-backed, growable) modes.
 pub fn LinearFifo(comptime T: type, comptime buffer_type: BufferType) type {
     return struct {
-        const Self = @This();
-
         buf: []T,
         head: usize = 0,
         count: usize = 0,
         allocator: if (buffer_type == .Dynamic) std.mem.Allocator else void =
             if (buffer_type == .Dynamic) undefined else {},
 
-        pub fn init(arg: if (buffer_type == .Dynamic) std.mem.Allocator else []T) Self {
+        pub fn init(arg: if (buffer_type == .Dynamic) std.mem.Allocator else []T) @This() {
             if (buffer_type == .Dynamic) {
                 return .{ .buf = &.{}, .head = 0, .count = 0, .allocator = arg };
             } else {
@@ -20,7 +18,7 @@ pub fn LinearFifo(comptime T: type, comptime buffer_type: BufferType) type {
             }
         }
 
-        pub fn deinit(self: *Self) void {
+        pub fn deinit(self: *@This()) void {
             if (buffer_type == .Dynamic) {
                 if (self.buf.len > 0) {
                     self.allocator.free(self.buf);
@@ -29,16 +27,17 @@ pub fn LinearFifo(comptime T: type, comptime buffer_type: BufferType) type {
             self.* = undefined;
         }
 
-        pub fn readableLength(self: *const Self) usize {
+        pub fn readableLength(self: *const @This()) usize {
             return self.count;
         }
 
-        pub fn readableSlice(self: *const Self, offset: usize) []const T {
+        pub fn readableSlice(self: *const @This(), offset: usize) []const T {
+            std.debug.assert(offset <= self.count);
             const start = self.head + offset;
             return self.buf[start .. start + self.count - offset];
         }
 
-        pub fn read(self: *Self, dest: []T) usize {
+        pub fn read(self: *@This(), dest: []T) usize {
             const n = @min(dest.len, self.count);
             @memcpy(dest[0..n], self.buf[self.head .. self.head + n]);
             self.head += n;
@@ -46,13 +45,13 @@ pub fn LinearFifo(comptime T: type, comptime buffer_type: BufferType) type {
             return n;
         }
 
-        pub fn discard(self: *Self, num: usize) void {
+        pub fn discard(self: *@This(), num: usize) void {
             const n = @min(num, self.count);
             self.head += n;
             self.count -= n;
         }
 
-        pub fn unget(self: *Self, data: []const T) !void {
+        pub fn unget(self: *@This(), data: []const T) !void {
             if (self.head < data.len) {
                 if (buffer_type == .Dynamic) {
                     try self.ensureCapacity(self.count + data.len);
@@ -68,7 +67,7 @@ pub fn LinearFifo(comptime T: type, comptime buffer_type: BufferType) type {
             self.count += data.len;
         }
 
-        pub fn write(self: *Self, data: []const T) !void {
+        pub fn write(self: *@This(), data: []const T) !void {
             const end = self.head + self.count;
             if (end + data.len > self.buf.len) {
                 if (self.count > 0 and self.head > 0) {
@@ -88,14 +87,12 @@ pub fn LinearFifo(comptime T: type, comptime buffer_type: BufferType) type {
             self.count += data.len;
         }
 
-        fn ensureCapacity(self: *Self, needed: usize) !void {
+        fn ensureCapacity(self: *@This(), needed: usize) !void {
             if (buffer_type != .Dynamic) return;
             if (self.buf.len >= needed) return;
             var new_cap = if (self.buf.len == 0) @as(usize, 64) else self.buf.len;
             while (new_cap < needed) {
-                new_cap = std.math.mul(usize, new_cap, 2) catch return {
-                    break;
-                };
+                new_cap = std.math.mul(usize, new_cap, 2) catch return error.OutOfMemory;
             }
             const new_buf = try self.allocator.alloc(T, new_cap);
             if (self.count > 0) {

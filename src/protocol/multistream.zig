@@ -1,9 +1,10 @@
 const std = @import("std");
 
-pub const PROTOCOL_ID = "/multistream/1.0.0";
-const MESSAGE_SUFFIX = "\n";
-const NA = "na";
-const MAX_MESSAGE_LENGTH = 1024;
+pub const protocol_id = "/multistream/1.0.0";
+const message_suffix = "\n";
+const na_response = "na";
+const max_message_length = 1024;
+const max_varint_bytes = 9;
 
 pub const Error = error{
     ProtocolIdTooLong,
@@ -17,42 +18,39 @@ pub const Error = error{
 
 /// Write a multistream-select message: length-prefixed, newline-terminated.
 fn writeMessage(stream: anytype, msg: []const u8) !void {
-    // Write varint length (msg + newline)
     var len_buf: [10]u8 = undefined;
     const len_bytes = encodeUvarint(msg.len + 1, &len_buf);
     try writeAllGeneric(stream, len_buf[0..len_bytes]);
     try writeAllGeneric(stream, msg);
-    try writeAllGeneric(stream, MESSAGE_SUFFIX);
+    try writeAllGeneric(stream, message_suffix);
 }
 
 /// Read a multistream-select message: length-prefixed, newline-terminated.
-fn readMessage(stream: anytype, buf: []u8) ![]const u8 {
-    // Read varint length
+fn readMessage(stream: anytype, buf: []u8) Error![]const u8 {
     var len: usize = 0;
-    var shift: u6 = 0;
-    while (true) {
+    var bytes_read: usize = 0;
+    while (bytes_read < max_varint_bytes) : (bytes_read += 1) {
         var byte_buf: [1]u8 = undefined;
-        const n = try stream.read(&byte_buf);
+        const n = stream.read(&byte_buf) catch return Error.UnexpectedEof;
         if (n == 0) return Error.UnexpectedEof;
         const b = byte_buf[0];
+        const shift: u6 = std.math.cast(u6, bytes_read * 7) orelse return Error.InvalidLength;
         len |= @as(usize, b & 0x7f) << shift;
         if (b & 0x80 == 0) break;
-        shift +|= 7;
-        if (shift >= 64) return Error.InvalidLength;
+    } else {
+        return Error.InvalidLength;
     }
 
-    if (len == 0 or len > MAX_MESSAGE_LENGTH) return Error.InvalidLength;
+    if (len == 0 or len > max_message_length) return Error.InvalidLength;
     if (len > buf.len) return Error.ProtocolIdTooLong;
 
-    // Read exactly `len` bytes
     var total: usize = 0;
     while (total < len) {
-        const n = try stream.read(buf[total..len]);
+        const n = stream.read(buf[total..len]) catch return Error.UnexpectedEof;
         if (n == 0) return Error.UnexpectedEof;
         total += n;
     }
 
-    // Verify and strip newline suffix
     if (buf[len - 1] != '\n') return Error.InvalidMultistreamSuffix;
     return buf[0 .. len - 1];
 }
@@ -61,26 +59,22 @@ fn readMessage(stream: anytype, buf: []u8) ![]const u8 {
 pub fn negotiateOutbound(
     stream: anytype,
     proposed_protocols: []const []const u8,
-) ![]const u8 {
-    var buf: [MAX_MESSAGE_LENGTH]u8 = undefined;
+) Error![]const u8 {
+    var buf: [max_message_length]u8 = undefined;
 
-    // Send multistream header
-    try writeMessage(stream, PROTOCOL_ID);
+    writeMessage(stream, protocol_id) catch return Error.UnexpectedEof;
 
-    // Read multistream header response
     const header = try readMessage(stream, &buf);
-    if (!std.mem.eql(u8, header, PROTOCOL_ID)) {
+    if (!std.mem.eql(u8, header, protocol_id)) {
         return Error.FirstLineShouldBeMultistream;
     }
 
-    // Propose each protocol until one is accepted
     for (proposed_protocols) |proto| {
-        try writeMessage(stream, proto);
+        writeMessage(stream, proto) catch return Error.UnexpectedEof;
         const response = try readMessage(stream, &buf);
         if (std.mem.eql(u8, response, proto)) {
-            return proto; // Accepted!
+            return proto;
         }
-        // "na" means rejected, try next
     }
 
     return Error.AllProposedProtocolsRejected;
@@ -90,31 +84,27 @@ pub fn negotiateOutbound(
 pub fn negotiateInbound(
     stream: anytype,
     supported_protocols: []const []const u8,
-) ![]const u8 {
-    var buf: [MAX_MESSAGE_LENGTH]u8 = undefined;
+) Error![]const u8 {
+    var buf: [max_message_length]u8 = undefined;
 
-    // Read multistream header
     const header = try readMessage(stream, &buf);
-    if (!std.mem.eql(u8, header, PROTOCOL_ID)) {
+    if (!std.mem.eql(u8, header, protocol_id)) {
         return Error.FirstLineShouldBeMultistream;
     }
 
-    // Send multistream header
-    try writeMessage(stream, PROTOCOL_ID);
+    writeMessage(stream, protocol_id) catch return Error.UnexpectedEof;
 
-    // Process proposals
     while (true) {
         const proposal = try readMessage(stream, &buf);
 
         for (supported_protocols) |supported| {
             if (std.mem.eql(u8, proposal, supported)) {
-                try writeMessage(stream, supported);
+                writeMessage(stream, supported) catch return Error.UnexpectedEof;
                 return supported;
             }
         }
 
-        // Reject unsupported protocol
-        try writeMessage(stream, NA);
+        writeMessage(stream, na_response) catch return Error.UnexpectedEof;
     }
 }
 
@@ -155,12 +145,9 @@ test "encodeUvarint single byte" {
     try std.testing.expectEqual(@as(u8, 21), buf[0]);
 }
 
-/// A mock stream backed by two fixed buffers, used for testing multistream negotiation.
 const MockStream = struct {
-    /// Data to be returned by read() calls — simulates incoming data from a remote peer.
     read_buf: []const u8,
     read_pos: usize = 0,
-    /// Data written via write() calls — captures outgoing data.
     write_buf: std.ArrayList(u8),
     allocator: std.mem.Allocator,
 
@@ -186,12 +173,11 @@ const MockStream = struct {
     }
 
     pub fn write(self: *MockStream, data: []const u8) !usize {
-        self.write_buf.appendSlice(self.allocator, data) catch return error.BrokenPipe;
+        try self.write_buf.appendSlice(self.allocator, data);
         return data.len;
     }
 };
 
-/// Encode a multistream message (varint length + payload + newline) into a buffer.
 fn encodeMessage(allocator: std.mem.Allocator, msg: []const u8) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -207,8 +193,7 @@ fn encodeMessage(allocator: std.mem.Allocator, msg: []const u8) ![]const u8 {
 test "negotiateOutbound succeeds on first protocol" {
     const allocator = std.testing.allocator;
 
-    // Build the responder's replies: multistream header + accepted protocol
-    const header_msg = try encodeMessage(allocator, PROTOCOL_ID);
+    const header_msg = try encodeMessage(allocator, protocol_id);
     defer allocator.free(header_msg);
     const proto_msg = try encodeMessage(allocator, "/ipfs/ping/1.0.0");
     defer allocator.free(proto_msg);
@@ -227,10 +212,9 @@ test "negotiateOutbound succeeds on first protocol" {
 test "negotiateOutbound falls back to second protocol" {
     const allocator = std.testing.allocator;
 
-    // Built responder replies: header + na (reject first) + accept second
-    const header_msg = try encodeMessage(allocator, PROTOCOL_ID);
+    const header_msg = try encodeMessage(allocator, protocol_id);
     defer allocator.free(header_msg);
-    const na_msg = try encodeMessage(allocator, NA);
+    const na_msg = try encodeMessage(allocator, na_response);
     defer allocator.free(na_msg);
     const proto_msg = try encodeMessage(allocator, "/ipfs/id/1.0.0");
     defer allocator.free(proto_msg);
@@ -249,9 +233,9 @@ test "negotiateOutbound falls back to second protocol" {
 test "negotiateOutbound all rejected" {
     const allocator = std.testing.allocator;
 
-    const header_msg = try encodeMessage(allocator, PROTOCOL_ID);
+    const header_msg = try encodeMessage(allocator, protocol_id);
     defer allocator.free(header_msg);
-    const na_msg = try encodeMessage(allocator, NA);
+    const na_msg = try encodeMessage(allocator, na_response);
     defer allocator.free(na_msg);
 
     const read_data = try std.mem.concat(allocator, u8, &.{ header_msg, na_msg });
@@ -268,8 +252,7 @@ test "negotiateOutbound all rejected" {
 test "negotiateInbound accepts supported protocol" {
     const allocator = std.testing.allocator;
 
-    // Build the initiator's messages: header + protocol proposal
-    const header_msg = try encodeMessage(allocator, PROTOCOL_ID);
+    const header_msg = try encodeMessage(allocator, protocol_id);
     defer allocator.free(header_msg);
     const proto_msg = try encodeMessage(allocator, "/ipfs/ping/1.0.0");
     defer allocator.free(proto_msg);
@@ -283,4 +266,14 @@ test "negotiateInbound accepts supported protocol" {
     const supported = [_][]const u8{"/ipfs/ping/1.0.0"};
     const result = try negotiateInbound(&stream, &supported);
     try std.testing.expectEqualStrings("/ipfs/ping/1.0.0", result);
+}
+
+test "readMessage rejects overlong varint" {
+    const bad_varint = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80 };
+    var stream = MockStream.init(std.testing.allocator, &bad_varint);
+    defer stream.deinit();
+
+    var buf: [max_message_length]u8 = undefined;
+    const result = readMessage(&stream, &buf);
+    try std.testing.expectError(Error.InvalidLength, result);
 }

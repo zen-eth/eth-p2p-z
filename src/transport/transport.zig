@@ -132,33 +132,19 @@ test "assertTransportInterface catches missing types" {
     _ = BadTransport;
 }
 
-test "AnyStream wrap and dispatch" {
+test "AnyStream wrap creates valid vtable" {
     const MockStream = struct {
-        read_called: bool = false,
-        write_called: bool = false,
-        close_called: bool = false,
-
-        pub fn read(self: *@This(), _: *std.Io, buf: []u8) anyerror!usize {
-            self.read_called = true;
-            buf[0] = 42;
+        pub fn read(_: *@This(), _: *std.Io, _: []u8) anyerror!usize {
             return 1;
         }
-        pub fn write(self: *@This(), _: *std.Io, _: []const u8) anyerror!usize {
-            self.write_called = true;
+        pub fn write(_: *@This(), _: *std.Io, _: []const u8) anyerror!usize {
             return 5;
         }
-        pub fn close(self: *@This(), _: *std.Io) void {
-            self.close_called = true;
-        }
+        pub fn close(_: *@This(), _: *std.Io) void {}
     };
 
     var mock = MockStream{};
     const any = AnyStream.wrap(MockStream, &mock);
-
-    const buf: [1]u8 = undefined;
-    // Note: We can't pass null for io in real code, but for mock testing
-    // the mock ignores the io parameter
-    _ = any;
-    _ = buf;
-    // Full test requires std.Io instance — deferred to integration tests
+    // Verify ptr was set correctly
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&mock)), any.ptr);
 }
