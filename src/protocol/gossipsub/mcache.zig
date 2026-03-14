@@ -12,6 +12,14 @@ pub fn defaultMsgId(allocator: std.mem.Allocator, msg: *const rpc.Message) error
     return std.mem.concat(allocator, u8, &.{ msg.from orelse "", msg.seqno orelse "" });
 }
 
+/// A message stored in the cache with a single contiguous backing buffer.
+/// All slices in `message` point into `backing`. Freeing `backing` releases
+/// all field data in one allocation.
+const StoredMessage = struct {
+    message: rpc.Message,
+    backing: []u8,
+};
+
 /// Sliding-window message cache for GossipSub.
 ///
 /// Messages are stored in a map for fast lookup and tracked in a sliding
@@ -20,9 +28,16 @@ pub fn defaultMsgId(allocator: std.mem.Allocator, msg: *const rpc.Message) error
 ///
 /// The first `gossip_window_count` windows are included in IHAVE gossip.
 /// On each `shift()`, windows slide right and the oldest window is evicted.
+///
+/// ## Allocation strategy
+///
+/// Each stored message uses a single contiguous backing buffer for all field
+/// data (from, seqno, topic, data, signature, key). This reduces allocations
+/// per `put()` from 7 to 2 (message ID + backing buffer) and makes `shift()`
+/// eviction cheaper with only 2 frees per message.
 pub const MessageCache = struct {
     allocator: std.mem.Allocator,
-    msgs: std.StringHashMap(rpc.Message),
+    msgs: std.StringHashMap(StoredMessage),
     peertx: std.StringHashMap(PeerTransmissionMap),
     history: std.ArrayList(?std.ArrayList(CacheEntry)),
     gossip_window_count: u32,
@@ -61,7 +76,7 @@ pub const MessageCache = struct {
 
         return MessageCache{
             .allocator = allocator,
-            .msgs = std.StringHashMap(rpc.Message).init(allocator),
+            .msgs = std.StringHashMap(StoredMessage).init(allocator),
             .peertx = std.StringHashMap(PeerTransmissionMap).init(allocator),
             .history = history,
             .gossip_window_count = gossip_window_count,
@@ -70,15 +85,13 @@ pub const MessageCache = struct {
     }
 
     pub fn deinit(self: *MessageCache) void {
-        // Clean up messages (reverse of: msgs populated in put/putWithId)
         var msgs_iter = self.msgs.iterator();
         while (msgs_iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            freeMessage(self.allocator, &entry.value_ptr.*);
+            self.allocator.free(entry.value_ptr.backing);
         }
         self.msgs.deinit();
 
-        // Clean up peer transmission maps (reverse of: peertx populated in getForPeer)
         var peertx_iter = self.peertx.iterator();
         while (peertx_iter.next()) |entry| {
             var peer_map = entry.value_ptr.*;
@@ -90,7 +103,6 @@ pub const MessageCache = struct {
         }
         self.peertx.deinit();
 
-        // Clean up history windows (reverse of: history allocated in init)
         for (self.history.items) |maybe_window| {
             if (maybe_window) |w| {
                 var window = w;
@@ -116,18 +128,18 @@ pub const MessageCache = struct {
             return Error.DuplicateMessage;
         }
 
-        const cloned_msg = cloneMessage(self.allocator, msg) catch {
+        const stored = cloneMessage(self.allocator, msg) catch {
             _ = self.msgs.fetchRemove(mid);
             self.allocator.free(mid);
             return error.OutOfMemory;
         };
 
-        gop.value_ptr.* = cloned_msg;
+        gop.value_ptr.* = stored;
         gop.key_ptr.* = mid;
 
-        const topic = cloned_msg.topic orelse {
+        const topic = stored.message.topic orelse {
             _ = self.msgs.fetchRemove(mid);
-            freeMessage(self.allocator, &cloned_msg);
+            self.allocator.free(stored.backing);
             self.allocator.free(mid);
             return Error.MissingTopic;
         };
@@ -137,7 +149,7 @@ pub const MessageCache = struct {
             .topic = topic,
         }) catch {
             _ = self.msgs.fetchRemove(mid);
-            freeMessage(self.allocator, &cloned_msg);
+            self.allocator.free(stored.backing);
             self.allocator.free(mid);
             return error.OutOfMemory;
         };
@@ -150,23 +162,23 @@ pub const MessageCache = struct {
             return Error.DuplicateMessage;
         }
 
-        const cloned_msg = cloneMessage(self.allocator, msg) catch {
+        const stored = cloneMessage(self.allocator, msg) catch {
             _ = self.msgs.fetchRemove(mid);
             return error.OutOfMemory;
         };
 
         const cloned_key = self.allocator.dupe(u8, mid) catch {
             _ = self.msgs.fetchRemove(mid);
-            freeMessage(self.allocator, &cloned_msg);
+            self.allocator.free(stored.backing);
             return error.OutOfMemory;
         };
 
-        gop.value_ptr.* = cloned_msg;
+        gop.value_ptr.* = stored;
         gop.key_ptr.* = cloned_key;
 
-        const topic = cloned_msg.topic orelse {
+        const topic = stored.message.topic orelse {
             _ = self.msgs.fetchRemove(cloned_key);
-            freeMessage(self.allocator, &cloned_msg);
+            self.allocator.free(stored.backing);
             self.allocator.free(cloned_key);
             return Error.MissingTopic;
         };
@@ -176,7 +188,7 @@ pub const MessageCache = struct {
             .topic = topic,
         }) catch {
             _ = self.msgs.fetchRemove(cloned_key);
-            freeMessage(self.allocator, &cloned_msg);
+            self.allocator.free(stored.backing);
             self.allocator.free(cloned_key);
             return error.OutOfMemory;
         };
@@ -184,13 +196,14 @@ pub const MessageCache = struct {
 
     /// Look up a message by ID.
     pub fn get(self: *MessageCache, mid: []const u8) ?*rpc.Message {
-        return self.msgs.getPtr(mid);
+        const stored = self.msgs.getPtr(mid) orelse return null;
+        return &stored.message;
     }
 
     /// Look up a message and track per-peer transmission count.
     /// Returns null if the message is not found.
     pub fn getForPeer(self: *MessageCache, mid: []const u8, peer_id: []const u8) !?struct { msg: *rpc.Message, count: i32 } {
-        const msg = self.msgs.getPtr(mid) orelse return null;
+        const stored = self.msgs.getPtr(mid) orelse return null;
 
         const tx_result = try self.peertx.getOrPut(self.msgs.getKey(mid).?);
         if (!tx_result.found_existing) {
@@ -204,7 +217,7 @@ pub const MessageCache = struct {
         }
         peer_result.value_ptr.* += 1;
 
-        return .{ .msg = msg, .count = peer_result.value_ptr.* };
+        return .{ .msg = &stored.message, .count = peer_result.value_ptr.* };
     }
 
     /// Return message IDs from the gossip windows for a given topic.
@@ -235,7 +248,7 @@ pub const MessageCache = struct {
             for (last_window.items) |entry| {
                 if (self.msgs.fetchRemove(entry.mid)) |*kv| {
                     self.allocator.free(kv.key);
-                    freeMessage(self.allocator, &kv.value);
+                    self.allocator.free(kv.value.backing);
                 }
 
                 if (self.peertx.fetchRemove(entry.mid)) |*kv| {
@@ -262,41 +275,50 @@ pub const MessageCache = struct {
     }
 };
 
-fn freeMessage(allocator: std.mem.Allocator, msg: *const rpc.Message) void {
-    if (msg.from) |from| allocator.free(from);
-    if (msg.seqno) |seqno| allocator.free(seqno);
-    if (msg.topic) |topic| allocator.free(topic);
-    if (msg.data) |data| allocator.free(data);
-    if (msg.signature) |sig| allocator.free(sig);
-    if (msg.key) |key| allocator.free(key);
+/// Clone a message into a single contiguous backing buffer.
+/// Returns a StoredMessage where all slice fields point into the backing buffer.
+/// Only 1 allocation for all field data.
+fn cloneMessage(allocator: std.mem.Allocator, msg: *const rpc.Message) error{OutOfMemory}!StoredMessage {
+    // Calculate total size needed
+    var total_len: usize = 0;
+    if (msg.from) |f| total_len += f.len;
+    if (msg.seqno) |s| total_len += s.len;
+    if (msg.topic) |t| total_len += t.len;
+    if (msg.data) |d| total_len += d.len;
+    if (msg.signature) |s| total_len += s.len;
+    if (msg.key) |k| total_len += k.len;
+
+    const backing = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+
+    const from = if (msg.from) |f| copyField(backing, &offset, f) else null;
+    const seqno = if (msg.seqno) |s| copyField(backing, &offset, s) else null;
+    const topic = if (msg.topic) |t| copyField(backing, &offset, t) else null;
+    const data = if (msg.data) |d| copyField(backing, &offset, d) else null;
+    const signature = if (msg.signature) |s| copyField(backing, &offset, s) else null;
+    const key = if (msg.key) |k| copyField(backing, &offset, k) else null;
+
+    std.debug.assert(offset == total_len);
+
+    return .{
+        .message = .{
+            .from = from,
+            .seqno = seqno,
+            .topic = topic,
+            .data = data,
+            .signature = signature,
+            .key = key,
+        },
+        .backing = backing,
+    };
 }
 
-fn cloneMessage(allocator: std.mem.Allocator, msg: *const rpc.Message) error{OutOfMemory}!rpc.Message {
-    const from = if (msg.from) |f| try allocator.dupe(u8, f) else null;
-    errdefer if (from) |f| allocator.free(f);
-
-    const seqno = if (msg.seqno) |s| try allocator.dupe(u8, s) else null;
-    errdefer if (seqno) |s| allocator.free(s);
-
-    const topic = if (msg.topic) |t| try allocator.dupe(u8, t) else null;
-    errdefer if (topic) |t| allocator.free(t);
-
-    const data = if (msg.data) |d| try allocator.dupe(u8, d) else null;
-    errdefer if (data) |d| allocator.free(d);
-
-    const signature = if (msg.signature) |s| try allocator.dupe(u8, s) else null;
-    errdefer if (signature) |s| allocator.free(s);
-
-    const key = if (msg.key) |k| try allocator.dupe(u8, k) else null;
-
-    return rpc.Message{
-        .from = from,
-        .seqno = seqno,
-        .topic = topic,
-        .data = data,
-        .signature = signature,
-        .key = key,
-    };
+/// Copy a field into the backing buffer at the current offset, returning a slice into it.
+inline fn copyField(backing: []u8, offset: *usize, source: []const u8) []const u8 {
+    const start = offset.*;
+    @memcpy(backing[start..][0..source.len], source);
+    offset.* = start + source.len;
+    return backing[start..][0..source.len];
 }
 
 // --- Tests ---
@@ -307,33 +329,22 @@ fn createTestMessage(
     seqno: []const u8,
     topic: []const u8,
     data: []const u8,
-) error{OutOfMemory}!rpc.Message {
-    const from_d = try allocator.dupe(u8, from);
-    errdefer allocator.free(from_d);
-
-    const seqno_d = try allocator.dupe(u8, seqno);
-    errdefer allocator.free(seqno_d);
-
-    const topic_d = try allocator.dupe(u8, topic);
-    errdefer allocator.free(topic_d);
-
-    const data_d = try allocator.dupe(u8, data);
-
-    return rpc.Message{
-        .from = from_d,
-        .seqno = seqno_d,
-        .topic = topic_d,
-        .data = data_d,
+) error{OutOfMemory}!StoredMessage {
+    return cloneMessage(allocator, &.{
+        .from = from,
+        .seqno = seqno,
+        .topic = topic,
+        .data = data,
         .signature = null,
         .key = null,
-    };
+    });
 }
 
-fn freeTestMessage(allocator: std.mem.Allocator, msg: *const rpc.Message) void {
-    freeMessage(allocator, msg);
+fn freeTestMessage(allocator: std.mem.Allocator, stored: *const StoredMessage) void {
+    allocator.free(stored.backing);
 }
 
-fn makeTestMessage(allocator: std.mem.Allocator, n: usize) !rpc.Message {
+fn makeTestMessage(allocator: std.mem.Allocator, n: usize) !StoredMessage {
     var seqno_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &seqno_bytes, @intCast(n), .big);
 
@@ -399,13 +410,13 @@ test "MessageCache put and get" {
     var cache = try MessageCache.init(allocator, 3, 5, defaultMsgId);
     defer cache.deinit();
 
-    var msg = try createTestMessage(allocator, "peer1", "seq1", "topic-a", "hello");
-    defer freeTestMessage(allocator, &msg);
+    var stored = try createTestMessage(allocator, "peer1", "seq1", "topic-a", "hello");
+    defer freeTestMessage(allocator, &stored);
 
-    try cache.put(&msg);
+    try cache.put(&stored.message);
     try std.testing.expectEqual(@as(u32, 1), cache.msgs.count());
 
-    const mid = try defaultMsgId(allocator, &msg);
+    const mid = try defaultMsgId(allocator, &stored.message);
     defer allocator.free(mid);
     const retrieved = cache.get(mid);
     try std.testing.expect(retrieved != null);
@@ -418,13 +429,13 @@ test "MessageCache rejects duplicate" {
     var cache = try MessageCache.init(allocator, 3, 5, defaultMsgId);
     defer cache.deinit();
 
-    var msg1 = try createTestMessage(allocator, "peer1", "seq1", "topic-a", "hello");
-    defer freeTestMessage(allocator, &msg1);
-    var msg2 = try createTestMessage(allocator, "peer1", "seq1", "topic-a", "world");
-    defer freeTestMessage(allocator, &msg2);
+    var s1 = try createTestMessage(allocator, "peer1", "seq1", "topic-a", "hello");
+    defer freeTestMessage(allocator, &s1);
+    var s2 = try createTestMessage(allocator, "peer1", "seq1", "topic-a", "world");
+    defer freeTestMessage(allocator, &s2);
 
-    try cache.put(&msg1);
-    const result = cache.put(&msg2);
+    try cache.put(&s1.message);
+    const result = cache.put(&s2.message);
     try std.testing.expectError(MessageCache.Error.DuplicateMessage, result);
     try std.testing.expectEqual(@as(u32, 1), cache.msgs.count());
 }
@@ -435,11 +446,11 @@ test "MessageCache getForPeer tracks transmission count" {
     var cache = try MessageCache.init(allocator, 3, 5, defaultMsgId);
     defer cache.deinit();
 
-    var msg = try createTestMessage(allocator, "peer1", "seq1", "topic-a", "hello");
-    defer freeTestMessage(allocator, &msg);
-    try cache.put(&msg);
+    var stored = try createTestMessage(allocator, "peer1", "seq1", "topic-a", "hello");
+    defer freeTestMessage(allocator, &stored);
+    try cache.put(&stored.message);
 
-    const mid = try defaultMsgId(allocator, &msg);
+    const mid = try defaultMsgId(allocator, &stored.message);
     defer allocator.free(mid);
 
     const r1 = try cache.getForPeer(mid, "peerA");
@@ -469,16 +480,16 @@ test "MessageCache getGossipIDs filters by topic" {
     var cache = try MessageCache.init(allocator, 2, 5, defaultMsgId);
     defer cache.deinit();
 
-    var msg1 = try createTestMessage(allocator, "p1", "s1", "topic-a", "d1");
-    defer freeTestMessage(allocator, &msg1);
-    var msg2 = try createTestMessage(allocator, "p2", "s2", "topic-b", "d2");
-    defer freeTestMessage(allocator, &msg2);
-    var msg3 = try createTestMessage(allocator, "p3", "s3", "topic-a", "d3");
-    defer freeTestMessage(allocator, &msg3);
+    var s1 = try createTestMessage(allocator, "p1", "s1", "topic-a", "d1");
+    defer freeTestMessage(allocator, &s1);
+    var s2 = try createTestMessage(allocator, "p2", "s2", "topic-b", "d2");
+    defer freeTestMessage(allocator, &s2);
+    var s3 = try createTestMessage(allocator, "p3", "s3", "topic-a", "d3");
+    defer freeTestMessage(allocator, &s3);
 
-    try cache.put(&msg1);
-    try cache.put(&msg2);
-    try cache.put(&msg3);
+    try cache.put(&s1.message);
+    try cache.put(&s2.message);
+    try cache.put(&s3.message);
 
     const ids = try cache.getGossipIDs("topic-a");
     defer allocator.free(ids);
@@ -491,9 +502,9 @@ test "MessageCache shift evicts oldest window" {
     var cache = try MessageCache.init(allocator, 2, 3, defaultMsgId);
     defer cache.deinit();
 
-    var msg = try createTestMessage(allocator, "p1", "s1", "topic-a", "d1");
-    defer freeTestMessage(allocator, &msg);
-    try cache.put(&msg);
+    var stored = try createTestMessage(allocator, "p1", "s1", "topic-a", "d1");
+    defer freeTestMessage(allocator, &stored);
+    try cache.put(&stored.message);
 
     try std.testing.expectEqual(@as(u32, 1), cache.msgs.count());
 
@@ -532,23 +543,60 @@ test "MessageCache memory management" {
         defer cache.deinit();
 
         for (0..10) |i| {
-            var msg = try makeTestMessage(allocator, i);
-            defer freeTestMessage(allocator, &msg);
-            try cache.put(&msg);
+            var stored = try makeTestMessage(allocator, i);
+            defer freeTestMessage(allocator, &stored);
+            try cache.put(&stored.message);
         }
 
         for (0..5) |_| {
             cache.shift();
         }
 
-        var test_msg = try createTestMessage(allocator, "test", "test", "test", "test");
-        defer freeTestMessage(allocator, &test_msg);
-        try cache.put(&test_msg);
+        var test_stored = try createTestMessage(allocator, "test", "test", "test", "test");
+        defer freeTestMessage(allocator, &test_stored);
+        try cache.put(&test_stored.message);
 
-        const mid = try defaultMsgId(allocator, &test_msg);
+        const mid = try defaultMsgId(allocator, &test_stored.message);
         defer allocator.free(mid);
 
         _ = try cache.getForPeer(mid, "peer1");
         _ = try cache.getForPeer(mid, "peer2");
     }
+}
+
+test "cloneMessage uses single backing buffer" {
+    const allocator = std.testing.allocator;
+
+    const stored = try cloneMessage(allocator, &.{
+        .from = "alice",
+        .seqno = "0001",
+        .topic = "chat",
+        .data = "hello world",
+        .signature = "sig",
+        .key = "pubkey",
+    });
+    defer allocator.free(stored.backing);
+
+    // All fields should point into the single backing buffer
+    const backing_start = @intFromPtr(stored.backing.ptr);
+    const backing_end = backing_start + stored.backing.len;
+
+    inline for (.{ stored.message.from, stored.message.seqno, stored.message.topic, stored.message.data, stored.message.signature, stored.message.key }) |maybe_field| {
+        if (maybe_field) |field| {
+            const field_start = @intFromPtr(field.ptr);
+            try std.testing.expect(field_start >= backing_start);
+            try std.testing.expect(field_start + field.len <= backing_end);
+        }
+    }
+
+    // Verify content
+    try std.testing.expectEqualStrings("alice", stored.message.from.?);
+    try std.testing.expectEqualStrings("0001", stored.message.seqno.?);
+    try std.testing.expectEqualStrings("chat", stored.message.topic.?);
+    try std.testing.expectEqualStrings("hello world", stored.message.data.?);
+    try std.testing.expectEqualStrings("sig", stored.message.signature.?);
+    try std.testing.expectEqualStrings("pubkey", stored.message.key.?);
+
+    // Total backing = 5 + 4 + 4 + 11 + 3 + 6 = 33 bytes, 1 allocation
+    try std.testing.expectEqual(@as(usize, 33), stored.backing.len);
 }
