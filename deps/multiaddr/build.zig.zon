@@ -1,0 +1,23 @@
+.{
+    .name = .multiaddr,
+
+    .fingerprint = 0x94ccdcfa76b2360a,
+
+    .version = "0.1.0",
+
+    .minimum_zig_version = "0.15.2",
+
+    .dependencies = .{
+        .zmultiformats = .{
+            .path = "../zmultiformats",
+        },
+        .peer_id = .{
+            .path = "../peer_id",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

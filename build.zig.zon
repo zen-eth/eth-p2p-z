@@ -6,6 +6,15 @@
         .secp256k1 = .{
             .path = "deps/secp256k1",
         },
+        .lsquic = .{
+            .path = "deps/lsquic",
+        },
+        .multiaddr = .{
+            .path = "deps/multiaddr",
+        },
+        .gremlin = .{
+            .path = "deps/gremlin",
+        },
     },
     .paths = .{
         "build.zig",
