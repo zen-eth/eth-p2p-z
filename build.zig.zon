@@ -9,6 +9,9 @@
         .lsquic = .{
             .path = "deps/lsquic",
         },
+        .boringssl = .{
+            .path = "deps/boringssl",
+        },
         .multiaddr = .{
             .path = "deps/multiaddr",
         },

@@ -11,14 +11,17 @@ pub fn build(b: *std.Build) void {
     });
     const secp_module = secp_dep.module("secp256k1");
 
-    // NOTE: lsquic dependency deferred until QUIC transport (Phase 2)
-    // const lsquic_dep = b.dependency("lsquic", .{
-    //     .target = target,
-    //     .optimize = optimize,
-    // });
-    // NOTE: lsquic artifact and include path deferred until QUIC transport (Phase 2)
-    // const lsquic_artifact = lsquic_dep.artifact("lsquic");
-    // root_module.addIncludePath(lsquic_dep.path("include"));
+    const lsquic_dep = b.dependency("lsquic", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const lsquic_artifact = lsquic_dep.artifact("lsquic");
+
+    const boringssl_dep = b.dependency("boringssl", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ssl_module = boringssl_dep.module("ssl");
 
     const multiaddr_dep = b.dependency("multiaddr", .{
         .target = target,
@@ -51,7 +54,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     root_module.addImport("secp256k1", secp_module);
-    // root_module.addImport("ssl", ssl_module);  // deferred until identity.zig is ported
+    root_module.addImport("ssl", ssl_module);
     root_module.addImport("multiaddr", multiaddr_module);
     root_module.addImport("peer_id", peer_id_module);
     root_module.addImport("gremlin", gremlin_module);
@@ -61,13 +64,13 @@ pub fn build(b: *std.Build) void {
         .root_module = root_module,
         .linkage = .static,
     });
-    // NOTE: lsquic/zlib linking deferred until QUIC transport is implemented (Phase 2)
-    // libp2p_lib.root_module.linkLibrary(lsquic_artifact);
-    // const zlib_system_name = switch (target.result.os.tag) {
-    //     .windows => "zlib1",
-    //     else => "z",
-    // };
-    // libp2p_lib.root_module.linkSystemLibrary(zlib_system_name, .{});
+    libp2p_lib.root_module.linkLibrary(lsquic_artifact);
+    libp2p_lib.root_module.addIncludePath(lsquic_dep.path("include"));
+    const zlib_system_name = switch (target.result.os.tag) {
+        .windows => "zlib1",
+        else => "z",
+    };
+    libp2p_lib.root_module.linkSystemLibrary(zlib_system_name, .{});
     b.installArtifact(libp2p_lib);
 
     const filters = b.option([]const []const u8, "filter", "filter based on name");
@@ -76,9 +79,9 @@ pub fn build(b: *std.Build) void {
         .root_module = root_module,
         .filters = filters orelse &.{},
     });
-    // NOTE: lsquic/zlib linking deferred until QUIC transport is implemented (Phase 2)
-    // libp2p_lib_unit_tests.root_module.linkLibrary(lsquic_artifact);
-    // libp2p_lib_unit_tests.root_module.linkSystemLibrary(zlib_system_name, .{});
+    libp2p_lib_unit_tests.root_module.linkLibrary(lsquic_artifact);
+    libp2p_lib_unit_tests.root_module.addIncludePath(lsquic_dep.path("include"));
+    libp2p_lib_unit_tests.root_module.linkSystemLibrary(zlib_system_name, .{});
     libp2p_lib_unit_tests.step.dependOn(&protobuf.step);
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
 

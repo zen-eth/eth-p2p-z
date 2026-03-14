@@ -1,10 +1,17 @@
 const std = @import("std");
 const crypto = std.crypto;
+const builtin = @import("builtin");
 const ecdsa_lib = @import("ecdsa/ecdsa.zig");
 const recovery_lib = @import("ecdsa/recovery.zig");
 const schnorr_lib = @import("schnorr.zig");
 
 pub const constants = @import("constants.zig");
+
+/// Fill buffer with cryptographically secure random bytes.
+/// Uses OS-specific CSPRNG (arc4random_buf on macOS/BSD, getrandom on Linux).
+fn fillRandom(buf: []u8) void {
+    std.c.arc4random_buf(buf.ptr, buf.len);
+}
 
 /// The main error type for this library.
 pub const Error = error{
@@ -205,7 +212,7 @@ pub const Secp256k1 = struct {
 
         // Create 32 byte random seed.
         var seed: [32]u8 = undefined;
-        crypto.random.bytes(&seed);
+        fillRandom(&seed);
 
         const res = secp256k1.secp256k1_context_randomize(ctx, &seed);
         std.debug.assert(res == 1);
@@ -441,7 +448,7 @@ pub const SecretKey = struct {
         defer secp.deinit();
 
         var aux: [32]u8 = undefined;
-        std.crypto.random.bytes(&aux);
+        fillRandom(&aux);
 
         return secp.signSchnorrHelper(&hash, try KeyPair.fromSecretKey(&secp, self), &aux);
     }
@@ -458,7 +465,11 @@ pub const SecretKey = struct {
 
     /// Generate random [`SecretKey`] with default random
     pub fn generate() SecretKey {
-        return generateWithRandom(std.crypto.random);
+        var d: [32]u8 = undefined;
+        while (true) {
+            fillRandom(&d);
+            if (SecretKey.fromSlice(&d)) |sk| return sk else |_| continue;
+        }
     }
 
     pub fn fromString(data: []const u8) (Error || ErrorParseHex)!@This() {

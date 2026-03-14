@@ -73,12 +73,60 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(libssl);
 
+    // Use a wrapper header that disables _Pragma macros before including ssl.h.
+    // Zig's translate-c cannot handle _Pragma() in macro expansions.
     const ssl_translate = b.addTranslateC(.{
-        .root_source_file = ssl_source.path("include/openssl/ssl.h"),
+        .root_source_file = b.path("include/openssl/ssl_zig.h"),
         .target = target,
         .optimize = optimize,
     });
     ssl_translate.addIncludePath(ssl_source.path("include"));
+
+    // BoringSSL's target.h needs architecture-specific predefined macros that
+    // Zig's translate-c may not set. Define them based on the target.
+    const arch = target.result.cpu.arch;
+    switch (arch) {
+        .aarch64, .aarch64_be => {
+            if (arch == .aarch64) {
+                ssl_translate.defineCMacro("__AARCH64EL__", "1");
+            }
+            ssl_translate.defineCMacro("__aarch64__", "1");
+        },
+        .x86_64 => {
+            ssl_translate.defineCMacro("__x86_64", "1");
+            ssl_translate.defineCMacro("__x86_64__", "1");
+        },
+        .x86 => {
+            ssl_translate.defineCMacro("__i386__", "1");
+        },
+        .arm, .armeb => {
+            ssl_translate.defineCMacro("__ARMEL__", "1");
+        },
+        .riscv64 => {
+            ssl_translate.defineCMacro("__riscv", "1");
+            ssl_translate.defineCMacro("__SIZEOF_POINTER__", "8");
+        },
+        .riscv32 => {
+            ssl_translate.defineCMacro("__riscv", "1");
+            ssl_translate.defineCMacro("__SIZEOF_POINTER__", "4");
+        },
+        else => {},
+    }
+
+    // OS-specific defines for BoringSSL
+    const os_tag = target.result.os.tag;
+    if (os_tag.isDarwin()) {
+        ssl_translate.defineCMacro("__APPLE__", "1");
+    } else if (os_tag == .linux) {
+        ssl_translate.defineCMacro("__linux__", "1");
+    } else if (os_tag == .windows) {
+        ssl_translate.defineCMacro("_WIN32", "1");
+    }
+
+    // Prevent va_list typedef conflict between Zig's built-in stdarg.h
+    // and the macOS SDK's _va_list.h.
+    ssl_translate.defineCMacro("_VA_LIST_T", null);
+
     const ssl_mod = b.addModule("ssl", .{
         .root_source_file = ssl_translate.getOutput(),
         .target = target,
