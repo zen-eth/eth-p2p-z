@@ -4,11 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const secp_dep = b.dependency("secp256k1", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const secp_module = secp_dep.module("secp256k1");
+
     const root_module = b.addModule("zig-libp2p", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    root_module.addImport("secp256k1", secp_module);
 
     const libp2p_lib = b.addLibrary(.{
         .name = "zig-libp2p",

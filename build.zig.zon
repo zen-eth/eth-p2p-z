@@ -2,7 +2,11 @@
     .name = .libp2p,
     .version = "0.1.0",
     .fingerprint = 0x227d092b880b3d4a,
-    .dependencies = .{},
+    .dependencies = .{
+        .secp256k1 = .{
+            .path = "deps/secp256k1",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
