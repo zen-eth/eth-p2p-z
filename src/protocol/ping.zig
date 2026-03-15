@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const stream_util = @import("../util/stream.zig");
 
 const readExact = stream_util.readExact;
@@ -16,19 +17,21 @@ pub const Error = error{
 };
 
 /// Handle an inbound ping: read 32 bytes from the stream, echo them back.
-pub fn handleInbound(stream: anytype) Error!void {
+pub fn handleInbound(io: Io, stream: anytype, ctx: anytype) Error!void {
+    _ = ctx;
     var buf: [payload_length]u8 = undefined;
-    readExact(stream, &buf) catch return Error.UnexpectedEof;
-    writeAll(stream, &buf) catch return Error.UnexpectedEof;
+    readExact(io, stream, &buf) catch return Error.UnexpectedEof;
+    writeAll(io, stream, &buf) catch return Error.UnexpectedEof;
 }
 
 /// Handle an outbound ping: send the given payload, wait for echo, verify match.
-/// Caller provides the payload (typically 32 random bytes) and handles RTT measurement.
-pub fn handleOutbound(stream: anytype, payload: *const [payload_length]u8) Error!void {
-    writeAll(stream, payload) catch return Error.UnexpectedEof;
+/// Caller provides the payload via ctx.payload (typically 32 random bytes) and handles RTT measurement.
+pub fn handleOutbound(io: Io, stream: anytype, ctx: anytype) Error!void {
+    const payload = ctx.payload;
+    writeAll(io, stream, payload) catch return Error.UnexpectedEof;
 
     var response: [payload_length]u8 = undefined;
-    readExact(stream, &response) catch return Error.UnexpectedEof;
+    readExact(io, stream, &response) catch return Error.UnexpectedEof;
 
     if (!std.mem.eql(u8, payload, &response)) {
         return Error.PayloadMismatch;
@@ -46,7 +49,7 @@ test "handleInbound echoes payload" {
     var stream = MockStream.init(allocator, &payload);
     defer stream.deinit();
 
-    try handleInbound(&stream);
+    try handleInbound(undefined, &stream, .{});
 
     try std.testing.expectEqual(payload_length, stream.write_buf.items.len);
     try std.testing.expectEqualSlices(u8, &payload, stream.write_buf.items);
@@ -59,7 +62,7 @@ test "handleInbound returns error on short read" {
     var stream = MockStream.init(allocator, &short_payload);
     defer stream.deinit();
 
-    const result = handleInbound(&stream);
+    const result = handleInbound(undefined, &stream, .{});
     try std.testing.expectError(Error.UnexpectedEof, result);
 }
 
@@ -70,7 +73,7 @@ test "handleOutbound succeeds with matching echo" {
     var stream = MockStream.init(allocator, &payload);
     defer stream.deinit();
 
-    try handleOutbound(&stream, &payload);
+    try handleOutbound(undefined, &stream, .{ .payload = &payload });
     try std.testing.expectEqualSlices(u8, &payload, stream.write_buf.items);
 }
 
@@ -82,6 +85,6 @@ test "handleOutbound detects payload mismatch" {
     defer stream.deinit();
 
     const payload = [_]u8{0xFF} ** payload_length;
-    const result = handleOutbound(&stream, &payload);
+    const result = handleOutbound(undefined, &stream, .{ .payload = &payload });
     try std.testing.expectError(Error.PayloadMismatch, result);
 }
