@@ -14,8 +14,11 @@ pub const identity = @import("security/identity.zig");
 pub const tls = @import("security/tls.zig");
 pub const quic_engine = @import("transport/quic/engine.zig");
 pub const quic_transport = @import("transport/quic/quic.zig");
+pub const @"switch" = @import("switch.zig");
 
 // Re-export key types
+pub const Switch = @"switch".Switch;
+pub const SwitchConfig = @"switch".SwitchConfig;
 pub const AnyStream = transport.AnyStream;
 pub const ProtocolId = protocol.ProtocolId;
 

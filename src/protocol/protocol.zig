@@ -6,8 +6,8 @@ pub const ProtocolId = []const u8;
 /// Asserts at comptime that type P satisfies the Protocol interface.
 /// A Protocol must provide:
 ///   - pub const id: []const u8  (protocol identifier string)
-///   - pub fn handleInbound(io: *std.Io, stream: anytype, ctx: anytype) !void
-///   - pub fn handleOutbound(io: *std.Io, stream: anytype, ctx: anytype) !void
+///   - pub fn handleInbound(io: Io, stream: anytype, ctx: anytype) !void
+///   - pub fn handleOutbound(io: Io, stream: anytype, ctx: anytype) !void
 pub fn assertProtocolInterface(comptime P: type) void {
     if (!@hasDecl(P, "id")) {
         @compileError("Protocol '" ++ @typeName(P) ++ "' missing 'id' declaration");
