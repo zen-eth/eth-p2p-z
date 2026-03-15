@@ -1,11 +1,12 @@
 const std = @import("std");
+const Io = std.Io;
 
 /// Read exactly `buf.len` bytes from a stream.
 /// Returns `UnexpectedEof` if the stream ends before the buffer is filled.
-pub fn readExact(stream: anytype, buf: []u8) error{UnexpectedEof}!void {
+pub fn readExact(io: Io, stream: anytype, buf: []u8) error{UnexpectedEof}!void {
     var total: usize = 0;
     while (total < buf.len) {
-        const n = stream.read(buf[total..]) catch return error.UnexpectedEof;
+        const n = stream.read(io, buf[total..]) catch return error.UnexpectedEof;
         if (n == 0) return error.UnexpectedEof;
         total += n;
     }
@@ -13,10 +14,10 @@ pub fn readExact(stream: anytype, buf: []u8) error{UnexpectedEof}!void {
 
 /// Write all bytes to a stream.
 /// Returns `BrokenPipe` if the stream refuses data before all bytes are written.
-pub fn writeAll(stream: anytype, data: []const u8) error{BrokenPipe}!void {
+pub fn writeAll(io: Io, stream: anytype, data: []const u8) error{BrokenPipe}!void {
     var total: usize = 0;
     while (total < data.len) {
-        const n = stream.write(data[total..]) catch return error.BrokenPipe;
+        const n = stream.write(io, data[total..]) catch return error.BrokenPipe;
         if (n == 0) return error.BrokenPipe;
         total += n;
     }
@@ -43,7 +44,7 @@ pub const MockStream = struct {
         self.* = undefined;
     }
 
-    pub fn read(self: *MockStream, buf: []u8) error{}!usize {
+    pub fn read(self: *MockStream, _: Io, buf: []u8) error{}!usize {
         if (self.read_pos >= self.read_buf.len) return 0;
         const available = self.read_buf.len - self.read_pos;
         const to_read = @min(buf.len, available);
@@ -52,7 +53,7 @@ pub const MockStream = struct {
         return to_read;
     }
 
-    pub fn write(self: *MockStream, data: []const u8) error{OutOfMemory}!usize {
+    pub fn write(self: *MockStream, _: Io, data: []const u8) error{OutOfMemory}!usize {
         self.write_buf.appendSlice(self.allocator, data) catch return error.OutOfMemory;
         return data.len;
     }
@@ -64,7 +65,7 @@ test "readExact reads full buffer" {
     defer stream.deinit();
 
     var buf: [5]u8 = undefined;
-    try readExact(&stream, &buf);
+    try readExact(undefined, &stream, &buf);
     try std.testing.expectEqualStrings("hello", &buf);
 }
 
@@ -74,7 +75,7 @@ test "readExact returns error on short stream" {
     defer stream.deinit();
 
     var buf: [5]u8 = undefined;
-    const result = readExact(&stream, &buf);
+    const result = readExact(undefined, &stream, &buf);
     try std.testing.expectError(error.UnexpectedEof, result);
 }
 
@@ -82,7 +83,7 @@ test "writeAll writes all data" {
     var stream = MockStream.init(std.testing.allocator, &.{});
     defer stream.deinit();
 
-    try writeAll(&stream, "hello");
+    try writeAll(undefined, &stream, "hello");
     try std.testing.expectEqualStrings("hello", stream.write_buf.items);
 }
 
@@ -91,9 +92,9 @@ test "MockStream read returns 0 at end" {
     defer stream.deinit();
 
     var buf: [2]u8 = undefined;
-    const n = try stream.read(&buf);
+    const n = try stream.read(undefined, &buf);
     try std.testing.expectEqual(@as(usize, 2), n);
 
-    const n2 = try stream.read(&buf);
+    const n2 = try stream.read(undefined, &buf);
     try std.testing.expectEqual(@as(usize, 0), n2);
 }
