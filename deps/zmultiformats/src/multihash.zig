@@ -1,6 +1,7 @@
 const std = @import("std");
 const Multicodec = @import("multicodec.zig").Multicodec;
 const varint = @import("unsigned_varint.zig");
+const fbs = @import("fixed_buffer_stream.zig");
 const testing = std.testing;
 
 /// Multihash is a wrapper around a digest and a code.
@@ -96,8 +97,9 @@ pub fn Multihash(comptime S: usize) type {
 
         /// readBytes reads a Multihash from a byte slice.
         pub fn readBytes(bytes: []const u8) !Self {
-            var stream = std.io.fixedBufferStream(bytes);
-            return try Self.read(stream.reader());
+            var stream = fbs.fixedBufferStream(bytes);
+            var reader = stream.reader();
+            return try Self.read(&reader);
         }
 
         /// read reads a Multihash from a reader.
@@ -121,8 +123,9 @@ pub fn Multihash(comptime S: usize) type {
 
         /// toBytes converts the Multihash to a byte slice.
         pub fn toBytes(self: *const Self, dest: []u8) ![]const u8 {
-            var stream = std.io.fixedBufferStream(dest);
-            const written = try self.write(stream.writer());
+            var stream = fbs.fixedBufferStream(dest);
+            var writer = stream.writer();
+            const written = try self.write(&writer);
             return dest[0..written];
         }
     };
@@ -636,16 +639,18 @@ test "multihash serialization" {
     var mh = try Multihash(32).wrap(Multicodec.SHA2_256, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 });
 
     var buf: [100]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const written = try mh.write(fbs.writer());
+    var stream = fbs.fixedBufferStream(&buf);
+    var writer = stream.writer();
+    const written = try mh.write(&writer);
     try testing.expectEqual(written, expected_bytes.len);
     try testing.expectEqualSlices(u8, buf[0..written], &expected_bytes);
 }
 
 test "multihash deserialization" {
     const input = [_]u8{ 0x12, 0x0a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    var fbs = std.io.fixedBufferStream(&input);
-    var mh = try Multihash(32).read(fbs.reader());
+    var stream = fbs.fixedBufferStream(&input);
+    var reader = stream.reader();
+    var mh = try Multihash(32).read(&reader);
 
     try testing.expectEqual(mh.getCode().getCode(), 0x12);
     try testing.expectEqual(mh.getSize(), 10);

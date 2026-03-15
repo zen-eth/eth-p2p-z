@@ -6,6 +6,7 @@ const Multihash = multihash.Multihash;
 const varint = @import("unsigned_varint.zig");
 const multibase = @import("multibase.zig");
 const MultiBaseCodec = multibase.MultiBaseCodec;
+const fbs = @import("fixed_buffer_stream.zig");
 
 const IPFS_DELIMITER = "/ipfs/";
 
@@ -217,9 +218,9 @@ pub fn CID(comptime S: usize) type {
 
         /// Converts the CID to a byte slice.
         pub fn toBytes(self: *const Self, dest: []u8) ![]u8 {
-            var stream = std.io.fixedBufferStream(dest);
-
-            const written = try self.writeStream(stream.writer());
+            var stream = fbs.fixedBufferStream(dest);
+            var writer = stream.writer();
+            const written = try self.writeStream(&writer);
             return dest[0..written];
         }
 
@@ -263,8 +264,9 @@ pub fn CID(comptime S: usize) type {
         }
 
         pub fn fromBytes(bytes: []const u8) !Self {
-            var fbs = std.io.fixedBufferStream(bytes);
-            return try Self.readStream(fbs.reader());
+            var stream = fbs.fixedBufferStream(bytes);
+            var reader = stream.reader();
+            return try Self.readStream(&reader);
         }
 
         pub fn fromString(codec: MultiBaseCodec, dest: []u8, cid_str: []const u8) !Self {
@@ -365,8 +367,9 @@ test CID {
         const bytes = try original.toBytes(buffer);
         defer allocator.free(buffer);
 
-        var fbs = std.io.fixedBufferStream(bytes);
-        const decoded = try CID(32).readStream(fbs.reader());
+        var stream = fbs.fixedBufferStream(bytes);
+        var reader = stream.reader();
+        const decoded = try CID(32).readStream(&reader);
 
         try testing.expect(original.isEqual(&decoded));
     }

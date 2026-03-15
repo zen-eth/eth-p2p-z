@@ -21,6 +21,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const zlib_dep = b.dependency("zlib", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zlib = zlib_dep.artifact("z");
+
     const ssl = boringssl.artifact("ssl");
     const crypto = boringssl.artifact("crypto");
 
@@ -88,6 +94,7 @@ pub fn build(b: *std.Build) void {
     lib.root_module.linkSystemLibrary("c", .{});
     lib.root_module.linkLibrary(ssl);
     lib.root_module.linkLibrary(crypto);
+    lib.root_module.linkLibrary(zlib);
 
     if (target.result.os.tag == .windows) {
         // Uncomment these when we have a windows test environment.

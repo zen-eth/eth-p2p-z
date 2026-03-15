@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const fbs = @import("fixed_buffer_stream.zig");
 
 /// VarintError represents an error that occurred during varint encoding or decoding.
 pub const VarintParseError = error{
@@ -239,18 +240,19 @@ test "specific_values" {
 }
 
 test "stream_identity" {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
 
     const numbers = [_]u64{ 1, 127, 128, 255, 300, 16384 };
 
     for (numbers) |n| {
         // Encode to stream
-        const written = try encodeStream(buf.writer(testing.allocator), u64, n);
+        var w = fbs.ArrayListWriter{ .list = &buf, .allocator = testing.allocator };
+        const written = try encodeStream(&w, u64, n);
         try testing.expectEqual(written, encode(u64, n, buf.items[0..]).len);
 
         // Decode from stream
-        var stream = std.io.fixedBufferStream(buf.items);
+        var stream = fbs.fixedBufferStream(buf.items);
         const decoded = try decodeStream(stream.reader(), u64);
 
         try testing.expectEqual(n, decoded);

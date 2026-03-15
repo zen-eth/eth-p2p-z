@@ -66,11 +66,6 @@ pub fn build(b: *std.Build) void {
     });
     libp2p_lib.root_module.linkLibrary(lsquic_artifact);
     libp2p_lib.root_module.addIncludePath(lsquic_dep.path("include"));
-    const zlib_system_name = switch (target.result.os.tag) {
-        .windows => "zlib1",
-        else => "z",
-    };
-    libp2p_lib.root_module.linkSystemLibrary(zlib_system_name, .{});
     b.installArtifact(libp2p_lib);
 
     const filters = b.option([]const []const u8, "filter", "filter based on name");
@@ -81,7 +76,6 @@ pub fn build(b: *std.Build) void {
     });
     libp2p_lib_unit_tests.root_module.linkLibrary(lsquic_artifact);
     libp2p_lib_unit_tests.root_module.addIncludePath(lsquic_dep.path("include"));
-    libp2p_lib_unit_tests.root_module.linkSystemLibrary(zlib_system_name, .{});
     libp2p_lib_unit_tests.step.dependOn(&protobuf.step);
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
 

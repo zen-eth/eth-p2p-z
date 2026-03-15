@@ -4,6 +4,44 @@ const multiformats = @import("multiformats");
 const uvarint = multiformats.uvarint;
 const PeerId = @import("peer-id").PeerId;
 
+/// Writer adapter for std.ArrayList(u8) that provides writeAll and print methods
+/// needed by Protocol.writeBytes and uvarint.encodeStream.
+const ArrayListWriter = struct {
+    list: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+
+    pub fn writeAll(self: *ArrayListWriter, data: []const u8) !void {
+        try self.list.appendSlice(self.allocator, data);
+    }
+
+    pub fn print(self: *ArrayListWriter, comptime fmt: []const u8, args: anytype) !void {
+        try std.fmt.format(self, fmt, args);
+    }
+
+    pub fn writeByteNTimes(self: *ArrayListWriter, byte: u8, n: usize) !void {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            try self.list.append(self.allocator, byte);
+        }
+    }
+};
+
+/// Writer adapter for a fixed buffer (replaces std.io.fixedBufferStream)
+const FixedBufferWriter = struct {
+    buf: []u8,
+    pos: usize = 0,
+
+    pub fn writeAll(self: *FixedBufferWriter, data: []const u8) !void {
+        if (self.pos + data.len > self.buf.len) return error.NoSpaceLeft;
+        @memcpy(self.buf[self.pos..][0..data.len], data);
+        self.pos += data.len;
+    }
+
+    pub fn getWritten(self: *const FixedBufferWriter) []const u8 {
+        return self.buf[0..self.pos];
+    }
+};
+
 pub const Error = error{
     DataLessThanLen,
     InvalidMultiaddr,
@@ -40,6 +78,22 @@ const QUIC_V1: u32 = 461;
 const P2P_CIRCUIT: u32 = 290;
 const WEBTRANSPORT: u32 = 465;
 
+pub const Ip4Addr = struct {
+    bytes: [4]u8,
+
+    pub fn init(bytes: [4]u8) Ip4Addr {
+        return .{ .bytes = bytes };
+    }
+};
+
+pub const Ip6Addr = struct {
+    bytes: [16]u8,
+
+    pub fn init(bytes: [16]u8) Ip6Addr {
+        return .{ .bytes = bytes };
+    }
+};
+
 pub const Protocol = union(enum) {
     Dccp: u16,
     Dns: []const u8,
@@ -48,8 +102,8 @@ pub const Protocol = union(enum) {
     Dnsaddr: []const u8,
     Http,
     Https,
-    Ip4: std.net.Ip4Address,
-    Ip6: std.net.Ip6Address,
+    Ip4: Ip4Addr,
+    Ip6: Ip6Addr,
     Tcp: u16,
     Udp: u16, // Added UDP protocol
     Unix: []const u8,
@@ -99,12 +153,12 @@ pub const Protocol = union(enum) {
         return switch (id) {
             IP4 => { // IP4
                 if (rest.len < 4) return Error.DataLessThanLen;
-                const addr = std.net.Ip4Address.init(rest[0..4].*, 0);
+                const addr = Ip4Addr{ .bytes = rest[0..4].* };
                 return .{ .proto = .{ .Ip4 = addr }, .rest = rest[4..] };
             },
             IP6 => { // IP6
                 if (rest.len < 16) return Error.DataLessThanLen;
-                const addr = std.net.Ip6Address.init(rest[0..16].*, 0, 0, 0);
+                const addr = Ip6Addr{ .bytes = rest[0..16].* };
                 return .{ .proto = .{ .Ip6 = addr }, .rest = rest[16..] };
             },
             TCP => { // TCP
@@ -206,13 +260,11 @@ pub const Protocol = union(enum) {
         switch (self) {
             .Ip4 => |addr| {
                 _ = try uvarint.encodeStream(writer, u32, IP4);
-                const bytes = std.mem.asBytes(&addr.sa.addr);
-                try writer.writeAll(bytes);
+                try writer.writeAll(&addr.bytes);
             },
             .Ip6 => |addr| {
                 _ = try uvarint.encodeStream(writer, u32, IP6);
-                const bytes = std.mem.asBytes(&addr.sa.addr);
-                try writer.writeAll(bytes);
+                try writer.writeAll(&addr.bytes);
             },
             .Tcp => |port| {
                 _ = try uvarint.encodeStream(writer, u32, TCP);
@@ -319,7 +371,7 @@ pub const Multiaddr = struct {
 
     pub fn init(allocator: std.mem.Allocator) Multiaddr {
         return .{
-            .bytes = .{},
+            .bytes = .empty,
             .allocator = allocator,
         };
     }
@@ -397,7 +449,8 @@ pub const Multiaddr = struct {
     }
 
     pub fn push(self: *Multiaddr, p: Protocol) !void {
-        try p.writeBytes(self.bytes.writer(self.allocator));
+        var writer = ArrayListWriter{ .list = &self.bytes, .allocator = self.allocator };
+        try p.writeBytes(&writer);
     }
 
     pub fn pop(self: *Multiaddr) !?Protocol {
@@ -493,15 +546,10 @@ pub const Multiaddr = struct {
                 .percent_encoded => |encoded| encoded,
             };
 
-            if (std.net.Address.parseIp(host, 0)) |ip| {
-                if (ip.any.family == std.posix.AF.INET) {
-                    const addr = @as([4]u8, @bitCast(ip.in.sa.addr));
-                    try ma.push(.{ .Ip4 = std.net.Ip4Address.init(addr, 0) });
-                } else if (ip.any.family == std.posix.AF.INET6) {
-                    const addr = @as([16]u8, @bitCast(ip.in6.sa.addr));
-                    try ma.push(.{ .Ip6 = std.net.Ip6Address.init(addr, 0, 0, 0) });
-                }
-            } else |_| {
+            var ip4_bytes: [4]u8 = undefined;
+            if (parseIp4Inline(host, &ip4_bytes)) {
+                try ma.push(.{ .Ip4 = Ip4Addr{ .bytes = ip4_bytes } });
+            } else {
                 try ma.push(.{ .Dns = host });
             }
         }
@@ -523,15 +571,10 @@ pub const Multiaddr = struct {
                 .percent_encoded => |encoded| encoded,
             };
 
-            if (std.net.Address.parseIp(host, 0)) |ip| {
-                if (ip.any.family == std.posix.AF.INET) {
-                    const addr = @as([4]u8, @bitCast(ip.in.sa.addr));
-                    try ma.push(.{ .Ip4 = std.net.Ip4Address.init(addr, 0) });
-                } else if (ip.any.family == std.posix.AF.INET6) {
-                    const addr = @as([16]u8, @bitCast(ip.in6.sa.addr));
-                    try ma.push(.{ .Ip6 = std.net.Ip6Address.init(addr, 0, 0, 0) });
-                }
-            } else |_| {
+            var ip4_bytes: [4]u8 = undefined;
+            if (parseIp4Inline(host, &ip4_bytes)) {
+                try ma.push(.{ .Ip4 = Ip4Addr{ .bytes = ip4_bytes } });
+            } else {
                 try ma.push(.{ .Dns = host });
             }
         }
@@ -580,50 +623,50 @@ pub const Multiaddr = struct {
     }
 
     pub fn toString(self: Multiaddr, allocator: std.mem.Allocator) ![]u8 {
-        var result: std.ArrayList(u8) = .{};
+        var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
+
+        var w = ArrayListWriter{ .list = &result, .allocator = allocator };
 
         var rest_bytes: []const u8 = self.bytes.items;
         while (rest_bytes.len > 0) {
             const decoded = try Protocol.fromBytes(rest_bytes);
             switch (decoded.proto) {
                 .Ip4 => |addr| {
-                    const bytes = @as([4]u8, @bitCast(addr.sa.addr));
-                    try result.writer(allocator).print("/ip4/{}.{}.{}.{}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
+                    try w.print("/ip4/{}.{}.{}.{}", .{ addr.bytes[0], addr.bytes[1], addr.bytes[2], addr.bytes[3] });
                 },
                 .Ip6 => |addr| {
-                    const bytes = @as([16]u8, @bitCast(addr.sa.addr));
-                    try result.writer(allocator).print("/ip6/{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
-                        bytes[0],  bytes[1],  bytes[2],  bytes[3],
-                        bytes[4],  bytes[5],  bytes[6],  bytes[7],
-                        bytes[8],  bytes[9],  bytes[10], bytes[11],
-                        bytes[12], bytes[13], bytes[14], bytes[15],
+                    try w.print("/ip6/{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
+                        addr.bytes[0],  addr.bytes[1],  addr.bytes[2],  addr.bytes[3],
+                        addr.bytes[4],  addr.bytes[5],  addr.bytes[6],  addr.bytes[7],
+                        addr.bytes[8],  addr.bytes[9],  addr.bytes[10], addr.bytes[11],
+                        addr.bytes[12], addr.bytes[13], addr.bytes[14], addr.bytes[15],
                     });
                 },
-                .Tcp => |port| try result.writer(allocator).print("/tcp/{}", .{port}),
-                .Udp => |port| try result.writer(allocator).print("/udp/{}", .{port}),
-                .Ws => try result.writer(allocator).print("/ws", .{}),
-                .Wss => try result.writer(allocator).print("/wss", .{}),
-                .Http => try result.writer(allocator).print("/http", .{}),
-                .Https => try result.writer(allocator).print("/https", .{}),
-                .Dns => |host| try result.writer(allocator).print("/dns/{s}", .{host}),
-                .Unix => |path| try result.writer(allocator).print("/unix/{s}", .{path}),
-                .Dns4 => |host| try result.writer(allocator).print("/dns4/{s}", .{host}),
-                .Dns6 => |host| try result.writer(allocator).print("/dns6/{s}", .{host}),
-                .Dnsaddr => |host| try result.writer(allocator).print("/dnsaddr/{s}", .{host}),
-                .Dccp => |port| try result.writer(allocator).print("/dccp/{}", .{port}),
-                .Sctp => |port| try result.writer(allocator).print("/sctp/{}", .{port}),
-                .Tls => try result.writer(allocator).print("/tls", .{}),
-                .Quic => try result.writer(allocator).print("/quic", .{}),
-                .QuicV1 => try result.writer(allocator).print("/quic-v1", .{}),
-                .P2pCircuit => try result.writer(allocator).print("/p2p-circuit", .{}),
-                .WebTransport => try result.writer(allocator).print("/webtransport", .{}),
+                .Tcp => |port| try w.print("/tcp/{}", .{port}),
+                .Udp => |port| try w.print("/udp/{}", .{port}),
+                .Ws => try w.print("/ws", .{}),
+                .Wss => try w.print("/wss", .{}),
+                .Http => try w.print("/http", .{}),
+                .Https => try w.print("/https", .{}),
+                .Dns => |host| try w.print("/dns/{s}", .{host}),
+                .Unix => |path| try w.print("/unix/{s}", .{path}),
+                .Dns4 => |host| try w.print("/dns4/{s}", .{host}),
+                .Dns6 => |host| try w.print("/dns6/{s}", .{host}),
+                .Dnsaddr => |host| try w.print("/dnsaddr/{s}", .{host}),
+                .Dccp => |port| try w.print("/dccp/{}", .{port}),
+                .Sctp => |port| try w.print("/sctp/{}", .{port}),
+                .Tls => try w.print("/tls", .{}),
+                .Quic => try w.print("/quic", .{}),
+                .QuicV1 => try w.print("/quic-v1", .{}),
+                .P2pCircuit => try w.print("/p2p-circuit", .{}),
+                .WebTransport => try w.print("/webtransport", .{}),
                 .P2P => |peer_id| {
                     const peerid_len = peer_id.toBase58Len();
                     const buffer = try allocator.alloc(u8, peerid_len);
                     defer allocator.free(buffer);
                     const bytes = try peer_id.toBase58(buffer);
-                    try result.writer(allocator).print("/p2p/{s}", .{bytes});
+                    try w.print("/p2p/{s}", .{bytes});
                 },
             }
             rest_bytes = decoded.rest;
@@ -656,7 +699,7 @@ pub const Multiaddr = struct {
                 const addr_str = parts.next() orelse return Error.InvalidProtocolString;
                 var addr: [4]u8 = undefined;
                 try parseIp4(addr_str, &addr);
-                break :blk Protocol{ .Ip4 = std.net.Ip4Address.init(addr, 0) };
+                break :blk Protocol{ .Ip4 = Ip4Addr{ .bytes = addr } };
             },
             .tcp, .udp => blk: {
                 const port_str = parts.next() orelse return Error.InvalidProtocolString;
@@ -691,6 +734,16 @@ pub const Multiaddr = struct {
         };
     }
 
+    fn parseIp4Inline(s: []const u8, out: *[4]u8) bool {
+        var it = std.mem.splitScalar(u8, s, '.');
+        var i: usize = 0;
+        while (it.next()) |num_str| : (i += 1) {
+            if (i >= 4) return false;
+            out[i] = std.fmt.parseInt(u8, num_str, 10) catch return false;
+        }
+        return i == 4;
+    }
+
     fn parseIp4(s: []const u8, out: *[4]u8) !void {
         var it = std.mem.splitScalar(u8, s, '.');
         var i: usize = 0;
@@ -706,7 +759,7 @@ test "multiaddr push and pop" {
     var ma = Multiaddr.init(testing.allocator);
     defer ma.deinit();
 
-    const ip4 = Protocol{ .Ip4 = std.net.Ip4Address.init([4]u8{ 127, 0, 0, 1 }, 0) };
+    const ip4 = Protocol{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } };
     const tcp = Protocol{ .Tcp = 8080 };
 
     try ma.push(ip4);
@@ -764,13 +817,12 @@ test "multiaddr empty" {
 
 test "protocol encoding/decoding" {
     var buf: [100]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
+    var writer = FixedBufferWriter{ .buf = &buf };
 
-    const ip4 = Protocol{ .Ip4 = std.net.Ip4Address.init([4]u8{ 127, 0, 0, 1 }, 0) };
-    try ip4.writeBytes(writer);
+    const ip4 = Protocol{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } };
+    try ip4.writeBytes(&writer);
 
-    const decoded = try Protocol.fromBytes(fbs.getWritten());
+    const decoded = try Protocol.fromBytes(writer.getWritten());
     try testing.expect(decoded.proto == .Ip4);
 }
 
@@ -809,7 +861,7 @@ test "multiaddr basic operations" {
     defer ma_cap.deinit();
     try testing.expect(ma_cap.isEmpty());
 
-    const ip4 = Protocol{ .Ip4 = std.net.Ip4Address.init([4]u8{ 127, 0, 0, 1 }, 0) };
+    const ip4 = Protocol{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } };
     try ma_cap.push(ip4);
     try testing.expect(!ma_cap.isEmpty());
 
@@ -823,7 +875,7 @@ test "multiaddr starts and ends with" {
     var ma2 = Multiaddr.init(testing.allocator);
     defer ma2.deinit();
 
-    const ip4 = Protocol{ .Ip4 = std.net.Ip4Address.init([4]u8{ 127, 0, 0, 1 }, 0) };
+    const ip4 = Protocol{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } };
     const tcp = Protocol{ .Tcp = 8080 };
 
     try ma1.push(ip4);
@@ -872,7 +924,7 @@ test "multiaddr iterator" {
     var ma = Multiaddr.init(testing.allocator);
     defer ma.deinit();
 
-    const ip4 = Protocol{ .Ip4 = std.net.Ip4Address.init([4]u8{ 127, 0, 0, 1 }, 0) };
+    const ip4 = Protocol{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } };
     const tcp = Protocol{ .Tcp = 8080 };
     try ma.push(ip4);
     try ma.push(tcp);
@@ -893,7 +945,7 @@ test "multiaddr with" {
     var ma = Multiaddr.init(testing.allocator);
     defer ma.deinit();
 
-    const ip4 = Protocol{ .Ip4 = std.net.Ip4Address.init([4]u8{ 127, 0, 0, 1 }, 0) };
+    const ip4 = Protocol{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } };
     const tcp = Protocol{ .Tcp = 8080 };
 
     var ma2 = try ma.with(testing.allocator, ip4);
@@ -921,7 +973,7 @@ test "multiaddr protocol stack" {
     var ma = Multiaddr.init(testing.allocator);
     defer ma.deinit();
 
-    const ip4 = Protocol{ .Ip4 = std.net.Ip4Address.init([4]u8{ 127, 0, 0, 1 }, 0) };
+    const ip4 = Protocol{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } };
     const tcp = Protocol{ .Tcp = 8080 };
     try ma.push(ip4);
     try ma.push(tcp);
@@ -942,7 +994,7 @@ test "multiaddr as bytes" {
     var ma = Multiaddr.init(testing.allocator);
     defer ma.deinit();
 
-    const ip4 = Protocol{ .Ip4 = std.net.Ip4Address.init([4]u8{ 127, 0, 0, 1 }, 0) };
+    const ip4 = Protocol{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } };
     const tcp = Protocol{ .Tcp = 8080 };
     try ma.push(ip4);
     try ma.push(tcp);
@@ -953,7 +1005,7 @@ test "multiaddr as bytes" {
 
 test "multiaddr from protocols" {
     const protocols = [_]Protocol{
-        .{ .Ip4 = std.net.Ip4Address.init([4]u8{ 127, 0, 0, 1 }, 0) },
+        .{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
         .{ .Tcp = 8080 },
     };
 
@@ -970,7 +1022,7 @@ test "multiaddr replace" {
     var ma = Multiaddr.init(testing.allocator);
     defer ma.deinit();
 
-    const ip4 = Protocol{ .Ip4 = std.net.Ip4Address.init([4]u8{ 127, 0, 0, 1 }, 0) };
+    const ip4 = Protocol{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } };
     const tcp = Protocol{ .Tcp = 8080 };
     const new_tcp = Protocol{ .Tcp = 9090 };
 
@@ -997,7 +1049,7 @@ test "multiaddr replace" {
 test "multiaddr deinit mutable and const" {
     // Test mutable instance
     var ma_mut = Multiaddr.init(testing.allocator);
-    const ip4 = Protocol{ .Ip4 = std.net.Ip4Address.init([4]u8{ 127, 0, 0, 1 }, 0) };
+    const ip4 = Protocol{ .Ip4 = Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } };
     try ma_mut.push(ip4);
     ma_mut.deinit();
 
