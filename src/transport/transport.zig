@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 /// Asserts at comptime that type T satisfies the Transport interface.
 /// A Transport must provide:
@@ -79,34 +80,34 @@ pub const AnyStream = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        readFn: *const fn (ptr: *anyopaque, io: *std.Io, buf: []u8) anyerror!usize,
-        writeFn: *const fn (ptr: *anyopaque, io: *std.Io, data: []const u8) anyerror!usize,
-        closeFn: *const fn (ptr: *anyopaque, io: *std.Io) void,
+        readFn: *const fn (ptr: *anyopaque, io: Io, buf: []u8) anyerror!usize,
+        writeFn: *const fn (ptr: *anyopaque, io: Io, data: []const u8) anyerror!usize,
+        closeFn: *const fn (ptr: *anyopaque, io: Io) void,
     };
 
-    pub fn read(self: AnyStream, io: *std.Io, buf: []u8) anyerror!usize {
+    pub fn read(self: AnyStream, io: Io, buf: []u8) anyerror!usize {
         return self.vtable.readFn(self.ptr, io, buf);
     }
 
-    pub fn write(self: AnyStream, io: *std.Io, data: []const u8) anyerror!usize {
+    pub fn write(self: AnyStream, io: Io, data: []const u8) anyerror!usize {
         return self.vtable.writeFn(self.ptr, io, data);
     }
 
-    pub fn close(self: AnyStream, io: *std.Io) void {
+    pub fn close(self: AnyStream, io: Io) void {
         self.vtable.closeFn(self.ptr, io);
     }
 
     pub fn wrap(comptime StreamT: type, stream: *StreamT) AnyStream {
         const Wrapper = struct {
-            fn readFn(ptr: *anyopaque, io: *std.Io, buf: []u8) anyerror!usize {
+            fn readFn(ptr: *anyopaque, io: Io, buf: []u8) anyerror!usize {
                 const s: *StreamT = @ptrCast(@alignCast(ptr));
                 return s.read(io, buf);
             }
-            fn writeFn(ptr: *anyopaque, io: *std.Io, data: []const u8) anyerror!usize {
+            fn writeFn(ptr: *anyopaque, io: Io, data: []const u8) anyerror!usize {
                 const s: *StreamT = @ptrCast(@alignCast(ptr));
                 return s.write(io, data);
             }
-            fn closeFn(ptr: *anyopaque, io: *std.Io) void {
+            fn closeFn(ptr: *anyopaque, io: Io) void {
                 const s: *StreamT = @ptrCast(@alignCast(ptr));
                 s.close(io);
             }
@@ -134,13 +135,13 @@ test "assertTransportInterface catches missing types" {
 
 test "AnyStream wrap creates valid vtable" {
     const MockStream = struct {
-        pub fn read(_: *@This(), _: *std.Io, _: []u8) anyerror!usize {
+        pub fn read(_: *@This(), _: Io, _: []u8) anyerror!usize {
             return 1;
         }
-        pub fn write(_: *@This(), _: *std.Io, _: []const u8) anyerror!usize {
+        pub fn write(_: *@This(), _: Io, _: []const u8) anyerror!usize {
             return 5;
         }
-        pub fn close(_: *@This(), _: *std.Io) void {}
+        pub fn close(_: *@This(), _: Io) void {}
     };
 
     var mock = MockStream{};
