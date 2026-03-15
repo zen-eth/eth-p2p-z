@@ -1,7 +1,6 @@
 const std = @import("std");
+const Io = std.Io;
 const stream_util = @import("../util/stream.zig");
-
-const writeAll = stream_util.writeAll;
 
 pub const protocol_id = "/multistream/1.0.0";
 const message_suffix = "\n";
@@ -20,21 +19,30 @@ pub const Error = error{
 };
 
 /// Write a multistream-select message: length-prefixed, newline-terminated.
-fn writeMessage(stream: anytype, msg: []const u8) Error!void {
+fn writeMessage(io: Io, stream: anytype, msg: []const u8) Error!void {
     var len_buf: [max_varint_bytes + 1]u8 = undefined;
     const len_bytes = encodeUvarint(msg.len + 1, &len_buf);
-    writeAll(stream, len_buf[0..len_bytes]) catch return Error.UnexpectedEof;
-    writeAll(stream, msg) catch return Error.UnexpectedEof;
-    writeAll(stream, message_suffix) catch return Error.UnexpectedEof;
+    writeAllGeneric(io, stream, len_buf[0..len_bytes]) catch return Error.UnexpectedEof;
+    writeAllGeneric(io, stream, msg) catch return Error.UnexpectedEof;
+    writeAllGeneric(io, stream, message_suffix) catch return Error.UnexpectedEof;
+}
+
+fn writeAllGeneric(io: Io, stream: anytype, data: []const u8) !void {
+    var total: usize = 0;
+    while (total < data.len) {
+        const n = stream.write(io, data[total..]) catch return error.BrokenPipe;
+        if (n == 0) return error.BrokenPipe;
+        total += n;
+    }
 }
 
 /// Read a multistream-select message: length-prefixed, newline-terminated.
-fn readMessage(stream: anytype, buf: []u8) Error![]const u8 {
+fn readMessage(io: Io, stream: anytype, buf: []u8) Error![]const u8 {
     var len: usize = 0;
     var bytes_read: usize = 0;
     while (bytes_read < max_varint_bytes) : (bytes_read += 1) {
         var byte_buf: [1]u8 = undefined;
-        const n = stream.read(&byte_buf) catch return Error.UnexpectedEof;
+        const n = stream.read(io, &byte_buf) catch return Error.UnexpectedEof;
         if (n == 0) return Error.UnexpectedEof;
         const b = byte_buf[0];
         const shift: u6 = std.math.cast(u6, bytes_read * 7) orelse return Error.InvalidLength;
@@ -49,7 +57,7 @@ fn readMessage(stream: anytype, buf: []u8) Error![]const u8 {
 
     var total: usize = 0;
     while (total < len) {
-        const n = stream.read(buf[total..len]) catch return Error.UnexpectedEof;
+        const n = stream.read(io, buf[total..len]) catch return Error.UnexpectedEof;
         if (n == 0) return Error.UnexpectedEof;
         total += n;
     }
@@ -60,21 +68,22 @@ fn readMessage(stream: anytype, buf: []u8) Error![]const u8 {
 
 /// Negotiate as initiator: propose protocols, return the selected one.
 pub fn negotiateOutbound(
+    io: Io,
     stream: anytype,
     proposed_protocols: []const []const u8,
 ) Error![]const u8 {
     var buf: [max_message_length]u8 = undefined;
 
-    try writeMessage(stream, protocol_id);
+    try writeMessage(io, stream, protocol_id);
 
-    const header = try readMessage(stream, &buf);
+    const header = try readMessage(io, stream, &buf);
     if (!std.mem.eql(u8, header, protocol_id)) {
         return Error.FirstLineShouldBeMultistream;
     }
 
     for (proposed_protocols) |proto| {
-        try writeMessage(stream, proto);
-        const response = try readMessage(stream, &buf);
+        try writeMessage(io, stream, proto);
+        const response = try readMessage(io, stream, &buf);
         if (std.mem.eql(u8, response, proto)) {
             return proto;
         }
@@ -85,29 +94,30 @@ pub fn negotiateOutbound(
 
 /// Negotiate as responder: wait for proposals, accept if supported.
 pub fn negotiateInbound(
+    io: Io,
     stream: anytype,
     supported_protocols: []const []const u8,
 ) Error![]const u8 {
     var buf: [max_message_length]u8 = undefined;
 
-    const header = try readMessage(stream, &buf);
+    const header = try readMessage(io, stream, &buf);
     if (!std.mem.eql(u8, header, protocol_id)) {
         return Error.FirstLineShouldBeMultistream;
     }
 
-    try writeMessage(stream, protocol_id);
+    try writeMessage(io, stream, protocol_id);
 
     while (true) {
-        const proposal = try readMessage(stream, &buf);
+        const proposal = try readMessage(io, stream, &buf);
 
         for (supported_protocols) |supported| {
             if (std.mem.eql(u8, proposal, supported)) {
-                try writeMessage(stream, supported);
+                try writeMessage(io, stream, supported);
                 return supported;
             }
         }
 
-        try writeMessage(stream, na_response);
+        try writeMessage(io, stream, na_response);
     }
 }
 
@@ -169,7 +179,7 @@ test "negotiateOutbound succeeds on first protocol" {
     defer stream.deinit();
 
     const proposed = [_][]const u8{"/ipfs/ping/1.0.0"};
-    const result = try negotiateOutbound(&stream, &proposed);
+    const result = try negotiateOutbound(undefined, &stream, &proposed);
     try std.testing.expectEqualStrings("/ipfs/ping/1.0.0", result);
 }
 
@@ -190,7 +200,7 @@ test "negotiateOutbound falls back to second protocol" {
     defer stream.deinit();
 
     const proposed = [_][]const u8{ "/ipfs/ping/1.0.0", "/ipfs/id/1.0.0" };
-    const result = try negotiateOutbound(&stream, &proposed);
+    const result = try negotiateOutbound(undefined, &stream, &proposed);
     try std.testing.expectEqualStrings("/ipfs/id/1.0.0", result);
 }
 
@@ -209,7 +219,7 @@ test "negotiateOutbound all rejected" {
     defer stream.deinit();
 
     const proposed = [_][]const u8{"/ipfs/ping/1.0.0"};
-    const result = negotiateOutbound(&stream, &proposed);
+    const result = negotiateOutbound(undefined, &stream, &proposed);
     try std.testing.expectError(Error.AllProposedProtocolsRejected, result);
 }
 
@@ -228,7 +238,7 @@ test "negotiateInbound accepts supported protocol" {
     defer stream.deinit();
 
     const supported = [_][]const u8{"/ipfs/ping/1.0.0"};
-    const result = try negotiateInbound(&stream, &supported);
+    const result = try negotiateInbound(undefined, &stream, &supported);
     try std.testing.expectEqualStrings("/ipfs/ping/1.0.0", result);
 }
 
@@ -238,6 +248,6 @@ test "readMessage rejects overlong varint" {
     defer stream.deinit();
 
     var buf: [max_message_length]u8 = undefined;
-    const result = readMessage(&stream, &buf);
+    const result = readMessage(undefined, &stream, &buf);
     try std.testing.expectError(Error.InvalidLength, result);
 }
