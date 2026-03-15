@@ -12,6 +12,8 @@ pub const io_adapter = @import("io/adapter.zig");
 pub const secp_context = @import("security/secp_context.zig");
 pub const identity = @import("security/identity.zig");
 pub const tls = @import("security/tls.zig");
+pub const quic_engine = @import("transport/quic/engine.zig");
+pub const quic_transport = @import("transport/quic/quic.zig");
 
 // Re-export key types
 pub const AnyStream = transport.AnyStream;

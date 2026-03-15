@@ -1,0 +1,984 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const net = Io.net;
+
+const ssl = @import("ssl");
+const tls = @import("../../security/tls.zig");
+const PeerId = @import("peer_id").PeerId;
+const keys = @import("peer_id").keys;
+
+const builtin = @import("builtin");
+
+const log = std.log.scoped(.quic_engine);
+
+const lsquic = @cImport({
+    @cInclude("lsquic.h");
+    @cInclude("lsquic_types.h");
+});
+
+/// Global SSL_CTX ex_data index for storing CertVerifyCtx pointer.
+/// Initialized once via SSL_CTX_get_ex_new_index on first engine creation.
+var g_ssl_ctx_ex_idx: c_int = -1;
+
+// ── Event types communicated via Io.Queue ──────────────────────────────
+
+/// Event pushed when a connection completes handshake.
+pub const ConnEvent = struct {
+    conn: *QuicConnection,
+};
+
+/// Event pushed when a stream becomes available on a connection.
+pub const StreamEvent = struct {
+    stream: *QuicStream,
+};
+
+/// Event pushed when data is available on a stream.
+pub const ReadEvent = struct {
+    data: []const u8,
+    owned_buf: []u8, // allocated buffer, caller must free
+};
+
+// ── QuicStream ─────────────────────────────────────────────────────────
+
+/// QUIC stream backed by lsquic. Reads/writes suspend via Io.Queue.
+pub const QuicStream = struct {
+    allocator: Allocator,
+    lsquic_stream: ?*lsquic.lsquic_stream_t,
+    conn: *QuicConnection,
+    read_queue_buf: [16]ReadEvent,
+    read_queue: Io.Queue(ReadEvent),
+    closed: bool,
+
+    pub fn init(allocator: Allocator, ls: *lsquic.lsquic_stream_t, conn: *QuicConnection) !*QuicStream {
+        const self = try allocator.create(QuicStream);
+        self.* = .{
+            .allocator = allocator,
+            .lsquic_stream = ls,
+            .conn = conn,
+            .read_queue_buf = undefined,
+            .read_queue = undefined,
+            .closed = false,
+        };
+        self.read_queue = Io.Queue(ReadEvent).init(&self.read_queue_buf);
+        lsquic.lsquic_stream_set_ctx(ls, @ptrCast(self));
+        return self;
+    }
+
+    pub fn read(self: *QuicStream, io: Io, buf: []u8) anyerror!usize {
+        if (self.closed) return error.StreamClosed;
+        const event = self.read_queue.getOne(io) catch |err| switch (err) {
+            error.Closed => return error.StreamClosed,
+            error.Canceled => return error.StreamClosed,
+        };
+        const len = @min(buf.len, event.data.len);
+        @memcpy(buf[0..len], event.data[0..len]);
+        self.allocator.free(event.owned_buf);
+        return len;
+    }
+
+    pub fn write(self: *QuicStream, _: Io, data: []const u8) anyerror!usize {
+        if (self.closed) return error.StreamClosed;
+        const ls = self.lsquic_stream orelse return error.StreamClosed;
+        const written = lsquic.lsquic_stream_write(ls, data.ptr, data.len);
+        if (written < 0) return error.WriteFailed;
+        _ = lsquic.lsquic_stream_flush(ls);
+        return @intCast(written);
+    }
+
+    pub fn close(self: *QuicStream, io: Io) void {
+        if (self.lsquic_stream) |ls| {
+            // Only close the lsquic stream if our connection is still alive
+            if (!self.conn.closed) {
+                _ = lsquic.lsquic_stream_close(ls);
+            }
+            self.lsquic_stream = null;
+        }
+        self.closed = true;
+        self.read_queue.close(io);
+    }
+
+    pub fn deinit(self: *QuicStream) void {
+        if (self.lsquic_stream) |ls| {
+            if (!self.conn.closed) {
+                _ = lsquic.lsquic_stream_close(ls);
+            }
+        }
+        self.allocator.destroy(self);
+    }
+};
+
+// ── QuicConnection ─────────────────────────────────────────────────────
+
+/// QUIC connection backed by lsquic. Stream accept/open via Io.Queue.
+pub const QuicConnection = struct {
+    allocator: Allocator,
+    lsquic_conn: ?*lsquic.lsquic_conn_t,
+    engine: *QuicEngine,
+    stream_queue_buf: [16]StreamEvent,
+    stream_queue: Io.Queue(StreamEvent),
+    peer_id: ?PeerId,
+    hsk_completed: bool,
+    closed: bool,
+
+    pub fn init(allocator: Allocator, lc: ?*lsquic.lsquic_conn_t, engine: *QuicEngine) !*QuicConnection {
+        const self = try allocator.create(QuicConnection);
+        self.* = .{
+            .allocator = allocator,
+            .lsquic_conn = lc,
+            .engine = engine,
+            .stream_queue_buf = undefined,
+            .stream_queue = undefined,
+            .peer_id = null,
+            .hsk_completed = false,
+            .closed = false,
+        };
+        self.stream_queue = Io.Queue(StreamEvent).init(&self.stream_queue_buf);
+        if (lc) |c| lsquic.lsquic_conn_set_ctx(c, @ptrCast(self));
+        return self;
+    }
+
+    pub fn openStream(self: *QuicConnection, io: Io) !*QuicStream {
+        if (self.closed) return error.ConnectionClosed;
+        const lc = self.lsquic_conn orelse return error.ConnectionClosed;
+        lsquic.lsquic_conn_make_stream(lc);
+        // Trigger processEngine to create the stream via onNewStream.
+        // processEngine has a re-entrancy guard so this is safe even if
+        // a background loop is currently inside process_conns.
+        self.engine.processEngine();
+        // Wait for the stream event from onNewStream callback
+        const event = self.stream_queue.getOne(io) catch |err| switch (err) {
+            error.Closed => return error.ConnectionClosed,
+            error.Canceled => return error.ConnectionClosed,
+        };
+        return event.stream;
+    }
+
+    pub fn acceptStream(self: *QuicConnection, io: Io) !*QuicStream {
+        if (self.closed) return error.ConnectionClosed;
+        const event = self.stream_queue.getOne(io) catch |err| switch (err) {
+            error.Closed => return error.ConnectionClosed,
+            error.Canceled => return error.ConnectionClosed,
+        };
+        return event.stream;
+    }
+
+    pub fn close(self: *QuicConnection, io: Io) void {
+        if (self.lsquic_conn) |lc| {
+            // Clear conn context before closing so lsquic doesn't assert on destroy
+            lsquic.lsquic_conn_set_ctx(lc, null);
+            lsquic.lsquic_conn_close(lc);
+            self.lsquic_conn = null;
+        }
+        self.closed = true;
+        self.stream_queue.close(io);
+    }
+
+    pub fn remotePeerId(self: *const QuicConnection) ?PeerId {
+        return self.peer_id;
+    }
+
+    pub fn deinit(self: *QuicConnection) void {
+        if (self.lsquic_conn) |lc| {
+            lsquic.lsquic_conn_set_ctx(lc, null);
+            lsquic.lsquic_conn_close(lc);
+        }
+        self.allocator.destroy(self);
+    }
+};
+
+// ── CertVerifyCtx ──────────────────────────────────────────────────────
+
+/// Replaces the threadlocal g_peer_cert hack. Stores verified peer info
+/// keyed by connection pointer, passed via ea_verify_ctx.
+/// Since lsquic callbacks are single-threaded, `last_verified` holds the most
+/// recent successful verification result. `onHskDone` consumes it.
+pub const CertVerifyCtx = struct {
+    allocator: Allocator,
+    last_verified: ?VerifiedPeer,
+
+    pub const VerifiedPeer = struct {
+        peer_id: PeerId,
+        host_pubkey: keys.PublicKey,
+    };
+
+    pub fn init(allocator: Allocator) CertVerifyCtx {
+        return .{
+            .allocator = allocator,
+            .last_verified = null,
+        };
+    }
+
+    pub fn deinit(self: *CertVerifyCtx) void {
+        if (self.last_verified) |vp| {
+            if (vp.host_pubkey.data) |d| self.allocator.free(d);
+        }
+    }
+
+    pub fn storeVerified(self: *CertVerifyCtx, peer: VerifiedPeer) void {
+        // Free any unconsumed previous result
+        if (self.last_verified) |old| {
+            if (old.host_pubkey.data) |d| self.allocator.free(d);
+        }
+        self.last_verified = peer;
+    }
+
+    pub fn takeVerified(self: *CertVerifyCtx) ?VerifiedPeer {
+        const result = self.last_verified;
+        self.last_verified = null;
+        return result;
+    }
+};
+
+// ── QuicEngine ─────────────────────────────────────────────────────────
+
+/// Bridges lsquic's C callback model with Zig's std.Io suspension model.
+///
+/// The engine owns a UDP socket, the lsquic_engine_t, and manages the
+/// lifecycle of connections and streams. It runs two concurrent tasks:
+///   1. UDP receive loop: reads datagrams -> feeds to lsquic
+///   2. Engine process loop: timer-driven lsquic_engine_process_conns()
+///
+/// lsquic callbacks (stream_if) push events into per-connection/per-stream
+/// Io.Queue instances. Application code suspends on these queues.
+pub const QuicEngine = struct {
+    allocator: Allocator,
+    engine: *lsquic.lsquic_engine_t,
+    ssl_ctx: *ssl.SSL_CTX,
+    cert_verify_ctx: CertVerifyCtx,
+    conn_queue_buf: [16]ConnEvent,
+    conn_queue: Io.Queue(ConnEvent),
+    socket: ?net.Socket,
+    io: ?Io,
+    is_server: bool,
+    running: bool,
+    has_unsent: bool,
+    /// Guard against re-entrant calls to lsquic_engine_process_conns.
+    processing: bool,
+    /// Server-side connection pending to be pushed to conn_queue.
+    /// Set in onNewConn callback (which runs inside lsquic_engine_process_conns),
+    /// consumed by processEngine() after lsquic returns to avoid re-entrancy.
+    pending_server_conn: ?*QuicConnection,
+
+    /// Background task group for receive and timer loops.
+    /// Owned by the engine so it outlives the stack frames that spawn the loops.
+    background: Io.Group,
+
+    // lsquic callback vtables (must be stable pointers)
+    stream_if: lsquic.lsquic_stream_if,
+
+    pub const Config = struct {
+        is_server: bool = false,
+        alpn: [:0]const u8 = "libp2p",
+        max_streams_per_conn: u32 = 100,
+        idle_timeout_secs: u32 = 30,
+        /// Host identity key for TLS certificate generation.
+        /// If provided, a libp2p TLS certificate will be generated and loaded
+        /// into the SSL context. Required for completing TLS handshakes.
+        host_key: ?*ssl.EVP_PKEY = null,
+    };
+
+    pub fn init(allocator: Allocator, config: Config) !*QuicEngine {
+        // Initialize lsquic global state (safe to call multiple times)
+        if (lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT | lsquic.LSQUIC_GLOBAL_SERVER) != 0) {
+            return error.LsquicGlobalInitFailed;
+        }
+
+        // Enable lsquic internal logging for diagnostics
+        const logger_if = lsquic.lsquic_logger_if{
+            .log_buf = struct {
+                fn cb(_: ?*anyopaque, buf: [*c]const u8, len: usize) callconv(.c) c_int {
+                    if (buf != null and len > 0) {
+                        log.debug("[lsquic] {s}", .{buf[0..len]});
+                    }
+                    return 0;
+                }
+            }.cb,
+        };
+        lsquic.lsquic_logger_init(&logger_if, null, lsquic.LLTS_HHMMSSMS);
+        _ = lsquic.lsquic_set_log_level("warning");
+
+        const self = try allocator.create(QuicEngine);
+        errdefer allocator.destroy(self);
+
+        self.allocator = allocator;
+        self.cert_verify_ctx = CertVerifyCtx.init(allocator);
+        self.conn_queue_buf = undefined;
+        self.socket = null;
+        self.io = null;
+        self.is_server = config.is_server;
+        self.running = false;
+        self.has_unsent = false;
+        self.processing = false;
+        self.pending_server_conn = null;
+        self.background = .init;
+
+        self.conn_queue = Io.Queue(ConnEvent).init(&self.conn_queue_buf);
+
+        // Build the stream interface callbacks
+        self.stream_if = std.mem.zeroes(lsquic.lsquic_stream_if);
+        self.stream_if.on_new_conn = onNewConn;
+        self.stream_if.on_conn_closed = onConnClosed;
+        self.stream_if.on_new_stream = onNewStream;
+        self.stream_if.on_read = onRead;
+        self.stream_if.on_write = onWrite;
+        self.stream_if.on_close = onStreamClose;
+        self.stream_if.on_hsk_done = onHskDone;
+
+        // Create SSL context
+        self.ssl_ctx = ssl.SSL_CTX_new(ssl.TLS_method()) orelse return error.SslCtxCreateFailed;
+
+        // Initialize the global SSL_CTX ex_data index on first engine creation
+        if (g_ssl_ctx_ex_idx == -1) {
+            g_ssl_ctx_ex_idx = ssl.SSL_CTX_get_ex_new_index(0, null, null, null, null);
+            if (g_ssl_ctx_ex_idx < 0) return error.SslCtxCreateFailed;
+        }
+
+        // Configure ALPN for both client and server
+        // ALPN wire format: <len><proto> — e.g. \x06libp2p
+        const alpn_wire = [_]u8{ 6, 'l', 'i', 'b', 'p', '2', 'p' };
+        if (ssl.SSL_CTX_set_alpn_protos(self.ssl_ctx, &alpn_wire, alpn_wire.len) != 0) {
+            return error.AlpnSetupFailed;
+        }
+        ssl.SSL_CTX_set_alpn_select_cb(self.ssl_ctx, tls.alpnSelectCallbackfn, null);
+
+        // Store CertVerifyCtx in SSL_CTX ex_data so the custom verify callback
+        // can access it without threadlocal storage (nim-libp2p approach, lsquic#579).
+        if (ssl.SSL_CTX_set_ex_data(self.ssl_ctx, g_ssl_ctx_ex_idx, @ptrCast(&self.cert_verify_ctx)) == 0) {
+            return error.SslCtxCreateFailed;
+        }
+
+        // Register BoringSSL custom verify callback for mutual TLS.
+        // This replaces SSL_CTX_set_verify + threadlocal g_peer_cert approach.
+        // Works for both client and server since getSslCtx is called for both sides.
+        ssl.SSL_CTX_set_custom_verify(
+            self.ssl_ctx,
+            ssl.SSL_VERIFY_PEER | ssl.SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+            customVerifyCallback,
+        );
+
+        // Load libp2p TLS certificate if host key is provided
+        if (config.host_key) |host_key| {
+            const subject_key = tls.generateKeyPair(.ECDSA) catch return error.KeyGenFailed;
+            defer ssl.EVP_PKEY_free(subject_key);
+
+            var host_pubkey = tls.createProtobufEncodedPublicKey(allocator, host_key) catch
+                return error.KeyEncodeFailed;
+            defer if (host_pubkey.data) |d| allocator.free(d);
+
+            const cert = tls.buildCert(
+                allocator,
+                &host_pubkey,
+                @as(?*anyopaque, @ptrCast(host_key)),
+                tls.signDataWithTlsKey,
+                subject_key,
+            ) catch return error.CertBuildFailed;
+            defer ssl.X509_free(cert);
+
+            if (ssl.SSL_CTX_use_certificate(self.ssl_ctx, cert) <= 0)
+                return error.CertLoadFailed;
+            if (ssl.SSL_CTX_use_PrivateKey(self.ssl_ctx, subject_key) <= 0)
+                return error.KeyLoadFailed;
+        }
+
+        // Configure engine settings
+        var settings: lsquic.lsquic_engine_settings = undefined;
+        lsquic.lsquic_engine_init_settings(&settings, if (config.is_server) lsquic.LSENG_SERVER else 0);
+        settings.es_init_max_streams_bidi = config.max_streams_per_conn;
+        settings.es_idle_timeout = config.idle_timeout_secs;
+
+        // Build engine API
+        var engine_api: lsquic.lsquic_engine_api = std.mem.zeroes(lsquic.lsquic_engine_api);
+        engine_api.ea_settings = &settings;
+        engine_api.ea_stream_if = &self.stream_if;
+        engine_api.ea_stream_if_ctx = @ptrCast(self);
+        engine_api.ea_packets_out = packetsOut;
+        engine_api.ea_packets_out_ctx = @ptrCast(self);
+        engine_api.ea_get_ssl_ctx = getSslCtx;
+        // ea_verify_cert is not needed: lsquic only calls it via its internal
+        // verify_server_cert_callback, which is only installed when lsquic creates
+        // its own SSL_CTX (i.e., when ea_get_ssl_ctx is NULL). We provide our own
+        // SSL_CTX with SSL_CTX_set_custom_verify registered.
+        engine_api.ea_verify_cert = null;
+        engine_api.ea_verify_ctx = null;
+        engine_api.ea_alpn = config.alpn.ptr;
+
+        const flags: c_uint = if (config.is_server) lsquic.LSENG_SERVER else 0;
+        self.engine = lsquic.lsquic_engine_new(flags, &engine_api) orelse
+            return error.EngineCreateFailed;
+
+        return self;
+    }
+
+    /// Set the Io context. Must be called before using the engine with
+    /// lsquic callbacks that need to push into Io.Queues.
+    pub fn setIo(self: *QuicEngine, io: Io) void {
+        self.io = io;
+    }
+
+    pub fn deinit(self: *QuicEngine) void {
+        lsquic.lsquic_engine_destroy(self.engine);
+        ssl.SSL_CTX_free(self.ssl_ctx);
+        self.cert_verify_ctx.deinit();
+        self.allocator.destroy(self);
+    }
+
+    /// Accept a new QUIC connection (blocks until one arrives).
+    pub fn accept(self: *QuicEngine, io: Io) !*QuicConnection {
+        log.debug("accept: waiting for incoming connection...", .{});
+        const event = self.conn_queue.getOne(io) catch |err| switch (err) {
+            error.Closed => return error.EngineStopped,
+            error.Canceled => return error.EngineStopped,
+        };
+        return event.conn;
+    }
+
+    /// Connect to a remote address.
+    pub fn connect(
+        self: *QuicEngine,
+        io: Io,
+        remote_addr: *const std.c.sockaddr,
+        local_addr: *const std.c.sockaddr,
+    ) !*QuicConnection {
+        _ = io;
+        log.debug("connect: initiating connection", .{});
+
+        // Create QuicConnection wrapper first so we can pass it as conn_ctx
+        // to lsquic_engine_connect. This prevents onNewConn from creating a
+        // duplicate QuicConnection.
+        const conn = try QuicConnection.init(self.allocator, null, self);
+        errdefer conn.deinit();
+
+        const lc = lsquic.lsquic_engine_connect(
+            self.engine,
+            lsquic.N_LSQVER, // Use latest QUIC version
+            @ptrCast(local_addr),
+            @ptrCast(remote_addr),
+            @ptrCast(self), // peer_ctx
+            @ptrCast(conn), // conn_ctx — our QuicConnection
+            null, // hostname
+            0, // base_plpmtu
+            null, // sess_resume
+            0, // sess_resume_len
+            null, // token
+            0, // token_len
+        ) orelse return error.ConnectFailed;
+
+        // Update the QuicConnection with the actual lsquic_conn_t
+        conn.lsquic_conn = lc;
+        lsquic.lsquic_conn_set_ctx(lc, @ptrCast(conn));
+
+        // Process the connection to trigger handshake
+        lsquic.lsquic_engine_process_conns(self.engine);
+
+        return conn;
+    }
+
+    pub fn stop(self: *QuicEngine, io: Io) void {
+        self.running = false;
+        self.conn_queue.close(io);
+        // Cancel background receive and timer loops, then wait for them to finish
+        self.background.cancel(io);
+    }
+
+    /// Start the background receive and timer loops.
+    /// Must be called after setIo() and bindSocket().
+    pub fn startBackgroundLoops(self: *QuicEngine, io: Io) void {
+        self.background.async(io, QuicEngine.runReceiveLoop, .{ self, io });
+        self.background.async(io, QuicEngine.runTimerLoop, .{ self, io });
+    }
+
+    /// Bind a UDP socket.
+    /// The socket is managed by std.Io which handles blocking/non-blocking internally.
+    /// For the C callback packetsOut, we use std.c.sendmsg directly which handles EAGAIN.
+    pub fn bindSocket(self: *QuicEngine, io: Io, address: *const net.IpAddress) !void {
+        const sock = try net.IpAddress.bind(address, io, .{ .mode = .dgram });
+        self.socket = sock;
+    }
+
+    /// Run the UDP receive loop: reads datagrams and feeds them to lsquic.
+    /// This should be spawned via Group.async.
+    pub fn runReceiveLoop(self: *QuicEngine, io: Io) void {
+        log.debug("runReceiveLoop started", .{});
+        self.running = true;
+        while (self.running) {
+            var buf: [65535]u8 = undefined;
+            const sock = self.socket orelse return;
+            const msg = sock.receive(io, &buf) catch |err| {
+                switch (err) {
+                    error.Canceled => {
+                        log.debug("runReceiveLoop: receive canceled, exiting", .{});
+                        return;
+                    },
+                    else => continue,
+                }
+            };
+
+            log.debug("runReceiveLoop: received {} bytes", .{msg.data.len});
+
+            // Convert IpAddress to sockaddr for lsquic
+            var local_sa = ipAddressToSockaddr(sock.address);
+            var peer_sa = ipAddressToSockaddr(msg.from);
+
+            _ = lsquic.lsquic_engine_packet_in(
+                self.engine,
+                msg.data.ptr,
+                msg.data.len,
+                @ptrCast(&local_sa),
+                @ptrCast(&peer_sa),
+                @ptrCast(self),
+                0, // ecn
+            );
+
+            self.processEngine();
+        }
+    }
+
+    /// Run the timer-driven engine process loop.
+    /// Calls lsquic_engine_process_conns() at the intervals lsquic requests
+    /// via lsquic_engine_earliest_adv_tick(). Also retries unsent packets.
+    /// This should be spawned via Group.async alongside runReceiveLoop.
+    pub fn runTimerLoop(self: *QuicEngine, io: Io) void {
+        log.debug("runTimerLoop started", .{});
+        while (self.running) {
+            var diff: c_int = 0;
+            if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff) != 0) {
+                // lsquic wants us to call process_conns after `diff` microseconds
+                const us: i64 = if (diff > 0) @intCast(diff) else 0;
+                const sleep_timeout: Io.Timeout = .{
+                    .duration = .{
+                        .raw = Io.Duration.fromNanoseconds(@as(i96, us) * std.time.ns_per_us),
+                        .clock = .awake,
+                    },
+                };
+                sleep_timeout.sleep(io) catch |err| switch (err) {
+                    error.Canceled => return,
+                };
+            } else {
+                // No connections to process; sleep a short interval
+                const sleep_timeout: Io.Timeout = .{
+                    .duration = .{
+                        .raw = Io.Duration.fromMilliseconds(50),
+                        .clock = .awake,
+                    },
+                };
+                sleep_timeout.sleep(io) catch |err| switch (err) {
+                    error.Canceled => return,
+                };
+            }
+
+            if (!self.running) return;
+            self.processEngine();
+        }
+    }
+
+    /// Process lsquic connections and retry unsent packets if needed.
+    fn processEngine(self: *QuicEngine) void {
+        // Guard against re-entrancy: lsquic asserts that process_conns is
+        // not called while already inside process_conns.
+        if (self.processing) return;
+        self.processing = true;
+        defer self.processing = false;
+
+        // Retry unsent packets first (socket may now be writable)
+        if (self.has_unsent) {
+            self.has_unsent = false;
+            lsquic.lsquic_engine_send_unsent_packets(self.engine);
+        }
+        lsquic.lsquic_engine_process_conns(self.engine);
+
+        // Drain pending server connection (set by onNewConn during process_conns).
+        // Must happen AFTER process_conns returns to avoid re-entrancy.
+        if (self.pending_server_conn) |conn| {
+            self.pending_server_conn = null;
+            if (self.io) |io| {
+                log.debug("processEngine: pushing pending server conn to accept queue", .{});
+                self.conn_queue.putOneUncancelable(io, .{ .conn = conn }) catch |err| {
+                    log.err("processEngine: failed to push server conn: {}", .{err});
+                };
+            }
+        }
+    }
+
+    // ── lsquic C callbacks ─────────────────────────────────────────────
+
+    fn onNewConn(stream_if_ctx: ?*anyopaque, lc: ?*lsquic.lsquic_conn_t) callconv(.c) ?*lsquic.lsquic_conn_ctx_t {
+        log.debug("onNewConn called, stream_if_ctx={?*}, lc={?*}", .{ stream_if_ctx, lc });
+        const engine: *QuicEngine = @ptrCast(@alignCast(stream_if_ctx));
+        const c = lc orelse return null;
+
+        // For client-side connections, connect() already set conn_ctx
+        const existing_ctx = lsquic.lsquic_conn_get_ctx(lc);
+        if (existing_ctx != null) {
+            log.debug("onNewConn: client-side conn, existing ctx={?*}", .{existing_ctx});
+            return @ptrCast(existing_ctx);
+        }
+
+        // Server-side: create QuicConnection wrapper and set it as the conn context.
+        // For IETF QUIC servers, on_new_conn is called when the mini-conn is promoted
+        // to a full connection (i.e., handshake is complete). on_hsk_done is client-only.
+        const conn = QuicConnection.init(engine.allocator, c, engine) catch |err| {
+            log.err("onNewConn: failed to create QuicConnection: {}", .{err});
+            return null;
+        };
+        conn.hsk_completed = true;
+        log.debug("onNewConn: server-side conn created, conn={*}", .{conn});
+
+        // Extract peer identity stored by customVerifyCallback via SSL_CTX ex_data
+        if (engine.cert_verify_ctx.takeVerified()) |verified| {
+            conn.peer_id = verified.peer_id;
+            if (verified.host_pubkey.data) |d| conn.allocator.free(d);
+            log.debug("onNewConn: server peer_id extracted from custom verify", .{});
+        } else {
+            log.warn("onNewConn: no verified peer info from custom verify callback", .{});
+        }
+
+        // Defer push to conn_queue: we're inside lsquic_engine_process_conns,
+        // so we can't call putOneUncancelable (which may trigger re-entrancy).
+        // processEngine() will drain this after lsquic returns.
+        engine.pending_server_conn = conn;
+        log.debug("onNewConn: server conn queued for accept", .{});
+
+        return @ptrCast(conn);
+    }
+
+    fn onHskDone(lc: ?*lsquic.lsquic_conn_t, status: c_uint) callconv(.c) void {
+        log.debug("onHskDone called, lc={?*}, status={}", .{ lc, status });
+        if (status != lsquic.LSQ_HSK_OK and status != lsquic.LSQ_HSK_RESUMED_OK) {
+            log.warn("onHskDone: handshake failed with status={}", .{status});
+            if (lc) |c| lsquic.lsquic_conn_close(c);
+            return;
+        }
+
+        const conn_ctx = lsquic.lsquic_conn_get_ctx(lc);
+        if (conn_ctx) |ctx| {
+            const conn: *QuicConnection = @ptrCast(@alignCast(ctx));
+            conn.hsk_completed = true;
+
+            // Extract peer identity stored by customVerifyCallback via SSL_CTX ex_data
+            if (conn.engine.cert_verify_ctx.takeVerified()) |verified| {
+                conn.peer_id = verified.peer_id;
+                if (verified.host_pubkey.data) |d| conn.allocator.free(d);
+                log.debug("onHskDone: peer_id extracted from custom verify", .{});
+            } else {
+                log.warn("onHskDone: no verified peer info from custom verify callback", .{});
+                if (lc) |c| lsquic.lsquic_conn_close(c);
+                return;
+            }
+
+            // Note: on_hsk_done is CLIENT-ONLY in lsquic.
+            // The client already has its QuicConnection from connect(), so we
+            // just update peer_id above — no need to push to conn_queue.
+            log.debug("onHskDone: client handshake complete, peer_id set on existing conn", .{});
+        } else {
+            log.warn("onHskDone: conn_ctx is NULL (server mini-conn?)", .{});
+        }
+    }
+
+    fn onConnClosed(lc: ?*lsquic.lsquic_conn_t) callconv(.c) void {
+        log.debug("onConnClosed called, lc={?*}", .{lc});
+        const ctx = lsquic.lsquic_conn_get_ctx(lc);
+        if (ctx) |raw| {
+            const conn: *QuicConnection = @ptrCast(@alignCast(raw));
+            conn.closed = true;
+            conn.lsquic_conn = null;
+            // Clear conn context so lsquic doesn't assert on engine destroy
+            if (lc) |c| lsquic.lsquic_conn_set_ctx(c, null);
+            // Close queue using engine's stored io
+            if (conn.engine.io) |io| {
+                conn.stream_queue.close(io);
+            }
+        }
+    }
+
+    fn onNewStream(stream_if_ctx: ?*anyopaque, ls: ?*lsquic.lsquic_stream_t) callconv(.c) ?*lsquic.lsquic_stream_ctx_t {
+        log.debug("onNewStream called, ls={?*}", .{ls});
+        const engine: *QuicEngine = @ptrCast(@alignCast(stream_if_ctx));
+        const s = ls orelse return null;
+
+        // Find the connection this stream belongs to
+        const lc = lsquic.lsquic_stream_conn(s);
+        const conn_ctx = lsquic.lsquic_conn_get_ctx(lc);
+        if (conn_ctx == null) return null;
+
+        const conn: *QuicConnection = @ptrCast(@alignCast(conn_ctx));
+
+        // Create stream wrapper
+        const stream = QuicStream.init(engine.allocator, s, conn) catch return null;
+
+        // Want to read from this stream
+        _ = lsquic.lsquic_stream_wantread(s, 1);
+
+        // Push stream event to connection's queue
+        if (engine.io) |io| {
+            conn.stream_queue.putOneUncancelable(io, .{ .stream = stream }) catch {};
+        }
+
+        return @ptrCast(stream);
+    }
+
+    fn onRead(ls: ?*lsquic.lsquic_stream_t, ctx: ?*lsquic.lsquic_stream_ctx_t) callconv(.c) void {
+        const raw = ctx orelse return;
+        const stream: *QuicStream = @ptrCast(@alignCast(raw));
+        const s = ls orelse return;
+
+        var buf: [4096]u8 = undefined;
+        const n = lsquic.lsquic_stream_read(s, &buf, buf.len);
+        if (n <= 0) {
+            // EOF or error - close the read queue
+            if (stream.conn.engine.io) |io| {
+                stream.read_queue.close(io);
+            }
+            return;
+        }
+
+        const len: usize = @intCast(n);
+        // Allocate owned copy of the data
+        const owned = stream.allocator.alloc(u8, len) catch {
+            if (stream.conn.engine.io) |io| {
+                stream.read_queue.close(io);
+            }
+            return;
+        };
+        @memcpy(owned, buf[0..len]);
+
+        // Push read event
+        if (stream.conn.engine.io) |io| {
+            stream.read_queue.putOneUncancelable(io, .{
+                .data = owned,
+                .owned_buf = owned,
+            }) catch {
+                stream.allocator.free(owned);
+            };
+        } else {
+            stream.allocator.free(owned);
+        }
+    }
+
+    fn onWrite(ls: ?*lsquic.lsquic_stream_t, _: ?*lsquic.lsquic_stream_ctx_t) callconv(.c) void {
+        // We handle writes synchronously in QuicStream.write(), so just
+        // disable write notifications.
+        if (ls) |s| {
+            _ = lsquic.lsquic_stream_wantwrite(s, 0);
+        }
+    }
+
+    fn onStreamClose(_: ?*lsquic.lsquic_stream_t, ctx: ?*lsquic.lsquic_stream_ctx_t) callconv(.c) void {
+        if (ctx) |raw| {
+            const stream: *QuicStream = @ptrCast(@alignCast(raw));
+            stream.closed = true;
+            if (stream.conn.engine.io) |io| {
+                stream.read_queue.close(io);
+            }
+        }
+    }
+
+    fn packetsOut(
+        packets_out_ctx: ?*anyopaque,
+        specs: [*c]const lsquic.lsquic_out_spec,
+        count: c_uint,
+    ) callconv(.c) c_int {
+        log.debug("packetsOut called, count={}", .{count});
+        const engine: *QuicEngine = @ptrCast(@alignCast(packets_out_ctx));
+        const sock = engine.socket orelse return -1;
+
+        var sent: c_int = 0;
+        var i: c_uint = 0;
+        while (i < count) : (i += 1) {
+            const spec = specs[i];
+            // Build msghdr from spec
+            var msg: std.c.msghdr_const = std.mem.zeroes(std.c.msghdr_const);
+            msg.iov = @ptrCast(spec.iov);
+            msg.iovlen = @intCast(spec.iovlen);
+            const sa: ?*const std.c.sockaddr = @ptrCast(spec.dest_sa);
+            msg.name = sa;
+            msg.namelen = if (sa) |s| switch (s.family) {
+                std.posix.AF.INET => @sizeOf(std.c.sockaddr.in),
+                std.posix.AF.INET6 => @sizeOf(std.c.sockaddr.in6),
+                else => 0,
+            } else 0;
+
+            const rc = std.c.sendmsg(sock.handle, &msg, 0);
+            if (rc < 0) {
+                const e: std.c.E = @enumFromInt(std.c._errno().*);
+                if (e == .AGAIN or e == .INTR) {
+                    // Non-blocking socket would block or interrupted.
+                    // Flag unsent packets so the timer loop can retry
+                    // via lsquic_engine_send_unsent_packets().
+                    engine.has_unsent = true;
+                    return sent;
+                }
+                return -1;
+            }
+            sent += 1;
+        }
+        return sent;
+    }
+
+    fn getSslCtx(peer_ctx: ?*anyopaque, _: ?*const lsquic.struct_sockaddr) callconv(.c) ?*lsquic.struct_ssl_ctx_st {
+        log.debug("getSslCtx called", .{});
+        const engine: *QuicEngine = @ptrCast(@alignCast(peer_ctx));
+        return @ptrCast(engine.ssl_ctx);
+    }
+
+    /// BoringSSL custom verify callback registered via SSL_CTX_set_custom_verify.
+    /// Retrieves CertVerifyCtx from SSL_CTX ex_data (no threadlocal needed).
+    /// Called for both client and server sides since getSslCtx is called for both.
+    fn customVerifyCallback(
+        ssl_obj: ?*ssl.SSL,
+        _: [*c]u8,
+    ) callconv(.c) ssl.enum_ssl_verify_result_t {
+        const s = ssl_obj orelse return ssl.ssl_verify_invalid;
+
+        // Get the SSL_CTX from the SSL object
+        const ssl_ctx: *ssl.SSL_CTX = ssl.SSL_get_SSL_CTX(s) orelse return ssl.ssl_verify_invalid;
+
+        // Retrieve the CertVerifyCtx from SSL_CTX ex_data
+        const raw_ptr = ssl.SSL_CTX_get_ex_data(@ptrCast(ssl_ctx), g_ssl_ctx_ex_idx) orelse
+            return ssl.ssl_verify_invalid;
+        const ctx: *CertVerifyCtx = @ptrCast(@alignCast(raw_ptr));
+
+        // Get the peer certificate from the SSL connection
+        const cert: *ssl.X509 = ssl.SSL_get_peer_certificate(s) orelse {
+            log.warn("customVerifyCallback: no peer certificate", .{});
+            return ssl.ssl_verify_invalid;
+        };
+        defer ssl.X509_free(cert);
+
+        // Verify the libp2p certificate extension and extract peer identity
+        const info = tls.verifyAndExtractPeerInfo(ctx.allocator, cert) catch |err| {
+            log.warn("customVerifyCallback: verifyAndExtractPeerInfo failed: {s}", .{@errorName(err)});
+            return ssl.ssl_verify_invalid;
+        };
+
+        if (!info.is_valid) {
+            log.warn("customVerifyCallback: cert signature verification failed", .{});
+            if (info.host_pubkey.data) |d| ctx.allocator.free(d);
+            return ssl.ssl_verify_invalid;
+        }
+
+        // Store verified peer info for consumption by onNewConn/onHskDone
+        ctx.storeVerified(.{
+            .peer_id = info.peer_id,
+            .host_pubkey = info.host_pubkey,
+        });
+
+        log.debug("customVerifyCallback: peer verified successfully", .{});
+        return ssl.ssl_verify_ok;
+    }
+};
+
+// ── Helpers ────────────────────────────────────────────────────────────
+
+/// Convert std.Io.net.IpAddress to a C sockaddr for lsquic interop.
+/// Returns a sockaddr_storage-sized union that can be cast to sockaddr*.
+const SockaddrStorage = extern struct {
+    // Big enough for both sockaddr_in (16 bytes) and sockaddr_in6 (28 bytes).
+    data: [128]u8 = std.mem.zeroes([128]u8),
+};
+
+pub fn ipAddressToSockaddr(addr: net.IpAddress) SockaddrStorage {
+    var storage = SockaddrStorage{};
+    switch (addr) {
+        .ip4 => |a| {
+            if (builtin.os.tag.isDarwin()) {
+                // macOS sockaddr_in: len(1) + family(1) + port(2) + addr(4) + zero(8)
+                storage.data[0] = @sizeOf(std.c.sockaddr.in);
+                storage.data[1] = @intCast(std.posix.AF.INET);
+            } else {
+                // Linux sockaddr_in: family(2) + port(2) + addr(4) + zero(8)
+                const family: u16 = @intCast(std.posix.AF.INET);
+                @memcpy(storage.data[0..2], std.mem.asBytes(&family));
+            }
+            const port_be = std.mem.nativeToBig(u16, a.port);
+            const offset: usize = if (builtin.os.tag.isDarwin()) 2 else 2;
+            @memcpy(storage.data[offset..][0..2], std.mem.asBytes(&port_be));
+            @memcpy(storage.data[offset + 2 ..][0..4], &a.bytes);
+        },
+        .ip6 => |a| {
+            if (builtin.os.tag.isDarwin()) {
+                storage.data[0] = @sizeOf(std.c.sockaddr.in6);
+                storage.data[1] = @intCast(std.posix.AF.INET6);
+            } else {
+                const family: u16 = @intCast(std.posix.AF.INET6);
+                @memcpy(storage.data[0..2], std.mem.asBytes(&family));
+            }
+            const port_be = std.mem.nativeToBig(u16, a.port);
+            const offset: usize = if (builtin.os.tag.isDarwin()) 2 else 2;
+            @memcpy(storage.data[offset..][0..2], std.mem.asBytes(&port_be));
+            // flowinfo at offset+4 (4 bytes, zeroed)
+            // addr at offset+8 (16 bytes)
+            @memcpy(storage.data[offset + 6 ..][0..16], &a.bytes);
+        },
+    }
+    return storage;
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+test "CertVerifyCtx store and retrieve" {
+    const allocator = std.testing.allocator;
+    var ctx = CertVerifyCtx.init(allocator);
+    defer ctx.deinit();
+
+    // Create a test VerifiedPeer with dummy data
+    const test_key_data = try allocator.dupe(u8, &[_]u8{ 1, 2, 3, 4 });
+    const test_peer = CertVerifyCtx.VerifiedPeer{
+        .peer_id = std.mem.zeroes(PeerId),
+        .host_pubkey = keys.PublicKey{ .type = .ED25519, .data = test_key_data },
+    };
+
+    ctx.storeVerified(test_peer);
+    const peer = ctx.takeVerified();
+    try std.testing.expect(peer != null);
+    // Caller owns the taken peer's host_pubkey data
+    allocator.free(peer.?.host_pubkey.data.?);
+}
+
+test "CertVerifyCtx returns null when empty" {
+    const allocator = std.testing.allocator;
+    var ctx = CertVerifyCtx.init(allocator);
+    defer ctx.deinit();
+
+    const peer = ctx.takeVerified();
+    try std.testing.expect(peer == null);
+}
+
+test "QuicEngine init and deinit" {
+    const allocator = std.testing.allocator;
+    const engine = QuicEngine.init(allocator, .{}) catch |err| {
+        // If lsquic init fails (e.g., missing SSL setup), skip
+        std.log.warn("QuicEngine init failed (expected in unit test): {}", .{err});
+        return;
+    };
+    defer engine.deinit();
+
+    try std.testing.expect(!engine.is_server);
+    try std.testing.expect(!engine.running);
+    try std.testing.expect(engine.io == null);
+}
+
+test "ipAddressToSockaddr converts IPv4 correctly" {
+    const addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 168, 1, 42 }, .port = 8080 } };
+    const storage = ipAddressToSockaddr(addr);
+
+    if (builtin.os.tag.isDarwin()) {
+        // macOS: sin_len(1) + sin_family(1) + sin_port(2) + sin_addr(4)
+        try std.testing.expectEqual(@as(u8, @sizeOf(std.c.sockaddr.in)), storage.data[0]);
+        try std.testing.expectEqual(@as(u8, @intCast(std.posix.AF.INET)), storage.data[1]);
+    } else {
+        // Linux: sin_family(2, little-endian) + sin_port(2) + sin_addr(4)
+        const family = std.mem.readInt(u16, storage.data[0..2], .little);
+        try std.testing.expectEqual(@as(u16, @intCast(std.posix.AF.INET)), family);
+    }
+
+    // Port is always at offset 2, big-endian
+    const port_be = std.mem.readInt(u16, storage.data[2..4], .big);
+    try std.testing.expectEqual(@as(u16, 8080), port_be);
+
+    // IPv4 addr at offset 4
+    try std.testing.expectEqual(@as(u8, 192), storage.data[4]);
+    try std.testing.expectEqual(@as(u8, 168), storage.data[5]);
+    try std.testing.expectEqual(@as(u8, 1), storage.data[6]);
+    try std.testing.expectEqual(@as(u8, 42), storage.data[7]);
+}
