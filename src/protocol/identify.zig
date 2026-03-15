@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const identify_pb = @import("../proto/identify.proto.zig");
 const stream_util = @import("../util/stream.zig");
 
@@ -36,10 +37,13 @@ const max_protocols: u32 = 128;
 
 /// Handle inbound identify (responder): encode and send our identity.
 pub fn handleInbound(
-    allocator: std.mem.Allocator,
+    io: Io,
     stream: anytype,
-    config: Config,
+    ctx: anytype,
 ) Error!void {
+    const allocator = ctx.allocator;
+    const config: Config = ctx.identify;
+
     var msg = identify_pb.Identify{};
     msg.protocol_version = config.protocol_version;
     msg.agent_version = config.agent_version;
@@ -71,21 +75,24 @@ pub fn handleInbound(
 
     if (encoded.len > max_message_size) return Error.MessageTooLarge;
 
-    writeAll(stream, encoded) catch return Error.UnexpectedEof;
+    writeAll(io, stream, encoded) catch return Error.UnexpectedEof;
 }
 
 /// Handle outbound identify (initiator): read the remote's identity.
 /// Caller owns the returned IdentifyResult and must call `deinit()`.
 pub fn handleOutbound(
-    allocator: std.mem.Allocator,
+    io: Io,
     stream: anytype,
+    ctx: anytype,
 ) Error!IdentifyResult {
+    const allocator = ctx.allocator;
+
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
     var tmp: [4096]u8 = undefined;
     while (buf.items.len < max_message_size) {
-        const n = stream.read(&tmp) catch return Error.UnexpectedEof;
+        const n = stream.read(io, &tmp) catch return Error.UnexpectedEof;
         if (n == 0) break;
         buf.appendSlice(allocator, tmp[0..n]) catch return Error.UnexpectedEof;
     }
@@ -144,9 +151,12 @@ test "handleInbound encodes and writes identify message" {
     var stream = MockStream.init(allocator, &.{});
     defer stream.deinit();
 
-    try handleInbound(allocator, &stream, .{
-        .protocol_version = "test/1.0.0",
-        .agent_version = "zig-libp2p/0.1.0",
+    try handleInbound(undefined, &stream, .{
+        .allocator = allocator,
+        .identify = Config{
+            .protocol_version = "test/1.0.0",
+            .agent_version = "zig-libp2p/0.1.0",
+        },
     });
 
     // Decode what was written
@@ -169,7 +179,7 @@ test "handleOutbound reads and decodes identify message" {
     var stream = MockStream.init(allocator, encoded);
     defer stream.deinit();
 
-    var result = try handleOutbound(allocator, &stream);
+    var result = try handleOutbound(undefined, &stream, .{ .allocator = allocator });
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("ipfs/0.1.0", result.protocolVersion());
@@ -183,6 +193,6 @@ test "handleOutbound rejects empty stream" {
     var stream = MockStream.init(allocator, &.{});
     defer stream.deinit();
 
-    const result = handleOutbound(allocator, &stream);
+    const result = handleOutbound(undefined, &stream, .{ .allocator = allocator });
     try std.testing.expectError(Error.UnexpectedEof, result);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const rpc = @import("../../proto/rpc.proto.zig");
 
 /// Maximum RPC message size (1 MiB, per libp2p spec).
@@ -66,13 +67,13 @@ pub fn encodeRpc(allocator: std.mem.Allocator, rpc_msg: *const rpc.RPC) Error![]
 }
 
 /// Write an RPC message as a varint-length-prefixed protobuf frame to a stream.
-pub fn writeRpc(allocator: std.mem.Allocator, stream: anytype, rpc_msg: *const rpc.RPC) Error!void {
+pub fn writeRpc(io: Io, allocator: std.mem.Allocator, stream: anytype, rpc_msg: *const rpc.RPC) Error!void {
     const frame = try encodeRpc(allocator, rpc_msg);
     defer allocator.free(frame);
 
     var total: usize = 0;
     while (total < frame.len) {
-        const n = stream.write(frame[total..]) catch return error.UnexpectedEof;
+        const n = stream.write(io, frame[total..]) catch return error.UnexpectedEof;
         if (n == 0) return error.UnexpectedEof;
         total += n;
     }
@@ -228,7 +229,7 @@ test "writeRpc writes to stream" {
     var stream = MockStream.init(allocator, &.{});
     defer stream.deinit();
 
-    try writeRpc(allocator, &stream, &rpc_msg);
+    try writeRpc(undefined, allocator, &stream, &rpc_msg);
 
     // Should have written a valid frame
     try std.testing.expect(stream.write_buf.items.len > 0);
