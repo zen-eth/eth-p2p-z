@@ -2047,16 +2047,7 @@ pub const Gossipsub = struct {
 
         var it = prune.keyIterator();
         while (it.next()) |topic| {
-            // GossipSub v1.1: Include backoff duration in PRUNE message
-            if (self.opts.gossipsub_v1_1) {
-                try prune_list.append(arena, .{
-                    .topic_i_d = topic.*,
-                    .backoff = self.opts.prune_backoff_s,
-                    .peers = null, // TODO: Implement peer exchange (PX)
-                });
-            } else {
-                try prune_list.append(arena, .{ .topic_i_d = topic.* });
-            }
+            try prune_list.append(arena, self.makeControlMessage(rpc.ControlPrune, topic.*, from.*));
         }
 
         return prune_list.toOwnedSlice(arena);
@@ -5124,4 +5115,118 @@ test "pubsub three-node propagation" {
     try std.testing.expect(message_c_source.?.eql(&node_a.transport.local_peer_id));
     try std.testing.expect(message_c_data != null);
     try std.testing.expect(std.mem.eql(u8, message_c_data.?, payload));
+}
+
+test "gossipsub prune backoff: addBackoff and inBackoff" {
+    const allocator = std.testing.allocator;
+
+    var node: TestGossipsubNode = undefined;
+    try node.init(allocator, 10467, .{ .gossipsub_v1_1 = true });
+    defer node.deinit();
+
+    const topic = "backoff-unit-test";
+    const peer_id = node.transport.local_peer_id;
+    const now_ms = std.time.milliTimestamp();
+
+    // No backoff set initially
+    try std.testing.expect(!node.router.inBackoff(topic, peer_id));
+
+    // Add backoff with a future timestamp — peer should be blocked
+    try node.router.addBackoff(topic, peer_id, now_ms + 10_000);
+    try std.testing.expect(node.router.inBackoff(topic, peer_id));
+
+    // Overwrite with an already-expired timestamp — peer should be clear
+    try node.router.addBackoff(topic, peer_id, now_ms - 1_000);
+    try std.testing.expect(!node.router.inBackoff(topic, peer_id));
+}
+
+test "gossipsub prune backoff: cleanupExpiredBackoffs removes only expired entries" {
+    const allocator = std.testing.allocator;
+
+    var node_a: TestGossipsubNode = undefined;
+    try node_a.init(allocator, 10468, .{ .gossipsub_v1_1 = true });
+    defer node_a.deinit();
+
+    var node_b: TestGossipsubNode = undefined;
+    try node_b.init(allocator, 10469, .{});
+    defer node_b.deinit();
+
+    const topic = "backoff-cleanup-test";
+    const now_ms = std.time.milliTimestamp();
+    const peer_a = node_a.transport.local_peer_id;
+    const peer_b = node_b.transport.local_peer_id;
+
+    // Add one expired and one active backoff entry
+    try node_a.router.addBackoff(topic, peer_a, now_ms - 1_000); // expired
+    try node_a.router.addBackoff(topic, peer_b, now_ms + 10_000); // still active
+
+    // Both entries should be present before cleanup
+    const before = node_a.router.backoff.getPtr(topic);
+    try std.testing.expect(before != null);
+    try std.testing.expectEqual(@as(u32, 2), before.?.count());
+
+    node_a.router.cleanupExpiredBackoffs(now_ms);
+
+    // Only the active entry should remain
+    const after = node_a.router.backoff.getPtr(topic);
+    try std.testing.expect(after != null);
+    try std.testing.expectEqual(@as(u32, 1), after.?.count());
+    try std.testing.expect(after.?.contains(peer_b));
+
+    // When ALL entries for a topic expire the topic key itself must be removed
+    node_a.router.cleanupExpiredBackoffs(now_ms + 20_000);
+    try std.testing.expect(node_a.router.backoff.getPtr(topic) == null);
+}
+
+test "gossipsub prune backoff: heartbeat skips graft for peer in backoff" {
+    const allocator = std.testing.allocator;
+    const opts: Gossipsub.Options = .{
+        .D = 1,
+        .D_lo = 1,
+        .D_hi = 2,
+        .D_lazy = 1,
+        .gossipsub_v1_1 = true,
+    };
+
+    var node_a: TestGossipsubNode = undefined;
+    try node_a.init(allocator, 10470, opts);
+    defer node_a.deinit();
+
+    var node_b: TestGossipsubNode = undefined;
+    try node_b.init(allocator, 10471, opts);
+    defer node_b.deinit();
+
+    const topic = "backoff-heartbeat-test";
+    try subscribeSync(&node_a.router, topic);
+    try subscribeSync(&node_b.router, topic);
+    try addPeerSync(&node_a.router, node_b.dial_addr);
+    try addPeerSync(&node_b.router, node_a.dial_addr);
+
+    const peer_b = node_b.transport.local_peer_id;
+
+    // Wait until node_a knows peer_b subscribes to the topic and has a usable stream,
+    // ensuring peer_b is a valid graft candidate before we stop the heartbeat
+    try waitForTopicPeer(&node_a.router, topic, peer_b, 5 * std.time.ns_per_s);
+    try waitForUsableStream(&node_a.router, peer_b, 5 * std.time.ns_per_s);
+
+    // Stop background heartbeats so mesh manipulation and the heartbeat call are race-free
+    node_a.router.heartbeat_running = false;
+    node_b.router.heartbeat_running = false;
+
+    // Remove peer_b from node_a's mesh so the heartbeat would normally re-graft it
+    if (node_a.router.mesh.getPtr(topic)) |peer_set| {
+        _ = peer_set.remove(peer_b);
+    }
+
+    // Place peer_b in backoff — heartbeat must not re-graft it
+    const backoff_until_ms = std.time.milliTimestamp() + 60_000;
+    try node_a.router.addBackoff(topic, peer_b, backoff_until_ms);
+
+    // Run one heartbeat cycle directly (deterministic, no sleep needed)
+    node_a.router.doHeartbeat();
+
+    // peer_b must not have been grafted back
+    const mesh_after = node_a.router.mesh.getPtr(topic);
+    try std.testing.expect(mesh_after != null);
+    try std.testing.expect(!mesh_after.?.contains(peer_b));
 }
