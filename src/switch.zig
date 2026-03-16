@@ -32,13 +32,17 @@ pub fn Switch(comptime config: SwitchConfig) type {
     return struct {
         const Self = @This();
 
+        /// Comptime-generated tuple type holding one instance per registered protocol handler.
+        const HandlerTuple = std.meta.Tuple(config.protocols);
+
         allocator: Allocator,
+        handlers: HandlerTuple,
 
         /// Protocol IDs for multistream-select negotiation (computed at comptime).
         const supported_protocol_ids = protocol_mod.protocolIds(config.protocols);
 
-        pub fn init(allocator: Allocator) Self {
-            return .{ .allocator = allocator };
+        pub fn init(allocator: Allocator, handlers: HandlerTuple) Self {
+            return .{ .allocator = allocator, .handlers = handlers };
         }
 
         pub fn deinit(self: *Self) void {
@@ -78,13 +82,12 @@ pub fn Switch(comptime config: SwitchConfig) type {
 
         /// Negotiate protocol on an inbound stream and dispatch to handler.
         /// io flows directly through multistream and protocol handler -- no adapter.
-        pub fn dispatchStream(_: *Self, io: Io, s: anytype) !void {
+        pub fn dispatchStream(self: *Self, io: Io, s: anytype) !void {
             const proto_id = try multistream.negotiateInbound(io, s, &supported_protocol_ids);
 
-            inline for (config.protocols) |P| {
+            inline for (config.protocols, 0..) |P, i| {
                 if (std.mem.eql(u8, proto_id, P.id)) {
-                    var handler: P = .{};
-                    try handler.handleInbound(io, s);
+                    try self.handlers[i].handleInbound(io, s);
                     return;
                 }
             }
@@ -93,7 +96,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// Open a stream, negotiate the given protocol via multistream-select,
         /// and run the protocol's outbound handler. Symmetric with dispatchStream.
         pub fn openStream(
-            _: *Self,
+            self: *Self,
             io: Io,
             conn: anytype,
             comptime P: type,
@@ -103,8 +106,21 @@ pub fn Switch(comptime config: SwitchConfig) type {
             var s = try conn.openStream(io);
             const stream = streamRef(&s);
             _ = try multistream.negotiateOutbound(io, stream, &.{P.id});
-            var handler: P = .{};
-            try handler.handleOutbound(io, stream, ctx);
+            inline for (config.protocols, 0..) |Proto, i| {
+                if (Proto == P) {
+                    try self.handlers[i].handleOutbound(io, stream, ctx);
+                    return;
+                }
+            }
+        }
+
+        /// Get a mutable pointer to the handler instance for protocol P.
+        /// Allows callers to access handler state directly (e.g. identify results).
+        pub fn getHandler(self: *Self, comptime P: type) *P {
+            inline for (config.protocols, 0..) |Proto, i| {
+                if (Proto == P) return &self.handlers[i];
+            }
+            @compileError("Protocol '" ++ @typeName(P) ++ "' not registered in Switch");
         }
 
         /// Returns a pointer suitable for protocol handlers.
@@ -174,7 +190,7 @@ test "Switch comptime validation accepts valid config" {
         .protocols = &.{MockProtocol},
     });
 
-    var sw = TestSwitch.init(std.testing.allocator);
+    var sw = TestSwitch.init(std.testing.allocator, .{MockProtocol{}});
     defer sw.deinit();
 
     // Verify protocol IDs are correct
@@ -204,7 +220,7 @@ test "Switch dispatchStream handles ping over QUIC" {
         .transports = &.{quic_mod.QuicTransport},
         .protocols = &.{ping_mod.Handler},
     });
-    var sw = Node.init(allocator);
+    var sw = Node.init(allocator, .{ping_mod.Handler{}});
     defer sw.deinit();
 
     // Set up QUIC server engine
