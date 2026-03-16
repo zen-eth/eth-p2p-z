@@ -5,12 +5,6 @@ const stream_util = @import("../util/stream.zig");
 
 const writeAll = stream_util.writeAll;
 
-/// Protocol identifier for libp2p identify.
-pub const id = "/ipfs/id/1.0.0";
-
-/// Protocol identifier for libp2p identify push.
-pub const push_id = "/ipfs/id/push/1.0.0";
-
 /// Maximum identify message size (8 KiB, per spec).
 const max_message_size: u32 = 8 * 1024;
 
@@ -35,83 +29,88 @@ pub const Config = struct {
 const max_listen_addrs: u32 = 64;
 const max_protocols: u32 = 128;
 
-/// Handle inbound identify (responder): encode and send our identity.
-pub fn handleInbound(
-    io: Io,
-    stream: anytype,
-    ctx: anytype,
-) Error!void {
-    const allocator = ctx.allocator;
-    const config: Config = ctx.identify;
+/// Identify protocol handler.
+/// Identify is stateful — it holds an allocator and config.
+pub const Handler = struct {
+    allocator: std.mem.Allocator,
+    config: Config,
 
-    var msg = identify_pb.Identify{};
-    msg.protocol_version = config.protocol_version;
-    msg.agent_version = config.agent_version;
-    msg.public_key = config.public_key;
-    msg.observed_addr = config.observed_addr;
+    /// Protocol identifier for libp2p identify.
+    pub const id = "/ipfs/id/1.0.0";
 
-    // Convert listen_addrs []const []const u8 -> []const ?[]const u8
-    var listen_addrs_buf: [max_listen_addrs]?[]const u8 = undefined;
-    if (config.listen_addrs) |addrs| {
-        if (addrs.len > max_listen_addrs) return Error.TooManyListenAddrs;
-        for (addrs, 0..) |addr, i| {
-            listen_addrs_buf[i] = addr;
+    /// Protocol identifier for libp2p identify push.
+    pub const push_id = "/ipfs/id/push/1.0.0";
+
+    /// Handle inbound identify (responder): encode and send our identity.
+    pub fn handleInbound(self: *Handler, io: Io, stream: anytype) Error!void {
+        const allocator = self.allocator;
+        const config = self.config;
+
+        var msg = identify_pb.Identify{};
+        msg.protocol_version = config.protocol_version;
+        msg.agent_version = config.agent_version;
+        msg.public_key = config.public_key;
+        msg.observed_addr = config.observed_addr;
+
+        // Convert listen_addrs []const []const u8 -> []const ?[]const u8
+        var listen_addrs_buf: [max_listen_addrs]?[]const u8 = undefined;
+        if (config.listen_addrs) |addrs| {
+            if (addrs.len > max_listen_addrs) return Error.TooManyListenAddrs;
+            for (addrs, 0..) |addr, i| {
+                listen_addrs_buf[i] = addr;
+            }
+            msg.listen_addrs = listen_addrs_buf[0..addrs.len];
         }
-        msg.listen_addrs = listen_addrs_buf[0..addrs.len];
-    }
 
-    // Convert protocols
-    var protocols_buf: [max_protocols]?[]const u8 = undefined;
-    if (config.supported_protocols) |protos| {
-        if (protos.len > max_protocols) return Error.TooManyProtocols;
-        for (protos, 0..) |proto, i| {
-            protocols_buf[i] = proto;
+        // Convert protocols
+        var protocols_buf: [max_protocols]?[]const u8 = undefined;
+        if (config.supported_protocols) |protos| {
+            if (protos.len > max_protocols) return Error.TooManyProtocols;
+            for (protos, 0..) |proto, i| {
+                protocols_buf[i] = proto;
+            }
+            msg.protocols = protocols_buf[0..protos.len];
         }
-        msg.protocols = protocols_buf[0..protos.len];
+
+        const encoded = msg.encode(allocator) catch return Error.InvalidProtobuf;
+        defer allocator.free(encoded);
+
+        if (encoded.len > max_message_size) return Error.MessageTooLarge;
+
+        writeAll(io, stream, encoded) catch return Error.UnexpectedEof;
     }
 
-    const encoded = msg.encode(allocator) catch return Error.InvalidProtobuf;
-    defer allocator.free(encoded);
+    /// Handle outbound identify (initiator): read the remote's identity.
+    /// Caller owns the returned IdentifyResult and must call `deinit()`.
+    pub fn handleOutbound(self: *Handler, io: Io, stream: anytype, _: anytype) Error!IdentifyResult {
+        const allocator = self.allocator;
 
-    if (encoded.len > max_message_size) return Error.MessageTooLarge;
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
 
-    writeAll(io, stream, encoded) catch return Error.UnexpectedEof;
-}
+        var tmp: [4096]u8 = undefined;
+        while (buf.items.len < max_message_size) {
+            const n = stream.read(io, &tmp) catch return Error.UnexpectedEof;
+            if (n == 0) break;
+            buf.appendSlice(allocator, tmp[0..n]) catch return Error.UnexpectedEof;
+        }
 
-/// Handle outbound identify (initiator): read the remote's identity.
-/// Caller owns the returned IdentifyResult and must call `deinit()`.
-pub fn handleOutbound(
-    io: Io,
-    stream: anytype,
-    ctx: anytype,
-) Error!IdentifyResult {
-    const allocator = ctx.allocator;
+        if (buf.items.len == 0) return Error.UnexpectedEof;
+        if (buf.items.len > max_message_size) return Error.MessageTooLarge;
 
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(allocator);
+        const owned = buf.toOwnedSlice(allocator) catch return Error.UnexpectedEof;
 
-    var tmp: [4096]u8 = undefined;
-    while (buf.items.len < max_message_size) {
-        const n = stream.read(io, &tmp) catch return Error.UnexpectedEof;
-        if (n == 0) break;
-        buf.appendSlice(allocator, tmp[0..n]) catch return Error.UnexpectedEof;
+        const reader = identify_pb.IdentifyReader.init(owned) catch {
+            allocator.free(owned);
+            return Error.InvalidProtobuf;
+        };
+
+        return .{
+            .reader = reader,
+            .raw_bytes = owned,
+        };
     }
-
-    if (buf.items.len == 0) return Error.UnexpectedEof;
-    if (buf.items.len > max_message_size) return Error.MessageTooLarge;
-
-    const owned = buf.toOwnedSlice(allocator) catch return Error.UnexpectedEof;
-
-    const reader = identify_pb.IdentifyReader.init(owned) catch {
-        allocator.free(owned);
-        return Error.InvalidProtobuf;
-    };
-
-    return .{
-        .reader = reader,
-        .raw_bytes = owned,
-    };
-}
+};
 
 /// Result from an outbound identify handshake.
 /// Caller must call `deinit()` to free the backing buffer.
@@ -151,13 +150,14 @@ test "handleInbound encodes and writes identify message" {
     var stream = MockStream.init(allocator, &.{});
     defer stream.deinit();
 
-    try handleInbound(undefined, &stream, .{
+    var handler: Handler = .{
         .allocator = allocator,
-        .identify = Config{
+        .config = .{
             .protocol_version = "test/1.0.0",
             .agent_version = "zig-libp2p/0.1.0",
         },
-    });
+    };
+    try handler.handleInbound(undefined, &stream);
 
     // Decode what was written
     var reader = try identify_pb.IdentifyReader.init(stream.write_buf.items);
@@ -179,7 +179,11 @@ test "handleOutbound reads and decodes identify message" {
     var stream = MockStream.init(allocator, encoded);
     defer stream.deinit();
 
-    var result = try handleOutbound(undefined, &stream, .{ .allocator = allocator });
+    var handler: Handler = .{
+        .allocator = allocator,
+        .config = .{},
+    };
+    var result = try handler.handleOutbound(undefined, &stream, .{});
     defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("ipfs/0.1.0", result.protocolVersion());
@@ -193,6 +197,10 @@ test "handleOutbound rejects empty stream" {
     var stream = MockStream.init(allocator, &.{});
     defer stream.deinit();
 
-    const result = handleOutbound(undefined, &stream, .{ .allocator = allocator });
+    var handler: Handler = .{
+        .allocator = allocator,
+        .config = .{},
+    };
+    const result = handler.handleOutbound(undefined, &stream, .{});
     try std.testing.expectError(Error.UnexpectedEof, result);
 }
