@@ -623,7 +623,6 @@ test "QUIC stream read/write round-trip" {
     const server_stream = server_conn.acceptStream(io) catch |err| {
         std.log.warn("acceptStream failed: {}", .{err});
         client_stream.close(io);
-        client_stream.deinit();
         server_conn.close(io);
         client_conn.close(io);
         server_eng.stop(io);
@@ -651,25 +650,20 @@ test "QUIC stream read/write round-trip" {
     try std.testing.expectEqualSlices(u8, echo_msg, echo_buf[0..echo_n]);
 
     // Clean up: order matters!
-    // 1. Close streams (marks them for close in lsquic)
+    // 1. Close streams (marks them for close in lsquic, onStreamClose frees QuicStream)
     // 2. Close connections (marks them for close in lsquic)
     // 3. Stop background loops
-    // 4. Destroy engines (force-closes remaining conns, triggers callbacks
-    //    that need QuicConnection still alive)
-    // 5. Free stream/connection structs last
+    // 4. Destroy engines (force-closes remaining conns, triggers callbacks)
+    // 5. Free connection structs last
     client_stream.close(io);
     server_stream.close(io);
     server_conn.close(io);
     client_conn.close(io);
     server_eng.stop(io);
     client_eng.stop(io);
-    // Engine destroy calls force_close_conn which calls onStreamClose/onConnClosed
-    // callbacks — these need QuicConnection to still be alive
     server_eng.deinit();
     client_eng.deinit();
-    // Now safe to free the wrappers
-    client_stream.deinit();
-    server_stream.deinit();
+    // QuicStream objects freed by onStreamClose callback
     server_conn.deinit();
     client_conn.deinit();
 }
@@ -771,7 +765,6 @@ test "QUIC multiple concurrent streams" {
             std.log.warn("openStream {} failed: {}", .{ i, err });
             for (0..i) |j| {
                 client_streams[j].close(io);
-                client_streams[j].deinit();
             }
             return;
         };
@@ -787,11 +780,9 @@ test "QUIC multiple concurrent streams" {
             std.log.warn("acceptStream {} failed: {}", .{ i, err });
             for (0..stream_count) |j| {
                 client_streams[j].close(io);
-                client_streams[j].deinit();
             }
             for (0..i) |j| {
                 server_streams[j].close(io);
-                server_streams[j].deinit();
             }
             return;
         };
@@ -801,14 +792,10 @@ test "QUIC multiple concurrent streams" {
         try std.testing.expectEqualSlices(u8, "stream-", buf[0..7]);
     }
 
-    // Clean up streams
+    // Clean up streams — onStreamClose frees QuicStream objects
     for (0..stream_count) |i| {
         client_streams[i].close(io);
         server_streams[i].close(io);
-    }
-    for (0..stream_count) |i| {
-        client_streams[i].deinit();
-        server_streams[i].deinit();
     }
 }
 
@@ -922,7 +909,6 @@ test "QUIC large message spanning multiple reads" {
     const written = client_stream.write(io, send_buf) catch |err| {
         std.log.warn("write failed: {}", .{err});
         client_stream.close(io);
-        client_stream.deinit();
         return;
     };
     try std.testing.expectEqual(msg_size, written);
@@ -931,7 +917,6 @@ test "QUIC large message spanning multiple reads" {
     const server_stream = ctx.server_conn.acceptStream(io) catch |err| {
         std.log.warn("acceptStream failed: {}", .{err});
         client_stream.close(io);
-        client_stream.deinit();
         return;
     };
 
@@ -953,8 +938,6 @@ test "QUIC large message spanning multiple reads" {
     // Clean up
     client_stream.close(io);
     server_stream.close(io);
-    client_stream.deinit();
-    server_stream.deinit();
 }
 
 test "QuicTransport dial and listen via multiaddr" {
@@ -1048,8 +1031,6 @@ test "QuicTransport dial and listen via multiaddr" {
         server_conn.close(io);
         client_conn.close(io);
         listener.close(io);
-        client_stream.inner.deinit();
-        server_conn.inner.deinit();
         client_conn.inner.deinit();
         return;
     };
@@ -1059,16 +1040,12 @@ test "QuicTransport dial and listen via multiaddr" {
     try std.testing.expectEqualSlices(u8, msg, buf[0..n]);
 
     // Clean up: close I/O resources first, then free inner allocations.
-    // Order matters: streams → connections → engines (via conn/listener close),
-    // then deinit inner objects after engines are destroyed.
+    // Streams are freed by onStreamClose callback.
     client_stream.close(io);
     server_stream.close(io);
     server_conn.close(io);
     client_conn.close(io);
     listener.close(io);
-    // Free heap-allocated inner objects (safe after engines are destroyed)
-    client_stream.inner.deinit();
-    server_stream.inner.deinit();
     server_conn.inner.deinit();
     client_conn.inner.deinit();
 }

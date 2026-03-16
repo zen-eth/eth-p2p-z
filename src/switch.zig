@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const log = std.log.scoped(.@"switch");
 
 const transport_mod = @import("transport/transport.zig");
 const protocol_mod = @import("protocol/protocol.zig");
@@ -88,18 +89,33 @@ pub fn Switch(comptime config: SwitchConfig) type {
             }
         }
 
-        /// Open a stream on a connection and negotiate the given protocol (outbound).
-        /// Returns the transport stream after successful negotiation.
-        pub fn negotiateOutbound(
-            self: *Self,
+        /// Open a stream, negotiate the given protocol via multistream-select,
+        /// and run the protocol's outbound handler. Symmetric with dispatchStream.
+        pub fn openStream(
+            _: *Self,
             io: Io,
             conn: anytype,
-            proto_id: []const u8,
-        ) !@TypeOf(conn.*).Stream {
-            _ = self;
+            comptime P: type,
+            ctx: anytype,
+        ) !void {
+            comptime protocol_mod.assertProtocolInterface(P);
             var s = try conn.openStream(io);
-            _ = try multistream.negotiateOutbound(io, &s, &.{proto_id});
-            return s;
+            const stream = streamRef(&s);
+            _ = try multistream.negotiateOutbound(io, stream, &.{P.id});
+            try P.handleOutbound(io, stream, ctx);
+        }
+
+        /// Returns a pointer suitable for protocol handlers.
+        /// If openStream returned a pointer (*QuicStream), we have *(*QuicStream) — dereference to get *QuicStream.
+        /// If openStream returned a value (Stream), we have *(Stream) — use as-is.
+        inline fn streamRef(s: anytype) switch (@typeInfo(@TypeOf(s.*))) {
+            .pointer => @TypeOf(s.*),
+            else => @TypeOf(s),
+        } {
+            return switch (@typeInfo(@TypeOf(s.*))) {
+                .pointer => s.*,
+                else => s,
+            };
         }
     };
 }
@@ -161,4 +177,136 @@ test "Switch comptime validation accepts valid config" {
 
     // Verify protocol IDs are correct
     try std.testing.expectEqualStrings("/test/mock/1.0.0", TestSwitch.supported_protocol_ids[0]);
+}
+
+test "Switch dispatchStream handles ping over QUIC" {
+    const quic_mod = @import("transport/quic/quic.zig");
+    const engine_mod = @import("transport/quic/engine.zig");
+    const QuicEngine = engine_mod.QuicEngine;
+    const ping_mod = @import("protocol/ping.zig");
+    const tls_mod = @import("security/tls.zig");
+    const ssl = @import("ssl");
+    const net = Io.net;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Generate TLS key pairs
+    const server_key = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(server_key);
+    const client_key = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(client_key);
+
+    // Create Switch with QUIC + ping
+    const Node = Switch(.{
+        .transports = &.{quic_mod.QuicTransport},
+        .protocols = &.{ping_mod},
+    });
+    var sw = Node.init(allocator);
+    defer sw.deinit();
+
+    // Set up QUIC server engine
+    const server_eng = QuicEngine.init(allocator, .{
+        .is_server = true,
+        .host_key = server_key,
+    }) catch return;
+    server_eng.setIo(io);
+    server_eng.bindSocket(io, &net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }) catch {
+        server_eng.deinit();
+        return;
+    };
+    const server_port = switch ((server_eng.socket orelse {
+        server_eng.deinit();
+        return;
+    }).address) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    server_eng.startBackgroundLoops(io);
+
+    // Set up QUIC client engine
+    const client_eng = QuicEngine.init(allocator, .{
+        .is_server = false,
+        .host_key = client_key,
+    }) catch {
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+    client_eng.setIo(io);
+    client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) }) catch {
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+
+    // Connect client to server
+    const remote = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = server_port } };
+    var remote_sa = engine_mod.ipAddressToSockaddr(remote);
+    const local_bound = (client_eng.socket orelse {
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    }).address;
+    var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
+    const client_conn = client_eng.connect(io, @ptrCast(&remote_sa), @ptrCast(&local_sa)) catch {
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+    client_eng.startBackgroundLoops(io);
+
+    // Accept connection on server
+    const server_conn = server_eng.accept(io) catch {
+        client_conn.close(io);
+        client_conn.deinit();
+        client_eng.stop(io);
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+
+    // Spawn server handler fiber FIRST — it will block on acceptStream until
+    // the client writes (QUIC lazy streams). Cooperative fibers interleave at I/O points.
+    server_eng.background.async(io, struct {
+        fn run(sw_ptr: *Node, io_arg: Io, conn: *engine_mod.QuicConnection) void {
+            const s_inner = conn.acceptStream(io_arg) catch |err| {
+                log.warn("server acceptStream failed: {}", .{err});
+                return;
+            };
+            var s = quic_mod.Stream{ .inner = s_inner };
+            sw_ptr.dispatchStream(io_arg, &s) catch |err| {
+                log.warn("server dispatchStream failed: {}", .{err});
+            };
+        }
+    }.run, .{ &sw, io, server_conn });
+
+    // Client: open stream → negotiate multistream → ping outbound (main fiber)
+    const payload = [_]u8{0x42} ** ping_mod.payload_length;
+    sw.openStream(io, client_conn, ping_mod, .{ .payload = &payload }) catch |err| {
+        log.warn("client openStream (ping) failed: {}", .{err});
+        server_conn.close(io);
+        client_conn.close(io);
+        server_eng.stop(io);
+        client_eng.stop(io);
+        server_eng.deinit();
+        client_eng.deinit();
+        server_conn.deinit();
+        client_conn.deinit();
+        return;
+    };
+
+    // Ping succeeded! Clean up.
+    server_conn.close(io);
+    client_conn.close(io);
+    server_eng.stop(io);
+    client_eng.stop(io);
+    server_eng.deinit();
+    client_eng.deinit();
+    server_conn.deinit();
+    client_conn.deinit();
 }

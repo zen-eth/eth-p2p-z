@@ -49,6 +49,9 @@ pub const QuicStream = struct {
     read_queue_buf: [16]ReadEvent,
     read_queue: Io.Queue(ReadEvent),
     closed: bool,
+    /// Leftover data from a previous ReadEvent when caller's buffer was too small.
+    leftover_buf: ?[]u8 = null,
+    leftover_offset: usize = 0,
 
     pub fn init(allocator: Allocator, ls: *lsquic.lsquic_stream_t, conn: *QuicConnection) !*QuicStream {
         const self = try allocator.create(QuicStream);
@@ -67,13 +70,37 @@ pub const QuicStream = struct {
 
     pub fn read(self: *QuicStream, io: Io, buf: []u8) anyerror!usize {
         if (self.closed) return error.StreamClosed;
+
+        // Serve from leftover data first
+        if (self.leftover_buf) |lb| {
+            const remaining = lb.len - self.leftover_offset;
+            const len = @min(buf.len, remaining);
+            @memcpy(buf[0..len], lb[self.leftover_offset..][0..len]);
+            if (len == remaining) {
+                // Consumed all leftover data, free the buffer
+                self.allocator.free(lb);
+                self.leftover_buf = null;
+                self.leftover_offset = 0;
+            } else {
+                self.leftover_offset += len;
+            }
+            return len;
+        }
+
         const event = self.read_queue.getOne(io) catch |err| switch (err) {
             error.Closed => return error.StreamClosed,
             error.Canceled => return error.StreamClosed,
         };
         const len = @min(buf.len, event.data.len);
         @memcpy(buf[0..len], event.data[0..len]);
-        self.allocator.free(event.owned_buf);
+        if (len < event.data.len) {
+            // Partial read — save remaining data for next read call
+            self.leftover_buf = event.owned_buf;
+            self.leftover_offset = len;
+        } else {
+            // Consumed everything, free immediately
+            self.allocator.free(event.owned_buf);
+        }
         return len;
     }
 
@@ -86,23 +113,25 @@ pub const QuicStream = struct {
         return @intCast(written);
     }
 
-    pub fn close(self: *QuicStream, io: Io) void {
+    pub fn close(self: *QuicStream, _: Io) void {
         if (self.lsquic_stream) |ls| {
-            // Only close the lsquic stream if our connection is still alive
+            // Tell lsquic to close the stream. This will trigger onStreamClose
+            // which handles cleanup (closing read_queue, freeing leftover, destroying self).
             if (!self.conn.closed) {
                 _ = lsquic.lsquic_stream_close(ls);
             }
-            self.lsquic_stream = null;
         }
-        self.closed = true;
-        self.read_queue.close(io);
     }
 
     pub fn deinit(self: *QuicStream) void {
+        // Only for manual cleanup when onStreamClose won't fire (e.g. error paths before lsquic knows about the stream)
         if (self.lsquic_stream) |ls| {
             if (!self.conn.closed) {
                 _ = lsquic.lsquic_stream_close(ls);
             }
+        }
+        if (self.leftover_buf) |lb| {
+            self.allocator.free(lb);
         }
         self.allocator.destroy(self);
     }
@@ -725,7 +754,8 @@ pub const QuicEngine = struct {
         var buf: [4096]u8 = undefined;
         const n = lsquic.lsquic_stream_read(s, &buf, buf.len);
         if (n <= 0) {
-            // EOF or error - close the read queue
+            // EOF or error - stop reading and close the read queue
+            _ = lsquic.lsquic_stream_wantread(s, 0);
             if (stream.conn.engine.io) |io| {
                 stream.read_queue.close(io);
             }
@@ -763,13 +793,23 @@ pub const QuicEngine = struct {
         }
     }
 
-    fn onStreamClose(_: ?*lsquic.lsquic_stream_t, ctx: ?*lsquic.lsquic_stream_ctx_t) callconv(.c) void {
+    fn onStreamClose(ls: ?*lsquic.lsquic_stream_t, ctx: ?*lsquic.lsquic_stream_ctx_t) callconv(.c) void {
         if (ctx) |raw| {
             const stream: *QuicStream = @ptrCast(@alignCast(raw));
+            log.debug("onStreamClose: stream={*}", .{stream});
+            stream.lsquic_stream = null;
             stream.closed = true;
             if (stream.conn.engine.io) |io| {
                 stream.read_queue.close(io);
             }
+            // Clear context so lsquic won't call us again
+            if (ls) |s| lsquic.lsquic_stream_set_ctx(s, null);
+            // Free leftover read buffer if any
+            if (stream.leftover_buf) |lb| {
+                stream.allocator.free(lb);
+                stream.leftover_buf = null;
+            }
+            stream.allocator.destroy(stream);
         }
     }
 
