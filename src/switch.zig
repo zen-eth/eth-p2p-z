@@ -11,7 +11,7 @@ const multistream = @import("protocol/multistream.zig");
 pub const SwitchConfig = struct {
     /// Transport types (must satisfy assertTransportInterface).
     transports: []const type,
-    /// Protocol types (must have id, handleInbound, handleOutbound).
+    /// Protocol types (must satisfy assertProtocolInterface — Handler structs with id, handleInbound, handleOutbound).
     protocols: []const type,
 };
 
@@ -78,12 +78,13 @@ pub fn Switch(comptime config: SwitchConfig) type {
 
         /// Negotiate protocol on an inbound stream and dispatch to handler.
         /// io flows directly through multistream and protocol handler -- no adapter.
-        pub fn dispatchStream(self: *Self, io: Io, s: anytype) !void {
+        pub fn dispatchStream(_: *Self, io: Io, s: anytype) !void {
             const proto_id = try multistream.negotiateInbound(io, s, &supported_protocol_ids);
 
             inline for (config.protocols) |P| {
                 if (std.mem.eql(u8, proto_id, P.id)) {
-                    try P.handleInbound(io, s, .{ .allocator = self.allocator });
+                    var handler: P = .{};
+                    try handler.handleInbound(io, s);
                     return;
                 }
             }
@@ -102,7 +103,8 @@ pub fn Switch(comptime config: SwitchConfig) type {
             var s = try conn.openStream(io);
             const stream = streamRef(&s);
             _ = try multistream.negotiateOutbound(io, stream, &.{P.id});
-            try P.handleOutbound(io, stream, ctx);
+            var handler: P = .{};
+            try handler.handleOutbound(io, stream, ctx);
         }
 
         /// Returns a pointer suitable for protocol handlers.
@@ -163,8 +165,8 @@ test "Switch comptime validation accepts valid config" {
 
     const MockProtocol = struct {
         pub const id = "/test/mock/1.0.0";
-        pub fn handleInbound(_: Io, _: anytype, _: anytype) !void {}
-        pub fn handleOutbound(_: Io, _: anytype, _: anytype) !void {}
+        pub fn handleInbound(_: *@This(), _: Io, _: anytype) !void {}
+        pub fn handleOutbound(_: *@This(), _: Io, _: anytype, _: anytype) !void {}
     };
 
     const TestSwitch = Switch(.{
@@ -200,7 +202,7 @@ test "Switch dispatchStream handles ping over QUIC" {
     // Create Switch with QUIC + ping
     const Node = Switch(.{
         .transports = &.{quic_mod.QuicTransport},
-        .protocols = &.{ping_mod},
+        .protocols = &.{ping_mod.Handler},
     });
     var sw = Node.init(allocator);
     defer sw.deinit();
@@ -287,7 +289,7 @@ test "Switch dispatchStream handles ping over QUIC" {
 
     // Client: open stream → negotiate multistream → ping outbound (main fiber)
     const payload = [_]u8{0x42} ** ping_mod.payload_length;
-    sw.openStream(io, client_conn, ping_mod, .{ .payload = &payload }) catch |err| {
+    sw.openStream(io, client_conn, ping_mod.Handler, .{ .payload = &payload }) catch |err| {
         log.warn("client openStream (ping) failed: {}", .{err});
         server_conn.close(io);
         client_conn.close(io);

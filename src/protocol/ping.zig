@@ -5,9 +5,6 @@ const stream_util = @import("../util/stream.zig");
 const readExact = stream_util.readExact;
 const writeAll = stream_util.writeAll;
 
-/// Protocol identifier for libp2p ping.
-pub const id = "/ipfs/ping/1.0.0";
-
 /// Length of a ping payload in bytes.
 pub const payload_length: u32 = 32;
 
@@ -16,27 +13,33 @@ pub const Error = error{
     PayloadMismatch,
 };
 
-/// Handle an inbound ping: read 32 bytes from the stream, echo them back.
-pub fn handleInbound(io: Io, stream: anytype, ctx: anytype) Error!void {
-    _ = ctx;
-    var buf: [payload_length]u8 = undefined;
-    readExact(io, stream, &buf) catch return Error.UnexpectedEof;
-    writeAll(io, stream, &buf) catch return Error.UnexpectedEof;
-}
+/// Ping protocol handler.
+/// Ping is stateless, so the handler carries no fields.
+pub const Handler = struct {
+    /// Protocol identifier for libp2p ping.
+    pub const id = "/ipfs/ping/1.0.0";
 
-/// Handle an outbound ping: send the given payload, wait for echo, verify match.
-/// Caller provides the payload via ctx.payload (typically 32 random bytes) and handles RTT measurement.
-pub fn handleOutbound(io: Io, stream: anytype, ctx: anytype) Error!void {
-    const payload = ctx.payload;
-    writeAll(io, stream, payload) catch return Error.UnexpectedEof;
-
-    var response: [payload_length]u8 = undefined;
-    readExact(io, stream, &response) catch return Error.UnexpectedEof;
-
-    if (!std.mem.eql(u8, payload, &response)) {
-        return Error.PayloadMismatch;
+    /// Handle an inbound ping: read 32 bytes from the stream, echo them back.
+    pub fn handleInbound(_: *Handler, io: Io, stream: anytype) Error!void {
+        var buf: [payload_length]u8 = undefined;
+        readExact(io, stream, &buf) catch return Error.UnexpectedEof;
+        writeAll(io, stream, &buf) catch return Error.UnexpectedEof;
     }
-}
+
+    /// Handle an outbound ping: send the given payload, wait for echo, verify match.
+    /// Caller provides the payload via ctx.payload (typically 32 random bytes) and handles RTT measurement.
+    pub fn handleOutbound(_: *Handler, io: Io, stream: anytype, ctx: anytype) Error!void {
+        const payload = ctx.payload;
+        writeAll(io, stream, payload) catch return Error.UnexpectedEof;
+
+        var response: [payload_length]u8 = undefined;
+        readExact(io, stream, &response) catch return Error.UnexpectedEof;
+
+        if (!std.mem.eql(u8, payload, &response)) {
+            return Error.PayloadMismatch;
+        }
+    }
+};
 
 // --- Tests ---
 
@@ -49,7 +52,8 @@ test "handleInbound echoes payload" {
     var stream = MockStream.init(allocator, &payload);
     defer stream.deinit();
 
-    try handleInbound(undefined, &stream, .{});
+    var handler: Handler = .{};
+    try handler.handleInbound(undefined, &stream);
 
     try std.testing.expectEqual(payload_length, stream.write_buf.items.len);
     try std.testing.expectEqualSlices(u8, &payload, stream.write_buf.items);
@@ -62,7 +66,8 @@ test "handleInbound returns error on short read" {
     var stream = MockStream.init(allocator, &short_payload);
     defer stream.deinit();
 
-    const result = handleInbound(undefined, &stream, .{});
+    var handler: Handler = .{};
+    const result = handler.handleInbound(undefined, &stream);
     try std.testing.expectError(Error.UnexpectedEof, result);
 }
 
@@ -73,7 +78,8 @@ test "handleOutbound succeeds with matching echo" {
     var stream = MockStream.init(allocator, &payload);
     defer stream.deinit();
 
-    try handleOutbound(undefined, &stream, .{ .payload = &payload });
+    var handler: Handler = .{};
+    try handler.handleOutbound(undefined, &stream, .{ .payload = &payload });
     try std.testing.expectEqualSlices(u8, &payload, stream.write_buf.items);
 }
 
@@ -84,7 +90,8 @@ test "handleOutbound detects payload mismatch" {
     var stream = MockStream.init(allocator, &wrong_response);
     defer stream.deinit();
 
+    var handler: Handler = .{};
     const payload = [_]u8{0xFF} ** payload_length;
-    const result = handleOutbound(undefined, &stream, .{ .payload = &payload });
+    const result = handler.handleOutbound(undefined, &stream, .{ .payload = &payload });
     try std.testing.expectError(Error.PayloadMismatch, result);
 }

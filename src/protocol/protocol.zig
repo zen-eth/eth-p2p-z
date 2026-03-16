@@ -3,11 +3,11 @@ const std = @import("std");
 /// Protocol identifier (e.g., "/ipfs/ping/1.0.0")
 pub const ProtocolId = []const u8;
 
-/// Asserts at comptime that type P satisfies the Protocol interface.
-/// A Protocol must provide:
+/// Asserts at comptime that type P satisfies the Protocol Handler interface.
+/// A Protocol Handler must provide:
 ///   - pub const id: []const u8  (protocol identifier string)
-///   - pub fn handleInbound(io: Io, stream: anytype, ctx: anytype) !void
-///   - pub fn handleOutbound(io: Io, stream: anytype, ctx: anytype) !void
+///   - pub fn handleInbound(self: *P, io: Io, stream: anytype) !void
+///   - pub fn handleOutbound(self: *P, io: Io, stream: anytype, ctx: anytype) !void
 pub fn assertProtocolInterface(comptime P: type) void {
     if (!@hasDecl(P, "id")) {
         @compileError("Protocol '" ++ @typeName(P) ++ "' missing 'id' declaration");
