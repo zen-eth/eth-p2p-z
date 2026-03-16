@@ -328,3 +328,177 @@ test "Switch dispatchStream handles ping over QUIC" {
     server_conn.deinit();
     client_conn.deinit();
 }
+
+test "Switch dispatchStream handles identify over QUIC" {
+    const quic_mod = @import("transport/quic/quic.zig");
+    const engine_mod = @import("transport/quic/engine.zig");
+    const QuicEngine = engine_mod.QuicEngine;
+    const identify_mod = @import("protocol/identify.zig");
+    const tls_mod = @import("security/tls.zig");
+    const ssl = @import("ssl");
+    const net = Io.net;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Generate TLS key pairs
+    const server_key = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(server_key);
+    const client_key = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(client_key);
+
+    // Create Switch with QUIC + identify
+    const Node = Switch(.{
+        .transports = &.{quic_mod.QuicTransport},
+        .protocols = &.{identify_mod.Handler},
+    });
+    var sw = Node.init(allocator, .{identify_mod.Handler{
+        .allocator = allocator,
+        .config = .{
+            .protocol_version = "test/1.0.0",
+            .agent_version = "zig-libp2p/0.1.0",
+        },
+    }});
+    defer sw.deinit();
+
+    // Set up QUIC server engine
+    const server_eng = QuicEngine.init(allocator, .{
+        .is_server = true,
+        .host_key = server_key,
+    }) catch return;
+    server_eng.setIo(io);
+    server_eng.bindSocket(io, &net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }) catch {
+        server_eng.deinit();
+        return;
+    };
+    const server_port = switch ((server_eng.socket orelse {
+        server_eng.deinit();
+        return;
+    }).address) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    server_eng.startBackgroundLoops(io);
+
+    // Set up QUIC client engine
+    const client_eng = QuicEngine.init(allocator, .{
+        .is_server = false,
+        .host_key = client_key,
+    }) catch {
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+    client_eng.setIo(io);
+    client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) }) catch {
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+
+    // Connect client to server
+    const remote = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = server_port } };
+    var remote_sa = engine_mod.ipAddressToSockaddr(remote);
+    const local_bound = (client_eng.socket orelse {
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    }).address;
+    var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
+    const client_conn = client_eng.connect(io, @ptrCast(&remote_sa), @ptrCast(&local_sa)) catch {
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+    client_eng.startBackgroundLoops(io);
+
+    // Accept connection on server
+    const server_conn = server_eng.accept(io) catch {
+        client_conn.close(io);
+        client_conn.deinit();
+        client_eng.stop(io);
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+
+    // Spawn server handler fiber — it will block on acceptStream until
+    // the client writes. Identify inbound sends our identity to the client.
+    // We must close the stream after dispatch so the client sees EOF.
+    server_eng.background.async(io, struct {
+        fn run(sw_ptr: *Node, io_arg: Io, conn: *engine_mod.QuicConnection) void {
+            const s_inner = conn.acceptStream(io_arg) catch |err| {
+                log.warn("server acceptStream failed: {}", .{err});
+                return;
+            };
+            var s = quic_mod.Stream{ .inner = s_inner };
+            defer s.close(io_arg);
+            sw_ptr.dispatchStream(io_arg, &s) catch |err| {
+                log.warn("server dispatchStream failed: {}", .{err});
+            };
+        }
+    }.run, .{ &sw, io, server_conn });
+
+    // Client: open stream → negotiate identify → get identity
+    const client_s = client_conn.openStream(io) catch |err| {
+        log.warn("client openStream failed: {}", .{err});
+        server_conn.close(io);
+        client_conn.close(io);
+        server_eng.stop(io);
+        client_eng.stop(io);
+        server_eng.deinit();
+        client_eng.deinit();
+        server_conn.deinit();
+        client_conn.deinit();
+        return;
+    };
+    var client_stream = quic_mod.Stream{ .inner = client_s };
+    _ = multistream.negotiateOutbound(io, &client_stream, &.{identify_mod.Handler.id}) catch |err| {
+        log.warn("client negotiate failed: {}", .{err});
+        server_conn.close(io);
+        client_conn.close(io);
+        server_eng.stop(io);
+        client_eng.stop(io);
+        server_eng.deinit();
+        client_eng.deinit();
+        server_conn.deinit();
+        client_conn.deinit();
+        return;
+    };
+    const handler = sw.getHandler(identify_mod.Handler);
+    var result = handler.handleOutbound(io, &client_stream, .{}) catch |err| {
+        log.warn("client identify failed: {}", .{err});
+        server_conn.close(io);
+        client_conn.close(io);
+        server_eng.stop(io);
+        client_eng.stop(io);
+        server_eng.deinit();
+        client_eng.deinit();
+        server_conn.deinit();
+        client_conn.deinit();
+        return;
+    };
+    defer result.deinit(allocator);
+
+    // Verify identify result
+    std.testing.expectEqualStrings("test/1.0.0", result.protocolVersion()) catch |err| {
+        log.warn("protocol version mismatch: {}", .{err});
+    };
+    std.testing.expectEqualStrings("zig-libp2p/0.1.0", result.agentVersion()) catch |err| {
+        log.warn("agent version mismatch: {}", .{err});
+    };
+
+    // Clean up
+    server_conn.close(io);
+    client_conn.close(io);
+    server_eng.stop(io);
+    client_eng.stop(io);
+    server_eng.deinit();
+    client_eng.deinit();
+    server_conn.deinit();
+    client_conn.deinit();
+}
