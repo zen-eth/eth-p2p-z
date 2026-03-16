@@ -3510,7 +3510,7 @@ const TestGossipsubNode = struct {
 
         self.sw.init(allocator, &self.transport);
 
-        self.ping_handler = ping.PingProtocolHandler.init(allocator, &self.sw);
+        self.ping_handler = ping.PingProtocolHandler.init(allocator, &self.loop);
         self.handler = PubSubPeerProtocolHandler.init(allocator);
         errdefer {
             self.handler.deinit();

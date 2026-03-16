@@ -34,8 +34,8 @@
             .hash = "zmultiformats-0.1.0-yjvchohoBADALnCylBLeQF7Vn0SKULmQ_sFOrhzgmvQO",
         },
         .gremlin = .{
-            .url = "git+https://github.com/norma-core/gremlin.zig#bdfcf36c2f4b22bdbd96a5ef5385ff0b940cffc2",
-            .hash = "gremlin-0.1.0-E2s91WkYEQCC1_KteI5rN9EU_tuyyZftimIOI4S4f8Fc",
+            .url = "git+https://github.com/norma-core/gremlin.zig#4f6922f66b191b145dc3146dfc344c2498a57ea0",
+            .hash = "gremlin-0.1.0-E2s91STHEQAvlGGPBw_vUYNiA_YkGanSINVKpc2oqJw1",
         },
         .lsquic = .{
             .url = "git+https://github.com/zen-eth/lsquic.git?ref=anshalshukla/zig-0.15.2-upgrade#87391b162a9d05053bd256fadf716bc7ced1ce63",

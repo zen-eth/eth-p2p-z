@@ -23,12 +23,13 @@ pub const payload_length: usize = 32;
 pub const default_timeout_ns: u64 = 10 * std.time.ns_per_s;
 
 /// Ping protocol handler that can be registered with the multistream-select handler.
+/// Handlers only use stream abstraction - event loop is injected directly.
 pub const PingProtocolHandler = struct {
     allocator: std.mem.Allocator,
     outbound_streams: std.StringHashMap(usize),
     inbound_streams: std.StringHashMap(usize),
     shutting_down: bool = false,
-    network_switch: *swarm.Switch,
+    io_event_loop: *io_loop.ThreadEventLoop,
     responder_behavior: ResponderBehavior,
 
     const Self = @This();
@@ -37,13 +38,13 @@ pub const PingProtocolHandler = struct {
         drop_responses: bool = false,
     };
 
-    pub fn init(allocator: std.mem.Allocator, network_switch: *swarm.Switch) Self {
-        return Self.initWithBehavior(allocator, network_switch, .{});
+    pub fn init(allocator: std.mem.Allocator, event_loop: *io_loop.ThreadEventLoop) Self {
+        return Self.initWithBehavior(allocator, event_loop, .{});
     }
 
     pub fn initWithBehavior(
         allocator: std.mem.Allocator,
-        network_switch: *swarm.Switch,
+        event_loop: *io_loop.ThreadEventLoop,
         behavior: ResponderBehavior,
     ) Self {
         return .{
@@ -51,7 +52,7 @@ pub const PingProtocolHandler = struct {
             .outbound_streams = std.StringHashMap(usize).init(allocator),
             .inbound_streams = std.StringHashMap(usize).init(allocator),
             .shutting_down = false,
-            .network_switch = network_switch,
+            .io_event_loop = event_loop,
             .responder_behavior = behavior,
         };
     }
@@ -256,7 +257,7 @@ pub const PingProtocolHandler = struct {
     }
 
     fn eventLoop(self: *Self) *io_loop.ThreadEventLoop {
-        return self.network_switch.transport.io_event_loop;
+        return self.io_event_loop;
     }
 };
 
@@ -965,7 +966,7 @@ test "ping listen callback exposes negotiated protocol" {
         server_switch.deinit();
     }
 
-    var server_ping = PingProtocolHandler.init(allocator, &server_switch);
+    var server_ping = PingProtocolHandler.init(allocator, &server_loop);
     defer server_ping.deinit();
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
@@ -1021,7 +1022,7 @@ test "ping listen callback exposes negotiated protocol" {
         client_switch.deinit();
     }
 
-    var client_ping = PingProtocolHandler.init(allocator, &client_switch);
+    var client_ping = PingProtocolHandler.init(allocator, &client_loop);
     defer client_ping.deinit();
 
     try client_switch.addProtocolHandler(protocol_id, client_ping.any());
@@ -1107,7 +1108,7 @@ test "ping protocol round trip" {
         server_switch.deinit();
     }
 
-    var server_ping = PingProtocolHandler.init(allocator, &server_switch);
+    var server_ping = PingProtocolHandler.init(allocator, &server_loop);
     defer server_ping.deinit();
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
@@ -1154,7 +1155,7 @@ test "ping protocol round trip" {
         client_switch.deinit();
     }
 
-    var client_ping = PingProtocolHandler.init(allocator, &client_switch);
+    var client_ping = PingProtocolHandler.init(allocator, &client_loop);
     defer client_ping.deinit();
 
     try client_switch.addProtocolHandler(protocol_id, client_ping.any());
@@ -1238,7 +1239,7 @@ test "ping multiaddr round trip" {
         server_switch.deinit();
     }
 
-    var server_ping = PingProtocolHandler.init(allocator, &server_switch);
+    var server_ping = PingProtocolHandler.init(allocator, &server_loop);
     defer server_ping.deinit();
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
@@ -1278,7 +1279,7 @@ test "ping multiaddr round trip" {
         client_switch.deinit();
     }
 
-    var client_ping = PingProtocolHandler.init(allocator, &client_switch);
+    var client_ping = PingProtocolHandler.init(allocator, &client_loop);
     defer client_ping.deinit();
 
     try client_switch.addProtocolHandler(protocol_id, client_ping.any());
@@ -1359,7 +1360,7 @@ test "ping protocol timeout" {
         server_switch.deinit();
     }
 
-    var server_ping = PingProtocolHandler.initWithBehavior(allocator, &server_switch, .{ .drop_responses = true });
+    var server_ping = PingProtocolHandler.initWithBehavior(allocator, &server_loop, .{ .drop_responses = true });
     defer server_ping.deinit();
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
@@ -1399,7 +1400,7 @@ test "ping protocol timeout" {
         client_switch.deinit();
     }
 
-    var client_ping = PingProtocolHandler.init(allocator, &client_switch);
+    var client_ping = PingProtocolHandler.init(allocator, &client_loop);
     defer client_ping.deinit();
 
     try client_switch.addProtocolHandler(protocol_id, client_ping.any());
@@ -1484,7 +1485,7 @@ test "ping protocol periodic pings" {
         server_switch.deinit();
     }
 
-    var server_ping = PingProtocolHandler.init(allocator, &server_switch);
+    var server_ping = PingProtocolHandler.init(allocator, &server_loop);
     defer server_ping.deinit();
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
@@ -1524,7 +1525,7 @@ test "ping protocol periodic pings" {
         client_switch.deinit();
     }
 
-    var client_ping = PingProtocolHandler.init(allocator, &client_switch);
+    var client_ping = PingProtocolHandler.init(allocator, &client_loop);
     defer client_ping.deinit();
 
     try client_switch.addProtocolHandler(protocol_id, client_ping.any());
@@ -1609,7 +1610,7 @@ test "ping protocol stream reuse" {
         server_switch.deinit();
     }
 
-    var server_ping = PingProtocolHandler.init(allocator, &server_switch);
+    var server_ping = PingProtocolHandler.init(allocator, &server_loop);
     defer server_ping.deinit();
 
     try server_switch.addProtocolHandler(protocol_id, server_ping.any());
@@ -1649,7 +1650,7 @@ test "ping protocol stream reuse" {
         client_switch.deinit();
     }
 
-    var client_ping = PingProtocolHandler.init(allocator, &client_switch);
+    var client_ping = PingProtocolHandler.init(allocator, &client_loop);
     defer client_ping.deinit();
 
     try client_switch.addProtocolHandler(protocol_id, client_ping.any());
