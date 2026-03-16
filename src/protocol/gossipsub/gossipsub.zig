@@ -2,6 +2,7 @@ pub const mcache = @import("mcache.zig");
 pub const codec = @import("codec.zig");
 pub const config = @import("config.zig");
 pub const router = @import("router.zig");
+pub const service = @import("service.zig");
 
 // Re-export key types
 pub const MessageCache = mcache.MessageCache;
@@ -13,6 +14,7 @@ pub const encodeRpc = codec.encodeRpc;
 pub const writeRpc = codec.writeRpc;
 
 pub const Router = router.Router;
+pub const Service = service.Service;
 pub const Config = config.Config;
 pub const Event = config.Event;
 pub const SignaturePolicy = config.SignaturePolicy;
