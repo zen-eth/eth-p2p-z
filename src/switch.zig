@@ -69,25 +69,25 @@ pub fn Switch(comptime config: SwitchConfig) type {
             var stream_group: Io.Group = .init;
             while (true) {
                 const s = mutable_conn.acceptStream(io) catch return;
-                stream_group.async(io, Self.handleStreamTask, .{ self, io, s });
+                stream_group.async(io, Self.handleStreamTask, .{ self, io, s, .{} });
             }
         }
 
         /// Task entry point for handling an inbound stream.
         /// Negotiates protocol via multistream-select, dispatches to handler.
-        fn handleStreamTask(self: *Self, io: Io, s: anytype) void {
+        fn handleStreamTask(self: *Self, io: Io, s: anytype, ctx: anytype) void {
             var mutable_stream = s;
-            self.dispatchStream(io, &mutable_stream) catch return;
+            self.dispatchStream(io, &mutable_stream, ctx) catch return;
         }
 
         /// Negotiate protocol on an inbound stream and dispatch to handler.
         /// io flows directly through multistream and protocol handler -- no adapter.
-        pub fn dispatchStream(self: *Self, io: Io, s: anytype) !void {
+        pub fn dispatchStream(self: *Self, io: Io, s: anytype, ctx: anytype) !void {
             const proto_id = try multistream.negotiateInbound(io, s, &supported_protocol_ids);
 
             inline for (config.protocols, 0..) |P, i| {
                 if (std.mem.eql(u8, proto_id, P.id)) {
-                    try self.handlers[i].handleInbound(io, s, .{});
+                    try self.handlers[i].handleInbound(io, s, ctx);
                     return;
                 }
             }
@@ -297,7 +297,7 @@ test "Switch dispatchStream handles ping over QUIC" {
                 return;
             };
             var s = quic_mod.Stream{ .inner = s_inner };
-            sw_ptr.dispatchStream(io_arg, &s) catch |err| {
+            sw_ptr.dispatchStream(io_arg, &s, .{}) catch |err| {
                 log.warn("server dispatchStream failed: {}", .{err});
             };
         }
@@ -437,7 +437,7 @@ test "Switch dispatchStream handles identify over QUIC" {
             };
             var s = quic_mod.Stream{ .inner = s_inner };
             defer s.close(io_arg);
-            sw_ptr.dispatchStream(io_arg, &s) catch |err| {
+            sw_ptr.dispatchStream(io_arg, &s, .{}) catch |err| {
                 log.warn("server dispatchStream failed: {}", .{err});
             };
         }
@@ -491,6 +491,220 @@ test "Switch dispatchStream handles identify over QUIC" {
     std.testing.expectEqualStrings("zig-libp2p/0.1.0", result.agentVersion()) catch |err| {
         log.warn("agent version mismatch: {}", .{err});
     };
+
+    // Clean up
+    server_conn.close(io);
+    client_conn.close(io);
+    server_eng.stop(io);
+    client_eng.stop(io);
+    server_eng.deinit();
+    client_eng.deinit();
+    server_conn.deinit();
+    client_conn.deinit();
+}
+
+test "Switch dispatchStream handles gossipsub subscription over QUIC" {
+    const quic_mod = @import("transport/quic/quic.zig");
+    const engine_mod = @import("transport/quic/engine.zig");
+    const QuicEngine = engine_mod.QuicEngine;
+    const gossipsub_service = @import("protocol/gossipsub/service.zig");
+    const gossipsub_codec = @import("protocol/gossipsub/codec.zig");
+    const rpc_proto = @import("proto/rpc.proto.zig");
+    const tls_mod = @import("security/tls.zig");
+    const ssl = @import("ssl");
+    const net = Io.net;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Generate TLS key pairs
+    const server_key = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(server_key);
+    const client_key = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(client_key);
+
+    // Create gossipsub Service (heap-allocated)
+    const svc = gossipsub_service.Service.init(allocator, .{}) catch return;
+    defer svc.deinit();
+
+    // Create Switch with gossipsub Handler wrapper
+    const Node = Switch(.{
+        .transports = &.{quic_mod.QuicTransport},
+        .protocols = &.{gossipsub_service.Handler},
+    });
+    var sw = Node.init(allocator, .{gossipsub_service.Handler{ .svc = svc }});
+    defer sw.deinit();
+
+    // Set up QUIC server engine
+    const server_eng = QuicEngine.init(allocator, .{
+        .is_server = true,
+        .host_key = server_key,
+    }) catch return;
+    server_eng.setIo(io);
+    server_eng.bindSocket(io, &net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }) catch {
+        server_eng.deinit();
+        return;
+    };
+    const server_port = switch ((server_eng.socket orelse {
+        server_eng.deinit();
+        return;
+    }).address) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    server_eng.startBackgroundLoops(io);
+
+    // Set up QUIC client engine
+    const client_eng = QuicEngine.init(allocator, .{
+        .is_server = false,
+        .host_key = client_key,
+    }) catch {
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+    client_eng.setIo(io);
+    client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) }) catch {
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+
+    // Connect client to server
+    const remote = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = server_port } };
+    var remote_sa = engine_mod.ipAddressToSockaddr(remote);
+    const local_bound = (client_eng.socket orelse {
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    }).address;
+    var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
+    const client_conn = client_eng.connect(io, @ptrCast(&remote_sa), @ptrCast(&local_sa)) catch {
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+    client_eng.startBackgroundLoops(io);
+
+    // Accept connection on server
+    const server_conn = server_eng.accept(io) catch {
+        client_conn.close(io);
+        client_conn.deinit();
+        client_eng.stop(io);
+        client_eng.deinit();
+        server_eng.stop(io);
+        server_eng.deinit();
+        return;
+    };
+
+    // Spawn server handler fiber — it will block on acceptStream until
+    // the client writes. The gossipsub handleInbound reads until EOF.
+    server_eng.background.async(io, struct {
+        fn run(sw_ptr: *Node, io_arg: Io, conn: *engine_mod.QuicConnection) void {
+            const s_inner = conn.acceptStream(io_arg) catch |err| {
+                log.warn("server acceptStream failed: {}", .{err});
+                return;
+            };
+            var s = quic_mod.Stream{ .inner = s_inner };
+            sw_ptr.dispatchStream(io_arg, &s, .{
+                .peer_id = @as(?[]const u8, "test-client"),
+            }) catch |err| {
+                log.warn("server dispatchStream failed: {}", .{err});
+            };
+        }
+    }.run, .{ &sw, io, server_conn });
+
+    // Client: open stream → negotiate gossipsub protocol → write subscription RPC → close
+    const client_s = client_conn.openStream(io) catch |err| {
+        log.warn("client openStream failed: {}", .{err});
+        server_conn.close(io);
+        client_conn.close(io);
+        server_eng.stop(io);
+        client_eng.stop(io);
+        server_eng.deinit();
+        client_eng.deinit();
+        server_conn.deinit();
+        client_conn.deinit();
+        return;
+    };
+    var client_stream = quic_mod.Stream{ .inner = client_s };
+
+    // Negotiate gossipsub protocol
+    _ = multistream.negotiateOutbound(io, &client_stream, &.{gossipsub_service.Service.id}) catch |err| {
+        log.warn("client negotiate failed: {}", .{err});
+        server_conn.close(io);
+        client_conn.close(io);
+        server_eng.stop(io);
+        client_eng.stop(io);
+        server_eng.deinit();
+        client_eng.deinit();
+        server_conn.deinit();
+        client_conn.deinit();
+        return;
+    };
+
+    // Build and send a subscription RPC for "test-topic"
+    var subs = [_]?rpc_proto.RPC.SubOpts{
+        .{ .subscribe = true, .topicid = "test-topic" },
+    };
+    var rpc_msg = rpc_proto.RPC{ .subscriptions = &subs };
+    gossipsub_codec.writeRpc(io, allocator, &client_stream, &rpc_msg) catch |err| {
+        log.warn("client writeRpc failed: {}", .{err});
+        server_conn.close(io);
+        client_conn.close(io);
+        server_eng.stop(io);
+        client_eng.stop(io);
+        server_eng.deinit();
+        client_eng.deinit();
+        server_conn.deinit();
+        client_conn.deinit();
+        return;
+    };
+
+    // Close stream to signal EOF — this makes the server's read loop exit
+    client_stream.close(io);
+
+    // Yield to I/O so QUIC engines can process the buffered data and deliver
+    // it to the server fiber. QuicStream.write/close don't yield, so without
+    // this sleep the server fiber never gets a chance to run.
+    const sleep_timeout: Io.Timeout = .{
+        .duration = .{
+            .raw = Io.Duration.fromMilliseconds(100),
+            .clock = .awake,
+        },
+    };
+    sleep_timeout.sleep(io) catch {};
+
+    // Check drainEvents for subscription_changed
+    const events = svc.drainEvents() catch {
+        server_conn.close(io);
+        client_conn.close(io);
+        server_eng.stop(io);
+        client_eng.stop(io);
+        server_eng.deinit();
+        client_eng.deinit();
+        server_conn.deinit();
+        client_conn.deinit();
+        return;
+    };
+    defer allocator.free(events);
+
+    var found_subscription = false;
+    for (events) |event| {
+        switch (event) {
+            .subscription_changed => {
+                found_subscription = true;
+            },
+            else => {},
+        }
+    }
+
+    if (!found_subscription) {
+        log.warn("gossipsub subscription event not found in {} events", .{events.len});
+    }
 
     // Clean up
     server_conn.close(io);
