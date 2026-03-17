@@ -78,6 +78,197 @@ pub fn Switch(comptime config: SwitchConfig) type {
             if (self.client_engine) |eng| eng.deinit();
         }
 
+        // ── Swarm API (Tasks 3-6) ──────────────────────────────────────────
+
+        /// Start listening for inbound QUIC connections on the given multiaddr.
+        /// Creates the server engine lazily on first call.
+        pub fn listen(self: *Self, io: Io, addr: Multiaddr) !void {
+            const parsed = try quic_mod.parseQuicMultiaddr(addr);
+
+            if (self.server_engine == null) {
+                const eng = try QuicEngine.init(self.allocator, .{
+                    .is_server = true,
+                    .host_key = self.engine_config.host_key,
+                });
+                eng.setIo(io);
+                self.server_engine = eng;
+            }
+
+            const eng = self.server_engine.?;
+            try eng.bindSocket(io, &parsed.ip);
+            eng.startBackgroundLoops(io);
+
+            self.background.async(io, Self.acceptLoop, .{ self, io });
+        }
+
+        /// Returns the server engine's bound address (useful for port-0 tests).
+        pub fn listenAddrs(self: *const Self) ?net.IpAddress {
+            const eng = self.server_engine orelse return null;
+            const sock = eng.socket orelse return null;
+            return sock.address;
+        }
+
+        /// Dial a remote peer via QUIC multiaddr.
+        /// Creates the client engine lazily on first call. Returns peer_id bytes
+        /// (owned by the connections map — valid until peer disconnects).
+        pub fn dial(self: *Self, io: Io, addr: Multiaddr) ![]const u8 {
+            const parsed = try quic_mod.parseQuicMultiaddr(addr);
+
+            if (self.client_engine == null) {
+                const eng = try QuicEngine.init(self.allocator, .{
+                    .is_server = false,
+                    .host_key = self.engine_config.host_key,
+                });
+                eng.setIo(io);
+                try eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) });
+                eng.startBackgroundLoops(io);
+                self.client_engine = eng;
+            }
+
+            const eng = self.client_engine.?;
+            var remote_sa = engine_mod.ipAddressToSockaddr(parsed.ip);
+            const local_bound = (eng.socket orelse return error.NoSocket).address;
+            var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
+            const conn = try eng.connect(io, @ptrCast(&remote_sa), @ptrCast(&local_sa));
+
+            // Wait for TLS handshake to extract peer_id
+            var pid_buf: [128]u8 = undefined;
+            const raw_peer_id: []const u8 = pid: {
+                var attempts: u32 = 0;
+                while (attempts < 200) : (attempts += 1) {
+                    if (conn.remotePeerId()) |pid| {
+                        break :pid pid.toBytes(&pid_buf) catch return error.PeerIdEncodeFailed;
+                    }
+                    const t: Io.Timeout = .{ .duration = .{
+                        .raw = Io.Duration.fromMilliseconds(5),
+                        .clock = .awake,
+                    } };
+                    t.sleep(io) catch {};
+                }
+                return error.HandshakeTimeout;
+            };
+
+            // Register connection (heap-owned key)
+            const owned_pid = try self.allocator.dupe(u8, raw_peer_id);
+            errdefer self.allocator.free(owned_pid);
+            try self.connections.put(owned_pid, conn);
+
+            // Spawn connection handler in background
+            self.background.async(io, Self.swarmConnectionTask, .{ self, io, conn });
+
+            return owned_pid;
+        }
+
+        /// Background fiber: accepts inbound connections from the server engine.
+        fn acceptLoop(self: *Self, io: Io) void {
+            const eng = self.server_engine orelse return;
+            while (true) {
+                const conn = eng.accept(io) catch return;
+                self.background.async(io, Self.swarmConnectionTask, .{ self, io, conn });
+            }
+        }
+
+        /// Manages a single QUIC connection's lifecycle.
+        /// Extracts peer_id from TLS, registers in connections map (if not already
+        /// registered by dial), accepts streams, deregisters on close.
+        fn swarmConnectionTask(self: *Self, io: Io, conn: *engine_mod.QuicConnection) void {
+            defer conn.close(io);
+            defer conn.deinit();
+
+            // Resolve peer_id from TLS
+            var pid_buf: [128]u8 = undefined;
+            const peer_id: ?[]const u8 = pid: {
+                var attempts: u32 = 0;
+                while (attempts < 200) : (attempts += 1) {
+                    if (conn.remotePeerId()) |pid| {
+                        break :pid pid.toBytes(&pid_buf) catch null;
+                    }
+                    const t: Io.Timeout = .{ .duration = .{
+                        .raw = Io.Duration.fromMilliseconds(5),
+                        .clock = .awake,
+                    } };
+                    t.sleep(io) catch {};
+                }
+                break :pid null;
+            };
+
+            // Register if not already registered (accepted connections)
+            if (peer_id) |pid| {
+                if (!self.connections.contains(pid)) {
+                    const owned = self.allocator.dupe(u8, pid) catch null;
+                    if (owned) |key| {
+                        self.connections.put(key, conn) catch {
+                            self.allocator.free(key);
+                        };
+                    }
+                }
+            }
+
+            // Deregister and notify on exit
+            defer {
+                if (peer_id) |pid| {
+                    if (self.connections.fetchRemove(pid)) |kv| {
+                        self.allocator.free(kv.key);
+                    }
+                }
+                self.notifyPeerDisconnected(peer_id);
+            }
+
+            // Accept streams loop
+            var stream_group: Io.Group = .init;
+            while (true) {
+                const s_inner = conn.acceptStream(io) catch return;
+                stream_group.async(io, Self.swarmStreamTask, .{
+                    self, io, quic_mod.Stream{ .inner = s_inner }, .{ .peer_id = peer_id },
+                });
+            }
+        }
+
+        /// Handles a single inbound stream: multistream-negotiate then dispatch.
+        fn swarmStreamTask(self: *Self, io: Io, s: quic_mod.Stream, ctx: anytype) void {
+            var mutable_stream = s;
+            self.dispatchStream(io, &mutable_stream, ctx) catch return;
+        }
+
+        /// Open a new outbound stream to a connected peer.
+        /// Looks up the connection by peer_id, opens a QUIC stream, negotiates
+        /// the protocol via multistream-select, and runs handleOutbound.
+        /// peer_id is automatically passed as ctx.peer_id.
+        pub fn newStream(self: *Self, io: Io, peer_id: []const u8, comptime P: type) !void {
+            comptime protocol_mod.assertProtocolInterface(P);
+            const conn = self.connections.get(peer_id) orelse return error.PeerNotConnected;
+            const s_inner = try conn.openStream(io);
+            var s = quic_mod.Stream{ .inner = s_inner };
+            _ = try multistream.negotiateOutbound(io, &s, &.{P.id});
+            inline for (config.protocols, 0..) |Proto, i| {
+                if (Proto == P) {
+                    try self.handlers[i].handleOutbound(io, &s, .{
+                        .peer_id = @as(?[]const u8, peer_id),
+                    });
+                    return;
+                }
+            }
+        }
+
+        /// Gracefully shut down the Switch.
+        /// Stops engines, cancels background fibers, notifies handlers, cleans up.
+        pub fn close(self: *Self, io: Io) void {
+            // Cancel all background fibers
+            self.background.cancel(io);
+
+            // Stop engines
+            if (self.server_engine) |eng| eng.stop(io);
+            if (self.client_engine) |eng| eng.stop(io);
+
+            // Notify handlers and free connection tracking
+            var it = self.connections.iterator();
+            while (it.next()) |entry| {
+                self.notifyPeerDisconnected(@as(?[]const u8, entry.key_ptr.*));
+                self.allocator.free(entry.key_ptr.*);
+            }
+            self.connections.clearRetainingCapacity();
+        }
+
         /// Run the accept loop for a listener. Accepts connections and spawns
         /// a concurrent handler per connection via Io.Group (cooperative fibers).
         /// Blocks until the listener is closed or an error occurs.
