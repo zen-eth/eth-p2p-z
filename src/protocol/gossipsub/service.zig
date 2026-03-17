@@ -364,6 +364,12 @@ pub const Handler = struct {
     pub fn handleOutbound(self: *Handler, io: Io, stream: anytype, ctx: anytype) !void {
         try self.svc.handleOutbound(io, stream, ctx);
     }
+
+    /// Called by the Switch when a connection to this peer closes.
+    /// Matches rust-libp2p's on_connection_closed / FromSwarm::ConnectionClosed.
+    pub fn onPeerDisconnected(self: *Handler, peer_id: []const u8) void {
+        self.svc.removePeer(peer_id);
+    }
 };
 
 // --- Tests ---
