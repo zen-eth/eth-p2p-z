@@ -618,7 +618,9 @@ test "Switch gossipsub subscription over QUIC via openStream" {
         }
     }.run, .{ &sw, io, server_conn });
 
-    // Client: use openStream — handleOutbound stores the stream and sends subscriptions
+    // Client: use openStream — handleOutbound stores the stream and sends subscriptions.
+    // The stream stays open (like go-libp2p/rust-libp2p), and handleInbound runs
+    // as a persistent background reader on the server side.
     sw.openStream(io, client_conn, gossipsub_service.Handler, .{
         .peer_id = @as(?[]const u8, "test-client"),
     }) catch |err| {
@@ -634,11 +636,8 @@ test "Switch gossipsub subscription over QUIC via openStream" {
         return;
     };
 
-    // Close the outbound stream to signal EOF to server's handleInbound
-    svc.removePeer("test-client");
-
-    // Yield to I/O so QUIC engines can process the buffered data + FIN
-    // and deliver it to the server fiber.
+    // Yield to I/O so QUIC engines can deliver the subscription RPC
+    // to the server's handleInbound reader.
     const sleep_timeout: Io.Timeout = .{
         .duration = .{
             .raw = Io.Duration.fromMilliseconds(100),
@@ -649,6 +648,7 @@ test "Switch gossipsub subscription over QUIC via openStream" {
 
     // Check drainEvents for subscription_changed
     const events = svc.drainEvents() catch {
+        svc.removePeer("test-client");
         server_conn.close(io);
         client_conn.close(io);
         server_eng.stop(io);
@@ -675,7 +675,10 @@ test "Switch gossipsub subscription over QUIC via openStream" {
         log.warn("gossipsub subscription event not found in {} events", .{events.len});
     }
 
-    // Clean up
+    // Clean up: removePeer closes the outbound stream owned by the Service.
+    // In production this is triggered by a connection-close notification from
+    // the transport layer, not called manually.
+    svc.removePeer("test-client");
     server_conn.close(io);
     client_conn.close(io);
     server_eng.stop(io);
