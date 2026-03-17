@@ -61,15 +61,31 @@ pub fn Switch(comptime config: SwitchConfig) type {
         }
 
         /// Task entry point for handling an inbound connection.
-        /// Accepts streams concurrently via Io.Group. Closes connection on exit.
+        /// Extracts peer_id from the TLS-verified connection identity, passes it to
+        /// stream handlers via ctx, and notifies handlers when the connection
+        /// closes (rust-libp2p FromSwarm::ConnectionClosed pattern).
         fn handleConnectionTask(self: *Self, io: Io, conn: anytype) void {
             var mutable_conn = conn;
             defer mutable_conn.close(io);
 
+            // Extract peer_id bytes from TLS-verified connection identity.
+            var pid_buf: [128]u8 = undefined;
+            const peer_id: ?[]const u8 = pid: {
+                if (@hasDecl(@TypeOf(mutable_conn), "remotePeerId")) {
+                    if (mutable_conn.remotePeerId()) |pid| {
+                        break :pid pid.toBytes(&pid_buf) catch null;
+                    }
+                }
+                break :pid null;
+            };
+            defer self.notifyPeerDisconnected(peer_id);
+
             var stream_group: Io.Group = .init;
             while (true) {
                 const s = mutable_conn.acceptStream(io) catch return;
-                stream_group.async(io, Self.handleStreamTask, .{ self, io, s, .{} });
+                stream_group.async(io, Self.handleStreamTask, .{
+                    self, io, s, .{ .peer_id = peer_id },
+                });
             }
         }
 
@@ -134,6 +150,18 @@ pub fn Switch(comptime config: SwitchConfig) type {
                 .pointer => s.*,
                 else => s,
             };
+        }
+
+        /// Notify all protocol handlers that a peer has disconnected.
+        /// Only calls handlers that declare `onPeerDisconnected` (comptime check).
+        /// Matches rust-libp2p's FromSwarm::ConnectionClosed pattern.
+        pub fn notifyPeerDisconnected(self: *Self, peer_id: ?[]const u8) void {
+            const pid = peer_id orelse return;
+            inline for (config.protocols, 0..) |P, i| {
+                if (@hasDecl(P, "onPeerDisconnected")) {
+                    self.handlers[i].onPeerDisconnected(pid);
+                }
+            }
         }
     };
 }
