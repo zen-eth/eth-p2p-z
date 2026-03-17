@@ -103,7 +103,7 @@ pub const Service = struct {
     /// FrameDecoder and passes each decoded RPC to the Router.
     ///
     /// The `peer_id` is passed as a context parameter by the integration layer.
-    pub fn handleInbound(self: *Self, io: Io, stream: anytype) !void {
+    pub fn handleInbound(self: *Self, io: Io, stream: anytype, _: anytype) !void {
         _ = self;
         _ = io;
         _ = stream;

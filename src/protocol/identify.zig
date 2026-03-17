@@ -42,7 +42,7 @@ pub const Handler = struct {
     pub const push_id = "/ipfs/id/push/1.0.0";
 
     /// Handle inbound identify (responder): encode and send our identity.
-    pub fn handleInbound(self: *Handler, io: Io, stream: anytype) Error!void {
+    pub fn handleInbound(self: *Handler, io: Io, stream: anytype, _: anytype) Error!void {
         const allocator = self.allocator;
         const config = self.config;
 
@@ -157,7 +157,7 @@ test "handleInbound encodes and writes identify message" {
             .agent_version = "zig-libp2p/0.1.0",
         },
     };
-    try handler.handleInbound(undefined, &stream);
+    try handler.handleInbound(undefined, &stream, .{});
 
     // Decode what was written
     var reader = try identify_pb.IdentifyReader.init(stream.write_buf.items);

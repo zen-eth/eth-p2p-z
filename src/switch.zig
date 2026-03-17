@@ -87,7 +87,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
 
             inline for (config.protocols, 0..) |P, i| {
                 if (std.mem.eql(u8, proto_id, P.id)) {
-                    try self.handlers[i].handleInbound(io, s);
+                    try self.handlers[i].handleInbound(io, s, .{});
                     return;
                 }
             }
@@ -181,7 +181,7 @@ test "Switch comptime validation accepts valid config" {
 
     const MockProtocol = struct {
         pub const id = "/test/mock/1.0.0";
-        pub fn handleInbound(_: *@This(), _: Io, _: anytype) !void {}
+        pub fn handleInbound(_: *@This(), _: Io, _: anytype, _: anytype) !void {}
         pub fn handleOutbound(_: *@This(), _: Io, _: anytype, _: anytype) !void {}
     };
 

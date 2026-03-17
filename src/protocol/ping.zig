@@ -20,7 +20,7 @@ pub const Handler = struct {
     pub const id = "/ipfs/ping/1.0.0";
 
     /// Handle an inbound ping: read 32 bytes from the stream, echo them back.
-    pub fn handleInbound(_: *Handler, io: Io, stream: anytype) Error!void {
+    pub fn handleInbound(_: *Handler, io: Io, stream: anytype, _: anytype) Error!void {
         var buf: [payload_length]u8 = undefined;
         readExact(io, stream, &buf) catch return Error.UnexpectedEof;
         writeAll(io, stream, &buf) catch return Error.UnexpectedEof;
@@ -53,8 +53,7 @@ test "handleInbound echoes payload" {
     defer stream.deinit();
 
     var handler: Handler = .{};
-    try handler.handleInbound(undefined, &stream);
-
+    try handler.handleInbound(undefined, &stream, .{});
     try std.testing.expectEqual(payload_length, stream.write_buf.items.len);
     try std.testing.expectEqualSlices(u8, &payload, stream.write_buf.items);
 }
@@ -67,7 +66,7 @@ test "handleInbound returns error on short read" {
     defer stream.deinit();
 
     var handler: Handler = .{};
-    const result = handler.handleInbound(undefined, &stream);
+    const result = handler.handleInbound(undefined, &stream, .{});
     try std.testing.expectError(Error.UnexpectedEof, result);
 }
 
