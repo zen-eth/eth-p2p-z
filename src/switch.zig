@@ -6,6 +6,13 @@ const log = std.log.scoped(.@"switch");
 const transport_mod = @import("transport/transport.zig");
 const protocol_mod = @import("protocol/protocol.zig");
 const multistream = @import("protocol/multistream.zig");
+const engine_mod = @import("transport/quic/engine.zig");
+const QuicEngine = engine_mod.QuicEngine;
+const quic_mod = @import("transport/quic/quic.zig");
+const multiaddr = @import("multiaddr");
+const Multiaddr = multiaddr.Multiaddr;
+const ssl = @import("ssl");
+const net = Io.net;
 
 /// Configuration for comptime Switch composition.
 pub const SwitchConfig = struct {
@@ -13,6 +20,11 @@ pub const SwitchConfig = struct {
     transports: []const type,
     /// Protocol types (must satisfy assertProtocolInterface — Handler structs with id, handleInbound, handleOutbound).
     protocols: []const type,
+};
+
+/// Runtime configuration for the Switch's QUIC engine infrastructure.
+pub const EngineConfig = struct {
+    host_key: ?*ssl.EVP_PKEY = null,
 };
 
 /// Comptime-composed libp2p Switch.
@@ -37,16 +49,33 @@ pub fn Switch(comptime config: SwitchConfig) type {
 
         allocator: Allocator,
         handlers: HandlerTuple,
+        server_engine: ?*QuicEngine = null,
+        client_engine: ?*QuicEngine = null,
+        connections: std.StringHashMap(*engine_mod.QuicConnection),
+        background: Io.Group,
+        engine_config: EngineConfig,
 
         /// Protocol IDs for multistream-select negotiation (computed at comptime).
         const supported_protocol_ids = protocol_mod.protocolIds(config.protocols);
 
-        pub fn init(allocator: Allocator, handlers: HandlerTuple) Self {
-            return .{ .allocator = allocator, .handlers = handlers };
+        pub fn init(allocator: Allocator, engine_config: EngineConfig, handlers: HandlerTuple) Self {
+            return .{
+                .allocator = allocator,
+                .handlers = handlers,
+                .connections = std.StringHashMap(*engine_mod.QuicConnection).init(allocator),
+                .background = .init,
+                .engine_config = engine_config,
+            };
         }
 
         pub fn deinit(self: *Self) void {
-            _ = self;
+            var it = self.connections.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+            self.connections.deinit();
+            if (self.server_engine) |eng| eng.deinit();
+            if (self.client_engine) |eng| eng.deinit();
         }
 
         /// Run the accept loop for a listener. Accepts connections and spawns
@@ -218,7 +247,7 @@ test "Switch comptime validation accepts valid config" {
         .protocols = &.{MockProtocol},
     });
 
-    var sw = TestSwitch.init(std.testing.allocator, .{MockProtocol{}});
+    var sw = TestSwitch.init(std.testing.allocator, .{}, .{MockProtocol{}});
     defer sw.deinit();
 
     // Verify protocol IDs are correct
@@ -226,13 +255,8 @@ test "Switch comptime validation accepts valid config" {
 }
 
 test "Switch dispatchStream handles ping over QUIC" {
-    const quic_mod = @import("transport/quic/quic.zig");
-    const engine_mod = @import("transport/quic/engine.zig");
-    const QuicEngine = engine_mod.QuicEngine;
     const ping_mod = @import("protocol/ping.zig");
     const tls_mod = @import("security/tls.zig");
-    const ssl = @import("ssl");
-    const net = Io.net;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -248,7 +272,7 @@ test "Switch dispatchStream handles ping over QUIC" {
         .transports = &.{quic_mod.QuicTransport},
         .protocols = &.{ping_mod.Handler},
     });
-    var sw = Node.init(allocator, .{ping_mod.Handler{}});
+    var sw = Node.init(allocator, .{}, .{ping_mod.Handler{}});
     defer sw.deinit();
 
     // Set up QUIC server engine
@@ -358,13 +382,8 @@ test "Switch dispatchStream handles ping over QUIC" {
 }
 
 test "Switch dispatchStream handles identify over QUIC" {
-    const quic_mod = @import("transport/quic/quic.zig");
-    const engine_mod = @import("transport/quic/engine.zig");
-    const QuicEngine = engine_mod.QuicEngine;
     const identify_mod = @import("protocol/identify.zig");
     const tls_mod = @import("security/tls.zig");
-    const ssl = @import("ssl");
-    const net = Io.net;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -380,7 +399,7 @@ test "Switch dispatchStream handles identify over QUIC" {
         .transports = &.{quic_mod.QuicTransport},
         .protocols = &.{identify_mod.Handler},
     });
-    var sw = Node.init(allocator, .{identify_mod.Handler{
+    var sw = Node.init(allocator, .{}, .{identify_mod.Handler{
         .allocator = allocator,
         .config = .{
             .protocol_version = "test/1.0.0",
@@ -532,13 +551,8 @@ test "Switch dispatchStream handles identify over QUIC" {
 }
 
 test "Switch gossipsub subscription over QUIC via openStream" {
-    const quic_mod = @import("transport/quic/quic.zig");
-    const engine_mod = @import("transport/quic/engine.zig");
-    const QuicEngine = engine_mod.QuicEngine;
     const gossipsub_service = @import("protocol/gossipsub/service.zig");
     const tls_mod = @import("security/tls.zig");
-    const ssl = @import("ssl");
-    const net = Io.net;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -561,7 +575,7 @@ test "Switch gossipsub subscription over QUIC via openStream" {
         .transports = &.{quic_mod.QuicTransport},
         .protocols = &.{gossipsub_service.Handler},
     });
-    var sw = Node.init(allocator, .{gossipsub_service.Handler{ .svc = svc }});
+    var sw = Node.init(allocator, .{}, .{gossipsub_service.Handler{ .svc = svc }});
     defer sw.deinit();
 
     // Set up QUIC server engine
