@@ -15,6 +15,7 @@ pub const writeRpc = codec.writeRpc;
 
 pub const Router = router.Router;
 pub const Service = service.Service;
+pub const Handler = service.Handler;
 pub const Config = config.Config;
 pub const Event = config.Event;
 pub const SignaturePolicy = config.SignaturePolicy;

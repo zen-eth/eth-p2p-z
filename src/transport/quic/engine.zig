@@ -88,7 +88,7 @@ pub const QuicStream = struct {
         }
 
         const event = self.read_queue.getOne(io) catch |err| switch (err) {
-            error.Closed => return error.StreamClosed,
+            error.Closed => return 0, // EOF — peer closed the stream
             error.Canceled => return error.StreamClosed,
         };
         const len = @min(buf.len, event.data.len);
@@ -171,10 +171,11 @@ pub const QuicConnection = struct {
         if (self.closed) return error.ConnectionClosed;
         const lc = self.lsquic_conn orelse return error.ConnectionClosed;
         lsquic.lsquic_conn_make_stream(lc);
-        // Trigger processEngine to create the stream via onNewStream.
-        // processEngine has a re-entrancy guard so this is safe even if
-        // a background loop is currently inside process_conns.
-        self.engine.processEngine();
+        // Let the background timer loop call processEngine to create the stream
+        // via onNewStream. Calling processEngine synchronously here can crash
+        // inside lsquic's SSL post-handshake processing when the crypto stream
+        // has pending events and the SSL session state is still settling.
+        // The suspend on stream_queue.getOne yields to the background loops.
         // Wait for the stream event from onNewStream callback
         const event = self.stream_queue.getOne(io) catch |err| switch (err) {
             error.Closed => return error.ConnectionClosed,

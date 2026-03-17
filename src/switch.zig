@@ -503,13 +503,11 @@ test "Switch dispatchStream handles identify over QUIC" {
     client_conn.deinit();
 }
 
-test "Switch dispatchStream handles gossipsub subscription over QUIC" {
+test "Switch gossipsub subscription over QUIC via openStream" {
     const quic_mod = @import("transport/quic/quic.zig");
     const engine_mod = @import("transport/quic/engine.zig");
     const QuicEngine = engine_mod.QuicEngine;
     const gossipsub_service = @import("protocol/gossipsub/service.zig");
-    const gossipsub_codec = @import("protocol/gossipsub/codec.zig");
-    const rpc_proto = @import("proto/rpc.proto.zig");
     const tls_mod = @import("security/tls.zig");
     const ssl = @import("ssl");
     const net = Io.net;
@@ -526,6 +524,9 @@ test "Switch dispatchStream handles gossipsub subscription over QUIC" {
     // Create gossipsub Service (heap-allocated)
     const svc = gossipsub_service.Service.init(allocator, .{}) catch return;
     defer svc.deinit();
+
+    // Subscribe BEFORE connecting so handleOutbound sends subscriptions
+    svc.subscribe("test-topic") catch return;
 
     // Create Switch with gossipsub Handler wrapper
     const Node = Switch(.{
@@ -600,8 +601,8 @@ test "Switch dispatchStream handles gossipsub subscription over QUIC" {
         return;
     };
 
-    // Spawn server handler fiber — it will block on acceptStream until
-    // the client writes. The gossipsub handleInbound reads until EOF.
+    // Spawn server handler fiber — accepts inbound stream and dispatches
+    // via Switch (multistream negotiate → gossipsub handleInbound).
     server_eng.background.async(io, struct {
         fn run(sw_ptr: *Node, io_arg: Io, conn: *engine_mod.QuicConnection) void {
             const s_inner = conn.acceptStream(io_arg) catch |err| {
@@ -617,24 +618,11 @@ test "Switch dispatchStream handles gossipsub subscription over QUIC" {
         }
     }.run, .{ &sw, io, server_conn });
 
-    // Client: open stream → negotiate gossipsub protocol → write subscription RPC → close
-    const client_s = client_conn.openStream(io) catch |err| {
-        log.warn("client openStream failed: {}", .{err});
-        server_conn.close(io);
-        client_conn.close(io);
-        server_eng.stop(io);
-        client_eng.stop(io);
-        server_eng.deinit();
-        client_eng.deinit();
-        server_conn.deinit();
-        client_conn.deinit();
-        return;
-    };
-    var client_stream = quic_mod.Stream{ .inner = client_s };
-
-    // Negotiate gossipsub protocol
-    _ = multistream.negotiateOutbound(io, &client_stream, &.{gossipsub_service.Service.id}) catch |err| {
-        log.warn("client negotiate failed: {}", .{err});
+    // Client: use openStream — handleOutbound stores the stream and sends subscriptions
+    sw.openStream(io, client_conn, gossipsub_service.Handler, .{
+        .peer_id = @as(?[]const u8, "test-client"),
+    }) catch |err| {
+        log.warn("client openStream (gossipsub) failed: {}", .{err});
         server_conn.close(io);
         client_conn.close(io);
         server_eng.stop(io);
@@ -646,30 +634,11 @@ test "Switch dispatchStream handles gossipsub subscription over QUIC" {
         return;
     };
 
-    // Build and send a subscription RPC for "test-topic"
-    var subs = [_]?rpc_proto.RPC.SubOpts{
-        .{ .subscribe = true, .topicid = "test-topic" },
-    };
-    var rpc_msg = rpc_proto.RPC{ .subscriptions = &subs };
-    gossipsub_codec.writeRpc(io, allocator, &client_stream, &rpc_msg) catch |err| {
-        log.warn("client writeRpc failed: {}", .{err});
-        server_conn.close(io);
-        client_conn.close(io);
-        server_eng.stop(io);
-        client_eng.stop(io);
-        server_eng.deinit();
-        client_eng.deinit();
-        server_conn.deinit();
-        client_conn.deinit();
-        return;
-    };
+    // Close the outbound stream to signal EOF to server's handleInbound
+    svc.removePeer("test-client");
 
-    // Close stream to signal EOF — this makes the server's read loop exit
-    client_stream.close(io);
-
-    // Yield to I/O so QUIC engines can process the buffered data and deliver
-    // it to the server fiber. QuicStream.write/close don't yield, so without
-    // this sleep the server fiber never gets a chance to run.
+    // Yield to I/O so QUIC engines can process the buffered data + FIN
+    // and deliver it to the server fiber.
     const sleep_timeout: Io.Timeout = .{
         .duration = .{
             .raw = Io.Duration.fromMilliseconds(100),
