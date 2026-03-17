@@ -130,6 +130,8 @@ pub const Service = struct {
     /// Handle an inbound gossipsub stream from a remote peer.
     /// Reads varint-length-prefixed protobuf frames from the stream using
     /// FrameDecoder and passes each decoded RPC to the Router.
+    /// When the read loop exits (stream closed / error), cleans up peer
+    /// state via removePeer — matching go-libp2p's handleIncoming pattern.
     pub fn handleInbound(self: *Self, io: Io, stream: anytype, ctx: anytype) !void {
         const peer_id: []const u8 = if (@hasField(@TypeOf(ctx), "peer_id"))
             (ctx.peer_id orelse return)
@@ -137,6 +139,7 @@ pub const Service = struct {
             return;
 
         self.io = io;
+        defer self.removePeer(peer_id);
 
         var decoder = FrameDecoder.init(self.allocator);
         defer decoder.deinit();
