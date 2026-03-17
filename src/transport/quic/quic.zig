@@ -196,12 +196,12 @@ pub const QuicTransport = struct {
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-const ParsedQuicAddr = struct {
+pub const ParsedQuicAddr = struct {
     ip: net.IpAddress,
 };
 
 /// Parse a multiaddr like /ip4/127.0.0.1/udp/9000/quic into an IpAddress.
-fn parseQuicMultiaddr(addr: Multiaddr) !ParsedQuicAddr {
+pub fn parseQuicMultiaddr(addr: Multiaddr) !ParsedQuicAddr {
     var it = addr.iterator();
     var ip4_addr: ?[4]u8 = null;
     var ip6_addr: ?[16]u8 = null;
