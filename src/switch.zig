@@ -676,6 +676,7 @@ test "Switch gossipsub subscription over QUIC via openStream" {
 
     // Check drainEvents for subscription_changed
     const events = svc.drainEvents() catch {
+        sw.notifyPeerDisconnected(@as(?[]const u8, "test-client"));
         client_conn.close(io);
         server_conn.close(io);
         server_eng.stop(io);
@@ -702,20 +703,14 @@ test "Switch gossipsub subscription over QUIC via openStream" {
         log.warn("gossipsub subscription event not found in {} events", .{events.len});
     }
 
-    // Clean up: closing connections triggers stream closes, which makes
-    // the server's handleInbound exit and call removePeer automatically
-    // (go-libp2p pattern). Close client first so the server sees EOF.
+    // Clean up: notify handlers that the peer disconnected
+    // (in production, handleConnectionTask does this via defer).
+    // Must happen before engine shutdown to close outbound streams
+    // while they're still valid.
+    sw.notifyPeerDisconnected(@as(?[]const u8, "test-client"));
+
+    // Now close connections and engines
     client_conn.close(io);
-
-    // Yield to let the server fiber process the stream close and run removePeer.
-    const cleanup_timeout: Io.Timeout = .{
-        .duration = .{
-            .raw = Io.Duration.fromMilliseconds(50),
-            .clock = .awake,
-        },
-    };
-    cleanup_timeout.sleep(io) catch {};
-
     server_conn.close(io);
     server_eng.stop(io);
     client_eng.stop(io);
