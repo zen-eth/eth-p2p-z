@@ -5,6 +5,9 @@ const Allocator = std.mem.Allocator;
 const router_mod = @import("router.zig");
 const codec_mod = @import("codec.zig");
 const config_mod = @import("config.zig");
+const transport_mod = @import("../../transport/transport.zig");
+const rpc = @import("../../proto/rpc.proto.zig");
+const AnyStream = transport_mod.AnyStream;
 
 const Config = config_mod.Config;
 const Event = config_mod.Event;
@@ -50,6 +53,12 @@ pub const Service = struct {
     rng_state: u64,
     /// Current time in milliseconds, set externally via setTime.
     time_ms: u64,
+    /// Io instance, stored when handling inbound/outbound streams.
+    io: ?Io,
+    /// Outbound streams keyed by peer ID (owned keys).
+    outbound_streams: std.StringHashMap(AnyStream),
+    /// Topics we are subscribed to (owned keys), for announcing to new peers.
+    tracked_subscriptions: std.StringHashMap(void),
 
     /// A pending outbound RPC message to a specific peer.
     pub const PendingRpc = struct {
@@ -74,6 +83,9 @@ pub const Service = struct {
             .pending_sends = .empty,
             .rng_state = 12345,
             .time_ms = 0,
+            .io = null,
+            .outbound_streams = std.StringHashMap(AnyStream).init(allocator),
+            .tracked_subscriptions = std.StringHashMap(void).init(allocator),
         };
         self.router = RouterType.init(allocator, gs_config, self) catch |e| {
             allocator.destroy(self);
@@ -89,6 +101,24 @@ pub const Service = struct {
             self.allocator.free(p.data);
         }
         self.pending_sends.deinit(self.allocator);
+
+        // Clean up outbound streams
+        var os_iter = self.outbound_streams.iterator();
+        while (os_iter.next()) |entry| {
+            if (self.io) |io| {
+                entry.value_ptr.*.close(io);
+            }
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.outbound_streams.deinit();
+
+        // Clean up tracked subscriptions
+        var ts_iter = self.tracked_subscriptions.iterator();
+        while (ts_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.tracked_subscriptions.deinit();
+
         self.router.deinit();
         self.allocator.destroy(self);
     }
@@ -98,31 +128,83 @@ pub const Service = struct {
     // ---------------------------------------------------------------
 
     /// Handle an inbound gossipsub stream from a remote peer.
-    ///
     /// Reads varint-length-prefixed protobuf frames from the stream using
     /// FrameDecoder and passes each decoded RPC to the Router.
-    ///
-    /// The `peer_id` is passed as a context parameter by the integration layer.
-    pub fn handleInbound(self: *Self, io: Io, stream: anytype, _: anytype) !void {
-        _ = self;
-        _ = io;
-        _ = stream;
-        // Stub: full implementation requires peer_id context from the Switch.
-        // The Switch currently does not pass peer_id to handleInbound.
-        // TODO: implement inbound stream read loop with FrameDecoder + router.handleRpc
-        //       once the Switch provides peer context.
+    pub fn handleInbound(self: *Self, io: Io, stream: anytype, ctx: anytype) !void {
+        const peer_id: []const u8 = if (@hasField(@TypeOf(ctx), "peer_id"))
+            (ctx.peer_id orelse return)
+        else
+            return;
+
+        self.io = io;
+
+        var decoder = FrameDecoder.init(self.allocator);
+        defer decoder.deinit();
+
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = stream.read(io, &buf) catch break;
+            if (n == 0) break;
+            decoder.feed(buf[0..n]) catch break;
+            while (decoder.next() catch null) |frame| {
+                defer self.allocator.free(frame);
+                self.router.handleRpc(peer_id, frame) catch {};
+            }
+        }
     }
 
     /// Handle an outbound gossipsub stream.
     ///
-    /// For GossipSub, outbound streams are managed externally through the
-    /// pending-sends queue rather than through the Switch's openStream flow.
-    /// This is a no-op to satisfy the protocol Handler interface.
+    /// Stores the stream as an AnyStream keyed by peer ID so that sendRpc
+    /// can write directly to it. Announces current subscriptions to the
+    /// new peer.
     pub fn handleOutbound(self: *Self, io: Io, stream: anytype, ctx: anytype) !void {
-        _ = self;
-        _ = io;
-        _ = stream;
-        _ = ctx;
+        const peer_id: []const u8 = if (@hasField(@TypeOf(ctx), "peer_id"))
+            (ctx.peer_id orelse return)
+        else
+            return;
+
+        self.io = io;
+
+        const any = AnyStream.wrap(@TypeOf(stream.*), stream);
+
+        // If peer already has an outbound stream, close the old one and free the old key
+        if (self.outbound_streams.fetchRemove(peer_id)) |old| {
+            old.value.close(io);
+            self.allocator.free(old.key);
+        }
+
+        const peer_copy = try self.allocator.dupe(u8, peer_id);
+        self.outbound_streams.put(peer_copy, any) catch {
+            self.allocator.free(peer_copy);
+            return;
+        };
+
+        self.router.addPeer(peer_id) catch {};
+        self.sendSubscriptionAnnouncement(peer_id);
+    }
+
+    /// Send a subscription announcement to a peer for all tracked subscriptions.
+    fn sendSubscriptionAnnouncement(self: *Self, peer_id: []const u8) void {
+        const count = self.tracked_subscriptions.count();
+        if (count == 0) return;
+
+        // Build subscription list from tracked_subscriptions
+        // Use a stack buffer for SubOpts (up to 64 topics)
+        var sub_opts: [64]?rpc.RPC.SubOpts = undefined;
+        var i: usize = 0;
+        var iter = self.tracked_subscriptions.keyIterator();
+        while (iter.next()) |key| {
+            if (i >= 64) break;
+            sub_opts[i] = .{ .subscribe = true, .topicid = key.* };
+            i += 1;
+        }
+        if (i == 0) return;
+
+        var rpc_msg = rpc.RPC{ .subscriptions = sub_opts[0..i] };
+        const frame = codec_mod.encodeRpc(self.allocator, &rpc_msg) catch return;
+        defer self.allocator.free(frame);
+        _ = self.sendRpc(peer_id, frame);
     }
 
     // ---------------------------------------------------------------
@@ -130,8 +212,22 @@ pub const Service = struct {
     // ---------------------------------------------------------------
 
     /// Send raw RPC bytes to a peer. Called by the Router.
-    /// Enqueues the data for later delivery by the integration layer.
+    /// Tries direct write to outbound stream first; falls back to
+    /// pending-sends queue for unit tests and unconnected peers.
     pub fn sendRpc(self: *Self, peer: []const u8, data: []const u8) bool {
+        // Try direct write to outbound stream
+        if (self.io) |io| {
+            if (self.outbound_streams.get(peer)) |any_stream| {
+                var total: usize = 0;
+                while (total < data.len) {
+                    const n = any_stream.write(io, data[total..]) catch return false;
+                    if (n == 0) return false;
+                    total += n;
+                }
+                return true;
+            }
+        }
+        // Fallback: enqueue for external draining (unit tests, unconnected peers)
         const peer_copy = self.allocator.dupe(u8, peer) catch return false;
         const data_copy = self.allocator.dupe(u8, data) catch {
             self.allocator.free(peer_copy);
@@ -178,11 +274,20 @@ pub const Service = struct {
     /// Subscribe to a topic. Joins the mesh for this topic.
     pub fn subscribe(self: *Self, topic: []const u8) !void {
         try self.router.subscribe(topic);
+        if (!self.tracked_subscriptions.contains(topic)) {
+            const topic_copy = try self.allocator.dupe(u8, topic);
+            self.tracked_subscriptions.put(topic_copy, {}) catch {
+                self.allocator.free(topic_copy);
+            };
+        }
     }
 
     /// Unsubscribe from a topic. Leaves the mesh for this topic.
     pub fn unsubscribe(self: *Self, topic: []const u8) !void {
         try self.router.unsubscribe(topic);
+        if (self.tracked_subscriptions.fetchRemove(topic)) |kv| {
+            self.allocator.free(kv.key);
+        }
     }
 
     /// Publish a message to a topic.
@@ -198,6 +303,12 @@ pub const Service = struct {
 
     /// Notify the Router that a peer has disconnected.
     pub fn removePeer(self: *Self, peer_id: []const u8) void {
+        if (self.outbound_streams.fetchRemove(peer_id)) |entry| {
+            if (self.io) |io| {
+                entry.value.close(io);
+            }
+            self.allocator.free(entry.key);
+        }
         self.router.removePeer(peer_id);
     }
 
@@ -236,9 +347,24 @@ pub const Service = struct {
     }
 };
 
-// --- Tests ---
+/// Handler wraps a heap-allocated Service for embedding in Switch's HandlerTuple.
+/// The Service is heap-allocated (self-referential: Router stores *Handler -> *Service).
+/// This thin wrapper stores a pointer to the Service and is safe to embed by value.
+pub const Handler = struct {
+    svc: *Service,
 
-const rpc = @import("../../proto/rpc.proto.zig");
+    pub const id = Service.id;
+
+    pub fn handleInbound(self: *Handler, io: Io, stream: anytype, ctx: anytype) !void {
+        try self.svc.handleInbound(io, stream, ctx);
+    }
+
+    pub fn handleOutbound(self: *Handler, io: Io, stream: anytype, ctx: anytype) !void {
+        try self.svc.handleOutbound(io, stream, ctx);
+    }
+};
+
+// --- Tests ---
 
 /// A message ID function that uses topic + data instead of from + seqno.
 /// Suitable for testing with strict_no_sign / anonymous policies where
@@ -348,11 +474,10 @@ test "Service publish generates pending sends to mesh peers" {
     try svc.addPeer("peer-2");
 
     // Subscribe peers to the topic so they are eligible for mesh
-    const rpc_mod = @import("../../proto/rpc.proto.zig");
-    var subs = [_]?rpc_mod.RPC.SubOpts{
+    var subs = [_]?rpc.RPC.SubOpts{
         .{ .subscribe = true, .topicid = "topic-a" },
     };
-    var rpc_msg = rpc_mod.RPC{ .subscriptions = &subs };
+    var rpc_msg = rpc.RPC{ .subscriptions = &subs };
     const encoded = rpc_msg.encode(std.testing.allocator) catch unreachable;
     defer std.testing.allocator.free(encoded);
     try svc.handleRpc("peer-1", encoded);
