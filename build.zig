@@ -81,4 +81,26 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_libp2p_lib_unit_tests.step);
+
+    // --- Interop binary ---
+    const interop_module = b.createModule(.{
+        .root_source_file = b.path("interop/transport/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    interop_module.addImport("zig-libp2p", root_module);
+    interop_module.addImport("ssl", ssl_module);
+    interop_module.addImport("multiaddr", multiaddr_module);
+    interop_module.addImport("peer_id", peer_id_module);
+
+    const interop_exe = b.addExecutable(.{
+        .name = "libp2p-transport-interop",
+        .root_module = interop_module,
+    });
+    interop_exe.root_module.linkLibrary(lsquic_artifact);
+    interop_exe.root_module.addIncludePath(lsquic_dep.path("include"));
+    b.installArtifact(interop_exe);
+
+    const interop_step = b.step("transport-interop", "Build the transport interop binary");
+    interop_step.dependOn(&interop_exe.step);
 }
