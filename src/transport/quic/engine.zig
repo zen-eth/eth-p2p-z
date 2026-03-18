@@ -146,6 +146,8 @@ pub const QuicConnection = struct {
     engine: *QuicEngine,
     stream_queue_buf: [16]StreamEvent,
     stream_queue: Io.Queue(StreamEvent),
+    outbound_stream_queue_buf: [16]StreamEvent,
+    outbound_stream_queue: Io.Queue(StreamEvent),
     peer_id: ?PeerId,
     hsk_completed: bool,
     closed: bool,
@@ -158,11 +160,14 @@ pub const QuicConnection = struct {
             .engine = engine,
             .stream_queue_buf = undefined,
             .stream_queue = undefined,
+            .outbound_stream_queue_buf = undefined,
+            .outbound_stream_queue = undefined,
             .peer_id = null,
             .hsk_completed = false,
             .closed = false,
         };
         self.stream_queue = Io.Queue(StreamEvent).init(&self.stream_queue_buf);
+        self.outbound_stream_queue = Io.Queue(StreamEvent).init(&self.outbound_stream_queue_buf);
         if (lc) |c| lsquic.lsquic_conn_set_ctx(c, @ptrCast(self));
         return self;
     }
@@ -175,9 +180,9 @@ pub const QuicConnection = struct {
         // via onNewStream. Calling processEngine synchronously here can crash
         // inside lsquic's SSL post-handshake processing when the crypto stream
         // has pending events and the SSL session state is still settling.
-        // The suspend on stream_queue.getOne yields to the background loops.
+        // The suspend on outbound_stream_queue.getOne yields to the background loops.
         // Wait for the stream event from onNewStream callback
-        const event = self.stream_queue.getOne(io) catch |err| switch (err) {
+        const event = self.outbound_stream_queue.getOne(io) catch |err| switch (err) {
             error.Closed => return error.ConnectionClosed,
             error.Canceled => return error.ConnectionClosed,
         };
@@ -202,6 +207,7 @@ pub const QuicConnection = struct {
         }
         self.closed = true;
         self.stream_queue.close(io);
+        self.outbound_stream_queue.close(io);
     }
 
     pub fn remotePeerId(self: *const QuicConnection) ?PeerId {
@@ -714,9 +720,10 @@ pub const QuicEngine = struct {
             conn.lsquic_conn = null;
             // Clear conn context so lsquic doesn't assert on engine destroy
             if (lc) |c| lsquic.lsquic_conn_set_ctx(c, null);
-            // Close queue using engine's stored io
+            // Close both queues using engine's stored io
             if (conn.engine.io) |io| {
                 conn.stream_queue.close(io);
+                conn.outbound_stream_queue.close(io);
             }
         }
     }
@@ -739,9 +746,20 @@ pub const QuicEngine = struct {
         // Want to read from this stream
         _ = lsquic.lsquic_stream_wantread(s, 1);
 
-        // Push stream event to connection's queue
+        // Route stream to the correct queue based on QUIC stream ID parity.
+        // RFC 9000: client-initiated bidi = 4n+0, server-initiated bidi = 4n+1.
+        // Locally-initiated streams go to outbound_stream_queue (for openStream),
+        // remotely-initiated streams go to stream_queue (for acceptStream).
         if (engine.io) |io| {
-            conn.stream_queue.putOneUncancelable(io, .{ .stream = stream }) catch {};
+            const stream_id = lsquic.lsquic_stream_id(s);
+            const is_server_initiated = (stream_id % 4 == 1);
+            const is_locally_initiated = (engine.is_server == is_server_initiated);
+
+            if (is_locally_initiated) {
+                conn.outbound_stream_queue.putOneUncancelable(io, .{ .stream = stream }) catch {};
+            } else {
+                conn.stream_queue.putOneUncancelable(io, .{ .stream = stream }) catch {};
+            }
         }
 
         return @ptrCast(stream);

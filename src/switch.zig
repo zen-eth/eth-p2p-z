@@ -6,6 +6,7 @@ const log = std.log.scoped(.@"switch");
 const transport_mod = @import("transport/transport.zig");
 const protocol_mod = @import("protocol/protocol.zig");
 const multistream = @import("protocol/multistream.zig");
+const identify_mod = @import("protocol/identify.zig");
 const engine_mod = @import("transport/quic/engine.zig");
 const QuicEngine = engine_mod.QuicEngine;
 const quic_mod = @import("transport/quic/quic.zig");
@@ -68,14 +69,20 @@ pub fn Switch(comptime config: SwitchConfig) type {
             };
         }
 
-        pub fn deinit(self: *Self) void {
-            var it = self.connections.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-            }
+        /// Tear down the Switch. Stops all background fibers and engines if
+        /// close() was not already called, then frees resources.
+        pub fn deinit(self: *Self, io: Io) void {
+            // Stop background fibers and engines if close() wasn't called
+            self.close(io);
             self.connections.deinit();
-            if (self.server_engine) |eng| eng.deinit();
-            if (self.client_engine) |eng| eng.deinit();
+            if (self.server_engine) |eng| {
+                eng.deinit();
+                self.server_engine = null;
+            }
+            if (self.client_engine) |eng| {
+                eng.deinit();
+                self.client_engine = null;
+            }
         }
 
         // ── Swarm API (Tasks 3-6) ──────────────────────────────────────────
@@ -170,11 +177,9 @@ pub fn Switch(comptime config: SwitchConfig) type {
 
         /// Manages a single QUIC connection's lifecycle.
         /// Extracts peer_id from TLS, registers in connections map (if not already
-        /// registered by dial), accepts streams, deregisters on close.
+        /// registered by dial), accepts streams. Connection map cleanup is handled
+        /// by close()/deinit() — NOT by this task's defers — to avoid races.
         fn swarmConnectionTask(self: *Self, io: Io, conn: *engine_mod.QuicConnection) void {
-            defer conn.close(io);
-            defer conn.deinit();
-
             // Resolve peer_id from TLS
             var pid_buf: [128]u8 = undefined;
             const peer_id: ?[]const u8 = pid: {
@@ -192,7 +197,7 @@ pub fn Switch(comptime config: SwitchConfig) type {
                 break :pid null;
             };
 
-            // Register if not already registered (accepted connections)
+            // Register if not already registered (accepted connections from listen)
             if (peer_id) |pid| {
                 if (!self.connections.contains(pid)) {
                     const owned = self.allocator.dupe(u8, pid) catch null;
@@ -202,30 +207,49 @@ pub fn Switch(comptime config: SwitchConfig) type {
                         };
                     }
                 }
+
+                // Auto-trigger identify (like go-libp2p's IDService).
+                // Runs in background so it doesn't block stream acceptance.
+                self.background.async(io, Self.identifyPeer, .{ self, io, pid });
             }
 
-            // Deregister and notify on exit
-            defer {
-                if (peer_id) |pid| {
-                    if (self.connections.fetchRemove(pid)) |kv| {
-                        self.allocator.free(kv.key);
-                    }
-                }
-                self.notifyPeerDisconnected(peer_id);
-            }
-
-            // Accept streams loop
-            var stream_group: Io.Group = .init;
+            // Accept streams loop — blocks until connection closes or engine stops.
+            // Note: stream_group tasks are implicitly cleaned up when the parent
+            // group (self.background) is canceled by close().
             while (true) {
-                const s_inner = conn.acceptStream(io) catch return;
-                stream_group.async(io, Self.swarmStreamTask, .{
-                    self, io, quic_mod.Stream{ .inner = s_inner }, .{ .peer_id = peer_id },
+                const s_inner = conn.acceptStream(io) catch break;
+                self.background.async(io, Self.swarmStreamTask, .{
+                    self, io, quic_mod.Stream{ .inner = s_inner }, SwarmStreamCtx{ .peer_id = peer_id },
                 });
             }
         }
 
+        /// Concrete context type for swarm stream tasks (Io.Group.async requires
+        /// concrete types — anytype cannot be used with ArgsTuple).
+        const SwarmStreamCtx = struct {
+            peer_id: ?[]const u8 = null,
+        };
+
+        /// Whether identify is registered as a protocol (comptime check).
+        const has_identify = blk: {
+            for (config.protocols) |P| {
+                if (P == identify_mod.Handler) break :blk true;
+            }
+            break :blk false;
+        };
+
+        /// Auto-trigger identify on a newly connected peer.
+        /// No-op if identify is not registered in this Switch's protocols.
+        fn identifyPeer(self: *Self, io: Io, peer_id: []const u8) void {
+            if (has_identify) {
+                self.newStream(io, peer_id, identify_mod.Handler) catch |err| {
+                    log.warn("auto-identify failed for peer: {}", .{err});
+                };
+            }
+        }
+
         /// Handles a single inbound stream: multistream-negotiate then dispatch.
-        fn swarmStreamTask(self: *Self, io: Io, s: quic_mod.Stream, ctx: anytype) void {
+        fn swarmStreamTask(self: *Self, io: Io, s: quic_mod.Stream, ctx: SwarmStreamCtx) void {
             var mutable_stream = s;
             self.dispatchStream(io, &mutable_stream, ctx) catch return;
         }
@@ -251,69 +275,26 @@ pub fn Switch(comptime config: SwitchConfig) type {
         }
 
         /// Gracefully shut down the Switch.
-        /// Stops engines, cancels background fibers, notifies handlers, cleans up.
+        /// Cancels background fibers, stops engines, notifies handlers, cleans up.
         pub fn close(self: *Self, io: Io) void {
-            // Cancel all background fibers
+            // Cancel ALL background fibers: accept loops, connection tasks, AND
+            // stream tasks (all spawned on self.background).
             self.background.cancel(io);
 
-            // Stop engines
+            // Stop engines (closes their internal background loops).
+            // Must happen after canceling Switch fibers, since those fibers
+            // may be blocked on engine IO operations.
             if (self.server_engine) |eng| eng.stop(io);
             if (self.client_engine) |eng| eng.stop(io);
 
-            // Notify handlers and free connection tracking
+            // Notify handlers, free connection objects, and free map keys
             var it = self.connections.iterator();
             while (it.next()) |entry| {
                 self.notifyPeerDisconnected(@as(?[]const u8, entry.key_ptr.*));
+                entry.value_ptr.*.deinit();
                 self.allocator.free(entry.key_ptr.*);
             }
             self.connections.clearRetainingCapacity();
-        }
-
-        /// Run the accept loop for a listener. Accepts connections and spawns
-        /// a concurrent handler per connection via Io.Group (cooperative fibers).
-        /// Blocks until the listener is closed or an error occurs.
-        pub fn serve(self: *Self, io: Io, listener: anytype) void {
-            var conn_group: Io.Group = .init;
-            while (true) {
-                const conn = listener.accept(io) catch return;
-                conn_group.async(io, Self.handleConnectionTask, .{ self, io, conn });
-            }
-        }
-
-        /// Task entry point for handling an inbound connection.
-        /// Extracts peer_id from the TLS-verified connection identity, passes it to
-        /// stream handlers via ctx, and notifies handlers when the connection
-        /// closes (rust-libp2p FromSwarm::ConnectionClosed pattern).
-        fn handleConnectionTask(self: *Self, io: Io, conn: anytype) void {
-            var mutable_conn = conn;
-            defer mutable_conn.close(io);
-
-            // Extract peer_id bytes from TLS-verified connection identity.
-            var pid_buf: [128]u8 = undefined;
-            const peer_id: ?[]const u8 = pid: {
-                if (@hasDecl(@TypeOf(mutable_conn), "remotePeerId")) {
-                    if (mutable_conn.remotePeerId()) |pid| {
-                        break :pid pid.toBytes(&pid_buf) catch null;
-                    }
-                }
-                break :pid null;
-            };
-            defer self.notifyPeerDisconnected(peer_id);
-
-            var stream_group: Io.Group = .init;
-            while (true) {
-                const s = mutable_conn.acceptStream(io) catch return;
-                stream_group.async(io, Self.handleStreamTask, .{
-                    self, io, s, .{ .peer_id = peer_id },
-                });
-            }
-        }
-
-        /// Task entry point for handling an inbound stream.
-        /// Negotiates protocol via multistream-select, dispatches to handler.
-        fn handleStreamTask(self: *Self, io: Io, s: anytype, ctx: anytype) void {
-            var mutable_stream = s;
-            self.dispatchStream(io, &mutable_stream, ctx) catch return;
         }
 
         /// Negotiate protocol on an inbound stream and dispatch to handler.
@@ -329,27 +310,6 @@ pub fn Switch(comptime config: SwitchConfig) type {
             }
         }
 
-        /// Open a stream, negotiate the given protocol via multistream-select,
-        /// and run the protocol's outbound handler. Symmetric with dispatchStream.
-        pub fn openStream(
-            self: *Self,
-            io: Io,
-            conn: anytype,
-            comptime P: type,
-            ctx: anytype,
-        ) !void {
-            comptime protocol_mod.assertProtocolInterface(P);
-            var s = try conn.openStream(io);
-            const stream = streamRef(&s);
-            _ = try multistream.negotiateOutbound(io, stream, &.{P.id});
-            inline for (config.protocols, 0..) |Proto, i| {
-                if (Proto == P) {
-                    try self.handlers[i].handleOutbound(io, stream, ctx);
-                    return;
-                }
-            }
-        }
-
         /// Get a mutable pointer to the handler instance for protocol P.
         /// Allows callers to access handler state directly (e.g. identify results).
         pub fn getHandler(self: *Self, comptime P: type) *P {
@@ -357,19 +317,6 @@ pub fn Switch(comptime config: SwitchConfig) type {
                 if (Proto == P) return &self.handlers[i];
             }
             @compileError("Protocol '" ++ @typeName(P) ++ "' not registered in Switch");
-        }
-
-        /// Returns a pointer suitable for protocol handlers.
-        /// If openStream returned a pointer (*QuicStream), we have *(*QuicStream) — dereference to get *QuicStream.
-        /// If openStream returned a value (Stream), we have *(Stream) — use as-is.
-        inline fn streamRef(s: anytype) switch (@typeInfo(@TypeOf(s.*))) {
-            .pointer => @TypeOf(s.*),
-            else => @TypeOf(s),
-        } {
-            return switch (@typeInfo(@TypeOf(s.*))) {
-                .pointer => s.*,
-                else => s,
-            };
         }
 
         /// Notify all protocol handlers that a peer has disconnected.
@@ -438,489 +385,149 @@ test "Switch comptime validation accepts valid config" {
         .protocols = &.{MockProtocol},
     });
 
+    const io = std.testing.io;
     var sw = TestSwitch.init(std.testing.allocator, .{}, .{MockProtocol{}});
-    defer sw.deinit();
+    defer sw.deinit(io);
 
     // Verify protocol IDs are correct
     try std.testing.expectEqualStrings("/test/mock/1.0.0", TestSwitch.supported_protocol_ids[0]);
 }
 
-test "Switch dispatchStream handles ping over QUIC" {
+test "Swarm ping over QUIC" {
     const ping_mod = @import("protocol/ping.zig");
     const tls_mod = @import("security/tls.zig");
+    const ma = multiaddr;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Generate TLS key pairs
-    const server_key = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(server_key);
-    const client_key = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(client_key);
+    const key1 = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(key1);
+    const key2 = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(key2);
 
-    // Create Switch with QUIC + ping
     const Node = Switch(.{
         .transports = &.{quic_mod.QuicTransport},
         .protocols = &.{ping_mod.Handler},
     });
-    var sw = Node.init(allocator, .{}, .{ping_mod.Handler{}});
-    defer sw.deinit();
 
-    // Set up QUIC server engine
-    const server_eng = QuicEngine.init(allocator, .{
-        .is_server = true,
-        .host_key = server_key,
+    // Server
+    var server = Node.init(allocator, .{ .host_key = key1 }, .{ping_mod.Handler{}});
+    defer server.deinit(io);
+
+    var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = 0 },
+        .QuicV1,
     }) catch return;
-    server_eng.setIo(io);
-    server_eng.bindSocket(io, &net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }) catch {
-        server_eng.deinit();
-        return;
-    };
-    const server_port = switch ((server_eng.socket orelse {
-        server_eng.deinit();
-        return;
-    }).address) {
+    defer listen_addr.deinit();
+    server.listen(io, listen_addr) catch return;
+
+    // Client
+    var client = Node.init(allocator, .{ .host_key = key2 }, .{ping_mod.Handler{}});
+    defer client.deinit(io);
+
+    const bound = server.listenAddrs() orelse return;
+    const port = switch (bound) {
         .ip4 => |a| a.port,
         .ip6 => |a| a.port,
     };
-    server_eng.startBackgroundLoops(io);
-
-    // Set up QUIC client engine
-    const client_eng = QuicEngine.init(allocator, .{
-        .is_server = false,
-        .host_key = client_key,
-    }) catch {
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    };
-    client_eng.setIo(io);
-    client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) }) catch {
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    };
-
-    // Connect client to server
-    const remote = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = server_port } };
-    var remote_sa = engine_mod.ipAddressToSockaddr(remote);
-    const local_bound = (client_eng.socket orelse {
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    }).address;
-    var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
-    const client_conn = client_eng.connect(io, @ptrCast(&remote_sa), @ptrCast(&local_sa)) catch {
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    };
-    client_eng.startBackgroundLoops(io);
-
-    // Accept connection on server
-    const server_conn = server_eng.accept(io) catch {
-        client_conn.close(io);
-        client_conn.deinit();
-        client_eng.stop(io);
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    };
-
-    // Spawn server handler fiber FIRST — it will block on acceptStream until
-    // the client writes (QUIC lazy streams). Cooperative fibers interleave at I/O points.
-    server_eng.background.async(io, struct {
-        fn run(sw_ptr: *Node, io_arg: Io, conn: *engine_mod.QuicConnection) void {
-            const s_inner = conn.acceptStream(io_arg) catch |err| {
-                log.warn("server acceptStream failed: {}", .{err});
-                return;
-            };
-            var s = quic_mod.Stream{ .inner = s_inner };
-            sw_ptr.dispatchStream(io_arg, &s, .{}) catch |err| {
-                log.warn("server dispatchStream failed: {}", .{err});
-            };
-        }
-    }.run, .{ &sw, io, server_conn });
-
-    // Client: open stream → negotiate multistream → ping outbound (main fiber)
-    const payload = [_]u8{0x42} ** ping_mod.payload_length;
-    sw.openStream(io, client_conn, ping_mod.Handler, .{ .payload = &payload }) catch |err| {
-        log.warn("client openStream (ping) failed: {}", .{err});
-        server_conn.close(io);
-        client_conn.close(io);
-        server_eng.stop(io);
-        client_eng.stop(io);
-        server_eng.deinit();
-        client_eng.deinit();
-        server_conn.deinit();
-        client_conn.deinit();
-        return;
-    };
-
-    // Ping succeeded! Clean up.
-    server_conn.close(io);
-    client_conn.close(io);
-    server_eng.stop(io);
-    client_eng.stop(io);
-    server_eng.deinit();
-    client_eng.deinit();
-    server_conn.deinit();
-    client_conn.deinit();
-}
-
-test "Switch dispatchStream handles identify over QUIC" {
-    const identify_mod = @import("protocol/identify.zig");
-    const tls_mod = @import("security/tls.zig");
-
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-
-    // Generate TLS key pairs
-    const server_key = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(server_key);
-    const client_key = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(client_key);
-
-    // Create Switch with QUIC + identify
-    const Node = Switch(.{
-        .transports = &.{quic_mod.QuicTransport},
-        .protocols = &.{identify_mod.Handler},
-    });
-    var sw = Node.init(allocator, .{}, .{identify_mod.Handler{
-        .allocator = allocator,
-        .config = .{
-            .protocol_version = "test/1.0.0",
-            .agent_version = "zig-libp2p/0.1.0",
-        },
-    }});
-    defer sw.deinit();
-
-    // Set up QUIC server engine
-    const server_eng = QuicEngine.init(allocator, .{
-        .is_server = true,
-        .host_key = server_key,
+    var dial_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
     }) catch return;
-    server_eng.setIo(io);
-    server_eng.bindSocket(io, &net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }) catch {
-        server_eng.deinit();
-        return;
-    };
-    const server_port = switch ((server_eng.socket orelse {
-        server_eng.deinit();
-        return;
-    }).address) {
-        .ip4 => |a| a.port,
-        .ip6 => |a| a.port,
-    };
-    server_eng.startBackgroundLoops(io);
+    defer dial_addr.deinit();
 
-    // Set up QUIC client engine
-    const client_eng = QuicEngine.init(allocator, .{
-        .is_server = false,
-        .host_key = client_key,
-    }) catch {
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    };
-    client_eng.setIo(io);
-    client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) }) catch {
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
+    const peer_id = client.dial(io, dial_addr) catch return;
+
+    // Ping via newStream — Handler generates payload and measures RTT internally
+    client.newStream(io, peer_id, ping_mod.Handler) catch |err| {
+        log.warn("ping failed: {}", .{err});
     };
 
-    // Connect client to server
-    const remote = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = server_port } };
-    var remote_sa = engine_mod.ipAddressToSockaddr(remote);
-    const local_bound = (client_eng.socket orelse {
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    }).address;
-    var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
-    const client_conn = client_eng.connect(io, @ptrCast(&remote_sa), @ptrCast(&local_sa)) catch {
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    };
-    client_eng.startBackgroundLoops(io);
-
-    // Accept connection on server
-    const server_conn = server_eng.accept(io) catch {
-        client_conn.close(io);
-        client_conn.deinit();
-        client_eng.stop(io);
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    };
-
-    // Spawn server handler fiber — it will block on acceptStream until
-    // the client writes. Identify inbound sends our identity to the client.
-    // We must close the stream after dispatch so the client sees EOF.
-    server_eng.background.async(io, struct {
-        fn run(sw_ptr: *Node, io_arg: Io, conn: *engine_mod.QuicConnection) void {
-            const s_inner = conn.acceptStream(io_arg) catch |err| {
-                log.warn("server acceptStream failed: {}", .{err});
-                return;
-            };
-            var s = quic_mod.Stream{ .inner = s_inner };
-            defer s.close(io_arg);
-            sw_ptr.dispatchStream(io_arg, &s, .{}) catch |err| {
-                log.warn("server dispatchStream failed: {}", .{err});
-            };
-        }
-    }.run, .{ &sw, io, server_conn });
-
-    // Client: open stream → negotiate identify → get identity
-    const client_s = client_conn.openStream(io) catch |err| {
-        log.warn("client openStream failed: {}", .{err});
-        server_conn.close(io);
-        client_conn.close(io);
-        server_eng.stop(io);
-        client_eng.stop(io);
-        server_eng.deinit();
-        client_eng.deinit();
-        server_conn.deinit();
-        client_conn.deinit();
-        return;
-    };
-    var client_stream = quic_mod.Stream{ .inner = client_s };
-    _ = multistream.negotiateOutbound(io, &client_stream, &.{identify_mod.Handler.id}) catch |err| {
-        log.warn("client negotiate failed: {}", .{err});
-        server_conn.close(io);
-        client_conn.close(io);
-        server_eng.stop(io);
-        client_eng.stop(io);
-        server_eng.deinit();
-        client_eng.deinit();
-        server_conn.deinit();
-        client_conn.deinit();
-        return;
-    };
-    const handler = sw.getHandler(identify_mod.Handler);
-    var result = handler.handleOutbound(io, &client_stream, .{}) catch |err| {
-        log.warn("client identify failed: {}", .{err});
-        server_conn.close(io);
-        client_conn.close(io);
-        server_eng.stop(io);
-        client_eng.stop(io);
-        server_eng.deinit();
-        client_eng.deinit();
-        server_conn.deinit();
-        client_conn.deinit();
-        return;
-    };
-    defer result.deinit(allocator);
-
-    // Verify identify result
-    std.testing.expectEqualStrings("test/1.0.0", result.protocolVersion()) catch |err| {
-        log.warn("protocol version mismatch: {}", .{err});
-    };
-    std.testing.expectEqualStrings("zig-libp2p/0.1.0", result.agentVersion()) catch |err| {
-        log.warn("agent version mismatch: {}", .{err});
-    };
-
-    // Clean up
-    server_conn.close(io);
-    client_conn.close(io);
-    server_eng.stop(io);
-    client_eng.stop(io);
-    server_eng.deinit();
-    client_eng.deinit();
-    server_conn.deinit();
-    client_conn.deinit();
+    client.close(io);
+    server.close(io);
 }
 
-test "Switch gossipsub subscription over QUIC via openStream" {
+test "Swarm gossipsub subscription over QUIC" {
     const gossipsub_service = @import("protocol/gossipsub/service.zig");
     const tls_mod = @import("security/tls.zig");
+    const ma = multiaddr;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Generate TLS key pairs
-    const server_key = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(server_key);
-    const client_key = tls_mod.generateKeyPair(.ECDSA) catch return;
-    defer ssl.EVP_PKEY_free(client_key);
+    const key1 = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(key1);
+    const key2 = tls_mod.generateKeyPair(.ECDSA) catch return;
+    defer ssl.EVP_PKEY_free(key2);
 
-    // Create gossipsub Service (heap-allocated)
-    const svc = gossipsub_service.Service.init(allocator, .{}) catch return;
-    defer svc.deinit();
+    // Server gossipsub
+    const svc1 = gossipsub_service.Service.init(allocator, .{}) catch return;
+    defer svc1.deinit();
 
-    // Subscribe BEFORE connecting so handleOutbound sends subscriptions
-    svc.subscribe("test-topic") catch return;
-
-    // Create Switch with gossipsub Handler wrapper
     const Node = Switch(.{
         .transports = &.{quic_mod.QuicTransport},
         .protocols = &.{gossipsub_service.Handler},
     });
-    var sw = Node.init(allocator, .{}, .{gossipsub_service.Handler{ .svc = svc }});
-    defer sw.deinit();
+    var server = Node.init(allocator, .{ .host_key = key1 }, .{gossipsub_service.Handler{ .svc = svc1 }});
+    defer server.deinit(io);
 
-    // Set up QUIC server engine
-    const server_eng = QuicEngine.init(allocator, .{
-        .is_server = true,
-        .host_key = server_key,
+    var listen_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = 0 },
+        .QuicV1,
     }) catch return;
-    server_eng.setIo(io);
-    server_eng.bindSocket(io, &net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }) catch {
-        server_eng.deinit();
-        return;
-    };
-    const server_port = switch ((server_eng.socket orelse {
-        server_eng.deinit();
-        return;
-    }).address) {
+    defer listen_addr.deinit();
+    server.listen(io, listen_addr) catch return;
+
+    // Client gossipsub
+    const svc2 = gossipsub_service.Service.init(allocator, .{}) catch return;
+    defer svc2.deinit();
+    svc2.subscribe("test-topic") catch return;
+
+    var client = Node.init(allocator, .{ .host_key = key2 }, .{gossipsub_service.Handler{ .svc = svc2 }});
+    defer client.deinit(io);
+
+    const bound = server.listenAddrs() orelse return;
+    const port = switch (bound) {
         .ip4 => |a| a.port,
         .ip6 => |a| a.port,
     };
-    server_eng.startBackgroundLoops(io);
+    var dial_addr = ma.Multiaddr.fromProtocols(allocator, &.{
+        .{ .Ip4 = ma.Ip4Addr{ .bytes = .{ 127, 0, 0, 1 } } },
+        .{ .Udp = port },
+        .QuicV1,
+    }) catch return;
+    defer dial_addr.deinit();
 
-    // Set up QUIC client engine
-    const client_eng = QuicEngine.init(allocator, .{
-        .is_server = false,
-        .host_key = client_key,
-    }) catch {
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    };
-    client_eng.setIo(io);
-    client_eng.bindSocket(io, &net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) }) catch {
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    };
+    const peer_id = client.dial(io, dial_addr) catch return;
 
-    // Connect client to server
-    const remote = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = server_port } };
-    var remote_sa = engine_mod.ipAddressToSockaddr(remote);
-    const local_bound = (client_eng.socket orelse {
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    }).address;
-    var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
-    const client_conn = client_eng.connect(io, @ptrCast(&remote_sa), @ptrCast(&local_sa)) catch {
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    };
-    client_eng.startBackgroundLoops(io);
+    // Open gossipsub stream -- newStream auto-provides peer_id ctx
+    client.newStream(io, peer_id, gossipsub_service.Handler) catch return;
 
-    // Accept connection on server
-    const server_conn = server_eng.accept(io) catch {
-        client_conn.close(io);
-        client_conn.deinit();
-        client_eng.stop(io);
-        client_eng.deinit();
-        server_eng.stop(io);
-        server_eng.deinit();
-        return;
-    };
-
-    // Spawn server handler fiber — accepts inbound stream and dispatches
-    // via Switch (multistream negotiate → gossipsub handleInbound).
-    server_eng.background.async(io, struct {
-        fn run(sw_ptr: *Node, io_arg: Io, conn: *engine_mod.QuicConnection) void {
-            const s_inner = conn.acceptStream(io_arg) catch |err| {
-                log.warn("server acceptStream failed: {}", .{err});
-                return;
-            };
-            var s = quic_mod.Stream{ .inner = s_inner };
-            sw_ptr.dispatchStream(io_arg, &s, .{
-                .peer_id = @as(?[]const u8, "test-client"),
-            }) catch |err| {
-                log.warn("server dispatchStream failed: {}", .{err});
-            };
-        }
-    }.run, .{ &sw, io, server_conn });
-
-    // Client: use openStream — handleOutbound stores the stream and sends subscriptions.
-    // The stream stays open (like go-libp2p/rust-libp2p), and handleInbound runs
-    // as a persistent background reader on the server side.
-    sw.openStream(io, client_conn, gossipsub_service.Handler, .{
-        .peer_id = @as(?[]const u8, "test-client"),
-    }) catch |err| {
-        log.warn("client openStream (gossipsub) failed: {}", .{err});
-        server_conn.close(io);
-        client_conn.close(io);
-        server_eng.stop(io);
-        client_eng.stop(io);
-        server_eng.deinit();
-        client_eng.deinit();
-        server_conn.deinit();
-        client_conn.deinit();
-        return;
-    };
-
-    // Yield to I/O so QUIC engines can deliver the subscription RPC
-    // to the server's handleInbound reader.
-    const sleep_timeout: Io.Timeout = .{
-        .duration = .{
-            .raw = Io.Duration.fromMilliseconds(100),
-            .clock = .awake,
-        },
-    };
+    // Wait for subscription RPC to arrive
+    const sleep_timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(100),
+        .clock = .awake,
+    } };
     sleep_timeout.sleep(io) catch {};
 
-    // Check drainEvents for subscription_changed
-    const events = svc.drainEvents() catch {
-        sw.notifyPeerDisconnected(@as(?[]const u8, "test-client"));
-        client_conn.close(io);
-        server_conn.close(io);
-        server_eng.stop(io);
-        client_eng.stop(io);
-        server_eng.deinit();
-        client_eng.deinit();
-        server_conn.deinit();
-        client_conn.deinit();
-        return;
-    };
+    // Verify subscription event on server
+    const events = svc1.drainEvents() catch return;
     defer allocator.free(events);
-
-    var found_subscription = false;
+    var found = false;
     for (events) |event| {
         switch (event) {
-            .subscription_changed => {
-                found_subscription = true;
-            },
+            .subscription_changed => found = true,
             else => {},
         }
     }
-
-    if (!found_subscription) {
+    if (!found) {
         log.warn("gossipsub subscription event not found in {} events", .{events.len});
     }
 
-    // Clean up: notify handlers that the peer disconnected
-    // (in production, handleConnectionTask does this via defer).
-    // Must happen before engine shutdown to close outbound streams
-    // while they're still valid.
-    sw.notifyPeerDisconnected(@as(?[]const u8, "test-client"));
-
-    // Now close connections and engines
-    client_conn.close(io);
-    server_conn.close(io);
-    server_eng.stop(io);
-    client_eng.stop(io);
-    server_eng.deinit();
-    client_eng.deinit();
-    server_conn.deinit();
-    client_conn.deinit();
+    client.close(io);
+    server.close(io);
 }

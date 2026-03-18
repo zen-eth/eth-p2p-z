@@ -56,9 +56,31 @@ pub const Service = struct {
     /// Io instance, stored when handling inbound/outbound streams.
     io: ?Io,
     /// Outbound streams keyed by peer ID (owned keys).
-    outbound_streams: std.StringHashMap(AnyStream),
+    /// Values include both the AnyStream and a destructor for the heap-allocated backing.
+    outbound_streams: std.StringHashMap(OwnedStream),
     /// Topics we are subscribed to (owned keys), for announcing to new peers.
     tracked_subscriptions: std.StringHashMap(void),
+
+    /// An AnyStream with heap-allocated backing that can be freed.
+    const OwnedStream = struct {
+        stream: AnyStream,
+        /// Raw pointer to the heap-allocated stream backing.
+        backing_ptr: *anyopaque,
+        /// Destructor that frees the backing_ptr via the allocator.
+        destroy_fn: *const fn (alloc: Allocator, ptr: *anyopaque) void,
+
+        fn close(self: OwnedStream, io: Io) void {
+            self.stream.close(io);
+        }
+
+        fn write(self: OwnedStream, io: Io, data: []const u8) anyerror!usize {
+            return self.stream.write(io, data);
+        }
+
+        fn destroyBacking(self: OwnedStream, alloc: Allocator) void {
+            self.destroy_fn(alloc, self.backing_ptr);
+        }
+    };
 
     /// A pending outbound RPC message to a specific peer.
     pub const PendingRpc = struct {
@@ -84,7 +106,7 @@ pub const Service = struct {
             .rng_state = 12345,
             .time_ms = 0,
             .io = null,
-            .outbound_streams = std.StringHashMap(AnyStream).init(allocator),
+            .outbound_streams = std.StringHashMap(OwnedStream).init(allocator),
             .tracked_subscriptions = std.StringHashMap(void).init(allocator),
         };
         self.router = RouterType.init(allocator, gs_config, self) catch |e| {
@@ -108,6 +130,7 @@ pub const Service = struct {
             if (self.io) |io| {
                 entry.value_ptr.*.close(io);
             }
+            entry.value_ptr.*.destroyBacking(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
         self.outbound_streams.deinit();
@@ -168,17 +191,36 @@ pub const Service = struct {
 
         self.io = io;
 
-        const any = AnyStream.wrap(@TypeOf(stream.*), stream);
+        // Heap-allocate a copy of the stream so the AnyStream pointer
+        // outlives the caller's stack frame (newStream/openStream).
+        const StreamT = @TypeOf(stream.*);
+        const heap_stream = try self.allocator.create(StreamT);
+        heap_stream.* = stream.*;
+        const any = AnyStream.wrap(StreamT, heap_stream);
+
+        const owned = OwnedStream{
+            .stream = any,
+            .backing_ptr = @ptrCast(heap_stream),
+            .destroy_fn = struct {
+                fn destroy(alloc: Allocator, ptr: *anyopaque) void {
+                    const p: *StreamT = @ptrCast(@alignCast(ptr));
+                    alloc.destroy(p);
+                }
+            }.destroy,
+        };
 
         // If peer already has an outbound stream, close the old one and free the old key
         if (self.outbound_streams.fetchRemove(peer_id)) |old| {
             old.value.close(io);
+            old.value.destroyBacking(self.allocator);
             self.allocator.free(old.key);
         }
 
         const peer_copy = try self.allocator.dupe(u8, peer_id);
-        self.outbound_streams.put(peer_copy, any) catch {
+        self.outbound_streams.put(peer_copy, owned) catch {
             self.allocator.free(peer_copy);
+            heap_stream.close(io);
+            self.allocator.destroy(heap_stream);
             return;
         };
 
@@ -219,10 +261,10 @@ pub const Service = struct {
     pub fn sendRpc(self: *Self, peer: []const u8, data: []const u8) bool {
         // Try direct write to outbound stream
         if (self.io) |io| {
-            if (self.outbound_streams.get(peer)) |any_stream| {
+            if (self.outbound_streams.get(peer)) |owned_stream| {
                 var total: usize = 0;
                 while (total < data.len) {
-                    const n = any_stream.write(io, data[total..]) catch return false;
+                    const n = owned_stream.write(io, data[total..]) catch return false;
                     if (n == 0) return false;
                     total += n;
                 }
@@ -309,6 +351,7 @@ pub const Service = struct {
             if (self.io) |io| {
                 entry.value.close(io);
             }
+            entry.value.destroyBacking(self.allocator);
             self.allocator.free(entry.key);
         }
         self.router.removePeer(peer_id);
