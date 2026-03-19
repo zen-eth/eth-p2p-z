@@ -364,6 +364,15 @@ pub const QuicEngine = struct {
         // Create SSL context
         self.ssl_ctx = ssl.SSL_CTX_new(ssl.TLS_method()) orelse return error.SslCtxCreateFailed;
 
+        // QUIC requires TLS 1.3 — pin the protocol version.
+        // Without this, BoringSSL may negotiate TLS 1.2, causing HKDF digest
+        // size mismatches (assertion failure in hkdf_extract_to_secret).
+        // Matches lsquic's own SSL_CTX setup in lsquic_enc_sess_ietf.c.
+        if (ssl.SSL_CTX_set_min_proto_version(self.ssl_ctx, @intCast(ssl.TLS1_3_VERSION)) == 0)
+            return error.SslCtxCreateFailed;
+        if (ssl.SSL_CTX_set_max_proto_version(self.ssl_ctx, @intCast(ssl.TLS1_3_VERSION)) == 0)
+            return error.SslCtxCreateFailed;
+
         // Initialize the global SSL_CTX ex_data index on first engine creation
         if (g_ssl_ctx_ex_idx == -1) {
             g_ssl_ctx_ex_idx = ssl.SSL_CTX_get_ex_new_index(0, null, null, null, null);
