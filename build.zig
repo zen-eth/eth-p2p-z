@@ -101,6 +101,7 @@ pub fn build(b: *std.Build) void {
     interop_exe.root_module.addIncludePath(lsquic_dep.path("include"));
     b.installArtifact(interop_exe);
 
+    const interop_install = b.addInstallArtifact(interop_exe, .{});
     const interop_step = b.step("transport-interop", "Build the transport interop binary");
-    interop_step.dependOn(&interop_exe.step);
+    interop_step.dependOn(&interop_install.step);
 }

@@ -1,14 +1,11 @@
 # syntax=docker/dockerfile:1
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG ZIG_VERSION=0.15.2
-ARG ZIG_LOG_LEVEL=info
-
+ARG ZIG_VERSION=0.16.0-dev.2821+3edaef9e0
 FROM debian:bookworm-slim AS build
 
 ARG DEBIAN_FRONTEND
 ARG ZIG_VERSION
-ARG ZIG_LOG_LEVEL
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -26,7 +23,7 @@ RUN apt-get update \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+RUN curl -fsSL "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
     | tar -xJ -C /opt \
     && mv /opt/zig-x86_64-linux-${ZIG_VERSION} /opt/zig
 
@@ -36,7 +33,7 @@ WORKDIR /app
 
 COPY . .
 
-RUN zig build -Doptimize=ReleaseFast -Dlibxev-backend=epoll -Dlog-level=${ZIG_LOG_LEVEL}
+RUN zig build transport-interop -Doptimize=ReleaseFast
 
 FROM debian:bookworm-slim AS runtime
 
