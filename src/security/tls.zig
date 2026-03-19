@@ -734,7 +734,7 @@ fn addExtension(cert: *ssl.X509, oid_str: [*:0]const u8, is_critical: bool, der_
 /// Converts an X509 certificate to PEM format using the provided allocator.
 /// The caller owns the returned slice and must free it.
 /// Returns error.OpenSSLFailed on failure.
-fn x509ToPem(allocator: Allocator, cert: *ssl.X509) ![]u8 {
+pub fn x509ToPem(allocator: Allocator, cert: *ssl.X509) ![]u8 {
     const bio = ssl.BIO_new(ssl.BIO_s_mem()) orelse return error.OpenSSLFailed;
     defer _ = ssl.BIO_free(bio);
 

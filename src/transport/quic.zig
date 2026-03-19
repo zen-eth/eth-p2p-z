@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 const UDP = xev.UDP;
 const posix = std.posix;
 const protoMsgHandler = libp2p.protocols.AnyProtocolMessageHandler;
-const multiaddr = @import("multiaddr");
+const multiaddr = @import("multiformats").multiaddr;
 const Multiaddr = multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 const keys = @import("peer_id").keys;
@@ -137,7 +137,7 @@ fn maybeInitLsquicLogger(allocator: Allocator) void {
 // BBR congestion control algorithm
 const CCAlgoBBR: c_int = 2;
 // Source Connection ID Issuance Rate
-const SCIDIssRate: c_int = 180; // Disable SCID issuance rate limiting
+const SCIDIssRate: c_int = 0; // Disable SCID issuance rate limiting
 
 const SignatureAlgs: []const u16 = &.{
     ssl.SSL_SIGN_ED25519,
@@ -213,12 +213,6 @@ pub const QuicEngine = struct {
 
     stopped: std.Thread.ResetEvent,
 
-    // Resolved local address for wildcard-bound sockets (0.0.0.0 or ::).
-    // When the socket is bound to a wildcard address, lsquic needs the actual
-    // local IP to correctly handle QUIC path validation. This is resolved on
-    // the first incoming packet using the "connect trick" and cached.
-    resolved_local_addr: ?std.net.Address,
-
     pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, transport: *QuicTransport, is_client_mode: bool) !void {
         var flags: c_uint = 0;
         if (!is_client_mode) {
@@ -229,7 +223,7 @@ pub const QuicEngine = struct {
         lsquic.lsquic_engine_init_settings(&engine_settings, flags);
 
         engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
-        engine_settings.es_cc_algo = CCAlgoBBR;
+        // engine_settings.es_cc_algo = CCAlgoBBR;
         engine_settings.es_scid_iss_rate = SCIDIssRate;
 
         var err_buf: [100]u8 = undefined;
@@ -272,45 +266,7 @@ pub const QuicEngine = struct {
             .connect_ctx = null,
             .stop_flag = false,
             .stopped = .{},
-            .resolved_local_addr = null,
         };
-    }
-
-    /// Returns true if the given address is a wildcard (0.0.0.0 or ::).
-    fn isWildcard(addr: std.net.Address) bool {
-        return switch (addr.any.family) {
-            posix.AF.INET => blk: {
-                const bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
-                break :blk std.mem.allEqual(u8, bytes, 0);
-            },
-            posix.AF.INET6 => blk: {
-                const bytes = @as(*const [16]u8, @ptrCast(&addr.in6.sa.addr));
-                break :blk std.mem.allEqual(u8, bytes, 0);
-            },
-            else => false,
-        };
-    }
-
-    /// Resolves the actual local IP address when the socket is bound to a wildcard
-    /// address (0.0.0.0 or ::). Uses the POSIX "connect trick": creates a temporary
-    /// UDP socket, connects it to the remote address (which sets the route without
-    /// sending data), then reads back the local address via getsockname.
-    /// Returns the original address unchanged if it is not a wildcard.
-    fn resolveLocalAddress(local: std.net.Address, remote: std.net.Address) std.net.Address {
-        if (!isWildcard(local)) return local;
-
-        const sock = posix.socket(remote.any.family, posix.SOCK.DGRAM, 0) catch return local;
-        defer posix.close(sock);
-
-        posix.connect(sock, &remote.any, remote.getOsSockLen()) catch return local;
-
-        var resolved: std.net.Address = undefined;
-        var len: posix.socklen_t = @sizeOf(std.net.Address);
-        posix.getsockname(sock, &resolved.any, &len) catch return local;
-
-        // Preserve the original port from the bound socket
-        resolved.setPort(local.getPort());
-        return resolved;
     }
 
     /// doStop is a private method that stops the QUIC engine by setting the stop flag.
@@ -550,28 +506,11 @@ pub const QuicEngine = struct {
             }
             return .rearm;
         }
-        // Resolve the actual local address for wildcard-bound server sockets.
-        // When a server socket is bound to 0.0.0.0, lsquic needs the real
-        // interface IP for correct QUIC path handling. Only apply this to
-        // server engines — client engines must keep using the address from
-        // lsquic_engine_connect to avoid path migration mismatches.
-        const local_addr_ptr: *const std.posix.sockaddr = blk: {
-            if (!self.is_client_mode and isWildcard(self.local_address)) {
-                if (self.resolved_local_addr == null) {
-                    self.resolved_local_addr = resolveLocalAddress(self.local_address, address);
-                }
-                if (self.resolved_local_addr) |*resolved| {
-                    break :blk &resolved.any;
-                }
-            }
-            break :blk &self.local_address.any;
-        };
-
         _ = lsquic.lsquic_engine_packet_in(
             self.engine,
             b.slice[0..n].ptr,
             n,
-            @ptrCast(local_addr_ptr),
+            @ptrCast(&self.local_address.any),
             @ptrCast(&address.any),
             self,
             0,
@@ -830,7 +769,7 @@ pub const QuicStream = struct {
         self.* = .{
             .stream = stream,
             .conn = conn,
-            .pending_writes = .empty,
+            .pending_writes = std.ArrayList(WriteRequest).init(conn.engine.allocator),
             .active_write = null,
             .proto_msg_handler = null,
             .proposed_protocols = null,
@@ -842,16 +781,16 @@ pub const QuicStream = struct {
     pub fn deinit(self: *QuicStream) void {
         if (self.active_write) |*req| {
             req.callback(req.callback_ctx, error.StreamClosed);
-            req.data.deinit(self.conn.engine.allocator);
+            req.data.deinit();
             self.active_write = null;
         }
 
         while (self.pending_writes.items.len > 0) {
             var req = self.pending_writes.pop().?;
             req.callback(req.callback_ctx, error.StreamClosed);
-            req.data.deinit(self.conn.engine.allocator);
+            req.data.deinit();
         }
-        self.pending_writes.deinit(self.conn.engine.allocator);
+        self.pending_writes.deinit();
     }
 
     pub fn setProtoMsgHandler(self: *QuicStream, handler: protoMsgHandler) void {
@@ -860,17 +799,16 @@ pub const QuicStream = struct {
     }
 
     pub fn write(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
-        var data_copy: std.ArrayList(u8) = .empty;
-        const alloc = self.conn.engine.allocator;
-        errdefer data_copy.deinit(alloc);
-        data_copy.appendSlice(alloc, data) catch |err| {
+        var data_copy = std.ArrayList(u8).init(self.conn.engine.allocator);
+        errdefer data_copy.deinit();
+        data_copy.appendSlice(data) catch |err| {
             callback(callback_ctx, err);
             return;
         };
         if (self.conn.engine.transport.io_event_loop.inEventLoopThread()) {
             self.doWrite(data_copy, callback_ctx, callback);
         } else {
-            io_loop.ThreadEventLoop.QuicTasks.queueQuicWriteStream(self.conn.engine.transport.io_event_loop, self, data_copy, alloc, callback_ctx, callback) catch |err| {
+            io_loop.ThreadEventLoop.QuicTasks.queueQuicWriteStream(self.conn.engine.transport.io_event_loop, self, data_copy, callback_ctx, callback) catch |err| {
                 callback(callback_ctx, err);
                 return;
             };
@@ -933,7 +871,7 @@ pub const QuicStream = struct {
             .callback = callback,
         };
 
-        self.pending_writes.append(self.conn.engine.allocator, write_req) catch |err| {
+        self.pending_writes.append(write_req) catch |err| {
             callback(callback_ctx, err);
             return;
         };
@@ -1430,7 +1368,7 @@ pub fn onStreamWrite(
 
             std.log.warn("lsquic_stream_write failed with error: {}", .{err});
             active_req.callback(active_req.callback_ctx, error.WriteFailed);
-            active_req.data.deinit(self.conn.engine.allocator);
+            active_req.data.deinit();
             self.active_write = null;
             return;
         } else if (n_written == 0) {
@@ -1441,11 +1379,11 @@ pub fn onStreamWrite(
             _ = lsquic.lsquic_stream_flush(stream.?);
             const written_usize: usize = @intCast(n_written);
             active_req.total_written += written_usize;
-            active_req.data.replaceRange(self.conn.engine.allocator, 0, written_usize, &.{}) catch unreachable;
+            active_req.data.replaceRange(0, written_usize, &.{}) catch unreachable;
 
             if (active_req.data.items.len == 0) {
                 active_req.callback(active_req.callback_ctx, active_req.total_written);
-                active_req.data.deinit(self.conn.engine.allocator);
+                active_req.data.deinit();
                 self.active_write = null;
 
                 if (self.pending_writes.items.len > 0) {
@@ -1456,7 +1394,7 @@ pub fn onStreamWrite(
             }
         }
     } else {
-        _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
+        // _ = lsquic.lsquic_stream_wantwrite(stream.?, 0);
         return;
     }
 }
@@ -1593,5 +1531,5 @@ test "lsquic engine initialization" {
         }
     }.callback);
 
-    std.Thread.sleep(std.time.ns_per_ms * 200); // Wait for the dial to complete
+    std.time.sleep(std.time.ns_per_ms * 200); // Wait for the dial to complete
 }

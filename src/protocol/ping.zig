@@ -36,12 +36,12 @@ pub const Handler = struct {
         var payload: [payload_length]u8 = undefined;
         fillRandom(&payload);
 
-        const start_ns = std.c.mach_absolute_time();
+        const start_ns = timestampNs();
         writeAll(io, stream, &payload) catch return Error.UnexpectedEof;
 
         var response: [payload_length]u8 = undefined;
         readExact(io, stream, &response) catch return Error.UnexpectedEof;
-        const end_ns = std.c.mach_absolute_time();
+        const end_ns = timestampNs();
 
         if (!std.mem.eql(u8, &payload, &response)) {
             return Error.PayloadMismatch;
@@ -54,6 +54,12 @@ pub const Handler = struct {
         std.c.arc4random_buf(buf.ptr, buf.len);
     }
 };
+
+fn timestampNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
 
 // --- Tests ---
 

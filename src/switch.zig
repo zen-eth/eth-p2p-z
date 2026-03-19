@@ -136,24 +136,12 @@ pub fn Switch(comptime config: SwitchConfig) type {
             var remote_sa = engine_mod.ipAddressToSockaddr(parsed.ip);
             const local_bound = (eng.socket orelse return error.NoSocket).address;
             var local_sa = engine_mod.ipAddressToSockaddr(local_bound);
-            const conn = try eng.connect(io, @ptrCast(&remote_sa), @ptrCast(&local_sa));
+            const conn = try eng.connect(io, @ptrCast(@alignCast(&remote_sa)), @ptrCast(@alignCast(&local_sa)));
 
-            // Wait for TLS handshake to extract peer_id
+            // Wait for TLS handshake — suspends until onHskDone fires
+            const peer_id = conn.waitHandshake(io) catch return error.HandshakeFailed;
             var pid_buf: [128]u8 = undefined;
-            const raw_peer_id: []const u8 = pid: {
-                var attempts: u32 = 0;
-                while (attempts < 200) : (attempts += 1) {
-                    if (conn.remotePeerId()) |pid| {
-                        break :pid pid.toBytes(&pid_buf) catch return error.PeerIdEncodeFailed;
-                    }
-                    const t: Io.Timeout = .{ .duration = .{
-                        .raw = Io.Duration.fromMilliseconds(5),
-                        .clock = .awake,
-                    } };
-                    t.sleep(io) catch {};
-                }
-                return error.HandshakeTimeout;
-            };
+            const raw_peer_id = peer_id.toBytes(&pid_buf) catch return error.PeerIdEncodeFailed;
 
             // Register connection (heap-owned key)
             const owned_pid = try self.allocator.dupe(u8, raw_peer_id);
@@ -180,22 +168,12 @@ pub fn Switch(comptime config: SwitchConfig) type {
         /// registered by dial), accepts streams. Connection map cleanup is handled
         /// by close()/deinit() — NOT by this task's defers — to avoid races.
         fn swarmConnectionTask(self: *Self, io: Io, conn: *engine_mod.QuicConnection) void {
-            // Resolve peer_id from TLS
+            // Wait for TLS handshake to complete (server: immediate, client: suspends)
             var pid_buf: [128]u8 = undefined;
-            const peer_id: ?[]const u8 = pid: {
-                var attempts: u32 = 0;
-                while (attempts < 200) : (attempts += 1) {
-                    if (conn.remotePeerId()) |pid| {
-                        break :pid pid.toBytes(&pid_buf) catch null;
-                    }
-                    const t: Io.Timeout = .{ .duration = .{
-                        .raw = Io.Duration.fromMilliseconds(5),
-                        .clock = .awake,
-                    } };
-                    t.sleep(io) catch {};
-                }
-                break :pid null;
-            };
+            const peer_id: ?[]const u8 = if (conn.waitHandshake(io)) |pid|
+                pid.toBytes(&pid_buf) catch null
+            else |_|
+                null;
 
             // Register if not already registered (accepted connections from listen)
             if (peer_id) |pid| {

@@ -3,9 +3,8 @@ const Io = std.Io;
 const net = Io.net;
 const libp2p = @import("zig-libp2p");
 const ping_mod = libp2p.ping;
-const identify_mod = libp2p.identify;
-const quic_mod = libp2p.quic_transport;
-const engine_mod = libp2p.quic_engine;
+const quic_mod = libp2p.quic_new;
+const engine_mod = libp2p.quic_engine_new;
 const identity = libp2p.identity;
 const tls_mod = libp2p.tls;
 const multiaddr = @import("multiaddr");
@@ -17,23 +16,43 @@ const keys = @import("peer_id").keys;
 
 const log = std.log.scoped(.interop);
 
+/// Convert the getaddrinfo return code to a plain integer.
+/// On Linux the return type is an enum; on Darwin it is c_int.
+fn gaiRetCode(rc: anytype) c_int {
+    const T = @TypeOf(rc);
+    return switch (@typeInfo(T)) {
+        .@"enum" => @intFromEnum(rc),
+        else => rc,
+    };
+}
+
 // ── Env ──────────────────────────────────────────────────────────────────
 
 const Env = struct {
     transport: []const u8,
     is_dialer: bool,
     bind_ip: []const u8,
+    publish_ip: []const u8,
     redis_host: []const u8,
     redis_port: u16,
     timeout_seconds: u32,
     listen_port: u16,
 
     fn load() Env {
-        const transport = getEnvOrDefault("TRANSPORT", "quic-v1");
-        const is_dialer = parseBool(getEnvOrDefault("IS_DIALER", "false"));
-        const bind_ip = getEnvOrDefault("IP", "0.0.0.0");
-        const redis_addr = getEnvOrDefault("REDIS_ADDR", "redis:6379");
-        const timeout_seconds = parseU32(getEnvOrDefault("TEST_TIMEOUT_SECONDS", "180"));
+        const transport = getEnvOrDefault("transport", getEnvOrDefault("TRANSPORT", "quic-v1"));
+        const is_dialer = parseBool(getEnvOrDefault("is_dialer", getEnvOrDefault("IS_DIALER", "false")));
+        const bind_ip = getEnvOrDefault("ip", getEnvOrDefault("IP", "0.0.0.0"));
+        // If PUBLISH_IP is explicitly set, use it. Otherwise, if binding to 0.0.0.0
+        // try to auto-detect the container IP (Docker networking).
+        const explicit_pub = std.c.getenv("PUBLISH_IP");
+        const publish_ip = if (explicit_pub) |v|
+            std.mem.span(v)
+        else if (std.mem.eql(u8, bind_ip, "0.0.0.0"))
+            detectContainerIp()
+        else
+            bind_ip;
+        const redis_addr = getEnvOrDefault("redis_addr", getEnvOrDefault("REDIS_ADDR", "redis:6379"));
+        const timeout_seconds = parseU32(getEnvOrDefault("test_timeout_seconds", getEnvOrDefault("TEST_TIMEOUT_SECONDS", "180")));
         const listen_port = parseU16(getEnvOrDefault("LISTEN_PORT", "4001"));
 
         const parsed = parseHostPort(redis_addr);
@@ -42,6 +61,7 @@ const Env = struct {
             .transport = transport,
             .is_dialer = is_dialer,
             .bind_ip = bind_ip,
+            .publish_ip = publish_ip,
             .redis_host = parsed.host,
             .redis_port = parsed.port,
             .timeout_seconds = timeout_seconds,
@@ -94,12 +114,50 @@ const RedisClient = struct {
     write_buf: [4096]u8,
 
     fn connect(io: Io, host: []const u8, port: u16) !RedisClient {
-        // Parse host IP
+        // Try parsing as IP first
         const ip = net.Ip4Address.parse(host, port) catch {
-            // Try loopback for "localhost"
-            return RedisClient.connectAddr(io, .{ .ip4 = net.Ip4Address.loopback(port) });
+            // Not a numeric IP — resolve hostname via getaddrinfo
+            return RedisClient.connectByName(io, host, port);
         };
         return RedisClient.connectAddr(io, .{ .ip4 = ip });
+    }
+
+    fn connectByName(io: Io, host: []const u8, port: u16) !RedisClient {
+        // Null-terminate the host string for C call
+        var host_buf: [256]u8 = undefined;
+        if (host.len >= host_buf.len) return error.HostNameTooLong;
+        @memcpy(host_buf[0..host.len], host);
+        host_buf[host.len] = 0;
+        const host_z: [*:0]const u8 = host_buf[0..host.len :0];
+
+        var port_buf: [8]u8 = undefined;
+        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch return error.FormatError;
+        var port_z_buf: [8]u8 = undefined;
+        @memcpy(port_z_buf[0..port_str.len], port_str);
+        port_z_buf[port_str.len] = 0;
+        const port_z: [*:0]const u8 = port_z_buf[0..port_str.len :0];
+
+        var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
+        hints.family = std.c.AF.INET;
+        hints.socktype = 1; // SOCK_STREAM
+
+        var result: ?*std.c.addrinfo = null;
+        const rc = std.c.getaddrinfo(host_z, port_z, &hints, &result);
+        if (gaiRetCode(rc) != 0) {
+            log.err("getaddrinfo failed for {s}: rc={d}", .{ host, gaiRetCode(rc) });
+            return error.DnsResolutionFailed;
+        }
+        defer std.c.freeaddrinfo(result.?);
+
+        const ai = result orelse return error.DnsResolutionFailed;
+        // Extract IPv4 address from the result
+        const sa: *const std.posix.sockaddr.in = @ptrCast(@alignCast(ai.addr.?));
+        const addr_bytes = @as(*const [4]u8, @ptrCast(&sa.addr));
+        const resolved = net.Ip4Address{ .bytes = addr_bytes.*, .port = port };
+        log.info("resolved {s} -> {d}.{d}.{d}.{d}", .{
+            host, addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3],
+        });
+        return RedisClient.connectAddr(io, .{ .ip4 = resolved });
     }
 
     fn connectAddr(io: Io, addr: net.IpAddress) !RedisClient {
@@ -235,17 +293,54 @@ const RedisClient = struct {
     }
 };
 
+// ── Host IP detection ────────────────────────────────────────────────────
+
+/// Resolve our own hostname to discover the container IP (for Docker networking).
+/// Falls back to "0.0.0.0" if resolution fails.
+fn detectContainerIp() []const u8 {
+    var name_buf: [256]u8 = undefined;
+    const rc = std.c.gethostname(&name_buf, name_buf.len);
+    if (rc != 0) return "0.0.0.0";
+
+    const hostname: [*:0]const u8 = @ptrCast(std.mem.sliceTo(&name_buf, 0));
+
+    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
+    hints.family = std.c.AF.INET;
+    hints.socktype = 1; // SOCK_STREAM
+
+    var result: ?*std.c.addrinfo = null;
+    const gai_rc = std.c.getaddrinfo(hostname, null, &hints, &result);
+    if (gaiRetCode(gai_rc) != 0) return "0.0.0.0";
+
+    const ai = result orelse return "0.0.0.0";
+    defer std.c.freeaddrinfo(ai);
+    const sa: *const std.posix.sockaddr.in = @ptrCast(@alignCast(ai.addr.?));
+    const b = @as(*const [4]u8, @ptrCast(&sa.addr));
+
+    // Store in a static buffer so we can return a stable slice
+    const S = struct {
+        var buf: [16]u8 = undefined;
+    };
+    const slice = std.fmt.bufPrint(&S.buf, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch return "0.0.0.0";
+    return slice;
+}
+
 // ── Timing ───────────────────────────────────────────────────────────────
 
 fn timestampNs() u64 {
-    return std.c.mach_absolute_time();
+    // Use clock_gettime on all platforms (works on both macOS and Linux).
+    // Avoids referencing std.c.mach_absolute_time which triggers a comptime
+    // assert in std.c.darwin on non-Darwin targets.
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
 // ── Switch type ──────────────────────────────────────────────────────────
 
 const AppSwitch = libp2p.Switch(.{
     .transports = &.{quic_mod.QuicTransport},
-    .protocols = &.{ ping_mod.Handler, identify_mod.Handler },
+    .protocols = &.{ping_mod.Handler},
 });
 
 // ── Entry point ──────────────────────────────────────────────────────────
@@ -273,8 +368,8 @@ pub fn main() !void {
         return error.UnsupportedTransport;
     }
 
-    // Generate ECDSA host key
-    const host_key = tls_mod.generateKeyPair(.ECDSA) catch |err| {
+    // Generate Ed25519 host key (Ed25519 has universal support across libp2p implementations)
+    const host_key = tls_mod.generateKeyPair(.ED25519) catch |err| {
         log.err("failed to generate host key: {}", .{err});
         return err;
     };
@@ -282,7 +377,7 @@ pub fn main() !void {
 
     // Derive local peer ID for listener address publishing
     var kp = identity.KeyPair{
-        .key_type = .ECDSA,
+        .key_type = .ED25519,
         .backend = .tls,
         .storage = .{ .tls = host_key },
     };
@@ -301,19 +396,29 @@ pub fn main() !void {
     // Init Switch
     var sw = AppSwitch.init(allocator, .{ .host_key = host_key }, .{
         ping_mod.Handler{},
-        identify_mod.Handler{
-            .allocator = allocator,
-            .config = .{},
-            .peer_results = std.StringHashMap(identify_mod.IdentifyResult).init(allocator),
-        },
     });
     defer sw.deinit(io);
 
-    // Connect to Redis
-    var redis = RedisClient.connect(io, env.redis_host, env.redis_port) catch |err| {
-        log.err("failed to connect to redis {s}:{d}: {}", .{ env.redis_host, env.redis_port, err });
-        return err;
-    };
+    // Connect to Redis (with retry for Docker network startup timing)
+    var redis: RedisClient = undefined;
+    var redis_connected = false;
+    for (0..10) |attempt| {
+        redis = RedisClient.connect(io, env.redis_host, env.redis_port) catch |err| {
+            log.warn("redis connect attempt {d}/10 failed: {}", .{ attempt + 1, err });
+            const retry_delay: Io.Timeout = .{ .duration = .{
+                .raw = Io.Duration.fromMilliseconds(1000),
+                .clock = .awake,
+            } };
+            retry_delay.sleep(io) catch {};
+            continue;
+        };
+        redis_connected = true;
+        break;
+    }
+    if (!redis_connected) {
+        log.err("failed to connect to redis after 10 attempts", .{});
+        return error.RedisConnectionFailed;
+    }
     defer redis.close(io);
 
     if (env.is_dialer) {
@@ -366,7 +471,7 @@ fn runListener(
     // Build published multiaddr string
     var publish_addr_buf: [256]u8 = undefined;
     const publish_addr = std.fmt.bufPrint(&publish_addr_buf, "/ip4/{s}/udp/{d}/quic-v1/p2p/{s}", .{
-        env.bind_ip, bound_port, local_peer_b58,
+        env.publish_ip, bound_port, local_peer_b58,
     }) catch |err| {
         log.err("failed to format publish addr: {}", .{err});
         return err;

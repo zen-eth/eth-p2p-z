@@ -119,6 +119,14 @@ pub fn build(b: *std.Build) void {
         ssl_translate.defineCMacro("__APPLE__", "1");
     } else if (os_tag == .linux) {
         ssl_translate.defineCMacro("__linux__", "1");
+        // Suppress _Float128 typedefs in glibc's floatn.h — Zig's translate-c
+        // cannot handle them on aarch64-linux.
+        if (arch == .aarch64 or arch == .aarch64_be) {
+            ssl_translate.defineCMacro("__HAVE_FLOAT128", "0");
+            ssl_translate.defineCMacro("__HAVE_DISTINCT_FLOAT128", "0");
+            ssl_translate.defineCMacro("__HAVE_FLOAT64X", "0");
+            ssl_translate.defineCMacro("__HAVE_FLOAT64X_LONG_DOUBLE", "0");
+        }
     } else if (os_tag == .windows) {
         ssl_translate.defineCMacro("_WIN32", "1");
     }
