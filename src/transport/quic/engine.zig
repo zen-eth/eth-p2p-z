@@ -320,9 +320,12 @@ pub const QuicEngine = struct {
     /// consumed by processEngine() after lsquic returns to avoid re-entrancy.
     pending_server_conn: ?*QuicConnection,
 
-    /// Dedicated OS thread running the poll-based event loop.
-    /// Replaces Io.Group fiber loops for zero-overhead packet processing.
-    engine_thread: ?std.Thread,
+    /// Guard against re-entrant calls to lsquic_engine_process_conns.
+    processing: bool,
+
+    /// Background task group for receive and timer loops.
+    /// Owned by the engine so it outlives the stack frames that spawn the loops.
+    background: Io.Group,
 
     // lsquic callback vtables (must be stable pointers)
     stream_if: lsquic.lsquic_stream_if,
@@ -369,8 +372,9 @@ pub const QuicEngine = struct {
         self.is_server = config.is_server;
         self.running = false;
         self.has_unsent = false;
+        self.processing = false;
         self.pending_server_conn = null;
-        self.engine_thread = null;
+        self.background = .init;
 
         self.conn_queue = Io.Queue(ConnEvent).init(&self.conn_queue_buf);
 
@@ -555,23 +559,16 @@ pub const QuicEngine = struct {
     pub fn stop(self: *QuicEngine, io: Io) void {
         self.running = false;
         self.conn_queue.close(io);
-        // Wait for the engine thread to finish
-        if (self.engine_thread) |t| {
-            t.join();
-            self.engine_thread = null;
-        }
+        // Cancel background receive and timer loops, then wait for them to finish
+        self.background.cancel(io);
     }
 
-    /// Start the dedicated engine thread running a poll-based event loop.
+    /// Start the background receive and timer loops.
     /// Must be called after setIo() and bindSocket().
-    /// The engine thread handles both UDP receive and timer-driven processing
-    /// on a single OS thread, eliminating thread pool scheduling overhead.
-    pub fn startBackgroundLoops(self: *QuicEngine, _: Io) void {
+    pub fn startBackgroundLoops(self: *QuicEngine, io: Io) void {
         self.running = true;
-        self.engine_thread = std.Thread.spawn(.{}, QuicEngine.runEngineThread, .{self}) catch |err| {
-            log.err("failed to spawn engine thread: {}", .{err});
-            return;
-        };
+        self.background.async(io, QuicEngine.runReceiveLoop, .{ self, io });
+        self.background.async(io, QuicEngine.runTimerLoop, .{ self, io });
     }
 
     /// Bind a UDP socket.
@@ -582,91 +579,88 @@ pub const QuicEngine = struct {
         self.socket = sock;
     }
 
-    /// Single-threaded engine loop using poll() for zero-overhead event processing.
-    /// Mirrors the old libxev single-threaded architecture: all lsquic calls happen
-    /// on this one thread, eliminating thread pool scheduling latency.
-    fn runEngineThread(self: *QuicEngine) void {
-        log.debug("engine thread started", .{});
-        const sock = self.socket orelse {
-            log.err("engine thread: no socket bound", .{});
-            return;
-        };
-        const fd = sock.handle;
-
-        // Set socket to non-blocking for poll-based loop
-        const current_flags = std.c.fcntl(fd, std.c.F.GETFL);
-        _ = std.c.fcntl(fd, std.c.F.SETFL, current_flags | @as(c_int, @bitCast(std.c.O{.NONBLOCK = true})));
-
-        var buf: [65535]u8 = undefined;
-
+    /// Run the UDP receive loop: reads datagrams and feeds them to lsquic.
+    /// This should be spawned via Group.async.
+    pub fn runReceiveLoop(self: *QuicEngine, io: Io) void {
+        log.debug("runReceiveLoop started", .{});
         while (self.running) {
-            // Determine poll timeout from lsquic timer
-            var diff: c_int = 0;
-            var timeout_ms: i32 = 1; // default 1ms poll when idle
-            if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff) != 0) {
-                if (diff <= 0) {
-                    timeout_ms = 0; // process immediately
-                } else {
-                    // Convert microseconds to milliseconds, rounding up
-                    timeout_ms = @intCast(@min(@as(i64, @divTrunc(@as(i64, @intCast(diff)) + 999, 1000)), 50));
+            var buf: [65535]u8 = undefined;
+            const sock = self.socket orelse return;
+            const msg = sock.receive(io, &buf) catch |err| {
+                switch (err) {
+                    error.Canceled => {
+                        log.debug("runReceiveLoop: receive canceled, exiting", .{});
+                        return;
+                    },
+                    else => continue,
                 }
-            }
+            };
 
-            // poll() on the UDP socket — wakes on packet arrival OR timeout
-            var pollfds = [1]std.c.pollfd{.{
-                .fd = fd,
-                .events = std.c.POLL.IN,
-                .revents = 0,
-            }};
-            _ = std.c.poll(&pollfds, 1, timeout_ms);
+            log.debug("runReceiveLoop: received {} bytes", .{msg.data.len});
 
-            if (!self.running) break;
+            // Convert IpAddress to sockaddr for lsquic
+            var local_sa = ipAddressToSockaddr(sock.address);
+            var peer_sa = ipAddressToSockaddr(msg.from);
 
-            // Read all available packets without blocking
-            while (true) {
-                var src_addr: std.c.sockaddr.storage = undefined;
-                var addr_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
-                const rc = std.c.recvfrom(
-                    fd,
-                    &buf,
-                    buf.len,
-                    0, // flags
-                    @ptrCast(&src_addr),
-                    &addr_len,
-                );
-                if (rc <= 0) break; // EAGAIN or error — no more packets
+            _ = lsquic.lsquic_engine_packet_in(
+                self.engine,
+                msg.data.ptr,
+                msg.data.len,
+                @ptrCast(&local_sa),
+                @ptrCast(&peer_sa),
+                @ptrCast(self),
+                0, // ecn
+            );
 
-                const n: usize = @intCast(rc);
-                log.debug("engine thread: received {} bytes", .{n});
-
-                var local_sa = ipAddressToSockaddr(sock.address);
-                var peer_sa: SockaddrStorage = undefined;
-                @memcpy(
-                    @as([*]u8, @ptrCast(&peer_sa))[0..addr_len],
-                    @as([*]const u8, @ptrCast(&src_addr))[0..addr_len],
-                );
-
-                _ = lsquic.lsquic_engine_packet_in(
-                    self.engine,
-                    &buf,
-                    n,
-                    @ptrCast(&local_sa),
-                    @ptrCast(&peer_sa),
-                    @ptrCast(self),
-                    0, // ecn
-                );
-            }
-
-            // Process connections (send responses, handle timers)
             self.processEngine();
         }
+    }
 
-        log.debug("engine thread exiting", .{});
+    /// Run the timer-driven engine process loop.
+    /// Calls lsquic_engine_process_conns() at the intervals lsquic requests
+    /// via lsquic_engine_earliest_adv_tick(). Also retries unsent packets.
+    /// This should be spawned via Group.async alongside runReceiveLoop.
+    pub fn runTimerLoop(self: *QuicEngine, io: Io) void {
+        log.debug("runTimerLoop started", .{});
+        while (self.running) {
+            var diff: c_int = 0;
+            if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff) != 0) {
+                // lsquic wants us to call process_conns after `diff` microseconds
+                const us: i64 = if (diff > 0) @intCast(diff) else 0;
+                const sleep_timeout: Io.Timeout = .{
+                    .duration = .{
+                        .raw = Io.Duration.fromNanoseconds(@as(i96, us) * std.time.ns_per_us),
+                        .clock = .awake,
+                    },
+                };
+                sleep_timeout.sleep(io) catch |err| switch (err) {
+                    error.Canceled => return,
+                };
+            } else {
+                // No connections to process; sleep a short interval
+                const sleep_timeout: Io.Timeout = .{
+                    .duration = .{
+                        .raw = Io.Duration.fromMilliseconds(50),
+                        .clock = .awake,
+                    },
+                };
+                sleep_timeout.sleep(io) catch |err| switch (err) {
+                    error.Canceled => return,
+                };
+            }
+
+            if (!self.running) return;
+            self.processEngine();
+        }
     }
 
     /// Process lsquic connections and retry unsent packets if needed.
-    /// Called only from the engine thread — no re-entrancy guard needed.
     fn processEngine(self: *QuicEngine) void {
+        // Guard against re-entrancy: lsquic asserts that process_conns is
+        // not called while already inside process_conns.
+        if (self.processing) return;
+        self.processing = true;
+        defer self.processing = false;
         // Retry unsent packets first (socket may now be writable)
         if (self.has_unsent) {
             self.has_unsent = false;
