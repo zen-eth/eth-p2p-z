@@ -31,9 +31,18 @@ RUN ARCH=$(uname -m) \
 RUN sed -i 's/return ev\.chdir(\&sync, dir_path_posix);/return chdir(\&sync, dir_path_posix);/' /opt/zig/lib/std/Io/Uring.zig
 
 # Patch glibc _Float* typedefs that Zig's translate-c cannot parse on x86_64.
-# These types are GCC extensions unused by BoringSSL; safe to remove.
-RUN if [ -f /usr/include/x86_64-linux-gnu/bits/floatn-common.h ]; then \
-      sed -i '/^typedef.*_Float[0-9][0-9]*x\?;/d' /usr/include/x86_64-linux-gnu/bits/floatn-common.h; \
+# Two-pronged fix:
+#   1) floatn.h: set __HAVE_FLOAT* = 0 → disables _Float* in stdlib.h, math.h (C++ compiler)
+#   2) floatn-common.h: remove typedef lines → fixes translate-c (has separate __GNUC_PREREQ guards)
+RUN if [ -f /usr/include/x86_64-linux-gnu/bits/floatn.h ]; then \
+      sed -i 's/^# *define __HAVE_FLOAT\([0-9]*\) 1/# define __HAVE_FLOAT\1 0/' \
+        /usr/include/x86_64-linux-gnu/bits/floatn.h; \
+      sed -i 's/^# *define __HAVE_FLOAT\([0-9]*X\) 1/# define __HAVE_FLOAT\1 0/' \
+        /usr/include/x86_64-linux-gnu/bits/floatn.h; \
+    fi \
+    && if [ -f /usr/include/x86_64-linux-gnu/bits/floatn-common.h ]; then \
+      sed -i '/^typedef.*_Float[0-9][0-9]*x\?;/d' \
+        /usr/include/x86_64-linux-gnu/bits/floatn-common.h; \
     fi
 
 ENV PATH="/opt/zig:${PATH}"
