@@ -30,6 +30,12 @@ RUN ARCH=$(uname -m) \
 # Patch Uring.zig chdir bug: ev.chdir() should be plain chdir() (standalone fn, not method)
 RUN sed -i 's/return ev\.chdir(\&sync, dir_path_posix);/return chdir(\&sync, dir_path_posix);/' /opt/zig/lib/std/Io/Uring.zig
 
+# Patch glibc _Float* typedefs that Zig's translate-c cannot parse on x86_64.
+# These types are GCC extensions unused by BoringSSL; safe to remove.
+RUN if [ -f /usr/include/x86_64-linux-gnu/bits/floatn-common.h ]; then \
+      sed -i '/^typedef.*_Float[0-9][0-9]*x\?;/d' /usr/include/x86_64-linux-gnu/bits/floatn-common.h; \
+    fi
+
 ENV PATH="/opt/zig:${PATH}"
 
 WORKDIR /app
