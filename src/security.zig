@@ -2,8 +2,6 @@ const std = @import("std");
 const PeerId = @import("peer_id").PeerId;
 const PublicKey = @import("peer_id").PublicKey;
 
-pub const plain = @import("security/plain.zig");
-pub const insecure = @import("security/insecure.zig");
 pub const tls = @import("security/tls.zig");
 
 pub const Session = struct {

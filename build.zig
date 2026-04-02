@@ -48,6 +48,9 @@ pub fn build(b: *std.Build) void {
         },
     );
 
+    const opts = b.addOptions();
+    opts.addOption(?[]const u8, "log_level", b.option([]const u8, "log_level", "Override log level (debug, info, warn, err)"));
+
     const root_module = b.addModule("zig-libp2p", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -58,6 +61,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("multiaddr", multiaddr_module);
     root_module.addImport("peer_id", peer_id_module);
     root_module.addImport("gremlin", gremlin_module);
+    root_module.addImport("build_options", opts.createModule());
 
     const libp2p_lib = b.addLibrary(.{
         .name = "zig-libp2p",

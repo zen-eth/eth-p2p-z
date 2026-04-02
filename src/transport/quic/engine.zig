@@ -110,6 +110,7 @@ pub const QuicStream = struct {
         const written = lsquic.lsquic_stream_write(ls, data.ptr, data.len);
         if (written < 0) return error.WriteFailed;
         _ = lsquic.lsquic_stream_flush(ls);
+        self.conn.engine.processEngine();
         return @intCast(written);
     }
 
@@ -184,12 +185,7 @@ pub const QuicConnection = struct {
         if (self.closed) return error.ConnectionClosed;
         const lc = self.lsquic_conn orelse return error.ConnectionClosed;
         lsquic.lsquic_conn_make_stream(lc);
-        // Let the background timer loop call processEngine to create the stream
-        // via onNewStream. Calling processEngine synchronously here can crash
-        // inside lsquic's SSL post-handshake processing when the crypto stream
-        // has pending events and the SSL session state is still settling.
-        // The suspend on outbound_stream_queue.getOne yields to the background loops.
-        // Wait for the stream event from onNewStream callback
+        self.engine.processEngine();
         const event = self.outbound_stream_queue.getOne(io) catch |err| switch (err) {
             error.Closed => return error.ConnectionClosed,
             error.Canceled => return error.ConnectionClosed,
@@ -323,6 +319,8 @@ pub const QuicEngine = struct {
     /// Guard against re-entrant calls to lsquic_engine_process_conns.
     processing: bool,
 
+    recv_buf: [65535]u8,
+
     /// Background task group for receive and timer loops.
     /// Owned by the engine so it outlives the stack frames that spawn the loops.
     background: Io.Group,
@@ -367,6 +365,7 @@ pub const QuicEngine = struct {
         self.allocator = allocator;
         self.cert_verify_ctx = CertVerifyCtx.init(allocator);
         self.conn_queue_buf = undefined;
+        self.recv_buf = undefined;
         self.socket = null;
         self.io = null;
         self.is_server = config.is_server;
@@ -584,9 +583,8 @@ pub const QuicEngine = struct {
     pub fn runReceiveLoop(self: *QuicEngine, io: Io) void {
         log.debug("runReceiveLoop started", .{});
         while (self.running) {
-            var buf: [65535]u8 = undefined;
             const sock = self.socket orelse return;
-            const msg = sock.receive(io, &buf) catch |err| {
+            const msg = sock.receive(io, &self.recv_buf) catch |err| {
                 switch (err) {
                     error.Canceled => {
                         log.debug("runReceiveLoop: receive canceled, exiting", .{});
@@ -637,10 +635,9 @@ pub const QuicEngine = struct {
                     error.Canceled => return,
                 };
             } else {
-                // No connections to process; sleep a short interval
                 const sleep_timeout: Io.Timeout = .{
                     .duration = .{
-                        .raw = Io.Duration.fromMilliseconds(50),
+                        .raw = Io.Duration.fromMilliseconds(10),
                         .clock = .awake,
                     },
                 };
