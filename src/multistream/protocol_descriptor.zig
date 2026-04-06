@@ -1,7 +1,6 @@
 const std = @import("std");
-const libp2p = @import("../root.zig");
 const Allocator = std.mem.Allocator;
-const ProtocolId = libp2p.protocols.ProtocolId;
+const ProtocolId = @import("./protocol_matcher.zig").ProtocolId;
 const ProtocolMatcher = @import("./protocol_matcher.zig").ProtocolMatcher;
 
 pub const ProtocolDescriptor = struct {
