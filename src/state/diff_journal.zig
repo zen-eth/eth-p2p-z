@@ -154,7 +154,7 @@ pub const EpochJournal = struct {
     pub fn init(allocator: Allocator, epoch: Epoch) Self {
         return Self{
             .epoch = epoch,
-            .entries = std.ArrayList(StoredDiffEntry).init(allocator),
+            .entries = .empty,
             .bloom = .{},
             .allocator = allocator,
         };
@@ -164,7 +164,7 @@ pub const EpochJournal = struct {
         for (self.entries.items) |entry| {
             self.allocator.free(entry.old_value);
         }
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
     /// Records a reverse diff: the old value of `gindex` before modification at `slot`.
@@ -172,7 +172,7 @@ pub const EpochJournal = struct {
         const owned_value = try self.allocator.alloc(u8, old_value.len);
         @memcpy(owned_value, old_value);
 
-        try self.entries.append(.{
+        try self.entries.append(self.allocator, .{
             .slot = slot,
             .gindex = gindex,
             .old_value = owned_value,
@@ -278,7 +278,7 @@ pub const DiffJournalStore = struct {
     pub fn init(allocator: Allocator) Self {
         return Self{
             .snapshot = FlatSnapshot.init(allocator),
-            .journals = std.ArrayList(EpochJournal).init(allocator),
+            .journals = .empty,
             .current_epoch = 0,
             .allocator = allocator,
         };
@@ -289,13 +289,13 @@ pub const DiffJournalStore = struct {
         for (self.journals.items) |*journal| {
             journal.deinit();
         }
-        self.journals.deinit();
+        self.journals.deinit(self.allocator);
     }
 
     /// Advances to a new epoch, creating a fresh journal for it.
     pub fn advanceEpoch(self: *Self, new_epoch: Epoch) !void {
         const journal = EpochJournal.init(self.allocator, new_epoch);
-        try self.journals.append(journal);
+        try self.journals.append(self.allocator, journal);
         self.current_epoch = new_epoch;
     }
 
