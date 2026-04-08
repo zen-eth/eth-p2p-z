@@ -18,6 +18,7 @@ pub const event = @import("event.zig");
 pub const xev = @import("xev_backend.zig").xev;
 pub const identity = @import("identity.zig");
 pub const secp_context = @import("secp_context.zig");
+pub const state = @import("state.zig");
 pub const QuicStream = transport.QuicStream;
 pub const QuicTransport = transport.QuicTransport;
 
