@@ -165,7 +165,7 @@ pub const WriteAheadLog = struct {
 
     pub fn init(allocator: Allocator) Self {
         return Self{
-            .entries = std.ArrayList(OwnedWalEntry).init(allocator),
+            .entries = .empty,
             .next_seq = 0,
             .allocator = allocator,
         };
@@ -176,7 +176,7 @@ pub const WriteAheadLog = struct {
             if (entry.new_value.len > 0) self.allocator.free(entry.new_value);
             if (entry.old_value.len > 0) self.allocator.free(entry.old_value);
         }
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
     /// Appends a new WAL entry and returns its sequence number.
@@ -196,7 +196,7 @@ pub const WriteAheadLog = struct {
             break :blk buf;
         } else &[_]u8{};
 
-        try self.entries.append(.{
+        try self.entries.append(self.allocator, .{
             .seq_num = seq,
             .key = key,
             .key_len = key_len,
