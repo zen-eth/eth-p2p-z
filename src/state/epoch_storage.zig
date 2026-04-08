@@ -231,7 +231,7 @@ pub const ActiveState = struct {
         const owned = try self.allocator.alloc(u8, value.len);
         @memcpy(owned, value);
 
-        if (self.data.fetchPut(gindex, owned)) |old_entry| {
+        if (try self.data.fetchPut(gindex, owned)) |old_entry| {
             self.allocator.free(old_entry.value);
         }
 
