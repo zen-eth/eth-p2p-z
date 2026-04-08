@@ -112,23 +112,23 @@ pub const EpochPack = struct {
         return Self{
             .epoch = epoch,
             .state_root = std.mem.zeroes([32]u8),
-            .objects = std.ArrayList(PackObjectEntry).init(allocator),
-            .data = std.ArrayList(u8).init(allocator),
+            .objects = .empty,
+            .data = .empty,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.objects.deinit();
-        self.data.deinit();
+        self.objects.deinit(self.allocator);
+        self.data.deinit(self.allocator);
     }
 
     /// Adds a raw chunk to the pack.
     pub fn addRawChunk(self: *Self, gindex: Gindex, chunk_data: []const u8) !void {
         const offset: u64 = @intCast(self.data.items.len);
-        try self.data.appendSlice(chunk_data);
+        try self.data.appendSlice(self.allocator, chunk_data);
 
-        try self.objects.append(.{
+        try self.objects.append(self.allocator, .{
             .gindex = gindex,
             .offset = offset,
             .size = @intCast(chunk_data.len),
@@ -140,7 +140,7 @@ pub const EpochPack = struct {
     /// Adds a delta-encoded reference to a base epoch's pack.
     pub fn addDelta(self: *Self, gindex: Gindex, base_epoch: Epoch, base_offset: u64, length: u32) !void {
         // Store the delta instruction as metadata (no data section bytes needed).
-        try self.objects.append(.{
+        try self.objects.append(self.allocator, .{
             .gindex = gindex,
             .offset = base_offset,
             .size = length,
@@ -308,7 +308,7 @@ pub const PackIndex = struct {
     pub fn init(allocator: Allocator) Self {
         return Self{
             .index = std.AutoHashMap(PackIndexKey, usize).init(allocator),
-            .packs = std.ArrayList(EpochPack).init(allocator),
+            .packs = .empty,
             .allocator = allocator,
         };
     }
@@ -318,7 +318,7 @@ pub const PackIndex = struct {
         for (self.packs.items) |*pack| {
             pack.deinit();
         }
-        self.packs.deinit();
+        self.packs.deinit(self.allocator);
     }
 
     /// Adds a pack to the index, indexing all its objects.
@@ -327,7 +327,7 @@ pub const PackIndex = struct {
         for (pack.objects.items) |obj| {
             try self.index.put(.{ .epoch = pack.epoch, .gindex = obj.gindex }, pack_idx);
         }
-        try self.packs.append(pack);
+        try self.packs.append(self.allocator, pack);
     }
 
     /// Looks up raw data for a gindex at a specific epoch.
@@ -380,13 +380,13 @@ pub const PackIndex = struct {
     /// Removes packs older than the given epoch (garbage collection).
     pub fn gc(self: *Self, min_epoch: Epoch) void {
         // Remove index entries for old epochs.
-        var keys_to_remove = std.ArrayList(PackIndexKey).init(self.allocator);
-        defer keys_to_remove.deinit();
+        var keys_to_remove: std.ArrayList(PackIndexKey) = .empty;
+        defer keys_to_remove.deinit(self.allocator);
 
         var it = self.index.keyIterator();
         while (it.next()) |key| {
             if (key.epoch < min_epoch) {
-                keys_to_remove.append(key.*) catch continue;
+                keys_to_remove.append(self.allocator, key.*) catch continue;
             }
         }
 
