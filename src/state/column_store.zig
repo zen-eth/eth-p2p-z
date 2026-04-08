@@ -138,18 +138,18 @@ pub const IoBatch = struct {
 
     pub fn init(allocator: Allocator) Self {
         return Self{
-            .requests = std.ArrayList(IoRequest).init(allocator),
+            .requests = .empty,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.requests.deinit();
+        self.requests.deinit(self.allocator);
     }
 
     /// Adds a read request for the specified column, offset, and length.
     pub fn addRead(self: *Self, column: ColumnFamily, offset: u64, length: u32, buffer: []align(DIRECT_IO_ALIGNMENT) u8) !void {
-        try self.requests.append(.{
+        try self.requests.append(self.allocator, .{
             .column = column,
             .offset = offset,
             .length = length,
@@ -160,7 +160,7 @@ pub const IoBatch = struct {
 
     /// Adds a write request for the specified column, offset, and length.
     pub fn addWrite(self: *Self, column: ColumnFamily, offset: u64, length: u32, buffer: []align(DIRECT_IO_ALIGNMENT) u8) !void {
-        try self.requests.append(.{
+        try self.requests.append(self.allocator, .{
             .column = column,
             .offset = offset,
             .length = length,
@@ -202,20 +202,20 @@ pub const ColumnBuffer = struct {
     pub fn init(allocator: Allocator, family: ColumnFamily) Self {
         return Self{
             .family = family,
-            .data = std.ArrayList(u8).init(allocator),
+            .data = .empty,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.data.deinit();
+        self.data.deinit(self.allocator);
     }
 
     /// Ensures the buffer has at least `min_size` bytes.
     pub fn ensureSize(self: *Self, min_size: usize) !void {
         if (self.data.items.len < min_size) {
             const extra = min_size - self.data.items.len;
-            try self.data.appendNTimes(0, extra);
+            try self.data.appendNTimes(self.allocator, 0, extra);
         }
     }
 
