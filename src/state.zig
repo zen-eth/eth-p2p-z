@@ -37,6 +37,8 @@ pub const diff_journal = @import("state/diff_journal.zig");
 pub const column_store = @import("state/column_store.zig");
 pub const adaptive_radix_tree = @import("state/adaptive_radix_tree.zig");
 pub const epoch_storage = @import("state/epoch_storage.zig");
+pub const merkle_backend = @import("state/merkle_backend.zig");
+pub const mutation_buffer = @import("state/mutation_buffer.zig");
 
 // Re-export primary types for convenience.
 pub const ChunkedArenaStore = chunked_arena.ChunkedArenaStore;
@@ -44,6 +46,15 @@ pub const DiffJournalStore = diff_journal.DiffJournalStore;
 pub const ColumnStore = column_store.ColumnStore;
 pub const ArtIndex = adaptive_radix_tree.ArtIndex;
 pub const EpochStorage = epoch_storage.EpochStorage;
+pub const MerkleBackend = merkle_backend.MerkleBackend;
+pub const MutationBuffer = mutation_buffer.MutationBuffer;
+
+// Re-export backend adapter constructors.
+pub const ChunkedArenaAdapter = merkle_backend.ChunkedArenaAdapter;
+pub const DiffJournalAdapter = merkle_backend.DiffJournalAdapter;
+pub const ColumnStoreAdapter = merkle_backend.ColumnStoreAdapter;
+pub const ArtAdapter = merkle_backend.ArtAdapter;
+pub const EpochStorageAdapter = merkle_backend.EpochStorageAdapter;
 
 test {
     testing.refAllDeclsRecursive(@This());
