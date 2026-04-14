@@ -1,8 +1,10 @@
+//TODO: remove lsquic exposure
 const lsquic = @cImport({
     @cInclude("lsquic.h");
     @cInclude("lsquic_types.h");
     @cInclude("lsxpack_header.h");
 });
+const lsquic_zig = @import("lsquic_zig");
 const std = @import("std");
 const libp2p = @import("../root.zig");
 const p2p_conn = libp2p.conn;
@@ -219,6 +221,10 @@ pub const QuicEngine = struct {
     // the first incoming packet using the "connect trick" and cached.
     resolved_local_addr: ?std.net.Address,
 
+    inline fn asEngine(self: *QuicEngine) *lsquic_zig.Engine {
+        return @ptrCast(self.engine);
+    }
+
     pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, transport: *QuicTransport, is_client_mode: bool) !void {
         var flags: c_uint = 0;
         if (!is_client_mode) {
@@ -337,7 +343,7 @@ pub const QuicEngine = struct {
                     engine.socket.fd = -1;
                 }
 
-                lsquic.lsquic_engine_destroy(engine.engine);
+                engine.asEngine().destroy();
 
                 engine.stopped.set();
 
@@ -482,10 +488,10 @@ pub const QuicEngine = struct {
     /// It is called from the event loop thread to ensure thread safety.
     /// It should not be called directly from other threads.
     fn processConns(self: *QuicEngine) void {
-        lsquic.lsquic_engine_process_conns(self.engine);
+        self.asEngine().processConns();
 
         var diff_us: c_int = 0;
-        if (lsquic.lsquic_engine_earliest_adv_tick(self.engine, &diff_us) > 0) {
+        if (self.asEngine().earliestAdvTick(&diff_us) > 0) {
             // Calculate the next timer interval in milliseconds
             // If diff_us is negative or less than the clock granularity, we set it to the clock granularity.
             // This ensures that we do not set a timer with a negative or zero interval.
@@ -653,6 +659,10 @@ pub const QuicConnection = struct {
 
     security_session: ?SecuritySession,
 
+    inline fn asConn(self: *QuicConnection) *lsquic_zig.Connection {
+        return @ptrCast(self.conn);
+    }
+
     pub const Error = error{
         NewStreamNotFinished,
         AlreadyAccepting,
@@ -722,7 +732,7 @@ pub const QuicConnection = struct {
             return;
         }
 
-        if (lsquic.lsquic_conn_n_pending_streams(self.conn) != 0) {
+        if (self.asConn().nPendingStreams() != 0) {
             // If there are pending streams, we should not create a new one.
             callback(callback_ctx, error.NewStreamNotFinished);
             return;
@@ -732,7 +742,7 @@ pub const QuicConnection = struct {
             .callback_ctx = callback_ctx,
             .callback = callback,
         };
-        lsquic.lsquic_conn_make_stream(self.conn);
+        self.asConn().makeStream();
 
         self.engine.processConns();
     }
@@ -767,7 +777,7 @@ pub const QuicConnection = struct {
                 .active_callback = callback,
             };
         }
-        lsquic.lsquic_conn_close(self.conn);
+        self.asConn().close();
         self.engine.processConns();
     }
 };
@@ -826,6 +836,10 @@ pub const QuicStream = struct {
 
     close_ctx: ?CloseCtx,
 
+    inline fn asStream(self: *QuicStream) *lsquic_zig.Stream {
+        return @ptrCast(@alignCast(self.stream));
+    }
+
     pub fn init(self: *QuicStream, stream: *lsquic.lsquic_stream_t, conn: *QuicConnection) void {
         self.* = .{
             .stream = stream,
@@ -856,7 +870,7 @@ pub const QuicStream = struct {
 
     pub fn setProtoMsgHandler(self: *QuicStream, handler: protoMsgHandler) void {
         self.proto_msg_handler = handler;
-        _ = lsquic.lsquic_stream_wantread(self.stream, 1);
+        _ = self.asStream().wantRead(true);
     }
 
     pub fn write(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
@@ -910,7 +924,7 @@ pub const QuicStream = struct {
             };
         }
 
-        _ = lsquic.lsquic_stream_close(self.stream);
+        _ = self.asStream().close();
     }
 
     /// Writes data to the QUIC stream asynchronously.
@@ -947,7 +961,7 @@ pub const QuicStream = struct {
         }
 
         self.active_write = self.pending_writes.orderedRemove(0);
-        _ = lsquic.lsquic_stream_wantwrite(self.stream, 1);
+        _ = self.asStream().wantWrite(true);
     }
 };
 
@@ -1043,10 +1057,9 @@ pub const QuicTransport = struct {
 
     pub fn init(self: *QuicTransport, loop: *io_loop.ThreadEventLoop, host_keypair: *identity.KeyPair, cert_key_type: keys.KeyType, allocator: Allocator) !void {
         maybeInitLsquicLogger(allocator);
-        const result = lsquic.lsquic_global_init(lsquic.LSQUIC_GLOBAL_CLIENT | lsquic.LSQUIC_GLOBAL_SERVER);
-        if (result != 0) {
+        lsquic_zig.globalInit(lsquic.LSQUIC_GLOBAL_CLIENT | lsquic.LSQUIC_GLOBAL_SERVER) catch {
             return error.InitializationFailed;
-        }
+        };
 
         const subject_keypair = try tls.generateKeyPair(cert_key_type);
 

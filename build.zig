@@ -45,6 +45,12 @@ pub fn build(b: *std.Build) void {
     });
     const ssl_module = ssl_dep.module("ssl");
 
+    const lsquic_zig_dep = b.dependency("lsquic_zig", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const lsquic_zig_module = lsquic_zig_dep.module("lsquic");
+
     const multiaddr_dep = b.dependency("multiaddr", .{
         .target = target,
         .optimize = optimize,
@@ -94,6 +100,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("multiaddr", multiaddr_module);
     root_module.addImport("ssl", ssl_module);
     root_module.addIncludePath(lsquic_dep.path("include"));
+    root_module.addImport("lsquic_zig", lsquic_zig_module);
     root_module.addImport("gremlin", gremlin_module);
     root_module.addImport("peer_id", peer_id_module);
     root_module.addImport("cache", cache_module);
@@ -107,11 +114,6 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
     });
     libp2p_lib.linkLibrary(lsquic_artifact);
-    const zlib_system_name = switch (target.result.os.tag) {
-        .windows => "zlib1",
-        else => "z",
-    };
-    libp2p_lib.linkSystemLibrary(zlib_system_name);
     b.installArtifact(libp2p_lib);
 
     const exe_module = b.createModule(.{
@@ -125,6 +127,7 @@ pub fn build(b: *std.Build) void {
     exe_module.addImport("multiformats", zmultiformats_module);
     exe_module.addImport("multiaddr", multiaddr_module);
     exe_module.addImport("ssl", ssl_module);
+    exe_module.addImport("lsquic_zig", lsquic_zig_module);
     exe_module.addImport("gremlin", gremlin_module);
     exe_module.addImport("peer_id", peer_id_module);
     exe_module.addImport("cache", cache_module);
@@ -137,7 +140,6 @@ pub fn build(b: *std.Build) void {
     libp2p_exe.step.dependOn(&protobuf.step);
 
     libp2p_exe.linkLibrary(lsquic_artifact);
-    libp2p_exe.linkSystemLibrary(zlib_system_name);
     b.installArtifact(libp2p_exe);
 
     const interop_module = b.createModule(.{
@@ -151,6 +153,7 @@ pub fn build(b: *std.Build) void {
     interop_module.addImport("multiformats", zmultiformats_module);
     interop_module.addImport("multiaddr", multiaddr_module);
     interop_module.addImport("ssl", ssl_module);
+    interop_module.addImport("lsquic_zig", lsquic_zig_module);
     interop_module.addImport("gremlin", gremlin_module);
     interop_module.addImport("peer_id", peer_id_module);
     interop_module.addImport("cache", cache_module);
@@ -163,7 +166,6 @@ pub fn build(b: *std.Build) void {
     });
     transport_interop_exe.step.dependOn(&protobuf.step);
     transport_interop_exe.linkLibrary(lsquic_artifact);
-    transport_interop_exe.linkSystemLibrary(zlib_system_name);
     b.installArtifact(transport_interop_exe);
 
     const transport_interop_run_cmd = b.addRunArtifact(transport_interop_exe);
@@ -207,7 +209,6 @@ pub fn build(b: *std.Build) void {
     });
 
     libp2p_lib_unit_tests.linkLibrary(lsquic_artifact);
-    libp2p_lib_unit_tests.linkSystemLibrary(zlib_system_name);
 
     libp2p_lib_unit_tests.step.dependOn(&protobuf.step);
     const run_libp2p_lib_unit_tests = b.addRunArtifact(libp2p_lib_unit_tests);
@@ -225,6 +226,7 @@ pub fn build(b: *std.Build) void {
     exe_test_module.addImport("gremlin", gremlin_module);
     exe_test_module.addImport("peer_id", peer_id_module);
     exe_test_module.addImport("ssl", ssl_module);
+    exe_test_module.addImport("lsquic_zig", lsquic_zig_module);
     exe_test_module.addImport("cache", cache_module);
     exe_test_module.addImport("secp256k1", secp_module);
 
@@ -234,7 +236,6 @@ pub fn build(b: *std.Build) void {
     libp2p_exe_unit_tests.step.dependOn(&protobuf.step);
 
     libp2p_exe_unit_tests.linkLibrary(lsquic_artifact);
-    libp2p_exe_unit_tests.linkSystemLibrary(zlib_system_name);
     // // for exe, lib, tests, etc.
     // exe_unit_tests.root_module.addImport("aio", zig_aio_module);
     // // for coroutines api

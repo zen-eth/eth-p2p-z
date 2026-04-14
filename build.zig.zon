@@ -38,8 +38,12 @@
             .hash = "gremlin-0.1.0-E2s91STHEQAvlGGPBw_vUYNiA_YkGanSINVKpc2oqJw1",
         },
         .lsquic = .{
-            .url = "git+https://github.com/zen-eth/lsquic.git?ref=anshalshukla/zig-0.15.2-upgrade#87391b162a9d05053bd256fadf716bc7ced1ce63",
-            .hash = "lsquic-0.0.0-jO7gdogfAAD9odKzV7c3R5ewa2LrX-73Kh6B5GJgS7Rh",
+            .url = "git+https://github.com/zen-eth/lsquic#56f7bb9aceabd50f17004d19df6c539d176cae98",
+            .hash = "lsquic-0.0.0-jO7gdu0fAABG1R6pRTgwAfzjjfw1VEnUx3btbDvzykiJ",
+        },
+        .lsquic_zig = .{
+            .url = "git+https://github.com/zen-eth/lsquic.zig#4ec44b5c29d4eea93e066a15a83b0008a8347882",
+            .hash = "lsquic_zig-0.0.0-Q3LEcK5-AADc_niBa0YEVGx-DzhjwLZRIMd8DHYnJ1_k",
         },
         .cache = .{
             .url = "git+https://github.com/karlseguin/cache.zig#9f3329b05b3e98da928fe9988d74971da70328b4",
