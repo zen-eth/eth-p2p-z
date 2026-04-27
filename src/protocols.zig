@@ -1,6 +1,5 @@
 const std = @import("std");
-const libp2p = @import("root.zig");
-const quic = libp2p.transport.quic;
+const PeerId = @import("peer_id").PeerId;
 
 pub const discard = @import("protocols/discard.zig");
 pub const mss = @import("protocols/mss.zig");
@@ -10,15 +9,75 @@ pub const identify = @import("protocols/identify.zig");
 
 pub const ProtocolId = []const u8;
 
+/// Transport-agnostic stream abstraction used by all protocol handlers.
+/// Replaces *quic.QuicStream throughout the protocol layer, enabling both
+/// QUIC streams and yamux streams to be used with the same handlers.
+pub const AnyStream = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        writeFn: *const fn (*anyopaque, []const u8, ?*anyopaque, *const fn (?*anyopaque, anyerror!usize) void) void,
+        closeFn: *const fn (*anyopaque, ?*anyopaque, *const fn (?*anyopaque, anyerror!void) void) void,
+        setProtoMsgHandlerFn: *const fn (*anyopaque, AnyProtocolMessageHandler) void,
+        getProtoMsgHandlerFn: *const fn (*anyopaque) ?AnyProtocolMessageHandler,
+        setNegotiatedProtocolFn: *const fn (*anyopaque, ?ProtocolId) void,
+        getNegotiatedProtocolFn: *const fn (*anyopaque) ?ProtocolId,
+        getProposedProtocolsFn: *const fn (*anyopaque) ?[]const ProtocolId,
+        getRemotePeerIdFn: *const fn (*anyopaque) ?PeerId,
+    };
+
+    pub fn write(
+        self: AnyStream,
+        data: []const u8,
+        ctx: ?*anyopaque,
+        cb: *const fn (?*anyopaque, anyerror!usize) void,
+    ) void {
+        self.vtable.writeFn(self.ptr, data, ctx, cb);
+    }
+
+    pub fn close(
+        self: AnyStream,
+        ctx: ?*anyopaque,
+        cb: *const fn (?*anyopaque, anyerror!void) void,
+    ) void {
+        self.vtable.closeFn(self.ptr, ctx, cb);
+    }
+
+    pub fn setProtoMsgHandler(self: AnyStream, handler: AnyProtocolMessageHandler) void {
+        self.vtable.setProtoMsgHandlerFn(self.ptr, handler);
+    }
+
+    pub fn getProtoMsgHandler(self: AnyStream) ?AnyProtocolMessageHandler {
+        return self.vtable.getProtoMsgHandlerFn(self.ptr);
+    }
+
+    pub fn setNegotiatedProtocol(self: AnyStream, proto: ?ProtocolId) void {
+        self.vtable.setNegotiatedProtocolFn(self.ptr, proto);
+    }
+
+    pub fn getNegotiatedProtocol(self: AnyStream) ?ProtocolId {
+        return self.vtable.getNegotiatedProtocolFn(self.ptr);
+    }
+
+    pub fn getProposedProtocols(self: AnyStream) ?[]const ProtocolId {
+        return self.vtable.getProposedProtocolsFn(self.ptr);
+    }
+
+    pub fn getRemotePeerId(self: AnyStream) ?PeerId {
+        return self.vtable.getRemotePeerIdFn(self.ptr);
+    }
+};
+
 pub const ProtocolStreamControllerVTable = struct {
-    getStreamFn: *const fn (instance: *anyopaque) *quic.QuicStream,
+    getStreamFn: *const fn (instance: *anyopaque) AnyStream,
 };
 
 pub const ProtocolStreamController = struct {
     instance: *anyopaque,
     vtable: *const ProtocolStreamControllerVTable,
 
-    pub fn getStream(self: *ProtocolStreamController) *quic.QuicStream {
+    pub fn getStream(self: *ProtocolStreamController) AnyStream {
         return self.vtable.getStreamFn(self.instance);
     }
 };
@@ -32,33 +91,27 @@ pub fn asStreamController(controller: ?*anyopaque) ?*ProtocolStreamController {
     return @ptrCast(@alignCast(controller.?));
 }
 
-pub fn getStream(controller: ?*anyopaque) ?*quic.QuicStream {
+pub fn getStream(controller: ?*anyopaque) ?AnyStream {
     const base = asStreamController(controller) orelse return null;
     return base.getStream();
 }
 
-/// This is the protocol binding interface for QUIC protocol message handlers.
-/// It registers the protocol handler with the QUIC transport and provides
-/// methods to handle protocol-specific messages.
 pub const ProtocolHandlerVTable = struct {
     onInitiatorStartFn: *const fn (
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void,
 
     onResponderStartFn: *const fn (
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void,
 };
 
-/// This struct represents a protocol handler that can be used with the QUIC transport.
-/// It contains an instance of the protocol handler and a vtable that defines the
-/// methods to be called when the protocol is started by the initiator or responder.
 pub const AnyProtocolHandler = struct {
     instance: *anyopaque,
     vtable: *const ProtocolHandlerVTable,
@@ -66,41 +119,43 @@ pub const AnyProtocolHandler = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn onInitiatorStart(self: *Self, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) !void {
+    pub fn onInitiatorStart(
+        self: *Self,
+        stream: AnyStream,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
+    ) !void {
         return self.vtable.onInitiatorStartFn(self.instance, stream, callback_ctx, callback);
     }
 
-    pub fn onResponderStart(self: *Self, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) !void {
+    pub fn onResponderStart(
+        self: *Self,
+        stream: AnyStream,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
+    ) !void {
         return self.vtable.onResponderStartFn(self.instance, stream, callback_ctx, callback);
     }
 };
 
-/// This is the protocol message handler interface for QUIC protocol messages.
-/// It defines the methods that need to be implemented by any protocol message handler.
-/// The methods are called when the protocol is activated, when a message is received,
-/// and when the stream is closed.
 pub const ProtocolMessageHandlerVTable = struct {
     onActivatedFn: *const fn (
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: AnyStream,
     ) anyerror!void,
 
     onMessageFn: *const fn (
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: AnyStream,
         message: []const u8,
     ) anyerror!void,
 
     onCloseFn: *const fn (
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: AnyStream,
     ) anyerror!void,
 };
 
-/// This struct represents a protocol message handler that can be used with the QUIC transport.
-/// It contains an instance of the protocol message handler and a vtable that defines
-/// the methods to be called when the protocol is activated, when a message is received,
-/// and when the stream is closed.
 pub const AnyProtocolMessageHandler = struct {
     instance: *anyopaque,
     vtable: *const ProtocolMessageHandlerVTable,
@@ -108,15 +163,15 @@ pub const AnyProtocolMessageHandler = struct {
     const Self = @This();
     pub const Error = anyerror;
 
-    pub fn onActivated(self: *Self, stream: *quic.QuicStream) !void {
+    pub fn onActivated(self: *Self, stream: AnyStream) !void {
         try self.vtable.onActivatedFn(self.instance, stream);
     }
 
-    pub fn onMessage(self: *Self, stream: *quic.QuicStream, message: []const u8) !void {
+    pub fn onMessage(self: *Self, stream: AnyStream, message: []const u8) !void {
         try self.vtable.onMessageFn(self.instance, stream, message);
     }
 
-    pub fn onClose(self: *Self, stream: *quic.QuicStream) !void {
+    pub fn onClose(self: *Self, stream: AnyStream) !void {
         try self.vtable.onCloseFn(self.instance, stream);
     }
 };

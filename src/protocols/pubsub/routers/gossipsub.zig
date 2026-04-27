@@ -412,7 +412,7 @@ pub const Gossipsub = struct {
     /// Used to prevent peers from re-grafting too quickly after being pruned
     backoff: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, i64)) = .empty,
 
-    const Options = struct {
+    pub const Options = struct {
         seen_ttl_s: u32 = 120,
         max_messages_per_rpc: ?usize = null,
         global_signature_policy: SignaturePolicy = .StrictSign,
@@ -459,7 +459,7 @@ pub const Gossipsub = struct {
                 return;
             };
             const stream_initiator: *PubSubPeerInitiator = @ptrCast(@alignCast(initiator.?));
-            const peer_id = stream_initiator.stream.conn.security_session.?.remote_id;
+            const peer_id = stream_initiator.stream.getRemotePeerId().?;
 
             if (self.semiduplex) |semi_duplex| {
                 semi_duplex.initiator = stream_initiator;
@@ -480,12 +480,20 @@ pub const Gossipsub = struct {
                 }
             }
 
-            stream_initiator.stream.close_ctx = .{
-                .active_callback_ctx = null,
-                .active_callback = null,
-                .callback_ctx = self.pubsub,
-                .callback = Gossipsub.onStreamClose,
+            // Register stream close notification so gossipsub can clean up the peer entry.
+            const close_ctx = self.pubsub.allocator.create(StreamCloseCtx) catch |err| {
+                std.log.warn("Failed to allocate StreamCloseCtx for initiator {}: {}", .{ peer_id, err });
+                self.callback(self.callback_ctx, {});
+                return;
             };
+            close_ctx.* = .{
+                .router = self.pubsub,
+                .peer_id = peer_id,
+                .is_initiator = true,
+                .allocator = self.pubsub.allocator,
+            };
+            stream_initiator.on_close_ctx = close_ctx;
+            stream_initiator.on_close = StreamCloseCtx.onStreamClose;
 
             self.pubsub.sendExistingSubscriptionsToPeer(peer_id) catch |err| {
                 std.log.warn("failed to send existing subscriptions to peer {}: {}", .{ peer_id, err });
@@ -655,7 +663,11 @@ pub const Gossipsub = struct {
             io_loop.ThreadEventLoop.PubsubTasks.queuePubsubStopHeartbeat(
                 self.swarm.transport.io_event_loop,
                 self.any(),
-            ) catch unreachable;
+            ) catch |err| {
+                std.log.err("failed to queue heartbeat stop: {}", .{err});
+                self.heartbeat_stop_event.set();
+                return;
+            };
             self.heartbeat_stop_event.wait();
         }
     }
@@ -794,7 +806,10 @@ pub const Gossipsub = struct {
                 peer,
                 callback_ctx,
                 callback,
-            ) catch unreachable;
+            ) catch |err| {
+                std.log.err("failed to queue removePeer: {}", .{err});
+                callback(callback_ctx, err);
+            };
         }
     }
 
@@ -808,7 +823,10 @@ pub const Gossipsub = struct {
                 peer,
                 callback_ctx,
                 callback,
-            ) catch unreachable;
+            ) catch |err| {
+                std.log.err("failed to queue addPeer: {}", .{err});
+                callback(callback_ctx, err);
+            };
         }
     }
 
@@ -822,7 +840,11 @@ pub const Gossipsub = struct {
 
         if (self.peers.getEntry(addr_and_peer_id.peer_id.?)) |entry| {
             if (entry.value_ptr.initiator == null) {
-                const add_peer_ctx = self.allocator.create(AddPeerCtx) catch unreachable;
+                const add_peer_ctx = self.allocator.create(AddPeerCtx) catch |err| {
+                    std.log.err("failed to allocate AddPeerCtx: {}", .{err});
+                    callback(callback_ctx, err);
+                    return;
+                };
                 add_peer_ctx.* = AddPeerCtx{
                     .pubsub = self,
                     .semiduplex = entry.value_ptr,
@@ -833,7 +855,11 @@ pub const Gossipsub = struct {
                 return;
             }
         } else {
-            const add_peer_ctx = self.allocator.create(AddPeerCtx) catch unreachable;
+            const add_peer_ctx = self.allocator.create(AddPeerCtx) catch |err| {
+                std.log.err("failed to allocate AddPeerCtx: {}", .{err});
+                callback(callback_ctx, err);
+                return;
+            };
             add_peer_ctx.* = AddPeerCtx{
                 .pubsub = self,
                 .semiduplex = null,
@@ -849,7 +875,11 @@ pub const Gossipsub = struct {
             return;
         }
 
-        const remove_peer_ctx = self.allocator.create(RemovePeerCtx) catch unreachable;
+        const remove_peer_ctx = self.allocator.create(RemovePeerCtx) catch |err| {
+            std.log.err("failed to allocate RemovePeerCtx: {}", .{err});
+            callback(callback_ctx, err);
+            return;
+        };
         remove_peer_ctx.* = RemovePeerCtx{
             .pubsub = self,
             .peer = peer,
@@ -861,19 +891,25 @@ pub const Gossipsub = struct {
 
     pub fn onIncomingNewStream(ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ctx.?));
-        const resp = controller catch unreachable;
+        const resp = controller catch |err| {
+            std.log.warn("incoming pubsub stream error: {}", .{err});
+            return;
+        };
         const responder: *PubSubPeerResponder = @ptrCast(@alignCast(resp.?));
         responder.pubsub = self.any();
-        const peer_id = responder.stream.conn.security_session.?.remote_id;
+        const peer_id = responder.stream.getRemotePeerId().?;
 
-        const result = self.peers.getOrPut(peer_id) catch unreachable;
+        const result = self.peers.getOrPut(peer_id) catch |err| {
+            std.log.warn("failed to register peer {}: {}", .{ peer_id, err });
+            return;
+        };
 
         if (result.found_existing) {
             if (result.value_ptr.responder != null) {
                 result.value_ptr.replace_stream = true;
                 const old_responder = result.value_ptr.responder.?;
                 old_responder.stream.close(null, struct {
-                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                    fn callback(_: ?*anyopaque, _: anyerror!void) void {}
                 }.callback);
             }
             result.value_ptr.responder = responder;
@@ -885,12 +921,19 @@ pub const Gossipsub = struct {
             };
         }
 
-        responder.stream.close_ctx = .{
-            .active_callback_ctx = null,
-            .active_callback = null,
-            .callback_ctx = self,
-            .callback = Self.onStreamClose,
+        // Register stream close notification so gossipsub can clean up the peer entry.
+        const close_ctx = self.allocator.create(StreamCloseCtx) catch |err| {
+            std.log.warn("Failed to allocate StreamCloseCtx for responder {}: {}", .{ peer_id, err });
+            return;
         };
+        close_ctx.* = .{
+            .router = self,
+            .peer_id = peer_id,
+            .is_initiator = false,
+            .allocator = self.allocator,
+        };
+        responder.on_close_ctx = close_ctx;
+        responder.on_close = StreamCloseCtx.onStreamClose;
     }
 
     pub fn publish(self: *Self, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
@@ -1310,42 +1353,38 @@ pub const Gossipsub = struct {
         }
     }
 
-    // This function is called when a stream is closed. It is set when the stream is created.
-    fn onStreamClose(ctx: ?*anyopaque, stream: anyerror!*libp2p.QuicStream) void {
-        const self: *Self = @ptrCast(@alignCast(ctx.?));
-        const s = stream catch unreachable;
-        const remote_peer_id = s.conn.security_session.?.remote_id;
+    /// Context registered on each stream to notify the gossipsub router when the stream closes.
+    const StreamCloseCtx = struct {
+        router: *Gossipsub,
+        peer_id: PeerId,
+        is_initiator: bool,
+        allocator: std.mem.Allocator,
 
-        if (!self.peers.contains(remote_peer_id)) {
-            // This should not be reached
-            std.log.warn("Stream closed for unknown peer: {}", .{s.conn.security_session.?.remote_id});
-            return;
+        fn onStreamClose(ctx: ?*anyopaque) void {
+            const self: *StreamCloseCtx = @ptrCast(@alignCast(ctx.?));
+            defer self.allocator.destroy(self);
+            self.router.handleStreamClose(self.peer_id, self.is_initiator);
         }
+    };
 
-        const semi_duplex = self.peers.getPtr(remote_peer_id).?;
-        if (semi_duplex.replace_stream) {
+    fn handleStreamClose(self: *Self, peer_id: PeerId, is_initiator: bool) void {
+        const semi_duplex = self.peers.getPtr(peer_id) orelse return;
+
+        // If this is a stream replacement (replace_stream flag), skip cleanup.
+        if (!is_initiator and semi_duplex.replace_stream) {
             semi_duplex.replace_stream = false;
             return;
         }
 
-        if (semi_duplex.initiator) |initiator| {
-            if (initiator.stream == s) {
-                semi_duplex.initiator = null;
-            }
-        }
-        if (semi_duplex.responder) |resp| {
-            if (resp.stream == s) {
-                semi_duplex.responder = null;
-            }
+        if (is_initiator) {
+            semi_duplex.initiator = null;
+        } else {
+            semi_duplex.responder = null;
         }
 
-        // If the close operation is not initiated by the application layer, we will try to close the other direction stream as well.
-        // If both directions are closed, we will remove the peer from the peer list.
-        // If the close operation is initiated by the application layer, we will not do anything here.
-        // Because the application layer will handle the removal of the peer.
         if (!semi_duplex.active_close) {
             if (semi_duplex.initiator == null and semi_duplex.responder == null) {
-                _ = self.peers.remove(remote_peer_id);
+                _ = self.peers.remove(peer_id);
             } else {
                 semi_duplex.close(null, struct {
                     fn callback(_: ?*anyopaque, _: anyerror!*Semiduplex) void {}
@@ -1784,7 +1823,7 @@ pub const Gossipsub = struct {
         const semi_duplex = self.peers.getPtr(peer_id) orelse return false;
         const initiator = semi_duplex.initiator orelse return false;
 
-        return std.mem.eql(u8, initiator.stream.negotiated_protocol.?, v1_2_id);
+        return std.mem.eql(u8, initiator.stream.getNegotiatedProtocol().?, v1_2_id);
     }
 
     fn handleMessage(self: *Self, arena: Allocator, from: *const PeerId, publish_msg: *const rpc.MessageReader) !void {
@@ -2272,7 +2311,7 @@ pub const Gossipsub = struct {
             const semi_duplex = self.peers.get(peer_id.*) orelse continue;
             if (semi_duplex.initiator == null) continue;
 
-            const negotiated_protocol = semi_duplex.initiator.?.stream.negotiated_protocol orelse continue;
+            const negotiated_protocol = semi_duplex.initiator.?.stream.getNegotiatedProtocol() orelse continue;
 
             if (self.supportsProtocol(negotiated_protocol) and !filter(filter_ctx, peer_id.*)) {
                 try candidate_peers.append(self.allocator, peer_id.*);
@@ -2300,7 +2339,7 @@ pub const Gossipsub = struct {
     fn hasUsableStream(self: *Self, peer: PeerId) bool {
         const semi_duplex = self.peers.get(peer) orelse return false;
         const initiator = semi_duplex.initiator orelse return false;
-        const negotiated = initiator.stream.negotiated_protocol orelse return false;
+        const negotiated = initiator.stream.getNegotiatedProtocol() orelse return false;
         return self.supportsProtocol(negotiated);
     }
 
@@ -3552,7 +3591,7 @@ test "gossipsub listen callback exposes negotiated protocol" {
 
             const controller = res catch return;
             const stream = libp2p.protocols.getStream(controller) orelse return;
-            self.observed_protocol = stream.negotiated_protocol;
+            self.observed_protocol = stream.getNegotiatedProtocol();
 
             if (self.router) |router| {
                 Gossipsub.onIncomingNewStream(@ptrCast(router), controller);
@@ -3603,7 +3642,7 @@ test "switch handles ping and gossipsub simultaneously" {
             const self: *Self = @ptrCast(@alignCast(ctx.?));
             const controller = res catch return;
             const stream = libp2p.protocols.getStream(controller) orelse return;
-            const proto = stream.negotiated_protocol orelse return;
+            const proto = stream.getNegotiatedProtocol() orelse return;
 
             if (std.mem.eql(u8, proto, v1_id) or std.mem.eql(u8, proto, v1_1_id)) {
                 Gossipsub.onIncomingNewStream(@ptrCast(&self.node.router), controller);
@@ -3615,7 +3654,7 @@ test "switch handles ping and gossipsub simultaneously" {
             }
 
             stream.close(null, struct {
-                fn onClosed(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn onClosed(_: ?*anyopaque, _: anyerror!void) void {}
             }.onClosed);
         }
     };
@@ -3743,7 +3782,7 @@ test "switch handles ping and gossipsub simultaneously" {
 
             const Self = @This();
 
-            fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+            fn callback(ctx: ?*anyopaque, _: anyerror!void) void {
                 const self: *Self = @ptrCast(@alignCast(ctx.?));
                 self.event.set();
             }

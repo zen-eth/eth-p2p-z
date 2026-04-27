@@ -949,6 +949,89 @@ pub const QuicStream = struct {
         self.active_write = self.pending_writes.orderedRemove(0);
         _ = lsquic.lsquic_stream_wantwrite(self.stream, 1);
     }
+
+    pub fn any(self: *QuicStream) libp2p.protocols.AnyStream {
+        return .{ .ptr = self, .vtable = &quic_stream_vtable };
+    }
+};
+
+/// Adapter to bridge QuicStream.close (anyerror!*QuicStream) → AnyStream.closeFn (anyerror!void).
+const QuicStreamCloseAdapter = struct {
+    user_ctx: ?*anyopaque,
+    user_cb: *const fn (?*anyopaque, anyerror!void) void,
+    allocator: Allocator,
+
+    fn run(raw_ctx: ?*anyopaque, res: anyerror!*QuicStream) void {
+        const self: *QuicStreamCloseAdapter = @ptrCast(@alignCast(raw_ctx.?));
+        const user_ctx = self.user_ctx;
+        const user_cb = self.user_cb;
+        const alloc = self.allocator;
+        alloc.destroy(self);
+        if (res) |_| {
+            user_cb(user_ctx, {});
+        } else |e| {
+            user_cb(user_ctx, e);
+        }
+    }
+};
+
+fn quicStreamWriteFn(ptr: *anyopaque, data: []const u8, ctx: ?*anyopaque, cb: *const fn (?*anyopaque, anyerror!usize) void) void {
+    const self: *QuicStream = @ptrCast(@alignCast(ptr));
+    self.write(data, ctx, cb);
+}
+
+fn quicStreamCloseFn(ptr: *anyopaque, ctx: ?*anyopaque, cb: *const fn (?*anyopaque, anyerror!void) void) void {
+    const self: *QuicStream = @ptrCast(@alignCast(ptr));
+    const adapter = self.conn.engine.allocator.create(QuicStreamCloseAdapter) catch |e| {
+        cb(ctx, e);
+        return;
+    };
+    adapter.* = .{ .user_ctx = ctx, .user_cb = cb, .allocator = self.conn.engine.allocator };
+    self.close(adapter, QuicStreamCloseAdapter.run);
+}
+
+fn quicStreamSetProtoMsgHandlerFn(ptr: *anyopaque, handler: libp2p.protocols.AnyProtocolMessageHandler) void {
+    const self: *QuicStream = @ptrCast(@alignCast(ptr));
+    self.setProtoMsgHandler(handler);
+}
+
+fn quicStreamGetProtoMsgHandlerFn(ptr: *anyopaque) ?libp2p.protocols.AnyProtocolMessageHandler {
+    const self: *QuicStream = @ptrCast(@alignCast(ptr));
+    return self.proto_msg_handler;
+}
+
+fn quicStreamSetNegotiatedProtocolFn(ptr: *anyopaque, proto: ?libp2p.protocols.ProtocolId) void {
+    const self: *QuicStream = @ptrCast(@alignCast(ptr));
+    self.negotiated_protocol = proto;
+}
+
+fn quicStreamGetNegotiatedProtocolFn(ptr: *anyopaque) ?libp2p.protocols.ProtocolId {
+    const self: *QuicStream = @ptrCast(@alignCast(ptr));
+    return self.negotiated_protocol;
+}
+
+fn quicStreamGetProposedProtocolsFn(ptr: *anyopaque) ?[]const libp2p.protocols.ProtocolId {
+    const self: *QuicStream = @ptrCast(@alignCast(ptr));
+    return self.proposed_protocols;
+}
+
+fn quicStreamGetRemotePeerIdFn(ptr: *anyopaque) ?PeerId {
+    const self: *QuicStream = @ptrCast(@alignCast(ptr));
+    if (self.conn.security_session) |session| {
+        return session.remote_id;
+    }
+    return null;
+}
+
+const quic_stream_vtable = libp2p.protocols.AnyStream.VTable{
+    .writeFn = quicStreamWriteFn,
+    .closeFn = quicStreamCloseFn,
+    .setProtoMsgHandlerFn = quicStreamSetProtoMsgHandlerFn,
+    .getProtoMsgHandlerFn = quicStreamGetProtoMsgHandlerFn,
+    .setNegotiatedProtocolFn = quicStreamSetNegotiatedProtocolFn,
+    .getNegotiatedProtocolFn = quicStreamGetNegotiatedProtocolFn,
+    .getProposedProtocolsFn = quicStreamGetProposedProtocolsFn,
+    .getRemotePeerIdFn = quicStreamGetRemotePeerIdFn,
 };
 
 /// QUIC listener that listens for incoming QUIC connections.
@@ -1369,7 +1452,7 @@ fn onStreamRead(
     while (true) {
         const n_read = lsquic.lsquic_stream_read(s, &buf, buf.len);
         if (n_read > 0) {
-            self.proto_msg_handler.?.onMessage(self, buf[0..@intCast(n_read)]) catch |err| {
+            self.proto_msg_handler.?.onMessage(self.any(), buf[0..@intCast(n_read)]) catch |err| {
                 std.log.warn("Protocol message handler failed with error: {}. ", .{err});
                 _ = lsquic.lsquic_stream_close(s);
                 return;
@@ -1482,7 +1565,7 @@ fn onStreamClose(
     // In this case, the stream will be closed until the connection closed.
     // TODO: Can we found a good approach?
     if (self.proto_msg_handler) |*proto_msg_handler| {
-        proto_msg_handler.onClose(self) catch |err| {
+        proto_msg_handler.onClose(self.any()) catch |err| {
             std.log.warn("Protocol message handler failed with error: {}.", .{err});
         };
     }
@@ -1510,6 +1593,9 @@ pub fn maToStdAddrAndPeerId(ma: Multiaddr) !struct { address: std.net.Address, p
             },
             .Udp => |udp_port| {
                 port = udp_port;
+            },
+            .Tcp => |tcp_port| {
+                port = tcp_port;
             },
             .P2P => |p2p_id| {
                 peer_id = p2p_id;

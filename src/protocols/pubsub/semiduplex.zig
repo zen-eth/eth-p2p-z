@@ -3,7 +3,6 @@ const linear_fifo = @import("../../linear_fifo.zig");
 const libp2p = @import("../../root.zig");
 const protocols = libp2p.protocols;
 const PeerId = @import("peer_id").PeerId;
-const quic = libp2p.transport.quic;
 const rpc = libp2p.protobuf.rpc;
 const pubsub = @import("pubsub.zig");
 const PubSub = pubsub.PubSub;
@@ -45,13 +44,13 @@ pub const Semiduplex = struct {
 
         if (current_initiator) |init| {
             init.stream.close(null, struct {
-                fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn callback(_: ?*anyopaque, _: anyerror!void) void {}
             }.callback);
         }
 
         if (current_responder) |resp| {
             resp.stream.close(null, struct {
-                fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn callback(_: ?*anyopaque, _: anyerror!void) void {}
             }.callback);
         }
         s_callback(s_callback_ctx, self);
@@ -75,7 +74,7 @@ pub const PubSubPeerProtocolHandler = struct {
 
     pub fn onInitiatorStart(
         self: *Self,
-        stream: *libp2p.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
@@ -92,7 +91,7 @@ pub const PubSubPeerProtocolHandler = struct {
 
     pub fn onResponderStart(
         self: *Self,
-        stream: *libp2p.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
@@ -111,7 +110,7 @@ pub const PubSubPeerProtocolHandler = struct {
 
     pub fn vtableOnResponderStartFn(
         instance: *anyopaque,
-        stream: *libp2p.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void {
@@ -121,7 +120,7 @@ pub const PubSubPeerProtocolHandler = struct {
 
     pub fn vtableOnInitiatorStartFn(
         instance: *anyopaque,
-        stream: *libp2p.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void {
@@ -142,12 +141,16 @@ pub const PubSubPeerProtocolHandler = struct {
 
 pub const PubSubPeerInitiator = struct {
     controller: protocols.ProtocolStreamController,
-    stream: *libp2p.QuicStream,
+    stream: protocols.AnyStream,
     callback_ctx: ?*anyopaque,
 
     callback: *const fn (ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
 
     allocator: std.mem.Allocator,
+
+    /// Optional close notification callback registered by the router to clean up peer state.
+    on_close_ctx: ?*anyopaque = null,
+    on_close: ?*const fn (ctx: ?*anyopaque) void = null,
 
     const Self = @This();
 
@@ -155,30 +158,33 @@ pub const PubSubPeerInitiator = struct {
         .getStreamFn = controllerGetStream,
     };
 
-    fn controllerGetStream(instance: *anyopaque) *libp2p.QuicStream {
+    fn controllerGetStream(instance: *anyopaque) protocols.AnyStream {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.stream;
     }
 
-    pub fn onActivated(self: *Self, stream: *libp2p.QuicStream) !void {
+    pub fn onActivated(self: *Self, stream: protocols.AnyStream) !void {
         self.stream = stream;
         const instance: *anyopaque = @ptrCast(self);
         self.controller = protocols.initStreamController(instance, &stream_controller_vtable);
         self.callback(self.callback_ctx, self);
     }
 
-    pub fn onMessage(_: *Self, _: *libp2p.QuicStream, msg: []const u8) !void {
+    pub fn onMessage(_: *Self, _: protocols.AnyStream, msg: []const u8) !void {
         std.log.warn("Write stream received a message with size: {d}", .{msg.len});
     }
 
-    pub fn onClose(self: *Self, _: *libp2p.QuicStream) !void {
+    pub fn onClose(self: *Self, _: protocols.AnyStream) !void {
+        if (self.on_close) |cb| {
+            cb(self.on_close_ctx);
+        }
         const allocator = self.allocator;
         allocator.destroy(self);
     }
 
     pub fn vtableOnActivatedFn(
         instance: *anyopaque,
-        stream: *libp2p.QuicStream,
+        stream: protocols.AnyStream,
     ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
@@ -186,7 +192,7 @@ pub const PubSubPeerInitiator = struct {
 
     pub fn vtableOnMessageFn(
         instance: *anyopaque,
-        stream: *libp2p.QuicStream,
+        stream: protocols.AnyStream,
         message: []const u8,
     ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
@@ -195,7 +201,7 @@ pub const PubSubPeerInitiator = struct {
 
     pub fn vtableOnCloseFn(
         instance: *anyopaque,
-        stream: *libp2p.QuicStream,
+        stream: protocols.AnyStream,
     ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);
@@ -215,7 +221,7 @@ pub const PubSubPeerInitiator = struct {
 
 pub const PubSubPeerResponder = struct {
     controller: protocols.ProtocolStreamController,
-    stream: *libp2p.QuicStream,
+    stream: protocols.AnyStream,
     callback_ctx: ?*anyopaque,
 
     callback: *const fn (ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
@@ -226,25 +232,29 @@ pub const PubSubPeerResponder = struct {
 
     received_buffer: linear_fifo.LinearFifo(u8, .Dynamic),
 
+    /// Optional close notification callback registered by the router to clean up peer state.
+    on_close_ctx: ?*anyopaque = null,
+    on_close: ?*const fn (ctx: ?*anyopaque) void = null,
+
     const Self = @This();
 
     const stream_controller_vtable = protocols.ProtocolStreamControllerVTable{
         .getStreamFn = controllerGetStream,
     };
 
-    fn controllerGetStream(instance: *anyopaque) *libp2p.QuicStream {
+    fn controllerGetStream(instance: *anyopaque) protocols.AnyStream {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.stream;
     }
 
-    pub fn onActivated(self: *Self, stream: *libp2p.QuicStream) !void {
+    pub fn onActivated(self: *Self, stream: protocols.AnyStream) !void {
         self.stream = stream;
         const instance: *anyopaque = @ptrCast(self);
         self.controller = protocols.initStreamController(instance, &stream_controller_vtable);
         self.callback(self.callback_ctx, self);
     }
 
-    pub fn onMessage(self: *Self, stream: *libp2p.QuicStream, message: []const u8) anyerror!void {
+    pub fn onMessage(self: *Self, stream: protocols.AnyStream, message: []const u8) anyerror!void {
         try self.received_buffer.write(message);
 
         while (true) {
@@ -281,7 +291,7 @@ pub const PubSubPeerResponder = struct {
             const rpc_reader = try rpc.RPCReader.init(copied_message);
             var rpc_message: pubsub.RPC = .{
                 .rpc_reader = rpc_reader,
-                .from = stream.conn.security_session.?.remote_id,
+                .from = stream.getRemotePeerId().?,
             };
             // we expect `handleRPC` to process synchronously and not hold onto the `rpc_message`,
             // if it does, it must copy the data out of it.
@@ -290,7 +300,10 @@ pub const PubSubPeerResponder = struct {
         }
     }
 
-    pub fn onClose(self: *Self, _: *libp2p.QuicStream) !void {
+    pub fn onClose(self: *Self, _: protocols.AnyStream) !void {
+        if (self.on_close) |cb| {
+            cb(self.on_close_ctx);
+        }
         const allocator = self.allocator;
         self.received_buffer.deinit();
         allocator.destroy(self);
@@ -298,7 +311,7 @@ pub const PubSubPeerResponder = struct {
 
     pub fn vtableOnActivatedFn(
         instance: *anyopaque,
-        stream: *libp2p.QuicStream,
+        stream: protocols.AnyStream,
     ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
@@ -306,7 +319,7 @@ pub const PubSubPeerResponder = struct {
 
     pub fn vtableOnMessageFn(
         instance: *anyopaque,
-        stream: *libp2p.QuicStream,
+        stream: protocols.AnyStream,
         message: []const u8,
     ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
@@ -315,7 +328,7 @@ pub const PubSubPeerResponder = struct {
 
     pub fn vtableOnCloseFn(
         instance: *anyopaque,
-        stream: *libp2p.QuicStream,
+        stream: protocols.AnyStream,
     ) !void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);

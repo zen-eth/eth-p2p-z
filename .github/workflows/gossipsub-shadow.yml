@@ -1,0 +1,44 @@
+name: GossipSub Shadow Interop
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  gossipsub-shadow:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout eth-p2p-z
+        uses: actions/checkout@v4
+        with:
+          path: eth-p2p-z
+
+      - name: Checkout test-plans
+        uses: actions/checkout@v4
+        with:
+          repository: bomanaps/test-plans
+          path: test-plans
+
+      - name: Cache Zig global packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-0.15.2-${{ hashFiles('eth-p2p-z/build.zig.zon') }}
+          restore-keys: |
+            zig-0.15.2-
+
+      - name: Build gossipsub-shadow Docker image
+        run: docker build -t gossipsub-shadow test-plans/gossipsub-interop/
+
+      - name: Run Shadow gossipsub interop (all-zig, 4 nodes)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/test-plans/gossipsub-interop:/work \
+            -v ${{ github.workspace }}/eth-p2p-z:/eth-p2p-z \
+            -v $HOME/.cache/zig:/root/.cache/zig \
+            gossipsub-shadow \
+            bash /work/run-shadow.sh --node_count 4 --composition all-zig --scenario subnet-blob-msg

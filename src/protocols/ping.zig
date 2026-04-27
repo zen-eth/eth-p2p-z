@@ -1,7 +1,6 @@
 const std = @import("std");
 const libp2p = @import("../root.zig");
 const protocols = libp2p.protocols;
-const quic = libp2p.transport.quic;
 const swarm = libp2p.swarm;
 const multiaddr = @import("multiaddr");
 const Multiaddr = multiaddr.Multiaddr;
@@ -74,14 +73,14 @@ pub const PingProtocolHandler = struct {
 
     pub fn onInitiatorStart(
         self: *Self,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
         const peer_key = self.acquireOutboundSlot(stream) catch |err| {
             callback(callback_ctx, err);
             stream.close(null, struct {
-                fn noop(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn noop(_: ?*anyopaque, _: anyerror!void) void {}
             }.noop);
             return err;
         };
@@ -90,7 +89,7 @@ pub const PingProtocolHandler = struct {
             self.releaseOutboundSlot(peer_key);
             callback(callback_ctx, err);
             stream.close(null, struct {
-                fn noop(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn noop(_: ?*anyopaque, _: anyerror!void) void {}
             }.noop);
             return err;
         };
@@ -118,7 +117,7 @@ pub const PingProtocolHandler = struct {
             self.allocator.destroy(handler);
             callback(callback_ctx, err);
             stream.close(null, struct {
-                fn noop(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn noop(_: ?*anyopaque, _: anyerror!void) void {}
             }.noop);
             return err;
         };
@@ -127,14 +126,14 @@ pub const PingProtocolHandler = struct {
 
     pub fn onResponderStart(
         self: *Self,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
         const peer_key = self.acquireInboundSlot(stream) catch |err| {
             callback(callback_ctx, err);
             stream.close(null, struct {
-                fn noop(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn noop(_: ?*anyopaque, _: anyerror!void) void {}
             }.noop);
             return err;
         };
@@ -143,7 +142,7 @@ pub const PingProtocolHandler = struct {
             self.releaseInboundSlot(peer_key);
             callback(callback_ctx, err);
             stream.close(null, struct {
-                fn noop(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn noop(_: ?*anyopaque, _: anyerror!void) void {}
             }.noop);
             return err;
         };
@@ -165,7 +164,7 @@ pub const PingProtocolHandler = struct {
 
     fn vtableOnInitiatorStartFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void {
@@ -175,7 +174,7 @@ pub const PingProtocolHandler = struct {
 
     fn vtableOnResponderStartFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void {
@@ -192,7 +191,7 @@ pub const PingProtocolHandler = struct {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 
-    fn acquireOutboundSlot(self: *Self, stream: *quic.QuicStream) ![]const u8 {
+    fn acquireOutboundSlot(self: *Self, stream: protocols.AnyStream) ![]const u8 {
         return self.acquireSlot(&self.outbound_streams, 1, stream) catch |err| switch (err) {
             error.PingStreamLimitExceeded => error.OutboundPingStreamLimitExceeded,
             else => err,
@@ -203,7 +202,7 @@ pub const PingProtocolHandler = struct {
         self.releaseSlot(&self.outbound_streams, key);
     }
 
-    fn acquireInboundSlot(self: *Self, stream: *quic.QuicStream) ![]const u8 {
+    fn acquireInboundSlot(self: *Self, stream: protocols.AnyStream) ![]const u8 {
         return self.acquireSlot(&self.inbound_streams, 2, stream) catch |err| switch (err) {
             error.PingStreamLimitExceeded => error.InboundPingStreamLimitExceeded,
             else => err,
@@ -214,11 +213,11 @@ pub const PingProtocolHandler = struct {
         self.releaseSlot(&self.inbound_streams, key);
     }
 
-    fn acquireSlot(self: *Self, map: *std.StringHashMap(usize), limit: usize, stream: *quic.QuicStream) ![]const u8 {
+    fn acquireSlot(self: *Self, map: *std.StringHashMap(usize), limit: usize, stream: protocols.AnyStream) ![]const u8 {
         if (self.shutting_down) return error.HandlerShutdown;
 
-        const session = stream.conn.security_session orelse return error.MissingRemotePeerId;
-        const key_buf = try self.peerKeyFromPeerId(&session.remote_id);
+        const peer_id = stream.getRemotePeerId() orelse return error.MissingRemotePeerId;
+        const key_buf = try self.peerKeyFromPeerId(&peer_id);
 
         const gop = try map.getOrPut(key_buf);
         if (gop.found_existing) {
@@ -262,10 +261,10 @@ pub const PingProtocolHandler = struct {
 };
 
 /// Controller for a single ping stream. Callers receive this handle and are responsible for
-/// closing the underlying QUIC stream when finished.
+/// closing the underlying stream when finished.
 pub const PingStream = struct {
     controller: protocols.ProtocolStreamController = undefined,
-    stream: ?*quic.QuicStream = null,
+    stream: ?protocols.AnyStream = null,
     initiator: ?*PingInitiator = null,
     allocator: Allocator,
     caller_managed: bool = false,
@@ -278,12 +277,12 @@ pub const PingStream = struct {
         .getStreamFn = controllerGetStream,
     };
 
-    fn controllerGetStream(instance: *anyopaque) *quic.QuicStream {
+    fn controllerGetStream(instance: *anyopaque) protocols.AnyStream {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.stream.?;
     }
 
-    pub fn init(stream: *quic.QuicStream, initiator: *PingInitiator, allocator: Allocator) Self {
+    pub fn init(stream: protocols.AnyStream, initiator: *PingInitiator, allocator: Allocator) Self {
         return .{
             .controller = undefined,
             .stream = stream,
@@ -300,7 +299,7 @@ pub const PingStream = struct {
     pub fn close(
         self: *Self,
         callback_ctx: ?*anyopaque,
-        callback: *const fn (ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void,
+        callback: *const fn (ctx: ?*anyopaque, res: anyerror!void) void,
     ) void {
         if (self.stream) |stream_| {
             stream_.close(callback_ctx, callback);
@@ -511,7 +510,7 @@ const PingRequest = struct {
 
 /// Handles ping messages on the initiator side.
 const PingInitiator = struct {
-    stream: *quic.QuicStream,
+    stream: protocols.AnyStream,
     allocator: std.mem.Allocator,
     callback_ctx: ?*anyopaque,
     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
@@ -532,7 +531,7 @@ const PingInitiator = struct {
 
     const Self = @This();
 
-    fn beginPing(self: *Self, timeout_ns: u64, callback_ctx: ?*anyopaque, callback: PingResultCallback) !void {
+    pub fn beginPing(self: *Self, timeout_ns: u64, callback_ctx: ?*anyopaque, callback: PingResultCallback) !void {
         if (self.pending_request != null) {
             return error.PingInProgress;
         }
@@ -733,7 +732,7 @@ const PingInitiator = struct {
         return .disarm;
     }
 
-    fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
+    fn onActivated(self: *Self, stream: protocols.AnyStream) anyerror!void {
         self.stream = stream;
         const sender = self.allocator.create(PingStream) catch |err| {
             self.callback(self.callback_ctx, err);
@@ -746,7 +745,7 @@ const PingInitiator = struct {
         self.callback(self.callback_ctx, sender);
     }
 
-    fn onMessage(self: *Self, _: *quic.QuicStream, message: []const u8) anyerror!void {
+    fn onMessage(self: *Self, _: protocols.AnyStream, message: []const u8) anyerror!void {
         if (message.len == 0) return;
 
         var offset: usize = 0;
@@ -794,7 +793,7 @@ const PingInitiator = struct {
         }.callback);
     }
 
-    fn onClose(self: *Self, _: *quic.QuicStream) anyerror!void {
+    fn onClose(self: *Self, _: protocols.AnyStream) anyerror!void {
         self.failPending(error.StreamClosed);
 
         if (self.sender) |sender| {
@@ -819,17 +818,17 @@ const PingInitiator = struct {
         self.scheduleDestroy(loop);
     }
 
-    fn vtableOnActivatedFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnActivatedFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
     }
 
-    fn vtableOnMessageFn(instance: *anyopaque, stream: *quic.QuicStream, message: []const u8) anyerror!void {
+    fn vtableOnMessageFn(instance: *anyopaque, stream: protocols.AnyStream, message: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onMessage(stream, message);
     }
 
-    fn vtableOnCloseFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnCloseFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);
     }
@@ -848,7 +847,7 @@ const PingInitiator = struct {
 /// Handles ping messages on the responder side.
 const PingResponder = struct {
     controller: protocols.ProtocolStreamController,
-    stream: *quic.QuicStream,
+    stream: protocols.AnyStream,
     allocator: std.mem.Allocator,
     callback_ctx: ?*anyopaque,
     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
@@ -864,19 +863,19 @@ const PingResponder = struct {
         .getStreamFn = controllerGetStream,
     };
 
-    fn controllerGetStream(instance: *anyopaque) *quic.QuicStream {
+    fn controllerGetStream(instance: *anyopaque) protocols.AnyStream {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.stream;
     }
 
-    fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
+    fn onActivated(self: *Self, stream: protocols.AnyStream) anyerror!void {
         self.stream = stream;
         const instance: *anyopaque = @ptrCast(self);
         self.controller = protocols.initStreamController(instance, &stream_controller_vtable);
         self.callback(self.callback_ctx, self);
     }
 
-    fn onMessage(self: *Self, stream: *quic.QuicStream, message: []const u8) anyerror!void {
+    fn onMessage(self: *Self, stream: protocols.AnyStream, message: []const u8) anyerror!void {
         if (message.len == 0) return;
 
         if (self.pending_len + message.len > payload_length) {
@@ -899,7 +898,7 @@ const PingResponder = struct {
         stream.write(self.pending_payload[0..payload_length], self, writeCallback);
     }
 
-    fn onClose(self: *Self, _: *quic.QuicStream) anyerror!void {
+    fn onClose(self: *Self, _: protocols.AnyStream) anyerror!void {
         self.handler.releaseInboundSlot(self.peer_key);
         self.allocator.destroy(self);
     }
@@ -915,17 +914,17 @@ const PingResponder = struct {
         self.pending_len = 0;
     }
 
-    fn vtableOnActivatedFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnActivatedFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
     }
 
-    fn vtableOnMessageFn(instance: *anyopaque, stream: *quic.QuicStream, message: []const u8) anyerror!void {
+    fn vtableOnMessageFn(instance: *anyopaque, stream: protocols.AnyStream, message: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onMessage(stream, message);
     }
 
-    fn vtableOnCloseFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnCloseFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);
     }
@@ -977,7 +976,6 @@ test "ping listen callback exposes negotiated protocol" {
     const ListenCtx = struct {
         event: std.Thread.ResetEvent = .{},
         protocol: ?[]const u8 = null,
-        stream: ?*quic.QuicStream = null,
 
         const Self = @This();
 
@@ -987,8 +985,7 @@ test "ping listen callback exposes negotiated protocol" {
 
             const controller = res catch return;
             const stream = libp2p.protocols.getStream(controller) orelse return;
-            self.protocol = stream.negotiated_protocol;
-            self.stream = stream;
+            self.protocol = stream.getNegotiatedProtocol();
         }
     };
 
@@ -1066,7 +1063,7 @@ test "ping listen callback exposes negotiated protocol" {
 
             const Self = @This();
 
-            fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+            fn callback(ctx: ?*anyopaque, _: anyerror!void) void {
                 const self: *Self = @ptrCast(@alignCast(ctx.?));
                 self.event.set();
             }
@@ -1201,7 +1198,7 @@ test "ping protocol round trip" {
 
             const Self = @This();
 
-            fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+            fn callback(ctx: ?*anyopaque, _: anyerror!void) void {
                 const self: *Self = @ptrCast(@alignCast(ctx.?));
                 self.event.set();
             }
@@ -1322,7 +1319,7 @@ test "ping multiaddr round trip" {
 
             const Self = @This();
 
-            fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+            fn callback(ctx: ?*anyopaque, _: anyerror!void) void {
                 const self: *Self = @ptrCast(@alignCast(ctx.?));
                 self.event.set();
             }
@@ -1447,7 +1444,7 @@ test "ping protocol timeout" {
 
             const Self = @This();
 
-            fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+            fn callback(ctx: ?*anyopaque, _: anyerror!void) void {
                 const self: *Self = @ptrCast(@alignCast(ctx.?));
                 self.event.set();
             }
@@ -1560,7 +1557,7 @@ test "ping protocol periodic pings" {
 
         const Self = @This();
 
-        fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+        fn callback(ctx: ?*anyopaque, _: anyerror!void) void {
             const self: *Self = @ptrCast(@alignCast(ctx.?));
             self.event.set();
         }
@@ -1710,7 +1707,7 @@ test "ping protocol stream reuse" {
 
         const Self = @This();
 
-        fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
+        fn callback(ctx: ?*anyopaque, _: anyerror!void) void {
             const self: *Self = @ptrCast(@alignCast(ctx.?));
             self.event.set();
         }
