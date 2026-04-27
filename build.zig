@@ -189,7 +189,10 @@ pub fn build(b: *std.Build) void {
     });
     gossipsub_interop_exe.step.dependOn(&protobuf.step);
     gossipsub_interop_exe.linkLibrary(lsquic_artifact);
-    gossipsub_interop_exe.linkSystemLibrary(zlib_system_name);
+    gossipsub_interop_exe.linkSystemLibrary(switch (target.result.os.tag) {
+        .windows => "zlib1",
+        else => "z",
+    });
     b.installArtifact(gossipsub_interop_exe);
 
     const gossipsub_interop_run_cmd = b.addRunArtifact(gossipsub_interop_exe);
