@@ -21,6 +21,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bomanaps/test-plans
+          ref: feat/gossipsub-zig-interop
           path: test-plans
 
       - name: Cache Zig global packages
