@@ -175,7 +175,7 @@ pub const QuicEngine = struct {
     // SSL context for the QUIC engine
     ssl_context: *ssl.SSL_CTX,
     // The lsquic engine instance
-    engine: *lsquic.lsquic_engine_t,
+    engine: *lsquic_zig.Engine,
     // The UDP socket used for QUIC communication
     socket: UDP,
     // Local address of the QUIC engine
@@ -221,39 +221,38 @@ pub const QuicEngine = struct {
     // the first incoming packet using the "connect trick" and cached.
     resolved_local_addr: ?std.net.Address,
 
-    inline fn asEngine(self: *QuicEngine) *lsquic_zig.Engine {
-        return @ptrCast(self.engine);
-    }
-
     pub fn init(self: *QuicEngine, allocator: Allocator, socket: UDP, transport: *QuicTransport, is_client_mode: bool) !void {
         var flags: c_uint = 0;
         if (!is_client_mode) {
-            flags |= lsquic.LSENG_SERVER;
+            flags |= lsquic_zig.EngineFlags.SERVER;
         }
 
-        var engine_settings: lsquic.lsquic_engine_settings = undefined;
-        lsquic.lsquic_engine_init_settings(&engine_settings, flags);
+        var engine_settings: lsquic_zig.EngineSettings = undefined;
+        lsquic_zig.initSettings(&engine_settings, flags);
 
         engine_settings.es_versions = lsquic.LSQUIC_IETF_VERSIONS;
         engine_settings.es_cc_algo = CCAlgoBBR;
         engine_settings.es_scid_iss_rate = SCIDIssRate;
 
         var err_buf: [100]u8 = undefined;
-        if (lsquic.lsquic_engine_check_settings(
-            &engine_settings,
-            flags,
-            &err_buf,
-            100,
-        ) == 1) {
+        if (!lsquic_zig.checkSettings(&engine_settings, flags, &err_buf)) {
             std.log.warn("lsquic_engine_check_settings failed: {any}", .{err_buf});
             return error.InitializationFailed;
         }
 
-        const engine_api: lsquic.lsquic_engine_api = .{ .ea_settings = &engine_settings, .ea_stream_if = @ptrCast(&stream_if), .ea_stream_if_ctx = self, .ea_packets_out = packetsOut, .ea_packets_out_ctx = self, .ea_get_ssl_ctx = getSslContext };
-        const engine = lsquic.lsquic_engine_new(flags, &engine_api);
-        if (engine == null) {
+        const ssl_ctx_fn: *const fn (?*anyopaque, ?*const anyopaque) callconv(.c) ?*anyopaque = @ptrCast(&getSslContext);
+        const engine_api = lsquic_zig.EngineApi.init(
+            &engine_settings,
+            &stream_if,
+            self,
+            @ptrCast(&packetsOut),
+            self,
+            null,
+            ssl_ctx_fn,
+        );
+        const engine = lsquic_zig.Engine.new(flags, &engine_api) catch {
             return error.InitializationFailed;
-        }
+        };
 
         var local_address: std.net.Address = undefined;
         var local_socklen: posix.socklen_t = @sizeOf(std.net.Address);
@@ -261,7 +260,7 @@ pub const QuicEngine = struct {
 
         self.* = .{
             .ssl_context = transport.ssl_context,
-            .engine = engine.?,
+            .engine = engine,
             .allocator = allocator,
             .socket = socket,
             .local_address = local_address,
@@ -343,7 +342,7 @@ pub const QuicEngine = struct {
                     engine.socket.fd = -1;
                 }
 
-                engine.asEngine().destroy();
+                engine.engine.destroy();
 
                 engine.stopped.set();
 
@@ -425,15 +424,14 @@ pub const QuicEngine = struct {
 
         self.doStart();
 
-        const local_addr_ptr: *const lsquic.struct_sockaddr = @ptrCast(@alignCast(&self.local_address.any));
-        const remote_addr_ptr: *const lsquic.struct_sockaddr = @ptrCast(@alignCast(&addrAndPeerId.address.any));
+        const local_addr_ptr: *const lsquic_zig.SockAddr = @ptrCast(@alignCast(&self.local_address.any));
+        const remote_addr_ptr: *const lsquic_zig.SockAddr = @ptrCast(@alignCast(&addrAndPeerId.address.any));
         std.log.debug(
             "lsquic_engine_connect local={any} remote={any}\n",
             .{ self.local_address.any, addrAndPeerId.address.any },
         );
-        const conn_res = lsquic.lsquic_engine_connect(
-            self.engine,
-            lsquic.N_LSQVER,
+        const conn_res = self.engine.connect(
+            lsquic_zig.LsquicVersion.N_LSQVER,
             local_addr_ptr,
             remote_addr_ptr,
             self,
@@ -488,10 +486,10 @@ pub const QuicEngine = struct {
     /// It is called from the event loop thread to ensure thread safety.
     /// It should not be called directly from other threads.
     fn processConns(self: *QuicEngine) void {
-        self.asEngine().processConns();
+        self.engine.processConns();
 
         var diff_us: c_int = 0;
-        if (self.asEngine().earliestAdvTick(&diff_us) > 0) {
+        if (self.engine.earliestAdvTick(&diff_us) > 0) {
             // Calculate the next timer interval in milliseconds
             // If diff_us is negative or less than the clock granularity, we set it to the clock granularity.
             // This ensures that we do not set a timer with a negative or zero interval.
@@ -504,7 +502,7 @@ pub const QuicEngine = struct {
             // which is important for maintaining the performance and responsiveness of the QUIC engine.
             // The timer is used to schedule the next processing of connections,
             // allowing the engine to handle incoming packets and manage connections efficiently.
-            const granularity_us: u64 = @as(u64, lsquic.LSQUIC_DF_CLOCK_GRANULARITY);
+            const granularity_us: u64 = @as(u64, lsquic_zig.LSQUIC_DF_CLOCK_GRANULARITY);
             var timeout_us: u64 = granularity_us;
             if (diff_us >= 0) {
                 timeout_us = @intCast(diff_us);
@@ -574,7 +572,7 @@ pub const QuicEngine = struct {
         };
 
         _ = lsquic.lsquic_engine_packet_in(
-            self.engine,
+            @ptrCast(self.engine),
             b.slice[0..n].ptr,
             n,
             @ptrCast(local_addr_ptr),
@@ -619,10 +617,10 @@ pub const QuicEngine = struct {
     /// Get the SSL context for a given peer.
     fn getSslContext(
         peer_ctx: ?*anyopaque,
-        _: ?*const lsquic.struct_sockaddr,
-    ) callconv(.c) ?*lsquic.struct_ssl_ctx_st {
+        _: ?*const lsquic_zig.SockAddr,
+    ) callconv(.c) ?*lsquic_zig.SslCtxSt {
         const self: *QuicEngine = @ptrCast(@alignCast(peer_ctx.?));
-        const res: *lsquic.struct_ssl_ctx_st = @ptrCast(@alignCast(self.ssl_context));
+        const res: *lsquic_zig.SslCtxSt = @ptrCast(@alignCast(self.ssl_context));
         return res;
     }
 
@@ -658,10 +656,6 @@ pub const QuicConnection = struct {
     on_stream_ctx: ?NewStreamCtx,
 
     security_session: ?SecuritySession,
-
-    inline fn asConn(self: *QuicConnection) *lsquic_zig.Connection {
-        return @ptrCast(self.conn);
-    }
 
     pub const Error = error{
         NewStreamNotFinished,
@@ -732,7 +726,7 @@ pub const QuicConnection = struct {
             return;
         }
 
-        if (self.asConn().nPendingStreams() != 0) {
+        if (self.conn.nPendingStreams() != 0) {
             // If there are pending streams, we should not create a new one.
             callback(callback_ctx, error.NewStreamNotFinished);
             return;
@@ -742,7 +736,7 @@ pub const QuicConnection = struct {
             .callback_ctx = callback_ctx,
             .callback = callback,
         };
-        self.asConn().makeStream();
+        self.conn.makeStream();
 
         self.engine.processConns();
     }
@@ -777,7 +771,7 @@ pub const QuicConnection = struct {
                 .active_callback = callback,
             };
         }
-        self.asConn().close();
+        self.conn.close();
         self.engine.processConns();
     }
 };
@@ -820,7 +814,7 @@ pub const QuicStream = struct {
         active_callback: ?*const fn (callback_ctx: ?*anyopaque, res: anyerror!*QuicStream) void,
     };
 
-    stream: *lsquic.lsquic_stream_t,
+    stream: *lsquic_zig.Stream,
 
     conn: *QuicConnection,
 
@@ -836,11 +830,7 @@ pub const QuicStream = struct {
 
     close_ctx: ?CloseCtx,
 
-    inline fn asStream(self: *QuicStream) *lsquic_zig.Stream {
-        return @ptrCast(@alignCast(self.stream));
-    }
-
-    pub fn init(self: *QuicStream, stream: *lsquic.lsquic_stream_t, conn: *QuicConnection) void {
+    pub fn init(self: *QuicStream, stream: *lsquic_zig.Stream, conn: *QuicConnection) void {
         self.* = .{
             .stream = stream,
             .conn = conn,
@@ -870,7 +860,7 @@ pub const QuicStream = struct {
 
     pub fn setProtoMsgHandler(self: *QuicStream, handler: protoMsgHandler) void {
         self.proto_msg_handler = handler;
-        _ = self.asStream().wantRead(true);
+        _ = self.stream.wantRead(true);
     }
 
     pub fn write(self: *QuicStream, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror!usize) void) void {
@@ -924,7 +914,7 @@ pub const QuicStream = struct {
             };
         }
 
-        _ = self.asStream().close();
+        _ = self.stream.close();
     }
 
     /// Writes data to the QUIC stream asynchronously.
@@ -961,7 +951,7 @@ pub const QuicStream = struct {
         }
 
         self.active_write = self.pending_writes.orderedRemove(0);
-        _ = self.asStream().wantWrite(true);
+        _ = self.stream.wantWrite(true);
     }
 };
 
@@ -1355,7 +1345,7 @@ fn onNewStream(ctx: ?*anyopaque, stream: ?*lsquic_zig.Stream) callconv(.c) ?*lsq
     const engine: *QuicEngine = @ptrCast(@alignCast(ctx.?));
     const conn: *QuicConnection = @ptrCast(@alignCast(lsquic.lsquic_conn_get_ctx(lsquic.lsquic_stream_conn(stream_raw.?))));
     const lsquic_stream: *QuicStream = engine.allocator.create(QuicStream) catch unreachable;
-    lsquic_stream.init(stream_raw.?, conn);
+    lsquic_stream.init(stream.?, conn);
 
     const stream_ctx: *lsquic_zig.StreamContext = @ptrCast(@alignCast(lsquic_stream));
     if (conn.direction == p2p_conn.Direction.INBOUND) {
