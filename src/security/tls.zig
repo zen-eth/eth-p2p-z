@@ -126,6 +126,19 @@ pub fn generateKeyPair(cert_key_type: keys.KeyType) !*ssl.EVP_PKEY {
     return maybe_subject_keypair orelse return error.OpenSSLFailed;
 }
 
+/// Creates a deterministic ED25519 EVP_PKEY from a 32-byte seed.
+/// Matches Go's ed25519.NewKeyFromSeed semantics.
+pub fn ed25519KeyPairFromSeed(seed: []const u8) !*ssl.EVP_PKEY {
+    if (seed.len != 32) return error.InvalidKeyLength;
+    const pkey = ssl.EVP_PKEY_new_raw_private_key(
+        ssl.EVP_PKEY_ED25519,
+        null,
+        seed.ptr,
+        seed.len,
+    ) orelse return error.OpenSSLFailed;
+    return pkey;
+}
+
 /// Builds a self-signed X.509 certificate suitable for libp2p's TLS handshake,
 /// The caller owns the returned certificate and must free it with ssl.X509.free().
 ///
