@@ -10,8 +10,8 @@ const ProtoMatcher = @import("protocol_matcher.zig").ProtocolMatcher;
 const multiformats = @import("multiformats");
 const uvarint = multiformats.uvarint;
 const Allocator = std.mem.Allocator;
-const linear_fifo = @import("../linear_fifo.zig");
-const LinearFifo = linear_fifo.LinearFifo;
+const byte_buffer = @import("../byte_buffer.zig");
+const SliceBuffer = byte_buffer.SliceBuffer;
 const io_loop = @import("../thread_event_loop.zig");
 const Upgrader = @import("../transport/upgrader.zig").ConnUpgrader;
 const insecure = @import("../security/insecure.zig");
@@ -95,7 +95,7 @@ pub const Negotiator = struct {
 
     allocator: Allocator,
 
-    buffer: LinearFifo(u8, .Slice),
+    buffer: SliceBuffer,
 
     // Current proposed protocol by the initiator.
     proposed_proto_index: usize = 0,
@@ -169,7 +169,7 @@ pub const Negotiator = struct {
             .bindings = bindings,
             .negotiation_time_limit = negotiation_time_limit,
             .allocator = allocator,
-            .buffer = LinearFifo(u8, .Slice).init(buffer),
+            .buffer = SliceBuffer.init(buffer),
             .callback_ctx = user_data,
             .callback = callback,
         };
