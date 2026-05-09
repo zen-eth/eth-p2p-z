@@ -565,9 +565,6 @@ pub fn main() !void {
     }
 
     std.log.info("all instructions executed — node_id={d}", .{node_id});
-
-    // Keep running so gossipsub can forward messages. Shadow will kill us.
-    std.Thread.sleep(std.math.maxInt(u64));
 }
 
 // ============================================================
