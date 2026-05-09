@@ -18,7 +18,4 @@ fn selectBackend() libxev.Backend {
 }
 
 pub const backend = selectBackend();
-comptime {
-    @compileLog("libxev backend selected:", backend);
-}
 pub const xev = backend.Api();
