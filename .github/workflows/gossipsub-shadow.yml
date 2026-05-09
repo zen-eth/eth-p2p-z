@@ -24,6 +24,20 @@ jobs:
           ref: feat/gossipsub-zig-interop
           path: test-plans
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: test-plans/gossipsub-interop/go-libp2p/go.mod
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Nim
+        run: |
+          curl https://nim-lang.org/choosenim/init.sh -sSf | sh -s -- -y
+          echo "$HOME/.nimble/bin" >> $GITHUB_PATH
+
       - name: Set up Zig 0.15.2
         run: |
           curl -fL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz \
