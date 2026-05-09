@@ -12,7 +12,6 @@
 ///   [2-3]  flags    = SYN=0x1 ACK=0x2 FIN=0x4 RST=0x8
 ///   [4-7]  stream_id
 ///   [8-11] length   (payload bytes for Data / increment delta for WindowUpdate)
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const conn_mod = @import("../conn.zig");

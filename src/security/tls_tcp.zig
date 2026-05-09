@@ -10,7 +10,6 @@
 /// Handshake completion calls the ConnUpgrader callback with a heap-allocated
 /// *SecuritySession whose remote_id carries the raw multihash bytes of the
 /// remote peer's libp2p identity key.
-
 const std = @import("std");
 const ssl = @import("ssl");
 const Allocator = std.mem.Allocator;

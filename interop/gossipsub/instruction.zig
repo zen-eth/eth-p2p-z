@@ -3,7 +3,6 @@
 /// Matches the JSON schema defined in test-plans/gossipsub-interop/script_instruction.py.
 /// All memory lives in an ArenaAllocator owned by ExperimentParams; call
 /// ExperimentParams.deinit() to free everything at once.
-
 const std = @import("std");
 
 // ------------------------------------------------------------------ //
