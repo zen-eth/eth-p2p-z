@@ -1,7 +1,6 @@
 const std = @import("std");
 const libp2p = @import("../root.zig");
 const protocols = libp2p.protocols;
-const quic = libp2p.transport.quic;
 const Allocator = std.mem.Allocator;
 const p2p_conn = libp2p.conn;
 const uvarint = @import("multiformats").uvarint;
@@ -215,7 +214,6 @@ pub const Negotiator = struct {
                         self.proposed_protocol_index += 1;
 
                         const buffer = self.allocator.alloc(u8, TOTAL_MESSAGE_LENGTH) catch unreachable;
-
                         var proto_buffer = std.io.fixedBufferStream(buffer);
                         const proto_writer = proto_buffer.writer();
 
@@ -304,7 +302,7 @@ pub const MultistreamSelectHandler = struct {
     const NegotiationSession = struct {
         allocator: Allocator,
 
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         // Only used by initiator
         proposed_protocols: ?[]const []const u8,
 
@@ -323,7 +321,7 @@ pub const MultistreamSelectHandler = struct {
             allocator: Allocator,
             proposed_protocols: ?[]const []const u8,
             supported_protocols: *std.StringHashMap(protocols.AnyProtocolHandler),
-            stream: *quic.QuicStream,
+            stream: protocols.AnyStream,
             user_callback_ctx: ?*anyopaque,
             user_callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
             is_initiator: bool,
@@ -369,7 +367,7 @@ pub const MultistreamSelectHandler = struct {
                 break :blk proto_id;
             };
 
-            self.stream.negotiated_protocol = stable_proto_id;
+            self.stream.setNegotiatedProtocol(stable_proto_id);
 
             if (self.is_initiator) {
                 selected_handler.onInitiatorStart(self.stream, self.user_callback_ctx, self.user_callback) catch |err| {
@@ -377,7 +375,7 @@ pub const MultistreamSelectHandler = struct {
                     self.user_callback(self.user_callback_ctx, err);
 
                     self.stream.close(null, struct {
-                        fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                        fn callback(_: ?*anyopaque, _: anyerror!void) void {}
                     }.callback);
                     return;
                 };
@@ -387,18 +385,19 @@ pub const MultistreamSelectHandler = struct {
                     self.user_callback(self.user_callback_ctx, err);
 
                     self.stream.close(null, struct {
-                        fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                        fn callback(_: ?*anyopaque, _: anyerror!void) void {}
                     }.callback);
                     return;
                 };
             }
 
-            self.stream.proto_msg_handler.?.onActivated(self.stream) catch |err| {
+            var handler = self.stream.getProtoMsgHandler().?;
+            handler.onActivated(self.stream) catch |err| {
                 std.log.warn("Proto message handler failed with error: {}. ", .{err});
                 self.user_callback(self.user_callback_ctx, err);
 
                 self.stream.close(null, struct {
-                    fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                    fn callback(_: ?*anyopaque, _: anyerror!void) void {}
                 }.callback);
                 return;
             };
@@ -408,12 +407,13 @@ pub const MultistreamSelectHandler = struct {
                 // to the selected protocol handler.
                 // This is necessary to ensure that any remaining data in the buffer
                 // is not lost and can be processed by the selected protocol handler.
-                self.stream.proto_msg_handler.?.onMessage(self.stream, self.buffer.readableSlice(0)) catch |err| {
+                var msg_handler = self.stream.getProtoMsgHandler().?;
+                msg_handler.onMessage(self.stream, self.buffer.readableSlice(0)) catch |err| {
                     std.log.warn("Proto message handler onMessage failed with error: {}. ", .{err});
                     self.user_callback(self.user_callback_ctx, err);
 
                     self.stream.close(null, struct {
-                        fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                        fn callback(_: ?*anyopaque, _: anyerror!void) void {}
                     }.callback);
                     return;
                 };
@@ -424,32 +424,32 @@ pub const MultistreamSelectHandler = struct {
         }
 
         // Protocol message handler implementation
-        pub fn onActivated(self: *NegotiationSession, stream: *quic.QuicStream) !void {
+        pub fn onActivated(self: *NegotiationSession, stream: protocols.AnyStream) !void {
             try self.negotiator.startNegotiate(stream);
         }
 
-        pub fn onMessage(self: *NegotiationSession, stream: *quic.QuicStream, message: []const u8) !void {
+        pub fn onMessage(self: *NegotiationSession, stream: protocols.AnyStream, message: []const u8) !void {
             std.log.debug("Multistream Negotiator onRead: {any}", .{message});
             try self.buffer.write(message);
             try self.negotiator.negotiate(stream);
         }
 
-        pub fn onClose(self: *NegotiationSession, _: *quic.QuicStream) !void {
+        pub fn onClose(self: *NegotiationSession, _: protocols.AnyStream) !void {
             // Always clean up the session itself
             self.deinit();
         }
 
-        pub fn vtableOnActivatedFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+        pub fn vtableOnActivatedFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
             const self: *NegotiationSession = @ptrCast(@alignCast(instance));
             return self.onActivated(stream);
         }
 
-        pub fn vtableOnMessageFn(instance: *anyopaque, stream: *quic.QuicStream, message: []const u8) anyerror!void {
+        pub fn vtableOnMessageFn(instance: *anyopaque, stream: protocols.AnyStream, message: []const u8) anyerror!void {
             const self: *NegotiationSession = @ptrCast(@alignCast(instance));
             return self.onMessage(stream, message);
         }
 
-        pub fn vtableOnCloseFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+        pub fn vtableOnCloseFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
             const self: *NegotiationSession = @ptrCast(@alignCast(instance));
             return self.onClose(stream);
         }
@@ -483,13 +483,12 @@ pub const MultistreamSelectHandler = struct {
     // Protocol handler implementation
     pub fn onInitiatorStart(
         self: *Self,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
         const handler = self.allocator.create(NegotiationSession) catch unreachable;
-        errdefer self.allocator.destroy(handler);
-        try handler.init(self.allocator, stream.proposed_protocols, &self.supported_protocols, stream, callback_ctx, callback, true);
+        try handler.init(self.allocator, stream.getProposedProtocols(), &self.supported_protocols, stream, callback_ctx, callback, true);
         // Set the negotiation session as the stream's handler
         // This handler will NEVER be replaced - it stays for the entire stream lifetime
         stream.setProtoMsgHandler(handler.any());
@@ -497,24 +496,23 @@ pub const MultistreamSelectHandler = struct {
 
     pub fn onResponderStart(
         self: *Self,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
         const handler = self.allocator.create(NegotiationSession) catch unreachable;
-        errdefer self.allocator.destroy(handler);
         try handler.init(self.allocator, null, &self.supported_protocols, stream, callback_ctx, callback, false);
         // Set the negotiation session as the stream's handler
         // This handler will NEVER be replaced - it stays for the entire stream lifetime
         stream.setProtoMsgHandler(handler.any());
     }
 
-    pub fn vtableOnResponderStartFn(instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) anyerror!void {
+    pub fn vtableOnResponderStartFn(instance: *anyopaque, stream: protocols.AnyStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onResponderStart(stream, callback_ctx, callback);
     }
 
-    pub fn vtableOnInitiatorStartFn(instance: *anyopaque, stream: *quic.QuicStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) anyerror!void {
+    pub fn vtableOnInitiatorStartFn(instance: *anyopaque, stream: protocols.AnyStream, callback_ctx: ?*anyopaque, callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onInitiatorStart(stream, callback_ctx, callback);
     }

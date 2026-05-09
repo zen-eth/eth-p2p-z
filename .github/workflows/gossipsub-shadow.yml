@@ -1,0 +1,86 @@
+name: GossipSub Shadow Interop
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  gossipsub-shadow:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout eth-p2p-z
+        uses: actions/checkout@v4
+        with:
+          path: eth-p2p-z
+
+      - name: Checkout test-plans
+        uses: actions/checkout@v4
+        with:
+          repository: bomanaps/test-plans
+          ref: feat/gossipsub-zig-interop
+          path: test-plans
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: test-plans/gossipsub-interop/go-libp2p/go.mod
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Nim
+        run: |
+          curl https://nim-lang.org/choosenim/init.sh -sSf | sh -s -- -y
+          echo "$HOME/.nimble/bin" >> $GITHUB_PATH
+
+      - name: Set up Zig 0.15.2
+        run: |
+          curl -fL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz \
+            | sudo tar -xJ -C /usr/local
+          sudo ln -sf /usr/local/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
+          zig version
+
+      - name: Cache Zig global packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-0.15.2-${{ hashFiles('eth-p2p-z/build.zig.zon') }}
+          restore-keys: |
+            zig-0.15.2-
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install Shadow simulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            findutils \
+            libclang-dev \
+            libc-dbg \
+            libglib2.0-0 \
+            libglib2.0-dev \
+            make \
+            netbase \
+            python3 \
+            python3-networkx \
+            xz-utils \
+            zlib1g-dev
+
+          git clone --depth 1 --branch v3.3.0 https://github.com/shadow/shadow.git shadow-simulator
+          cd shadow-simulator
+          ./setup build --clean
+          ./setup install
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Run gossipsub interop tests (Zig)
+        working-directory: test-plans/gossipsub-interop
+        run: make test-zig

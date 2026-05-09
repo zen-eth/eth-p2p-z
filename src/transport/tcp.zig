@@ -726,7 +726,7 @@ test "dial connection refused" {
     defer transport.deinit();
 
     var conn_holder: ConnHolder = .{ .channel = undefined };
-    const addr = try std.net.Address.parseIp("0.0.0.0", 8081);
+    const addr = try std.net.Address.parseIp("127.0.0.1", 19991);
     transport.dial(addr, &conn_holder, ConnHolder.init);
     conn_holder.ready.wait();
     try std.testing.expectEqual(error.ConnectionRefused, conn_holder.err.?);

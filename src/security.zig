@@ -5,6 +5,7 @@ const PublicKey = @import("peer_id").PublicKey;
 pub const plain = @import("security/plain.zig");
 pub const insecure = @import("security/insecure.zig");
 pub const tls = @import("security/tls.zig");
+pub const tls_tcp = @import("security/tls_tcp.zig");
 
 pub const Session = struct {
     local_id: []const u8,

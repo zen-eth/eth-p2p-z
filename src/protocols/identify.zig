@@ -1,7 +1,6 @@
 const std = @import("std");
 const libp2p = @import("../root.zig");
 const protocols = libp2p.protocols;
-const quic = libp2p.transport.quic;
 const swarm = libp2p.swarm;
 const multiaddr = @import("multiaddr");
 const Multiaddr = multiaddr.Multiaddr;
@@ -138,14 +137,14 @@ pub const IdentifyProtocolHandler = struct {
 
     pub fn onInitiatorStart(
         self: *Self,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
         const handler = self.allocator.create(IdentifyInitiator) catch |err| {
             callback(callback_ctx, err);
             stream.close(null, struct {
-                fn noop(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn noop(_: ?*anyopaque, _: anyerror!void) void {}
             }.noop);
             return err;
         };
@@ -167,14 +166,14 @@ pub const IdentifyProtocolHandler = struct {
 
     pub fn onResponderStart(
         self: *Self,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
         const handler = self.allocator.create(IdentifyResponder) catch |err| {
             callback(callback_ctx, err);
             stream.close(null, struct {
-                fn noop(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn noop(_: ?*anyopaque, _: anyerror!void) void {}
             }.noop);
             return err;
         };
@@ -191,7 +190,7 @@ pub const IdentifyProtocolHandler = struct {
 
     fn vtableOnInitiatorStartFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void {
@@ -201,7 +200,7 @@ pub const IdentifyProtocolHandler = struct {
 
     fn vtableOnResponderStartFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void {
@@ -226,7 +225,7 @@ pub const IdentifyProtocolHandler = struct {
 
 /// Handles identify messages on the initiator side (querying remote peer).
 const IdentifyInitiator = struct {
-    stream: *quic.QuicStream,
+    stream: protocols.AnyStream,
     allocator: std.mem.Allocator,
     callback_ctx: ?*anyopaque,
     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
@@ -235,12 +234,12 @@ const IdentifyInitiator = struct {
 
     const Self = @This();
 
-    fn onActivated(self: *Self, _: *quic.QuicStream) anyerror!void {
+    fn onActivated(self: *Self, _: protocols.AnyStream) anyerror!void {
         _ = self;
         // Initiator waits for response, no action needed on activation
     }
 
-    fn onMessage(self: *Self, stream: *quic.QuicStream, message: []const u8) anyerror!void {
+    fn onMessage(self: *Self, stream: protocols.AnyStream, message: []const u8) anyerror!void {
         _ = stream;
         if (message.len == 0) return;
 
@@ -251,7 +250,7 @@ const IdentifyInitiator = struct {
         };
     }
 
-    fn onClose(self: *Self, stream: *quic.QuicStream) anyerror!void {
+    fn onClose(self: *Self, stream: protocols.AnyStream) anyerror!void {
         _ = stream;
         if (self.response_received) return;
         self.response_received = true;
@@ -304,17 +303,17 @@ const IdentifyInitiator = struct {
         self.deliverErrorAndCleanup(err);
     }
 
-    fn vtableOnActivatedFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnActivatedFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
     }
 
-    fn vtableOnMessageFn(instance: *anyopaque, stream: *quic.QuicStream, message: []const u8) anyerror!void {
+    fn vtableOnMessageFn(instance: *anyopaque, stream: protocols.AnyStream, message: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onMessage(stream, message);
     }
 
-    fn vtableOnCloseFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnCloseFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);
     }
@@ -332,7 +331,7 @@ const IdentifyInitiator = struct {
 
 /// Handles identify messages on the responder side (responding to query).
 const IdentifyResponder = struct {
-    stream: *quic.QuicStream,
+    stream: protocols.AnyStream,
     allocator: std.mem.Allocator,
     callback_ctx: ?*anyopaque,
     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
@@ -342,7 +341,7 @@ const IdentifyResponder = struct {
 
     const Self = @This();
 
-    fn onActivated(self: *Self, _: *quic.QuicStream) anyerror!void {
+    fn onActivated(self: *Self, _: protocols.AnyStream) anyerror!void {
         // Build identify message using shared builder
         var identify_msg = try self.handler.builder.build(self.allocator);
         errdefer self.handler.builder.freeMessage(self.allocator, &identify_msg);
@@ -376,7 +375,7 @@ const IdentifyResponder = struct {
         self.stream.close(self, closeCallback);
     }
 
-    fn closeCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
+    fn closeCallback(ctx: ?*anyopaque, res: anyerror!void) void {
         const self: *Self = @ptrCast(@alignCast(ctx.?));
         _ = res catch |err| {
             self.fail(err);
@@ -387,12 +386,12 @@ const IdentifyResponder = struct {
         self.allocator.destroy(self);
     }
 
-    fn onMessage(self: *Self, _: *quic.QuicStream, _: []const u8) anyerror!void {
+    fn onMessage(self: *Self, _: protocols.AnyStream, _: []const u8) anyerror!void {
         _ = self;
         // Responder should not receive messages, but we'll ignore them
     }
 
-    fn onClose(self: *Self, stream: *quic.QuicStream) anyerror!void {
+    fn onClose(self: *Self, stream: protocols.AnyStream) anyerror!void {
         _ = stream;
         if (!self.message_sent) {
             self.fail(error.StreamClosedBeforeResponse);
@@ -409,17 +408,17 @@ const IdentifyResponder = struct {
         self.allocator.destroy(self);
     }
 
-    fn vtableOnActivatedFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnActivatedFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
     }
 
-    fn vtableOnMessageFn(instance: *anyopaque, stream: *quic.QuicStream, message: []const u8) anyerror!void {
+    fn vtableOnMessageFn(instance: *anyopaque, stream: protocols.AnyStream, message: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onMessage(stream, message);
     }
 
-    fn vtableOnCloseFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnCloseFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);
     }
@@ -635,14 +634,14 @@ pub const IdentifyPushHandler = struct {
 
     pub fn onInitiatorStart(
         self: *Self,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
         const handler = self.allocator.create(IdentifyPushInitiator) catch |err| {
             callback(callback_ctx, err);
             stream.close(null, struct {
-                fn noop(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn noop(_: ?*anyopaque, _: anyerror!void) void {}
             }.noop);
             return err;
         };
@@ -659,14 +658,14 @@ pub const IdentifyPushHandler = struct {
 
     pub fn onResponderStart(
         self: *Self,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
         const handler = self.allocator.create(IdentifyPushResponder) catch |err| {
             callback(callback_ctx, err);
             stream.close(null, struct {
-                fn noop(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
+                fn noop(_: ?*anyopaque, _: anyerror!void) void {}
             }.noop);
             return err;
         };
@@ -688,7 +687,7 @@ pub const IdentifyPushHandler = struct {
 
     fn vtableOnInitiatorStartFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void {
@@ -698,7 +697,7 @@ pub const IdentifyPushHandler = struct {
 
     fn vtableOnResponderStartFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void {
@@ -723,7 +722,7 @@ pub const IdentifyPushHandler = struct {
 
 /// Handles identify push messages on the initiator side (sending push update).
 const IdentifyPushInitiator = struct {
-    stream: *quic.QuicStream,
+    stream: protocols.AnyStream,
     allocator: std.mem.Allocator,
     callback_ctx: ?*anyopaque,
     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
@@ -733,7 +732,7 @@ const IdentifyPushInitiator = struct {
 
     const Self = @This();
 
-    fn onActivated(self: *Self, _: *quic.QuicStream) anyerror!void {
+    fn onActivated(self: *Self, _: protocols.AnyStream) anyerror!void {
         // Build identify message using shared builder
         var identify_msg = try self.handler.builder.build(self.allocator);
         errdefer self.handler.builder.freeMessage(self.allocator, &identify_msg);
@@ -767,7 +766,7 @@ const IdentifyPushInitiator = struct {
         self.stream.close(self, closeCallback);
     }
 
-    fn closeCallback(ctx: ?*anyopaque, res: anyerror!*quic.QuicStream) void {
+    fn closeCallback(ctx: ?*anyopaque, res: anyerror!void) void {
         const self: *Self = @ptrCast(@alignCast(ctx.?));
         _ = res catch |err| {
             self.fail(err);
@@ -778,12 +777,12 @@ const IdentifyPushInitiator = struct {
         self.allocator.destroy(self);
     }
 
-    fn onMessage(self: *Self, _: *quic.QuicStream, _: []const u8) anyerror!void {
+    fn onMessage(self: *Self, _: protocols.AnyStream, _: []const u8) anyerror!void {
         _ = self;
         // Initiator should not receive messages
     }
 
-    fn onClose(self: *Self, stream: *quic.QuicStream) anyerror!void {
+    fn onClose(self: *Self, stream: protocols.AnyStream) anyerror!void {
         _ = stream;
         if (!self.message_sent) {
             self.fail(error.StreamClosedBeforeResponse);
@@ -799,17 +798,17 @@ const IdentifyPushInitiator = struct {
         self.allocator.destroy(self);
     }
 
-    fn vtableOnActivatedFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnActivatedFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
     }
 
-    fn vtableOnMessageFn(instance: *anyopaque, stream: *quic.QuicStream, message: []const u8) anyerror!void {
+    fn vtableOnMessageFn(instance: *anyopaque, stream: protocols.AnyStream, message: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onMessage(stream, message);
     }
 
-    fn vtableOnCloseFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnCloseFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);
     }
@@ -827,7 +826,7 @@ const IdentifyPushInitiator = struct {
 
 /// Handles identify push messages on the responder side (receiving push update).
 const IdentifyPushResponder = struct {
-    stream: *quic.QuicStream,
+    stream: protocols.AnyStream,
     allocator: std.mem.Allocator,
     callback_ctx: ?*anyopaque,
     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
@@ -836,12 +835,12 @@ const IdentifyPushResponder = struct {
 
     const Self = @This();
 
-    fn onActivated(self: *Self, _: *quic.QuicStream) anyerror!void {
+    fn onActivated(self: *Self, _: protocols.AnyStream) anyerror!void {
         _ = self;
         // Responder waits for push message
     }
 
-    fn onMessage(self: *Self, stream: *quic.QuicStream, message: []const u8) anyerror!void {
+    fn onMessage(self: *Self, stream: protocols.AnyStream, message: []const u8) anyerror!void {
         _ = stream;
         if (message.len == 0) return;
 
@@ -852,7 +851,7 @@ const IdentifyPushResponder = struct {
         };
     }
 
-    fn onClose(self: *Self, stream: *quic.QuicStream) anyerror!void {
+    fn onClose(self: *Self, stream: protocols.AnyStream) anyerror!void {
         _ = stream;
         if (self.response_received) return;
         self.response_received = true;
@@ -905,17 +904,17 @@ const IdentifyPushResponder = struct {
         self.deliverErrorAndCleanup(err);
     }
 
-    fn vtableOnActivatedFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnActivatedFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
     }
 
-    fn vtableOnMessageFn(instance: *anyopaque, stream: *quic.QuicStream, message: []const u8) anyerror!void {
+    fn vtableOnMessageFn(instance: *anyopaque, stream: protocols.AnyStream, message: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onMessage(stream, message);
     }
 
-    fn vtableOnCloseFn(instance: *anyopaque, stream: *quic.QuicStream) anyerror!void {
+    fn vtableOnCloseFn(instance: *anyopaque, stream: protocols.AnyStream) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);
     }

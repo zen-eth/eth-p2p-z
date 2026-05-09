@@ -120,6 +120,17 @@ pub const KeyPair = struct {
         };
     }
 
+    /// Creates a deterministic ED25519 KeyPair from a 32-byte seed.
+    /// Matches Go's ed25519.NewKeyFromSeed semantics.
+    pub fn fromEd25519Seed(seed: []const u8) Error!Self {
+        const pkey = try tls.ed25519KeyPairFromSeed(seed);
+        return .{
+            .key_type = .ED25519,
+            .backend = .tls,
+            .storage = .{ .tls = pkey },
+        };
+    }
+
     /// Releases any resources associated with the key pair.
     pub fn deinit(self: *Self) void {
         const storage_ptr = &self.storage;

@@ -176,6 +176,35 @@ pub fn build(b: *std.Build) void {
     const transport_interop_step = b.step("transport-interop", "Run the transport interop binary");
     transport_interop_step.dependOn(&transport_interop_run_cmd.step);
 
+    const gossipsub_interop_module = b.createModule(.{
+        .root_source_file = b.path("interop/gossipsub/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gossipsub_interop_module.addImport("zig-libp2p", root_module);
+    gossipsub_interop_module.addImport("peer_id", peer_id_module);
+    gossipsub_interop_module.addImport("multiaddr", multiaddr_module);
+
+    const gossipsub_interop_exe = b.addExecutable(.{
+        .name = "gossipsub-bin",
+        .root_module = gossipsub_interop_module,
+    });
+    gossipsub_interop_exe.step.dependOn(&protobuf.step);
+    gossipsub_interop_exe.linkLibrary(lsquic_artifact);
+    gossipsub_interop_exe.linkSystemLibrary(switch (target.result.os.tag) {
+        .windows => "zlib1",
+        else => "z",
+    });
+    b.installArtifact(gossipsub_interop_exe);
+
+    const gossipsub_interop_run_cmd = b.addRunArtifact(gossipsub_interop_exe);
+    gossipsub_interop_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        gossipsub_interop_run_cmd.addArgs(args);
+    }
+    const gossipsub_interop_step = b.step("gossipsub-interop", "Run the gossipsub interop binary");
+    gossipsub_interop_step.dependOn(&gossipsub_interop_run_cmd.step);
+
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.

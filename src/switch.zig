@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const libp2p = @import("root.zig");
 const quic = libp2p.transport.quic;
+const yamux = libp2p.transport.yamux;
 const protocols = libp2p.protocols;
 const Allocator = std.mem.Allocator;
 const mss = protocols.mss;
@@ -72,6 +73,9 @@ pub const Switch = struct {
 
     incoming_connections: std.ArrayList(*quic.QuicConnection),
 
+    /// Yamux sessions keyed by peer multiaddr string (for TCP connections).
+    yamux_sessions: std.StringArrayHashMap(YamuxTcpPeer),
+
     is_stopping: std.atomic.Value(bool),
 
     stopped_notify: std.Thread.ResetEvent,
@@ -83,6 +87,7 @@ pub const Switch = struct {
             .allocator = allocator,
             .listeners = std.StringArrayHashMap(quic.QuicListener).init(allocator),
             .incoming_connections = .empty,
+            .yamux_sessions = std.StringArrayHashMap(YamuxTcpPeer).init(allocator),
             .is_stopping = std.atomic.Value(bool).init(false),
             .mss_handler = mss.MultistreamSelectHandler.init(allocator),
             .stopped_notify = .{},
@@ -154,7 +159,7 @@ pub const Switch = struct {
                 };
             }
 
-            self.network_switch.mss_handler.onResponderStart(stream, self.callback_ctx, self.callback) catch |err| {
+            self.network_switch.mss_handler.onResponderStart(stream.any(), self.callback_ctx, self.callback) catch |err| {
                 std.log.warn("Failed to start responder: {}", .{err});
                 self.callback(self.callback_ctx, err);
 
@@ -171,7 +176,7 @@ pub const Switch = struct {
             };
 
             // `onResponderStart` should set the stream's protocol message handler.
-            stream.proto_msg_handler.?.onActivated(stream) catch |err| {
+            stream.proto_msg_handler.?.onActivated(stream.any()) catch |err| {
                 std.log.warn("Proto message handler failed with error: {any}. Closing stream {any}.", .{ err, stream });
                 self.callback(self.callback_ctx, err);
 
@@ -218,7 +223,7 @@ pub const Switch = struct {
 
             stream.proposed_protocols = self.proposed_protocols;
 
-            self.network_switch.mss_handler.onInitiatorStart(stream, self.callback_ctx, self.callback) catch |err| {
+            self.network_switch.mss_handler.onInitiatorStart(stream.any(), self.callback_ctx, self.callback) catch |err| {
                 std.log.warn("Failed to start initiator: {}", .{err});
                 self.callback(self.callback_ctx, err);
 
@@ -231,7 +236,7 @@ pub const Switch = struct {
             };
 
             // `onInitiatorStart` should set the stream's protocol message handler.
-            stream.proto_msg_handler.?.onActivated(stream) catch |err| {
+            stream.proto_msg_handler.?.onActivated(stream.any()) catch |err| {
                 std.log.warn("Proto message handler failed with error: {}. ", .{err});
                 self.callback(self.callback_ctx, err);
 
@@ -240,7 +245,7 @@ pub const Switch = struct {
                 stream.close(null, struct {
                     fn callback(_: ?*anyopaque, _: anyerror!*quic.QuicStream) void {}
                 }.callback);
-                stream.proto_msg_handler.?.onClose(stream) catch |e| {
+                stream.proto_msg_handler.?.onClose(stream.any()) catch |e| {
                     std.log.warn("Protocol message handler failed with error: {}.", .{e});
                 };
                 return;
@@ -310,7 +315,33 @@ pub const Switch = struct {
         };
         defer self.allocator.free(address_str);
 
-        // Check if the connection already exists.
+        // Check if we have a TCP yamux session for this address.
+        if (self.yamux_sessions.get(address_str)) |tcp_peer| {
+            const stream = tcp_peer.session.openStream() catch |err| {
+                callback(callback_ctx, err);
+                return;
+            };
+            stream.proposed_protocols = proposed_protocols;
+            const bridge = self.allocator.create(TcpStreamBridge) catch {
+                callback(callback_ctx, error.OutOfMemory);
+                return;
+            };
+            bridge.* = .{ .stream = stream.any(), .allocator = self.allocator };
+            stream.setDataHandler(bridge.any());
+            self.mss_handler.onInitiatorStart(stream.any(), callback_ctx, callback) catch |err| {
+                callback(callback_ctx, err);
+                return;
+            };
+            if (stream.proto_msg_handler) |*h| {
+                h.onActivated(stream.any()) catch |err| {
+                    std.log.warn("TCP yamux stream onActivated failed: {}", .{err});
+                    callback(callback_ctx, err);
+                };
+            }
+            return;
+        }
+
+        // Check if the QUIC connection already exists.
         if (self.outgoing_connections.get(address_str)) |conn| {
             // If the connection already exists, we can just create a new stream on it.
             const stream_ctx = self.allocator.create(StreamCallbackCtx) catch unreachable;
@@ -683,6 +714,164 @@ pub const Switch = struct {
         std.log.warn("Incoming connection close callback invoked, but connection not found in the list.", .{});
     }
 
+    /// Routes YamuxStream data_handler bytes → proto_msg_handler.onMessage.
+    /// Heap-allocated; frees itself when the stream closes.
+    const TcpStreamBridge = struct {
+        stream: protocols.AnyStream,
+        allocator: Allocator,
+
+        const vtable = yamux.StreamDataHandlerVTable{
+            .onDataFn = onDataImpl,
+            .onCloseFn = onCloseImpl,
+        };
+
+        fn onDataImpl(instance: *anyopaque, data: []const u8) anyerror!void {
+            const self: *TcpStreamBridge = @ptrCast(@alignCast(instance));
+            if (self.stream.getProtoMsgHandler()) |h| {
+                var handler = h;
+                try handler.onMessage(self.stream, data);
+            }
+        }
+
+        fn onCloseImpl(instance: *anyopaque) void {
+            const self: *TcpStreamBridge = @ptrCast(@alignCast(instance));
+            self.allocator.destroy(self);
+        }
+
+        pub fn any(self: *TcpStreamBridge) yamux.AnyStreamDataHandler {
+            return .{ .instance = self, .vtable = &vtable };
+        }
+    };
+
+    /// Combined session + accept-loop context for a single inbound TCP peer.
+    const YamuxTcpPeer = struct {
+        session: *yamux.YamuxSession,
+        ctx: *YamuxStreamCtx,
+    };
+
+    /// Accept-loop state for one Yamux session.
+    /// Stored on the heap and lives for the duration of the session.
+    const YamuxStreamCtx = struct {
+        network_switch: *Switch,
+        session: *yamux.YamuxSession,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (?*anyopaque, anyerror!?*anyopaque) void,
+
+        /// Called by YamuxSession each time a new inbound stream is ready.
+        fn onStream(raw_ctx: ?*anyopaque, res: anyerror!*yamux.YamuxStream) void {
+            const self: *YamuxStreamCtx = @ptrCast(@alignCast(raw_ctx.?));
+            if (res) |stream| {
+                const any_stream = stream.any();
+                const bridge = self.network_switch.allocator.create(TcpStreamBridge) catch |err| {
+                    std.log.warn("Failed to allocate TcpStreamBridge: {}", .{err});
+                    self.session.acceptStream(self, onStream);
+                    return;
+                };
+                bridge.* = .{ .stream = any_stream, .allocator = self.network_switch.allocator };
+                stream.setDataHandler(bridge.any());
+                self.network_switch.mss_handler.onResponderStart(any_stream, self.callback_ctx, self.callback) catch |err| {
+                    std.log.warn("mss responder failed on yamux stream: {}", .{err});
+                    // re-arm the accept loop even on error so new streams can arrive
+                    self.session.acceptStream(self, onStream);
+                    return;
+                };
+                if (stream.proto_msg_handler) |*handler| {
+                    handler.onActivated(any_stream) catch |err| {
+                        std.log.warn("proto onActivated failed on yamux stream: {}", .{err});
+                    };
+                }
+            } else |err| {
+                std.log.warn("yamux acceptStream error: {}", .{err});
+            }
+            // Re-arm to accept the next inbound stream.
+            self.session.acceptStream(self, onStream);
+        }
+    };
+
+    /// Accept an already-established TCP connection and multiplex streams over it.
+    /// `addr_str` is used as the map key (the caller retains ownership; it is duped here).
+    /// `callback_ctx`/`callback` receive the protocol controller for each successfully
+    /// negotiated inbound stream (same contract as the QUIC `listen` callback).
+    pub fn acceptTcpConn(
+        self: *Switch,
+        addr_str: []const u8,
+        conn: libp2p.conn.AnyConn,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (?*anyopaque, anyerror!?*anyopaque) void,
+    ) void {
+        const session = yamux.YamuxSession.init(self.allocator, conn, false) catch |err| {
+            std.log.warn("Failed to create YamuxSession for {s}: {}", .{ addr_str, err });
+            return;
+        };
+
+        const ctx = self.allocator.create(YamuxStreamCtx) catch |err| {
+            std.log.warn("Failed to allocate YamuxStreamCtx: {}", .{err});
+            session.deinit();
+            return;
+        };
+        ctx.* = .{
+            .network_switch = self,
+            .session = session,
+            .callback_ctx = callback_ctx,
+            .callback = callback,
+        };
+
+        const key = self.allocator.dupe(u8, addr_str) catch |err| {
+            std.log.warn("Failed to dupe addr_str for yamux session: {}", .{err});
+            self.allocator.destroy(ctx);
+            session.deinit();
+            return;
+        };
+
+        self.yamux_sessions.put(key, .{ .session = session, .ctx = ctx }) catch |err| {
+            std.log.warn("Failed to store yamux session for {s}: {}", .{ key, err });
+            self.allocator.free(key);
+            self.allocator.destroy(ctx);
+            session.deinit();
+            return;
+        };
+
+        // Kick off the accept loop: fires once per inbound stream.
+        session.acceptStream(ctx, YamuxStreamCtx.onStream);
+    }
+
+    /// Register an already-established (post-TLS) YamuxSession with the switch.
+    /// The session is stored under `addr_str` so `newStream` can open outbound
+    /// streams over it.  Inbound streams are dispatched to `callback`.
+    pub fn registerTcpYamux(
+        self: *Switch,
+        addr_str: []const u8,
+        session: *yamux.YamuxSession,
+        callback_ctx: ?*anyopaque,
+        callback: *const fn (?*anyopaque, anyerror!?*anyopaque) void,
+    ) void {
+        const ctx = self.allocator.create(YamuxStreamCtx) catch |err| {
+            std.log.warn("Failed to allocate YamuxStreamCtx for {s}: {}", .{ addr_str, err });
+            return;
+        };
+        ctx.* = .{
+            .network_switch = self,
+            .session = session,
+            .callback_ctx = callback_ctx,
+            .callback = callback,
+        };
+
+        const key = self.allocator.dupe(u8, addr_str) catch |err| {
+            std.log.warn("Failed to dupe addr_str for yamux session {s}: {}", .{ addr_str, err });
+            self.allocator.destroy(ctx);
+            return;
+        };
+
+        self.yamux_sessions.put(key, .{ .session = session, .ctx = ctx }) catch |err| {
+            std.log.warn("Failed to store yamux session for {s}: {}", .{ key, err });
+            self.allocator.free(key);
+            self.allocator.destroy(ctx);
+            return;
+        };
+
+        session.acceptStream(ctx, YamuxStreamCtx.onStream);
+    }
+
     fn cleanResources(self: *Switch) void {
         var listener_iter = self.listeners.iterator();
         while (listener_iter.next()) |entry| {
@@ -712,6 +901,14 @@ pub const Switch = struct {
         }
         self.outgoing_connections.deinit();
         self.incoming_connections.deinit(self.allocator);
+
+        var yamux_iter = self.yamux_sessions.iterator();
+        while (yamux_iter.next()) |entry| {
+            entry.value_ptr.session.deinit(); // deinit() calls allocator.destroy(self) internally
+            self.allocator.destroy(entry.value_ptr.ctx);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.yamux_sessions.deinit();
 
         self.finalCleanup();
     }

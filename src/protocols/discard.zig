@@ -27,7 +27,7 @@ pub const DiscardProtocolHandler = struct {
 
     pub fn onInitiatorStart(
         self: *Self,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
@@ -43,7 +43,7 @@ pub const DiscardProtocolHandler = struct {
 
     pub fn onResponderStart(
         self: *Self,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
@@ -60,7 +60,7 @@ pub const DiscardProtocolHandler = struct {
 
     pub fn vtableOnResponderStartFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void {
@@ -70,7 +70,7 @@ pub const DiscardProtocolHandler = struct {
 
     pub fn vtableOnInitiatorStartFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) anyerror!void {
@@ -100,7 +100,7 @@ pub const DiscardInitiator = struct {
 
     const Self = @This();
 
-    pub fn onActivated(self: *Self, stream: *quic.QuicStream) anyerror!void {
+    pub fn onActivated(self: *Self, stream: protocols.AnyStream) anyerror!void {
         const sender = self.allocator.create(DiscardSender) catch unreachable;
         sender.* = DiscardSender.init(stream);
         sender.setup();
@@ -108,13 +108,13 @@ pub const DiscardInitiator = struct {
         self.callback(self.callback_ctx, sender);
     }
 
-    pub fn onMessage(self: *Self, _: *quic.QuicStream, msg: []const u8) anyerror!void {
+    pub fn onMessage(self: *Self, _: protocols.AnyStream, msg: []const u8) anyerror!void {
         std.log.warn("Discard protocol received a message: {s}", .{msg});
         self.callback(self.callback_ctx, error.InvalidMessage);
         return error.InvalidMessage;
     }
 
-    pub fn onClose(self: *Self, _: *quic.QuicStream) anyerror!void {
+    pub fn onClose(self: *Self, _: protocols.AnyStream) anyerror!void {
         self.allocator.destroy(self.sender);
 
         const allocator = self.allocator;
@@ -123,7 +123,7 @@ pub const DiscardInitiator = struct {
 
     pub fn vtableOnActivatedFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
     ) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
@@ -131,7 +131,7 @@ pub const DiscardInitiator = struct {
 
     pub fn vtableOnMessageFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         message: []const u8,
     ) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
@@ -140,7 +140,7 @@ pub const DiscardInitiator = struct {
 
     pub fn vtableOnCloseFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
     ) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);
@@ -171,22 +171,22 @@ pub const DiscardResponder = struct {
 
     const Self = @This();
 
-    pub fn onActivated(_: *Self, _: *quic.QuicStream) anyerror!void {}
+    pub fn onActivated(_: *Self, _: protocols.AnyStream) anyerror!void {}
 
-    pub fn onMessage(self: *Self, _: *quic.QuicStream, msg: []const u8) anyerror!void {
+    pub fn onMessage(self: *Self, _: protocols.AnyStream, msg: []const u8) anyerror!void {
         self.total_received += msg.len;
         self.message_count += 1;
         std.debug.print("DiscardResponder received message {}: {}\n", .{ self.message_count, msg.len });
     }
 
-    pub fn onClose(self: *Self, _: *quic.QuicStream) anyerror!void {
+    pub fn onClose(self: *Self, _: protocols.AnyStream) anyerror!void {
         const allocator = self.allocator;
         allocator.destroy(self);
     }
 
     pub fn vtableOnActivatedFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
     ) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onActivated(stream);
@@ -194,7 +194,7 @@ pub const DiscardResponder = struct {
 
     pub fn vtableOnMessageFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
         message: []const u8,
     ) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
@@ -203,7 +203,7 @@ pub const DiscardResponder = struct {
 
     pub fn vtableOnCloseFn(
         instance: *anyopaque,
-        stream: *quic.QuicStream,
+        stream: protocols.AnyStream,
     ) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.onClose(stream);
@@ -223,11 +223,11 @@ pub const DiscardResponder = struct {
 
 pub const DiscardSender = struct {
     controller: protocols.ProtocolStreamController,
-    stream: *quic.QuicStream,
+    stream: protocols.AnyStream,
 
     const Self = @This();
 
-    pub fn init(stream: *quic.QuicStream) Self {
+    pub fn init(stream: protocols.AnyStream) Self {
         return Self{
             .controller = undefined,
             .stream = stream,
@@ -239,7 +239,7 @@ pub const DiscardSender = struct {
         self.controller = protocols.initStreamController(instance, &stream_controller_vtable);
     }
 
-    fn controllerGetStream(instance: *anyopaque) *quic.QuicStream {
+    fn controllerGetStream(instance: *anyopaque) protocols.AnyStream {
         const self: *Self = @ptrCast(@alignCast(instance));
         return self.stream;
     }
@@ -489,7 +489,7 @@ test "discard protocol using switch" {
     );
 
     callback.mutex.wait();
-    try std.testing.expect(callback.sender.stream.conn.security_session.?.remote_id.eql(&server_peer_id));
+    try std.testing.expect(callback.sender.stream.getRemotePeerId().?.eql(&server_peer_id));
 
     callback.sender.send("Hello from Switch 2", null, struct {
         pub fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
@@ -515,7 +515,7 @@ test "discard protocol using switch" {
 
     callback1.mutex.wait();
 
-    try std.testing.expect(callback1.sender.stream.conn.security_session.?.remote_id.eql(&server_peer_id));
+    try std.testing.expect(callback1.sender.stream.getRemotePeerId().?.eql(&server_peer_id));
     callback1.sender.send("Hello from Switch 2 (second message)", null, struct {
         pub fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
             if (res) |size| {
@@ -543,7 +543,7 @@ test "discard protocol using switch" {
     );
 
     callback2.mutex.wait();
-    try std.testing.expect(callback2.sender.stream.conn.security_session.?.remote_id.eql(&server_peer_id1));
+    try std.testing.expect(callback2.sender.stream.getRemotePeerId().?.eql(&server_peer_id1));
 
     std.Thread.sleep(200 * std.time.ns_per_ms);
 
@@ -668,7 +668,7 @@ test "discard protocol using switch with secp256k1 identities" {
     switch2.newStream(dial_ma, &.{"discard"}, &callback, TestNewStreamCallback.callback);
 
     callback.mutex.wait();
-    try std.testing.expect(callback.sender.stream.conn.security_session.?.remote_id.eql(&server_peer_id));
+    try std.testing.expect(callback.sender.stream.getRemotePeerId().?.eql(&server_peer_id));
 
     callback.sender.send("Hello from Switch 2", null, struct {
         pub fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
@@ -685,7 +685,7 @@ test "discard protocol using switch with secp256k1 identities" {
     switch2.newStream(dial_ma, &.{"discard"}, &callback1, TestNewStreamCallback.callback);
 
     callback1.mutex.wait();
-    try std.testing.expect(callback1.sender.stream.conn.security_session.?.remote_id.eql(&server_peer_id));
+    try std.testing.expect(callback1.sender.stream.getRemotePeerId().?.eql(&server_peer_id));
 
     callback1.sender.send("Hello from Switch 2 (second message)", null, struct {
         pub fn callback_(_: ?*anyopaque, res: anyerror!usize) void {
@@ -706,7 +706,7 @@ test "discard protocol using switch with secp256k1 identities" {
     switch1.newStream(dial_ma1, &.{"discard"}, &callback2, TestNewStreamCallback.callback);
 
     callback2.mutex.wait();
-    try std.testing.expect(callback2.sender.stream.conn.security_session.?.remote_id.eql(&server_peer_id1));
+    try std.testing.expect(callback2.sender.stream.getRemotePeerId().?.eql(&server_peer_id1));
 
     std.Thread.sleep(200 * std.time.ns_per_ms);
 

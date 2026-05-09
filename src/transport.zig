@@ -12,6 +12,10 @@ pub const QuicListener = quic.QuicListener;
 pub const QuicConnection = quic.QuicConnection;
 pub const QuicStream = quic.QuicStream;
 
+pub const yamux = @import("transport/yamux.zig");
+pub const YamuxSession = yamux.YamuxSession;
+pub const YamuxStream = yamux.YamuxStream;
+
 pub const ConnectionUpgrader = @import("transport/upgrader.zig").ConnUpgrader;
 
 /// Listener interface for accepting incoming connections.
