@@ -9,7 +9,7 @@ on:
 
 jobs:
   gossipsub-shadow:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout eth-p2p-z
@@ -24,6 +24,13 @@ jobs:
           ref: feat/gossipsub-zig-interop
           path: test-plans
 
+      - name: Set up Zig 0.15.2
+        run: |
+          curl -fL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz \
+            | sudo tar -xJ -C /usr/local
+          sudo ln -sf /usr/local/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
+          zig version
+
       - name: Cache Zig global packages
         uses: actions/cache@v4
         with:
@@ -32,14 +39,34 @@ jobs:
           restore-keys: |
             zig-0.15.2-
 
-      - name: Build gossipsub-shadow Docker image
-        run: docker build -t gossipsub-shadow test-plans/gossipsub-interop/
-
-      - name: Run Shadow gossipsub interop (zig, 4 nodes)
+      - name: Install uv
         run: |
-          docker run --rm \
-            -v ${{ github.workspace }}/test-plans/gossipsub-interop:/work \
-            -v ${{ github.workspace }}/eth-p2p-z:/eth-p2p-z \
-            -v $HOME/.cache/zig:/root/.cache/zig \
-            gossipsub-shadow \
-            bash /work/run-shadow.sh --node_count 4 --composition zig --scenario subnet-blob-msg
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install Shadow simulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            findutils \
+            libclang-dev \
+            libc-dbg \
+            libglib2.0-0 \
+            libglib2.0-dev \
+            make \
+            netbase \
+            python3 \
+            python3-networkx \
+            xz-utils \
+            zlib1g-dev
+
+          git clone --depth 1 --branch v3.3.0 https://github.com/shadow/shadow.git shadow-simulator
+          cd shadow-simulator
+          ./setup build --clean
+          ./setup install
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Run gossipsub interop tests (Zig)
+        working-directory: test-plans/gossipsub-interop
+        run: make test-zig
