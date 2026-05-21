@@ -1,28 +1,32 @@
-//! By convention, root.zig is the root source file when making a library. If
-//! you are making an executable, the convention is to delete this file and
-//! start with main.zig instead.
 const std = @import("std");
-const testing = std.testing;
 
 pub const std_options = @import("std_options.zig").options;
-pub const concurrent = @import("concurrent.zig");
-pub const conn = @import("conn.zig");
-pub const thread_event_loop = @import("thread_event_loop.zig");
-pub const transport = @import("transport.zig");
-pub const multistream = @import("multistream/lib.zig");
-pub const security = @import("security.zig");
-pub const swarm = @import("switch.zig");
-pub const protobuf = @import("protobuf.zig");
-pub const protocols = @import("protocols.zig");
-pub const event = @import("event.zig");
-pub const xev = @import("xev_backend.zig").xev;
 pub const identity = @import("identity.zig");
+pub const security = @import("security.zig");
+pub const quic = @import("quic.zig");
+pub const protocols = @import("protocols.zig");
+pub const protobuf = @import("protobuf.zig");
 pub const secp_context = @import("secp_context.zig");
-pub const QuicStream = transport.QuicStream;
-pub const QuicTransport = transport.QuicTransport;
+pub const swarm = @import("switch.zig");
+
+pub const Connection = quic.Connection;
+pub const ConnectionStats = quic.ConnectionStats;
+pub const Datagram = quic.Datagram;
+pub const EndpointStats = quic.EndpointStats;
+pub const PathStats = quic.PathStats;
+pub const QuicEndpoint = quic.QuicEndpoint;
+pub const Stream = quic.Stream;
+pub const Switch = swarm.Switch;
+pub const SwitchConnection = swarm.SwitchConnection;
+pub const ManagedConnection = swarm.ManagedConnection;
 
 pub const PubSubMessage = protobuf.rpc.Message;
 
 test {
-    std.testing.refAllDeclsRecursive(@This());
+    std.testing.refAllDecls(@This());
+    _ = @import("quic/config.zig");
+    _ = @import("quic/endpoint/mod.zig");
+    _ = @import("quic/io/socket_control.zig");
+    _ = @import("quic/router/retry_token.zig");
+    _ = @import("switch.zig");
 }

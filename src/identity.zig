@@ -1,5 +1,5 @@
 const std = @import("std");
-const ssl = @import("ssl");
+const ssl = @import("ssl").c;
 const tls = @import("security/tls.zig");
 const secp = @import("secp256k1");
 const secp_context = @import("secp_context.zig");
@@ -8,15 +8,7 @@ const PeerId = @import("peer_id").PeerId;
 
 const Allocator = std.mem.Allocator;
 
-pub const Error = tls.Error || error{
-    UnsupportedBackend,
-    KeyMaterialReleased,
-    OutOfMemory,
-    InvalidVarInt,
-    InvalidTag,
-    InvalidData,
-    InvalidSize,
-};
+pub const Error = tls.SignCallbackError;
 
 pub fn signWithKeyPair(ctx: ?*anyopaque, allocator: Allocator, data: []const u8) Error![]u8 {
     const key_pair_ptr: *const KeyPair = @ptrCast(@alignCast(ctx orelse return error.KeyMaterialReleased));

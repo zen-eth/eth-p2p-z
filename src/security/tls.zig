@@ -1,5 +1,16 @@
+//! libp2p-flavored TLS for QUIC.
+//!
+//! This is not generic TLS: certificates carry a libp2p `signed-key-extension`
+//! (OID `1.3.6.1.4.1.53594.1.1`) embedding the host's libp2p identity public
+//! key plus a signature binding the TLS keypair to that identity. The
+//! verifier on the peer side parses that extension and recovers the
+//! authenticated `keys.PublicKey`. Peers without the extension are rejected.
+//!
+//! This module is not appropriate for non-libp2p deployments.
+
 const std = @import("std");
-const ssl = @import("ssl");
+const ssl = @import("ssl").c;
+const quiche = @import("quiche").c;
 const secp = @import("secp256k1");
 const secp_context = @import("../secp_context.zig");
 const Allocator = std.mem.Allocator;
@@ -19,13 +30,12 @@ const CertNotBeforeOffsetSeconds = -3600; // 1 hour before current time
 /// The offset to apply to the certificate's notAfter field.
 const CertNotAfterOffsetSeconds = 365 * 24 * 3600; // 1 year after current time
 
-// There is no approach to get cert in the lsquic `onHskDone` callback, but we need it to verify the peer's identity.
-// So we store it in a thread-local variable. It assumes that the callback will be called in the same thread for each engine,
-// and that multiple connections will not be handled concurrently in the same thread.
-// cpp-libp2p fork the lsquic library and add a function to retrieve the peer certificate.
-// https://github.com/libp2p/cpp-libp2p/blob/c386b481410af1910c23f96aec81789410204dbd/vcpkg-overlay/liblsquic/lsquic_conn_ssl.patch .
-// TODO: If thread-local storage is not suitable, consider apply that patch.
-threadlocal var g_peer_cert: ?*ssl.X509 = null;
+const SignatureAlgs: []const u16 = &.{
+    ssl.SSL_SIGN_ED25519,
+    ssl.SSL_SIGN_ECDSA_SECP256R1_SHA256,
+    ssl.SSL_SIGN_RSA_PSS_RSAE_SHA256,
+    ssl.SSL_SIGN_RSA_PKCS1_SHA256,
+};
 
 pub const Error = error{
     CertCreationFailed,
@@ -49,14 +59,108 @@ pub const Error = error{
     UnsupportedKeyType,
     IncompatibleCertificateExtension,
     InvalidKeyLength,
+    InitializationFailed,
 };
+
+pub const SignCallbackError = Error || error{
+    UnsupportedBackend,
+    KeyMaterialReleased,
+    OutOfMemory,
+    InvalidVarInt,
+    InvalidTag,
+    InvalidData,
+    InvalidSize,
+};
+
+pub const ContextCreateError = SignCallbackError || Allocator.Error;
 
 pub const ExtensionData = struct {
     host_pubkey: []u8,
     signature: []u8,
 };
 
-pub const SignCallback = *const fn (ctx: ?*anyopaque, allocator: Allocator, data: []const u8) anyerror![]u8;
+pub const SignCallback = *const fn (ctx: ?*anyopaque, allocator: Allocator, data: []const u8) SignCallbackError![]u8;
+
+pub const Context = struct {
+    ssl_ctx: *ssl.SSL_CTX,
+    subject_keypair: *ssl.EVP_PKEY,
+    subject_cert: *ssl.X509,
+    local_peer_id: PeerId,
+
+    pub fn create(
+        allocator: Allocator,
+        host_keypair: anytype,
+        cert_key_type: keys.KeyType,
+        sign_ctx: ?*anyopaque,
+        sign_fn: SignCallback,
+    ) ContextCreateError!Context {
+        const subject_keypair = try generateKeyPair(cert_key_type);
+        errdefer ssl.EVP_PKEY_free(subject_keypair);
+
+        var host_pubkey = try host_keypair.publicKey(allocator);
+        defer if (host_pubkey.data) |data| allocator.free(data);
+
+        const subject_cert = try buildCert(allocator, &host_pubkey, sign_ctx, sign_fn, subject_keypair);
+        errdefer ssl.X509_free(subject_cert);
+
+        const ssl_ctx = try createSslContext(subject_keypair, subject_cert);
+        errdefer ssl.SSL_CTX_free(ssl_ctx);
+
+        return .{
+            .ssl_ctx = ssl_ctx,
+            .subject_keypair = subject_keypair,
+            .subject_cert = subject_cert,
+            .local_peer_id = try PeerId.fromPublicKey(allocator, &host_pubkey),
+        };
+    }
+
+    pub fn deinit(ctx: *Context) void {
+        ssl.SSL_CTX_free(ctx.ssl_ctx);
+        ssl.X509_free(ctx.subject_cert);
+        ssl.EVP_PKEY_free(ctx.subject_keypair);
+        ctx.* = undefined;
+    }
+
+    pub fn newSsl(ctx: *const Context) !*ssl.SSL {
+        return ssl.SSL_new(ctx.ssl_ctx) orelse error.OpenSSLFailed;
+    }
+};
+
+pub fn createSslContext(subject_key: *ssl.EVP_PKEY, cert: *ssl.X509) !*ssl.SSL_CTX {
+    const ssl_ctx = ssl.SSL_CTX_new(ssl.TLS_method()) orelse return error.InitializationFailed;
+    errdefer ssl.SSL_CTX_free(ssl_ctx);
+
+    if (ssl.SSL_CTX_set_min_proto_version(ssl_ctx, ssl.TLS1_3_VERSION) == 0) return error.InitializationFailed;
+    if (ssl.SSL_CTX_set_max_proto_version(ssl_ctx, ssl.TLS1_3_VERSION) == 0) return error.InitializationFailed;
+
+    _ = ssl.SSL_CTX_set_options(
+        ssl_ctx,
+        ssl.SSL_OP_NO_TLSv1 |
+            ssl.SSL_OP_NO_TLSv1_1 |
+            ssl.SSL_OP_NO_TLSv1_2 |
+            ssl.SSL_OP_NO_COMPRESSION |
+            ssl.SSL_OP_NO_SSLv2 |
+            ssl.SSL_OP_NO_SSLv3,
+    );
+
+    ssl.SSL_CTX_set_verify(
+        ssl_ctx,
+        ssl.SSL_VERIFY_PEER | ssl.SSL_VERIFY_FAIL_IF_NO_PEER_CERT | ssl.SSL_VERIFY_CLIENT_ONCE,
+        libp2pVerifyCallback,
+    );
+
+    if (ssl.SSL_CTX_set_verify_algorithm_prefs(ssl_ctx, SignatureAlgs.ptr, @intCast(SignatureAlgs.len)) == 0)
+        return error.InitializationFailed;
+    if (ssl.SSL_CTX_set_signing_algorithm_prefs(ssl_ctx, SignatureAlgs.ptr, @intCast(SignatureAlgs.len)) == 0)
+        return error.InitializationFailed;
+    if (ssl.SSL_CTX_use_PrivateKey(ssl_ctx, subject_key) == 0) return error.InitializationFailed;
+    if (ssl.SSL_CTX_use_certificate(ssl_ctx, cert) == 0) return error.InitializationFailed;
+    if (ssl.SSL_CTX_set_alpn_protos(ssl_ctx, ALPN_PROTOS.ptr, @intCast(ALPN_PROTOS.len)) != 0)
+        return error.InitializationFailed;
+    ssl.SSL_CTX_set_alpn_select_cb(ssl_ctx, alpnSelectCallbackfn, null);
+
+    return ssl_ctx;
+}
 
 /// Generates a new key pair based on the specified key type.
 /// This is a helper function to encapsulate the complexity of key generation using OpenSSL.
@@ -150,9 +254,12 @@ pub fn buildCert(
     const serial = ssl.ASN1_INTEGER_new() orelse return error.CertSerialCreationFailed;
     defer ssl.ASN1_INTEGER_free(serial);
 
-    const random_serial: i64 = std.crypto.random.intRangeAtMost(i64, 1, std.math.maxInt(i64));
+    var random_serial_bytes: [8]u8 = undefined;
+    if (ssl.RAND_bytes(&random_serial_bytes, random_serial_bytes.len) != 1) return error.CertSerialCreationFailed;
+    var random_serial_u64: u64 = @bitCast(random_serial_bytes);
+    if (random_serial_u64 == 0) random_serial_u64 = 1;
 
-    if (ssl.ASN1_INTEGER_set_int64(serial, random_serial) <= 0) return error.CertSerialSetFailed;
+    if (ssl.ASN1_INTEGER_set_uint64(serial, random_serial_u64) <= 0) return error.CertSerialSetFailed;
     if (ssl.X509_set_serialNumber(cert, serial) <= 0) return error.CertSerialSetFailed;
 
     if (ssl.X509_set_pubkey(cert, subjectKey) <= 0) return error.CertPKeySetFailed;
@@ -187,7 +294,6 @@ pub fn buildCert(
 
     const host_pubkey_proto = host_public_key.encode(allocator) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidData,
     };
     defer allocator.free(host_pubkey_proto);
 
@@ -411,9 +517,31 @@ pub fn signData(allocator: Allocator, pkey: *ssl.EVP_PKEY, data: []const u8) ![]
     return sig_buf;
 }
 
-pub fn signDataWithTlsKey(ctx: ?*anyopaque, allocator: Allocator, data: []const u8) anyerror![]u8 {
+pub fn signDataWithTlsKey(ctx: ?*anyopaque, allocator: Allocator, data: []const u8) SignCallbackError![]u8 {
     const key_ptr: *ssl.EVP_PKEY = @ptrCast(@alignCast(ctx orelse return error.SignDataFailed));
     return signData(allocator, key_ptr, data);
+}
+
+/// Extracts the verified libp2p host public key from the peer certificate of
+/// a fully-handshaked quiche connection. The returned `keys.PublicKey` owns
+/// its `data` slice; the caller is responsible for freeing it via
+/// `allocator.free(pub_key.data.?)`.
+pub fn extractPublicKey(allocator: Allocator, conn: *quiche.quiche_conn) !keys.PublicKey {
+    var cert_ptr: [*c]const u8 = null;
+    var cert_len: usize = 0;
+    quiche.quiche_conn_peer_cert(conn, &cert_ptr, &cert_len);
+    if (cert_ptr == null or cert_len == 0) return error.HandshakeFailed;
+
+    var der_ptr = cert_ptr;
+    const cert = ssl.d2i_X509(null, &der_ptr, @intCast(cert_len)) orelse return error.HandshakeFailed;
+    defer ssl.X509_free(cert);
+
+    const info = verifyAndExtractPeerInfo(allocator, cert) catch return error.HandshakeFailed;
+    if (!info.is_valid) {
+        if (info.host_pubkey.data) |data| allocator.free(data);
+        return error.HandshakeFailed;
+    }
+    return info.host_pubkey;
 }
 
 pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !struct { is_valid: bool, host_pubkey: keys.PublicKey, peer_id: PeerId } {
@@ -433,7 +561,7 @@ pub fn verifyAndExtractPeerInfo(allocator: Allocator, cert: *const ssl.X509) !st
 
     const peer_id = try PeerId.fromPublicKey(allocator, &host_pubkey);
 
-    const cert_pkey = ssl.X509_get_pubkey(cert);
+    const cert_pkey = ssl.X509_get_pubkey(@constCast(cert));
     if (cert_pkey == null) return error.InvalidCertificate;
     defer ssl.EVP_PKEY_free(cert_pkey);
 
@@ -480,8 +608,6 @@ pub fn reconstructEvpKeyFromPublicKey(public_key: *const keys.PublicKey) !*ssl.E
         .SECP256K1 => {
             return error.UnsupportedKeyType; // BoringSSL not supported
         },
-
-        else => return error.UnsupportedKeyType,
     }
 }
 
@@ -782,11 +908,6 @@ pub fn libp2pVerifyCallback(_: c_int, cert_ctx: ?*ssl.X509_STORE_CTX) callconv(.
         return 0;
     }
 
-    if (g_peer_cert) |old_cert| {
-        ssl.X509_free(old_cert);
-    }
-    g_peer_cert = ssl.X509_dup(cert.?);
-
     var subject_name: [256]u8 = std.mem.zeroes([256]u8);
     const subject_name_ptr = ssl.X509_get_subject_name(cert);
     if (subject_name_ptr != null) {
@@ -838,19 +959,6 @@ pub fn libp2pVerifyCallback(_: c_int, cert_ctx: ?*ssl.X509_STORE_CTX) callconv(.
     }
 
     return res;
-}
-
-pub fn takeSavedPeerCertificate() ?*ssl.X509 {
-    const cert = g_peer_cert;
-    g_peer_cert = null;
-    return cert;
-}
-
-pub fn clearSavedPeerCertificate() void {
-    if (g_peer_cert) |cert| {
-        ssl.X509_free(cert);
-        g_peer_cert = null;
-    }
 }
 
 fn x509ErrorToStr(error_code: c_int) []const u8 {
@@ -957,10 +1065,13 @@ fn checkCriticalExtensions(cert: *ssl.X509) !bool {
 }
 
 test "Build certificate using Ed25519 keys" {
-    const fs = std.fs.cwd();
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const fs = std.Io.Dir.cwd();
     const file_path = "test_cert.pem";
 
-    fs.deleteFile(file_path) catch |err| {
+    fs.deleteFile(io, file_path) catch |err| {
         if (err != error.FileNotFound) {
             return err;
         }
@@ -985,11 +1096,11 @@ test "Build certificate using Ed25519 keys" {
     defer ssl.X509_free(cert);
 
     // TODO: Write the certificate to a file for checking the cert file outside, will use assert once verify side is implemented.
-    const file = try std.fs.cwd().createFile("test_cert.pem", .{ .truncate = true });
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, "test_cert.pem", .{ .truncate = true });
+    defer file.close(io);
     const pem_buf = try x509ToPem(std.testing.allocator, cert);
     defer std.testing.allocator.free(pem_buf);
-    try file.writeAll(pem_buf);
+    try file.writeStreamingAll(io, pem_buf);
 }
 
 test "Verify certificate with Ed25519 keys" {
@@ -1103,9 +1214,12 @@ test "Build certificate using RSA keys" {
     defer std.testing.allocator.free(pem_buf);
 
     // Dump a sample RSA certificate for interop debugging.
-    const file = try std.fs.cwd().createFile("rsa_test_cert.pem", .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(pem_buf);
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const file = try std.Io.Dir.cwd().createFile(io, "rsa_test_cert.pem", .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, pem_buf);
 
     // Verify the certificate was created successfully
     try std.testing.expect(pem_buf.len > 0);

@@ -2,44 +2,39 @@ pub const std_options = @import("zig-libp2p").std_options;
 
 const std = @import("std");
 const libp2p = @import("zig-libp2p");
-const io_loop = libp2p.thread_event_loop;
-const quic = libp2p.transport.quic;
+const zio = @import("zio");
 const identity = libp2p.identity;
-const swarm = libp2p.swarm;
 const protocols = libp2p.protocols;
-const ping = libp2p.protocols.ping;
-const keys = @import("peer_id").keys;
-const Multiaddr = @import("multiaddr").Multiaddr;
+const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 
 const RedisClient = struct {
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    reader: std.net.Stream.Reader,
-    writer: std.net.Stream.Writer,
-    read_buf: [4096]u8,
-    write_buf: [4096]u8,
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    reader: std.Io.net.Stream.Reader = undefined,
+    writer: std.Io.net.Stream.Writer = undefined,
+    read_buf: [4096]u8 = undefined,
+    write_buf: [4096]u8 = undefined,
+    initialized: bool = false,
 
-    pub fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16) !RedisClient {
-        const stream = try std.net.tcpConnectToHost(allocator, host, port);
-        errdefer stream.close();
-
-        var client = RedisClient{
+    pub fn connect(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !RedisClient {
+        const stream = try connectTcp(io, host, port);
+        return .{
             .allocator = allocator,
+            .io = io,
             .stream = stream,
-            .reader = undefined,
-            .writer = undefined,
-            .read_buf = undefined,
-            .write_buf = undefined,
         };
-        client.reader = stream.reader(&client.read_buf);
-        client.writer = stream.writer(&client.write_buf);
+    }
 
-        return client;
+    pub fn initBuffers(self: *RedisClient) void {
+        self.reader = self.stream.reader(self.io, &self.read_buf);
+        self.writer = self.stream.writer(self.io, &self.write_buf);
+        self.initialized = true;
     }
 
     pub fn deinit(self: *RedisClient) void {
-        self.writer.interface.flush() catch {};
-        self.stream.close();
+        if (self.initialized) self.writer.interface.flush() catch {};
+        self.stream.close(self.io);
     }
 
     fn writeCommand(self: *RedisClient, parts: []const []const u8) !void {
@@ -50,17 +45,17 @@ const RedisClient = struct {
             try writer.writeAll(part);
             try writer.writeAll("\r\n");
         }
-        try self.writer.interface.flush();
+        try writer.flush();
     }
 
     fn readOneByte(self: *RedisClient) !u8 {
         var buf: [1]u8 = undefined;
-        try self.reader.interface().readSliceAll(&buf);
+        try self.reader.interface.readSliceAll(&buf);
         return buf[0];
     }
 
     fn readExact(self: *RedisClient, buffer: []u8) !void {
-        try self.reader.interface().readSliceAll(buffer);
+        try self.reader.interface.readSliceAll(buffer);
     }
 
     fn readLine(self: *RedisClient, buffer: *std.ArrayList(u8)) !void {
@@ -87,10 +82,7 @@ const RedisClient = struct {
         return self.readBulkStringBody(scratch);
     }
 
-    fn readBulkStringBody(
-        self: *RedisClient,
-        scratch: *std.ArrayList(u8),
-    ) !?[]u8 {
+    fn readBulkStringBody(self: *RedisClient, scratch: *std.ArrayList(u8)) !?[]u8 {
         scratch.clearRetainingCapacity();
         while (true) {
             const byte = try self.readOneByte();
@@ -101,24 +93,15 @@ const RedisClient = struct {
             }
             try scratch.append(self.allocator, byte);
         }
-        const length = std.fmt.parseInt(i64, scratch.items, 10) catch {
-            std.log.err("invalid bulk length line: {s}", .{scratch.items});
-            return error.InvalidResponse;
-        };
-        if (length < 0) {
-            return null;
-        }
-        const usize_len: usize = @intCast(length);
-        const data = try self.allocator.alloc(u8, usize_len);
-        errdefer self.allocator.free(data);
+        const length = std.fmt.parseInt(i64, scratch.items, 10) catch return error.InvalidResponse;
+        if (length < 0) return null;
 
-        try self.readExact(data);
-        const cr = try self.readOneByte();
-        const lf = try self.readOneByte();
-        if (cr != '\r' or lf != '\n') {
-            return error.InvalidResponse;
-        }
-        return data;
+        const out = try self.allocator.alloc(u8, @intCast(length));
+        errdefer self.allocator.free(out);
+        try self.readExact(out);
+        if (try self.readOneByte() != '\r') return error.InvalidResponse;
+        if (try self.readOneByte() != '\n') return error.InvalidResponse;
+        return out;
     }
 
     pub fn rpush(self: *RedisClient, key: []const u8, value: []const u8, scratch: *std.ArrayList(u8)) !void {
@@ -147,16 +130,13 @@ const RedisClient = struct {
         switch (prefix) {
             '*' => {
                 const count = try self.readInteger(scratch);
-                if (count == 0) return null;
+                if (count < 0) return null;
                 if (count != 2) return error.InvalidResponse;
                 const key_value = try self.readBulkString(scratch) orelse return error.InvalidResponse;
                 defer self.allocator.free(key_value);
                 return self.readBulkString(scratch);
             },
-            '$' => {
-                const value = try self.readBulkStringBody(scratch);
-                return value;
-            },
+            '$' => return self.readBulkStringBody(scratch),
             '-' => {
                 try self.readLine(scratch);
                 return error.RedisError;
@@ -166,9 +146,12 @@ const RedisClient = struct {
     }
 };
 
+const listener_addr_key = "listenerAddr";
+
 const Env = struct {
     transport: []const u8,
     is_dialer: bool,
+    debug: bool,
     muxer: ?[]u8,
     security: ?[]u8,
     bind_ip: []const u8,
@@ -178,49 +161,52 @@ const Env = struct {
     timeout_seconds: u32,
     listen_port: u16,
 
-    fn load(allocator: std.mem.Allocator) !Env {
-        const transport_owned = try getRequiredOwned(allocator, "TRANSPORT");
+    fn load(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) !Env {
+        const transport_owned = try getRequiredOwned(allocator, env_map, "transport");
         errdefer allocator.free(transport_owned);
 
-        const is_dialer_raw = try getRequiredOwned(allocator, "IS_DIALER");
+        const is_dialer_raw = try getRequiredOwned(allocator, env_map, "is_dialer");
         defer allocator.free(is_dialer_raw);
         const is_dialer = try parseBool(is_dialer_raw);
 
-        const bind_ip_owned = try getOptionalOwnedOrDefault(allocator, "IP", "0.0.0.0");
+        const debug_owned = try getOptionalOwnedOrDefault(allocator, env_map, "debug", "false");
+        defer allocator.free(debug_owned);
+        const debug = try parseBool(debug_owned);
+
+        const bind_ip_owned = try getOptionalOwnedOrDefault(allocator, env_map, "ip", "0.0.0.0");
         errdefer allocator.free(bind_ip_owned);
 
         const default_publish = if (is_dialer) "dialer" else "listener";
-        const publish_host_owned = try getOptionalOwnedOrDefault(allocator, "PUBLISH_HOST", default_publish);
+        const publish_host_owned = try getOptionalOwnedOrDefault(allocator, env_map, "publish_host", default_publish);
         errdefer allocator.free(publish_host_owned);
 
-        const muxer_owned = try getOptionalOwned(allocator, "MUXER");
+        const muxer_owned = try getOptionalOwned(allocator, env_map, "muxer");
         errdefer if (muxer_owned) |value| allocator.free(value);
 
-        const security_owned = try getOptionalOwned(allocator, "SECURITY");
+        const security_owned = try getOptionalOwned(allocator, env_map, "security");
         errdefer if (security_owned) |value| allocator.free(value);
 
-        const redis_addr_owned = try getOptionalOwnedOrDefault(allocator, "REDIS_ADDR", "redis:6379");
-        errdefer allocator.free(redis_addr_owned);
-        const parsed = try parseHostPort(allocator, redis_addr_owned);
-        const redis_host_owned = parsed.host;
-        allocator.free(redis_addr_owned);
+        const redis_addr_owned = try getOptionalOwnedOrDefault(allocator, env_map, "redis_addr", "redis:6379");
+        defer allocator.free(redis_addr_owned);
+        const parsed_redis = try parseHostPort(allocator, redis_addr_owned);
+        errdefer allocator.free(parsed_redis.host);
 
-        const timeout_secs = try getOptionalUint(allocator, "TEST_TIMEOUT_SECONDS", 180);
-        const listen_port_value = try getOptionalUint(allocator, "LISTEN_PORT", 4001);
+        const timeout_secs = try getOptionalUint(env_map, "test_timeout_seconds", 180);
+        const listen_port_value = try getOptionalUint(env_map, "listen_port", 4001);
         if (listen_port_value > std.math.maxInt(u16)) return error.InvalidPort;
-        const listen_port = @as(u16, @intCast(listen_port_value));
 
-        return Env{
+        return .{
             .transport = transport_owned,
             .is_dialer = is_dialer,
+            .debug = debug,
             .muxer = muxer_owned,
             .security = security_owned,
             .bind_ip = bind_ip_owned,
             .publish_host = publish_host_owned,
-            .redis_host = redis_host_owned,
-            .redis_port = parsed.port,
+            .redis_host = parsed_redis.host,
+            .redis_port = parsed_redis.port,
             .timeout_seconds = timeout_secs,
-            .listen_port = listen_port,
+            .listen_port = @intCast(listen_port_value),
         };
     }
 
@@ -239,111 +225,42 @@ const ParsedHostPort = struct {
     port: u16,
 };
 
-fn parseHostPort(allocator: std.mem.Allocator, value: []const u8) !ParsedHostPort {
-    const idx = std.mem.lastIndexOfScalar(u8, value, ':') orelse return error.InvalidAddressFormat;
-    const host_part = value[0..idx];
-    const port_part = value[idx + 1 ..];
-    const port = try std.fmt.parseInt(u16, port_part, 10);
-    const host_buf = try allocator.dupe(u8, host_part);
-    return ParsedHostPort{ .host = host_buf, .port = port };
-}
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const runtime = try zio.Runtime.init(allocator, .{});
+    defer runtime.deinit();
+    const io = runtime.io();
 
-fn getRequiredOwned(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, key) catch |err| {
-        if (err == error.EnvironmentVariableNotFound) {
-            std.log.err("missing required env var {s}", .{key});
-        }
-        return err;
-    };
-}
-
-fn getOptionalOwnedOrDefault(allocator: std.mem.Allocator, key: []const u8, default_value: []const u8) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => allocator.dupe(u8, default_value),
-        else => err,
-    };
-}
-
-fn getOptionalOwned(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-    return std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => err,
-    };
-}
-
-fn resolvePublishHost(allocator: std.mem.Allocator, is_dialer: bool, bind_ip: []const u8) ![]u8 {
-    if (is_dialer) {
-        return allocator.dupe(u8, "dialer");
-    }
-
-    std.log.info("listener bind_ip {s}", .{bind_ip});
-    return allocator.dupe(u8, bind_ip);
-}
-
-fn logEnvironment(allocator: std.mem.Allocator) void {
-    var env_map = std.process.getEnvMap(allocator) catch |err| {
-        std.log.err("unable to load environment map: {any}", .{err});
-        return;
-    };
-    defer env_map.deinit();
-
-    var it = env_map.iterator();
-    while (it.next()) |entry| {
-        std.log.info("env {s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
-    }
-}
-
-fn getOptionalUint(allocator: std.mem.Allocator, key: []const u8, default_value: u32) !u32 {
-    const owned = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => return default_value,
-        else => return err,
-    };
-    defer allocator.free(owned);
-    return std.fmt.parseInt(u32, owned, 10);
-}
-
-fn parseBool(value: []const u8) !bool {
-    if (std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1")) return true;
-    if (std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "0")) return false;
-    return error.InvalidBoolean;
-}
-
-const PingResultCtx = struct {
-    event: std.Thread.ResetEvent = .{},
-    result_ns: ?u64 = null,
-    err: ?anyerror = null,
-    sender: ?*ping.PingStream = null,
-
-    fn callback(ctx: ?*anyopaque, sender: ?*ping.PingStream, res: anyerror!u64) void {
-        const self: *PingResultCtx = @ptrCast(@alignCast(ctx.?));
-        self.result_ns = res catch |err| {
-            self.err = err;
-            self.sender = sender;
-            self.event.set();
-            return;
-        };
-        self.sender = sender;
-        self.event.set();
-    }
-};
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const check = gpa.deinit();
-        if (check == .leak) std.log.warn("memory leaked from GPA", .{});
-    }
-    const allocator = gpa.allocator();
-
-    logEnvironment(allocator);
-
-    var env = try Env.load(allocator);
+    var env = try Env.load(allocator, init.environ_map);
     defer env.deinit(allocator);
+    if (env.debug) logEnvironment(init.environ_map);
+    try validateInteropEnv(&env);
 
-    {
-        std.debug.print("env redis host: {s}:{d}\n", .{ env.redis_host, env.redis_port });
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+    const endpoint = try libp2p.QuicEndpoint.initWithIdentity(allocator, io, &host_key, .{});
+    defer endpoint.deinit();
+    const switcher = try libp2p.Switch.init(allocator, io, endpoint);
+    defer switcher.deinit();
+
+    var ping_handler = protocols.ping.PingHandler.init(allocator);
+    try switcher.addProtocolService(
+        protocols.ping.protocol_id,
+        protocols.streamHandlerService(protocols.ping.PingHandler, protocols.ping.PingHandler.run, &ping_handler),
+    );
+
+    var redis = try RedisClient.connect(allocator, io, env.redis_host, env.redis_port);
+    redis.initBuffers();
+    defer redis.deinit();
+
+    if (env.is_dialer) {
+        try runDialer(allocator, io, switcher, &redis, &env);
+    } else {
+        try runListener(allocator, io, switcher, &host_key, &redis, &env);
     }
+}
 
+fn validateInteropEnv(env: *const Env) !void {
     if (!std.mem.eql(u8, env.transport, "quic") and !std.mem.eql(u8, env.transport, "quic-v1")) {
         std.log.err("unsupported transport {s}", .{env.transport});
         return error.UnsupportedTransport;
@@ -362,232 +279,341 @@ pub fn main() !void {
             return error.UnsupportedSecurity;
         }
     }
-
-    var loop: io_loop.ThreadEventLoop = undefined;
-    try loop.init(allocator);
-    defer {
-        loop.deinit();
-    }
-
-    var host_key = try identity.KeyPair.generate(keys.KeyType.ED25519);
-    defer host_key.deinit();
-
-    var transport: quic.QuicTransport = undefined;
-    try transport.init(&loop, &host_key, keys.KeyType.ECDSA, allocator);
-
-    var switcher: swarm.Switch = undefined;
-    switcher.init(allocator, &transport);
-    defer {
-        switcher.stop();
-        loop.close();
-        switcher.deinit();
-    }
-
-    var ping_handler = ping.PingProtocolHandler.init(allocator, &loop);
-    defer ping_handler.deinit();
-    try switcher.addProtocolHandler(ping.protocol_id, ping_handler.any());
-
-    var redis = try RedisClient.connect(allocator, env.redis_host, env.redis_port);
-    defer redis.deinit();
-
-    if (env.is_dialer) {
-        try runDialer(allocator, &switcher, &redis, &env, &transport);
-    } else {
-        try runListener(allocator, &switcher, &redis, &env, &transport);
-    }
 }
 
 fn runListener(
     allocator: std.mem.Allocator,
-    switcher: *swarm.Switch,
+    io: std.Io,
+    switcher: *libp2p.Switch,
+    host_key: *identity.KeyPair,
     redis: *RedisClient,
     env: *const Env,
-    transport: *quic.QuicTransport,
 ) !void {
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(allocator);
 
-    const listen_addr_str = try std.fmt.allocPrint(allocator, "/ip4/{s}/udp/{d}/{s}", .{ env.bind_ip, env.listen_port, env.transport });
-    defer allocator.free(listen_addr_str);
-    std.debug.print("interop[listener] -> starting listener on {s}\n", .{listen_addr_str});
+    const listen_addr_text = try buildListenMultiaddr(allocator, env.bind_ip, env.listen_port);
+    defer allocator.free(listen_addr_text);
+    std.log.info("listener binding {s}", .{listen_addr_text});
 
-    var listen_addr = try Multiaddr.fromString(allocator, listen_addr_str);
-    defer listen_addr.deinit();
+    var listen_addr = try Multiaddr.fromString(allocator, listen_addr_text);
+    defer listen_addr.deinit(allocator);
+    try switcher.listen(listen_addr);
 
-    try switcher.listen(listen_addr, null, struct {
-        fn onStream(_: ?*anyopaque, res: anyerror!?*anyopaque) void {
-            _ = res catch |err| {
-                std.log.warn("incoming stream error: {any}", .{err});
-                return;
-            };
-        }
-    }.onStream);
-
-    const peer_buf = try allocator.alloc(u8, transport.local_peer_id.toBase58Len());
-    defer allocator.free(peer_buf);
-    const peer_slice = try transport.local_peer_id.toBase58(peer_buf);
-
-    var listen_addrs: ?std.ArrayList([]u8) = null;
-    var publish_base: []u8 = undefined;
-
-    discovery: {
-        const discovered = switcher.listenMultiaddrs(allocator) catch |err| {
-            std.log.warn(
-                "unable to enumerate listener addresses via switch: {any}; falling back to configured publish host {s}",
-                .{ err, env.publish_host },
-            );
-            publish_base = try buildBaseMultiaddrString(allocator, env.publish_host, env.listen_port, env.transport);
-            break :discovery;
-        };
-        listen_addrs = discovered;
-        const list_view = listen_addrs.?;
-        std.log.info("enumerated {d} listener address(es):", .{list_view.items.len});
-        for (list_view.items, 0..) |addr, i| {
-            std.log.info("  [{d}] {s}", .{ i, addr });
-        }
-        if (list_view.items.len > 0) {
-            publish_base = try allocator.dupe(u8, list_view.items[0]);
-        } else {
-            std.log.warn(
-                "no listen addresses produced by switch; using configured publish host {s}",
-                .{env.publish_host},
-            );
-            publish_base = try buildBaseMultiaddrString(allocator, env.publish_host, env.listen_port, env.transport);
-        }
-    }
-
-    defer allocator.free(publish_base);
-    defer if (listen_addrs) |*list| swarm.Switch.freeListenMultiaddrs(allocator, list);
-
-    const published_addr = try std.fmt.allocPrint(allocator, "{s}/p2p/{s}", .{ publish_base, peer_slice });
+    const published_addr = try buildPublishedMultiaddr(allocator, io, switcher, host_key, env);
     defer allocator.free(published_addr);
 
-    redis.del("listenerAddr", &scratch) catch |err| {
-        std.log.warn("failed to clear listenerAddr list: {any}", .{err});
+    redis.del(listener_addr_key, &scratch) catch |err| {
+        std.log.warn("failed to clear {s}: {any}", .{ listener_addr_key, err });
     };
+    try redis.rpush(listener_addr_key, published_addr, &scratch);
+    std.log.info("listener published {s}", .{published_addr});
 
-    std.log.info("listener publishing {s}", .{published_addr});
-    try redis.rpush("listenerAddr", published_addr, &scratch);
+    const conn = try switcher.accept();
+    defer conn.deinit();
+    try conn.startInboundDispatcher(.{});
 
-    const sleep_ns = std.math.clamp(@as(u64, env.timeout_seconds) * std.time.ns_per_s, std.time.ns_per_s, std.math.maxInt(u64));
-    std.Thread.sleep(sleep_ns);
-}
-
-fn buildBaseMultiaddrString(allocator: std.mem.Allocator, host: []const u8, port: u16, transport: []const u8) ![]u8 {
-    var ma = Multiaddr.init(allocator);
-    errdefer ma.deinit();
-
-    const addr = std.net.Address.parseIp(host, port) catch |err| switch (err) {
-        error.InvalidIPAddressFormat => blk: {
-            try ma.push(.{ .Dns4 = host });
-            break :blk null;
-        },
-        else => return err,
-    };
-
-    if (addr) |parsed| {
-        switch (parsed.any.family) {
-            std.posix.AF.INET => {
-                const ip_bytes = std.mem.toBytes(parsed.in.sa.addr);
-                try ma.push(.{ .Ip4 = std.net.Ip4Address.init(ip_bytes, 0) });
-            },
-            std.posix.AF.INET6 => {
-                const ip_bytes = std.mem.toBytes(parsed.in6.sa.addr);
-                try ma.push(.{ .Ip6 = std.net.Ip6Address.init(ip_bytes, 0, 0, 0) });
-            },
-            else => {},
-        }
-    }
-
-    try ma.push(.{ .Udp = port });
-    try pushTransport(&ma, transport);
-
-    const rendered = try ma.toString(allocator);
-    ma.deinit();
-    return rendered;
-}
-
-fn pushTransport(ma: *Multiaddr, transport: []const u8) !void {
-    if (std.mem.eql(u8, transport, "quic")) {
-        try ma.push(.Quic);
-    } else if (std.mem.eql(u8, transport, "quic-v1")) {
-        try ma.push(.QuicV1);
-    } else {
-        return error.UnsupportedTransport;
-    }
+    try timeoutFromSeconds(env.timeout_seconds).sleep(io);
 }
 
 fn runDialer(
     allocator: std.mem.Allocator,
-    switcher: *swarm.Switch,
+    io: std.Io,
+    switcher: *libp2p.Switch,
     redis: *RedisClient,
     env: *const Env,
-    transport: *quic.QuicTransport,
 ) !void {
-    _ = transport;
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(allocator);
 
-    std.log.info("waiting for listener address", .{});
-    const blpop_res = try redis.blpop("listenerAddr", env.timeout_seconds, &scratch);
-    const addr_bytes = blpop_res orelse return error.ListenerAddressTimeout;
+    std.log.info("waiting for listener address in Redis key {s}", .{listener_addr_key});
+    const addr_bytes = try waitForListenerMultiaddr(redis, listener_addr_key, env.timeout_seconds, &scratch);
     defer allocator.free(addr_bytes);
 
     const trimmed = std.mem.trim(u8, addr_bytes, " \t\r\n");
     std.log.info("dialing {s}", .{trimmed});
-
     var remote_addr = try Multiaddr.fromString(allocator, trimmed);
-    defer remote_addr.deinit();
+    defer remote_addr.deinit(allocator);
 
-    var ping_ctx = PingResultCtx{};
-    var timer = try std.time.Timer.start();
-    const timeout_ns = @as(u128, env.timeout_seconds) * std.time.ns_per_s;
-    const ping_timeout_ns: u64 = if (timeout_ns > std.math.maxInt(u64))
-        std.math.maxInt(u64)
-    else
-        @intCast(timeout_ns);
-    std.debug.print("interop[dialer] -> initiating ping\n", .{});
-    var ping_service = ping.PingService.init(allocator, switcher);
-    try ping_service.ping(remote_addr, .{ .timeout_ns = ping_timeout_ns }, &ping_ctx, PingResultCtx.callback);
-    ping_ctx.event.wait();
+    const total_start_ns = monotonicNs(io);
+    const conn = try switcher.dial(remote_addr, .{ .timeout = timeoutFromSeconds(env.timeout_seconds) });
+    defer conn.deinit();
 
-    if (ping_ctx.sender) |sender| {
-        const CloseCtx = struct {
-            event: std.Thread.ResetEvent = .{},
+    const rtt_ns = try runPing(allocator, io, conn);
+    const total_ns = monotonicNs(io) -| total_start_ns;
 
-            const Self = @This();
-
-            fn callback(ctx: ?*anyopaque, _: anyerror!*quic.QuicStream) void {
-                const self: *Self = @ptrCast(@alignCast(ctx.?));
-                self.event.set();
-            }
-        };
-
-        var close_ctx = CloseCtx{};
-        sender.close(&close_ctx, CloseCtx.callback);
-        close_ctx.event.wait();
-    }
-
-    if (ping_ctx.err) |err| {
-        std.debug.print("interop[dialer] -> ping failed: {any}\n", .{err});
-        return err;
-    }
-    std.debug.print("interop[dialer] -> ping completed successfully\n", .{});
-    const rtt_ns = ping_ctx.result_ns orelse return error.PingFailed;
-    const total_ns = timer.read();
-
-    const handshake_ms = @as(f64, @floatFromInt(total_ns)) / @as(f64, std.time.ns_per_ms);
-    const ping_ms = @as(f64, @floatFromInt(rtt_ns)) / @as(f64, std.time.ns_per_ms);
-
-    const metrics = struct {
-        handshakePlusOneRTTMillis: f64,
-        pingRTTMilllis: f64,
-    }{ .handshakePlusOneRTTMillis = handshake_ms, .pingRTTMilllis = ping_ms };
-
-    const stdout_file: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+    const stdout_file: std.Io.File = .{
+        .handle = std.posix.STDOUT_FILENO,
+        .flags = .{ .nonblocking = false },
+    };
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = stdout_file.writer(&stdout_buf);
-    try std.json.Stringify.value(metrics, .{}, &stdout_writer.interface);
-    try stdout_writer.interface.writeAll("\n");
+    var stdout_writer = stdout_file.writer(io, &stdout_buf);
+    try stdout_writer.interface.print(
+        "{{\"handshakePlusOneRTTMillis\":{d:.3},\"pingRTTMilllis\":{d:.3}}}\n",
+        .{ nsToMillis(total_ns), nsToMillis(rtt_ns) },
+    );
     try stdout_writer.interface.flush();
+}
+
+fn waitForListenerMultiaddr(
+    redis: *RedisClient,
+    key: []const u8,
+    timeout_seconds: u32,
+    scratch: *std.ArrayList(u8),
+) ![]u8 {
+    return (try redis.blpop(key, timeout_seconds, scratch)) orelse error.ListenerAddressTimeout;
+}
+
+fn runPing(allocator: std.mem.Allocator, io: std.Io, conn: *libp2p.ManagedConnection) !u64 {
+    _ = allocator;
+    const stream = try conn.openProtocolStream(protocols.ping.protocol_id, .{});
+    defer stream.deinit();
+    defer stream.close(io) catch {};
+
+    var payload: [32]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @intCast(i);
+
+    const start_ns = monotonicNs(io);
+    try stream.writeAll(io, &payload, .{});
+
+    var reply: [32]u8 = undefined;
+    try stream.readAll(io, &reply, .{});
+    if (!std.mem.eql(u8, &payload, &reply)) return error.PingMismatch;
+    return monotonicNs(io) -| start_ns;
+}
+
+fn buildListenMultiaddr(allocator: std.mem.Allocator, bind_ip: []const u8, port: u16) ![]u8 {
+    const proto = if (std.Io.net.IpAddress.parseIp4(bind_ip, port)) |_|
+        "ip4"
+    else |_| if (std.Io.net.IpAddress.parseIp6(bind_ip, port)) |_|
+        "ip6"
+    else |_|
+        return error.InvalidBindAddress;
+
+    return std.fmt.allocPrint(allocator, "/{s}/{s}/udp/{d}/quic-v1", .{ proto, bind_ip, port });
+}
+
+fn buildPublishedMultiaddr(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    switcher: *libp2p.Switch,
+    host_key: *identity.KeyPair,
+    env: *const Env,
+) ![]u8 {
+    var addrs = try switcher.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    if (addrs.items.len == 0) return error.NoListenAddress;
+
+    var local = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer local.deinit(allocator);
+    const parsed = try local.parseIpUdp(allocator);
+
+    const published_host = try resolvePublishedHost(allocator, io, env, parsed.address.getPort());
+    defer allocator.free(published_host.text);
+
+    const transport = if (std.mem.eql(u8, env.transport, "quic")) "quic" else "quic-v1";
+    const local_peer_id = try host_key.peerId(allocator);
+    const peer_text = try local_peer_id.toString(allocator);
+    defer allocator.free(peer_text);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "/{s}/{s}/udp/{d}/{s}/p2p/{s}",
+        .{ published_host.proto, published_host.text, parsed.address.getPort(), transport, peer_text },
+    );
+}
+
+const PublishedHost = struct {
+    proto: []const u8,
+    text: []u8,
+};
+
+fn resolvePublishedHost(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const Env,
+    port: u16,
+) !PublishedHost {
+    const direct_proto = hostProtocol(env.publish_host);
+    if (!std.mem.eql(u8, direct_proto, "dns4")) {
+        return .{
+            .proto = direct_proto,
+            .text = try allocator.dupe(u8, env.publish_host),
+        };
+    }
+
+    if (resolveHostAddress(io, env.publish_host, port)) |address| {
+        return ipAddressHostText(allocator, address);
+    } else |err| {
+        std.log.warn("failed to resolve publish host {s}: {any}", .{ env.publish_host, err });
+    }
+
+    return .{
+        .proto = direct_proto,
+        .text = try allocator.dupe(u8, env.publish_host),
+    };
+}
+
+fn ipAddressHostText(allocator: std.mem.Allocator, address: std.Io.net.IpAddress) !PublishedHost {
+    return switch (address) {
+        .ip4 => |ip4| .{
+            .proto = "ip4",
+            .text = try std.fmt.allocPrint(
+                allocator,
+                "{d}.{d}.{d}.{d}",
+                .{ ip4.bytes[0], ip4.bytes[1], ip4.bytes[2], ip4.bytes[3] },
+            ),
+        },
+        .ip6 => |ip6| .{
+            .proto = "ip6",
+            .text = try std.fmt.allocPrint(
+                allocator,
+                "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}",
+                .{
+                    ip6.bytes[0],
+                    ip6.bytes[1],
+                    ip6.bytes[2],
+                    ip6.bytes[3],
+                    ip6.bytes[4],
+                    ip6.bytes[5],
+                    ip6.bytes[6],
+                    ip6.bytes[7],
+                    ip6.bytes[8],
+                    ip6.bytes[9],
+                    ip6.bytes[10],
+                    ip6.bytes[11],
+                    ip6.bytes[12],
+                    ip6.bytes[13],
+                    ip6.bytes[14],
+                    ip6.bytes[15],
+                },
+            ),
+        },
+    };
+}
+
+fn hostProtocol(host: []const u8) []const u8 {
+    if (std.Io.net.IpAddress.parseIp4(host, 0)) |_| return "ip4" else |_| {}
+    if (std.Io.net.IpAddress.parseIp6(host, 0)) |_| return "ip6" else |_| {}
+    return "dns4";
+}
+
+fn connectTcp(io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
+    if (std.Io.net.IpAddress.resolve(io, host, port)) |address| {
+        return std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
+    } else |_| {}
+
+    const host_name = try std.Io.net.HostName.init(host);
+    var result_storage: [16]std.Io.net.HostName.LookupResult = undefined;
+    var results = std.Io.Queue(std.Io.net.HostName.LookupResult).init(&result_storage);
+    try std.Io.net.HostName.lookup(host_name, io, &results, .{ .port = port });
+
+    var first_connect_err: ?anyerror = null;
+    while (true) {
+        const result = results.getOne(io) catch |err| switch (err) {
+            error.Closed => break,
+            else => |e| return e,
+        };
+        switch (result) {
+            .address => |address| {
+                return std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream }) catch |err| {
+                    if (first_connect_err == null) first_connect_err = err;
+                    continue;
+                };
+            },
+            .canonical_name => {},
+        }
+    }
+
+    if (first_connect_err) |err| return err;
+    return error.NoAddressReturned;
+}
+
+fn resolveHostAddress(io: std.Io, host: []const u8, port: u16) !std.Io.net.IpAddress {
+    if (std.Io.net.IpAddress.resolve(io, host, port)) |address| return address else |_| {}
+
+    const host_name = try std.Io.net.HostName.init(host);
+    var result_storage: [16]std.Io.net.HostName.LookupResult = undefined;
+    var results = std.Io.Queue(std.Io.net.HostName.LookupResult).init(&result_storage);
+    try std.Io.net.HostName.lookup(host_name, io, &results, .{ .port = port });
+
+    while (true) {
+        const result = results.getOne(io) catch |err| switch (err) {
+            error.Closed => break,
+            else => |e| return e,
+        };
+        switch (result) {
+            .address => |address| return address,
+            .canonical_name => {},
+        }
+    }
+
+    return error.NoAddressReturned;
+}
+
+fn parseHostPort(allocator: std.mem.Allocator, value: []const u8) !ParsedHostPort {
+    const idx = std.mem.lastIndexOfScalar(u8, value, ':') orelse return error.InvalidAddressFormat;
+    const host_part = value[0..idx];
+    const port_part = value[idx + 1 ..];
+    const port = try std.fmt.parseInt(u16, port_part, 10);
+    return .{
+        .host = try allocator.dupe(u8, host_part),
+        .port = port,
+    };
+}
+
+fn getRequiredOwned(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map, key: []const u8) ![]u8 {
+    if (env_map.get(key)) |value| return allocator.dupe(u8, value);
+    std.log.err("missing required env var {s}", .{key});
+    return error.EnvironmentVariableMissing;
+}
+
+fn getOptionalOwnedOrDefault(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    key: []const u8,
+    default_value: []const u8,
+) ![]u8 {
+    if (env_map.get(key)) |value| return allocator.dupe(u8, value);
+    return allocator.dupe(u8, default_value);
+}
+
+fn getOptionalOwned(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map, key: []const u8) !?[]u8 {
+    if (env_map.get(key)) |value| return try allocator.dupe(u8, value);
+    return null;
+}
+
+fn getOptionalUint(env_map: *const std.process.Environ.Map, key: []const u8, default_value: u32) !u32 {
+    if (env_map.get(key)) |value| return std.fmt.parseInt(u32, value, 10);
+    return default_value;
+}
+
+fn parseBool(value: []const u8) !bool {
+    if (std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "0")) return false;
+    return error.InvalidBoolean;
+}
+
+fn logEnvironment(env_map: *const std.process.Environ.Map) void {
+    var it = env_map.iterator();
+    while (it.next()) |entry| {
+        std.log.info("env {s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+    }
+}
+
+fn timeoutFromSeconds(seconds: u32) std.Io.Timeout {
+    const ns_u64 = std.math.mul(u64, seconds, std.time.ns_per_s) catch std.math.maxInt(u64);
+    return .{ .duration = .{ .raw = .fromNanoseconds(@intCast(ns_u64)), .clock = .awake } };
+}
+
+fn nsToMillis(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / @as(f64, std.time.ns_per_ms);
+}
+
+fn monotonicNs(io: std.Io) u64 {
+    const ns = std.Io.Clock.awake.now(io).toNanoseconds();
+    return if (ns <= 0) 0 else @intCast(ns);
 }
