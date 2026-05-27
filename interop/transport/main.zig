@@ -227,7 +227,7 @@ const ParsedHostPort = struct {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const runtime = try zio.Runtime.init(allocator, .{});
+    const runtime = try zio.Runtime.init(allocator, .{ .executors = .exact(4) });
     defer runtime.deinit();
     const io = runtime.io();
 
@@ -254,6 +254,9 @@ pub fn main(init: std.process.Init) !void {
     defer redis.deinit();
 
     if (env.is_dialer) {
+        // Dialer must bind a local endpoint before dialing — dial() requires a
+        // bound shared_socket (else error.EndpointNotBound). Bind ephemeral.
+        _ = try endpoint.bind(.{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } });
         try runDialer(allocator, io, switcher, &redis, &env);
     } else {
         try runListener(allocator, io, switcher, &host_key, &redis, &env);
