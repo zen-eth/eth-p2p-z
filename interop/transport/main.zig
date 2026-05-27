@@ -345,17 +345,22 @@ fn runDialer(
     const rtt_ns = try runPing(allocator, io, conn);
     const total_ns = monotonicNs(io) -| total_start_ns;
 
-    const stdout_file: std.Io.File = .{
-        .handle = std.posix.STDOUT_FILENO,
-        .flags = .{ .nonblocking = false },
-    };
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = stdout_file.writer(io, &stdout_buf);
-    try stdout_writer.interface.print(
+    // Emit the result JSON with a plain blocking syscall rather than the zio
+    // std.Io file writer: zio's epoll backend fails async writes to the stdout
+    // pipe with error.WriteFailed (the QUIC handshake + ping themselves succeed).
+    // Program output needs no async runtime, so write it directly.
+    var json_buf: [256]u8 = undefined;
+    const json = std.fmt.bufPrint(
+        &json_buf,
         "{{\"handshakePlusOneRTTMillis\":{d:.3},\"pingRTTMilllis\":{d:.3}}}\n",
         .{ nsToMillis(total_ns), nsToMillis(rtt_ns) },
-    );
-    try stdout_writer.interface.flush();
+    ) catch unreachable;
+    var written: usize = 0;
+    while (written < json.len) {
+        const n = std.c.write(std.posix.STDOUT_FILENO, json[written..].ptr, json.len - written);
+        if (n <= 0) return error.StdoutWriteFailed;
+        written += @intCast(n);
+    }
 }
 
 fn waitForListenerMultiaddr(
