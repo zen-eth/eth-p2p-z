@@ -34,8 +34,8 @@
             .hash = "quiche-0.1.0-rnTCo4cQAACPgyY1ZYEYw7Yw0JNl2jGqlVLz6pOmA06t",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=v0.11.0#53abdf9ce5e6279e29703a39180ce1cedd8ac4ca",
-            .hash = "zio-0.11.0-xHbVVEqQGwDz0MYoQ0j7Ke0Y9E_iZVe5eLAWK4gd9U0i",
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.12.0#d3e014e43f3db066d26b298fa7d12970651569c4",
+            .hash = "zio-0.12.0-xHbVVFATHADYAPIA-VBDQTpqaj9P8KgbygkBNiyWccZZ",
         },
     },
     .paths = .{
