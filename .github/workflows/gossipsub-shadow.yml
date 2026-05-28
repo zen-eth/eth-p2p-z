@@ -84,3 +84,11 @@ jobs:
       - name: Run gossipsub interop tests (Zig)
         working-directory: test-plans/gossipsub-interop
         run: make test-zig
+
+      - name: Upload Shadow output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadow-output
+          path: test-plans/gossipsub-interop/shadow-outputs/
+          retention-days: 5
