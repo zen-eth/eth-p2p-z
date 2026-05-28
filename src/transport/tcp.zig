@@ -451,15 +451,27 @@ pub const XevListener = struct {
         c: *xev.Completion,
         r: xev.AcceptError!xev.TCP,
     ) xev.CallbackAction {
+        _ = c;
         const accept_ctx = instance.?;
         const transport = accept_ctx.transport;
-        defer transport.io_event_loop.completion_pool.destroy(c);
-        defer transport.io_event_loop.accept_ctx_pool.destroy(accept_ctx);
+
+        // ALWAYS return .rearm: a libxev accept completion is one-shot per
+        // call, so a listener that returns .disarm here only ever accepts a
+        // single connection in its lifetime. The Shadow run that surfaced
+        // this lost every connection past the first per listener — peers
+        // dialed in and sat in the kernel backlog forever, dialer side hung
+        // on dial_slot.event.wait(). Returning .rearm keeps libxev re-running
+        // accept on the same completion so the listener keeps accepting.
+        //
+        // We don't destroy `c` or `accept_ctx` because libxev reuses them on
+        // the next call. The shutdown error paths below allocate a *fresh*
+        // completion for socket.shutdown so we never recycle the accept
+        // completion for a different op (which would race with libxev's
+        // re-arm of the kevent).
 
         const socket = r catch |err| {
             accept_ctx.callback(accept_ctx.callback_instance, err);
-
-            return .disarm;
+            return .rearm;
         };
 
         const channel = transport.allocator.create(XevSocketChannel) catch unreachable;
@@ -468,43 +480,45 @@ pub const XevListener = struct {
 
         const p = transport.io_event_loop.handler_pipeline_pool.create() catch unreachable;
         p.init(transport.allocator, any_rx_conn) catch |err| {
+            const shutdown_c = transport.io_event_loop.completion_pool.create() catch unreachable;
             const close_ctx = transport.io_event_loop.close_ctx_pool.create() catch unreachable;
             close_ctx.* = .{
                 .channel = channel,
                 .callback = XevSocketChannel.noopCloseCB,
                 .callback_instance = channel,
             };
-            socket.shutdown(l, c, io_loop.CloseCtx, close_ctx, XevSocketChannel.shutdownCB);
+            socket.shutdown(l, shutdown_c, io_loop.CloseCtx, close_ctx, XevSocketChannel.shutdownCB);
 
             accept_ctx.callback(accept_ctx.callback_instance, err);
-            return .disarm;
+            return .rearm;
         };
         channel.handler_pipeline = p;
 
         transport.conn_enhancer.enhanceConn(any_rx_conn) catch |err| {
+            const shutdown_c = transport.io_event_loop.completion_pool.create() catch unreachable;
             const close_ctx = transport.io_event_loop.close_ctx_pool.create() catch unreachable;
             close_ctx.* = .{
                 .channel = channel,
                 .callback = XevSocketChannel.noopCloseCB,
                 .callback_instance = channel,
             };
-            socket.shutdown(l, c, io_loop.CloseCtx, close_ctx, XevSocketChannel.shutdownCB);
+            socket.shutdown(l, shutdown_c, io_loop.CloseCtx, close_ctx, XevSocketChannel.shutdownCB);
 
             accept_ctx.callback(accept_ctx.callback_instance, err);
-            return .disarm;
+            return .rearm;
         };
 
         accept_ctx.callback(accept_ctx.callback_instance, any_rx_conn);
         p.fireActive() catch |err| {
             accept_ctx.callback(accept_ctx.callback_instance, err);
-            return .disarm;
+            return .rearm;
         };
 
         const read_buf = transport.io_event_loop.read_buffer_pool.create() catch unreachable;
         const read_c = transport.io_event_loop.completion_pool.create() catch unreachable;
         socket.read(l, read_c, .{ .slice = read_buf }, XevSocketChannel, channel, XevSocketChannel.readCB);
 
-        return .disarm;
+        return .rearm;
     }
 };
 

@@ -540,7 +540,9 @@ pub fn main() !void {
     const bind_addr = try std.net.Address.parseIp("0.0.0.0", listen_port);
     const listener = try listen_transport.listen(bind_addr);
 
-    // Pre-arm 16 accepts so inbound connections can queue up.
+    // Arm a single accept. acceptCB returns .rearm on every path so libxev
+    // keeps re-running accept on the same completion for the lifetime of the
+    // listener — every inbound connection gets a fresh channel.
     const AcceptCtx = struct {
         fn callback(_: ?*anyopaque, res: anyerror!p2p_conn.AnyConn) void {
             _ = res catch |err| {
@@ -549,10 +551,7 @@ pub fn main() !void {
             // TlsTcpEnhancer handles the rest asynchronously.
         }
     };
-    var j: usize = 0;
-    while (j < 16) : (j += 1) {
-        listener.accept(null, AcceptCtx.callback);
-    }
+    listener.accept(null, AcceptCtx.callback);
 
     std.log.info("Phase 2.3 started — node_id={d} peer_id={s} listening on port {d}", .{ node_id, peer_id_str, listen_port });
 
