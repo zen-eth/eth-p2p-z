@@ -178,6 +178,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("interop/gossipsub/main.zig"),
         .target = target,
         .optimize = optimize,
+        // Keep debug symbols even under ReleaseFast so the segfault handler's
+        // stack trace under Shadow names actual functions instead of just
+        // addresses. The size cost is negligible for an interop binary.
+        .strip = false,
     });
     gossipsub_interop_module.addImport("zig-libp2p", root_module);
     gossipsub_interop_module.addImport("peer_id", peer_id_module);

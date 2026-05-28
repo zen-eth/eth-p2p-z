@@ -292,7 +292,13 @@ const ListenerUpgradeCtx = struct {
 // ============================================================
 
 /// Resolve "node<N>" hostname to the first IPv4 address.
+/// LOCAL DEBUG: if env var LIBP2P_LOCAL_DEBUG=1, return 127.0.0.1 with port (TCP_PORT + node_id).
 fn resolveNodeIp(allocator: std.mem.Allocator, node_id: u64) !std.net.Address {
+    if (std.posix.getenv("LIBP2P_LOCAL_DEBUG")) |_| {
+        const port: u16 = TCP_PORT + @as(u16, @intCast(node_id));
+        return std.net.Address.parseIp4("127.0.0.1", port);
+    }
+
     const hostname = try std.fmt.allocPrint(allocator, "node{d}", .{node_id});
     defer allocator.free(hostname);
 
@@ -349,6 +355,12 @@ fn gossipSubOptions(params: instr_mod.GossipSubParams) Gossipsub.Options {
 // ============================================================
 
 pub fn main() !void {
+    // Install Zig's built-in segfault handler so a SIGSEGV (or other fatal
+    // signal) under Shadow prints a stack trace to stderr before the process
+    // dies. Shadow captures per-host stderr into shadow.data.hosts/<node>/...,
+    // which the CI workflow uploads as the `shadow-output` artifact.
+    std.debug.attachSegfaultHandler();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -360,10 +372,14 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var params_path: ?[]const u8 = null;
+    var node_id_override: ?u64 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--params") and i + 1 < args.len) {
             params_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--node-id") and i + 1 < args.len) {
+            node_id_override = std.fmt.parseInt(u64, args[i + 1], 10) catch null;
             i += 1;
         }
     }
@@ -373,18 +389,27 @@ pub fn main() !void {
     }
 
     // ------------------------------------------------------------------ //
-    // 2. Hostname → node ID
+    // 2. Hostname → node ID  (or --node-id CLI override for local debug)
     // ------------------------------------------------------------------ //
     var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const hostname = try std.posix.gethostname(hostname_buf[0..]);
 
     var node_id: u64 = 0;
-    if (std.mem.startsWith(u8, hostname, "node")) {
+    if (node_id_override) |n| {
+        node_id = n;
+    } else if (std.mem.startsWith(u8, hostname, "node")) {
         node_id = std.fmt.parseInt(u64, hostname[4..], 10) catch blk: {
             std.log.warn("could not parse node ID from '{s}', defaulting to 0", .{hostname});
             break :blk 0;
         };
     }
+
+    // LOCAL DEBUG: if LIBP2P_LOCAL_DEBUG is set, listen on TCP_PORT + node_id
+    // so multiple instances can run on the same machine.
+    const listen_port: u16 = if (std.posix.getenv("LIBP2P_LOCAL_DEBUG") != null)
+        TCP_PORT + @as(u16, @intCast(node_id))
+    else
+        TCP_PORT;
 
     // ------------------------------------------------------------------ //
     // 3. Deterministic ED25519 key pair
@@ -477,7 +502,7 @@ pub fn main() !void {
     // 11. Init Gossipsub
     // ------------------------------------------------------------------ //
     var listen_ma_str_buf: [64]u8 = undefined;
-    const listen_ma_str = try std.fmt.bufPrint(&listen_ma_str_buf, "/ip4/0.0.0.0/tcp/{d}", .{TCP_PORT});
+    const listen_ma_str = try std.fmt.bufPrint(&listen_ma_str_buf, "/ip4/0.0.0.0/tcp/{d}", .{listen_port});
     var listen_ma = try Multiaddr.fromString(allocator, listen_ma_str);
     defer listen_ma.deinit();
 
@@ -512,7 +537,7 @@ pub fn main() !void {
     var listen_transport: tcp_mod.XevTransport = undefined;
     try listen_transport.init(listener_enhancer.any(), &loop, allocator, .{ .backlog = 128 });
 
-    const bind_addr = try std.net.Address.parseIp("0.0.0.0", TCP_PORT);
+    const bind_addr = try std.net.Address.parseIp("0.0.0.0", listen_port);
     const listener = try listen_transport.listen(bind_addr);
 
     // Pre-arm 16 accepts so inbound connections can queue up.
@@ -529,7 +554,7 @@ pub fn main() !void {
         listener.accept(null, AcceptCtx.callback);
     }
 
-    std.log.info("Phase 2.3 started — node_id={d} peer_id={s} listening on port {d}", .{ node_id, peer_id_str, TCP_PORT });
+    std.log.info("Phase 2.3 started — node_id={d} peer_id={s} listening on port {d}", .{ node_id, peer_id_str, listen_port });
 
     // ------------------------------------------------------------------ //
     // 14. Init DIALER enhancer + XevTransport (reuses same TLS channel)
@@ -711,14 +736,20 @@ fn connectToPeer(
     const target_peer_id = try nodePublicKey(allocator, target_node_id);
 
     // Build the target's multiaddr using the Multiaddr API.
-    // Extract IPv4 octets from the network-byte-order u32.
-    var ip_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &ip_bytes, peer_addr.in.sa.addr, .big);
+    // Extract IPv4 octets from the network-byte-order u32 via bitCast
+    // (portable across endianness since s_addr is always network order).
+    const ip_bytes: [4]u8 = @bitCast(peer_addr.in.sa.addr);
+
+    // LOCAL DEBUG: when LIBP2P_LOCAL_DEBUG is set, peer listens on TCP_PORT + target_node_id.
+    const peer_port: u16 = if (std.posix.getenv("LIBP2P_LOCAL_DEBUG") != null)
+        TCP_PORT + @as(u16, @intCast(target_node_id))
+    else
+        TCP_PORT;
 
     var peer_ma = Multiaddr.init(allocator);
     defer peer_ma.deinit();
     try peer_ma.push(.{ .Ip4 = std.net.Ip4Address.init(ip_bytes, 0) });
-    try peer_ma.push(.{ .Tcp = TCP_PORT });
+    try peer_ma.push(.{ .Tcp = peer_port });
     try peer_ma.push(.{ .P2P = target_peer_id });
 
     const peer_ma_str = try peer_ma.toString(allocator);
@@ -745,17 +776,21 @@ fn connectToPeer(
     };
     var tcp_ctx = TcpDialCtx{};
     dial_transport.dial(peer_addr, &tcp_ctx, TcpDialCtx.callback);
+    std.log.info("[dbg] waiting on tcp dial to node{d}", .{target_node_id});
     tcp_ctx.event.wait();
     if (tcp_ctx.err) |err| return err;
+    std.log.info("[dbg] tcp dial done; waiting on tls+yamux to node{d}", .{target_node_id});
 
     // Wait for TLS + Yamux.
     dial_slot.event.wait();
     if (dial_slot.err) |err| return err;
+    std.log.info("[dbg] tls+yamux done for node{d}", .{target_node_id});
 
     const yamux = dial_slot.yamux.?;
 
     // Register the Yamux session so switch.newStream can find it by multiaddr.
     sw.registerTcpYamux(peer_ma_str, yamux, gs, Gossipsub.onIncomingNewStream);
+    std.log.info("[dbg] registerTcpYamux done; calling gs.addPeer(node{d})", .{target_node_id});
 
     // Ask Gossipsub to add this peer (opens a gossipsub stream over yamux).
     const AddPeerCtx = struct {
@@ -770,6 +805,7 @@ fn connectToPeer(
     };
     var ap_ctx = AddPeerCtx{};
     gs.addPeer(peer_ma, &ap_ctx, AddPeerCtx.cb);
+    std.log.info("[dbg] waiting on gs.addPeer callback for node{d}", .{target_node_id});
     ap_ctx.event.wait();
     if (ap_ctx.err) |err| {
         std.log.warn("addPeer for node{d} failed: {}", .{ target_node_id, err });

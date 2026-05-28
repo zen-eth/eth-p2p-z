@@ -33,25 +33,43 @@ pub const XevSocketChannel = struct {
     /// The timeout for read operations in milliseconds.
     read_timeout_ms: u64 = 30000,
 
+    /// Persistent libxev write queue for ordered, non-clobbering writes.
+    /// Plain xev.TCP.write() does NOT preserve order across consecutive
+    /// calls on the same socket — back-to-back writes can drop one. We use
+    /// queueWrite, which serializes writes via this queue.
+    write_queue: xev.WriteQueue = .{},
+
     /// Initialize the channel with the given socket and transport.
     pub fn init(self: *XevSocketChannel, socket: TCP, transport: *XevTransport, direction: p2p_conn.Direction) void {
         self.socket = socket;
         self.transport = transport;
         self.direction = direction;
+        self.write_queue = .{};
     }
 
     /// Write the given buffer to the socket channel asynchronously.
     pub fn write(self: *XevSocketChannel, buffer: []const u8, callback_instance: ?*anyopaque, callback: *const fn (instance: ?*anyopaque, res: anyerror!usize) void) void {
+        std.log.info("[dbg-tcp] XevSocketChannel.write entry: {d} bytes (in_loop={})", .{ buffer.len, self.transport.io_event_loop.inEventLoopThread() });
         if (self.transport.io_event_loop.inEventLoopThread()) {
-            const c = self.transport.io_event_loop.completion_pool.create() catch unreachable;
+            const req = self.transport.io_event_loop.allocator.create(xev.WriteRequest) catch unreachable;
+            req.* = undefined;
             const w_ctx = self.transport.io_event_loop.write_ctx_pool.create() catch unreachable;
 
             w_ctx.* = .{
                 .channel = self,
                 .callback_instance = callback_instance,
                 .callback = callback,
+                .write_request = req,
             };
-            self.socket.write(&self.transport.io_event_loop.loop, c, .{ .slice = buffer }, io_loop.WriteCtx, w_ctx, writeCallback);
+            self.socket.queueWrite(
+                &self.transport.io_event_loop.loop,
+                &self.write_queue,
+                req,
+                .{ .slice = buffer },
+                io_loop.WriteCtx,
+                w_ctx,
+                writeCallback,
+            );
         } else {
             io_loop.ThreadEventLoop.TcpTasks.queueTcpWrite(self.transport.io_event_loop, self, buffer, self.write_timeout_ms, callback_instance, callback) catch |err| {
                 callback(callback_instance, err);
@@ -152,21 +170,95 @@ pub const XevSocketChannel = struct {
         return .{ .instance = self, .vtable = &vtable_instance };
     }
 
+    /// Deferred-user-callback task. See writeCallback's long comment for
+    /// why we don't invoke the user CB synchronously from inside libxev's
+    /// queueWrite closure.
+    const DeferredWriteCb = struct {
+        callback: *const fn (instance: ?*anyopaque, res: anyerror!usize) void,
+        callback_instance: ?*anyopaque,
+        result: xev.WriteError!usize,
+    };
+
+    fn runDeferredWriteCb(loop: *io_loop.ThreadEventLoop, ctx: *DeferredWriteCb) void {
+        _ = loop;
+        ctx.callback(ctx.callback_instance, ctx.result);
+    }
+
     pub fn writeCallback(
         instance: ?*io_loop.WriteCtx,
         _: *xev.Loop,
-        c: *xev.Completion,
+        _: *xev.Completion,
         _: xev.TCP,
-        _: xev.WriteBuffer,
+        wb: xev.WriteBuffer,
         r: xev.WriteError!usize,
     ) xev.CallbackAction {
         const w_ctx = instance.?;
         const transport = w_ctx.channel.transport;
-        defer transport.io_event_loop.completion_pool.destroy(c);
-        defer transport.io_event_loop.write_ctx_pool.destroy(w_ctx);
+        const loop = transport.io_event_loop;
 
-        // In general, user defined callbacks should close the channel on error.
-        w_ctx.callback(w_ctx.callback_instance, r);
+        if (r) |sent| {
+            std.log.info("[dbg-tcp] writeCallback: sent {d} of {d} bytes", .{ sent, wb.slice.len });
+        } else |err| {
+            std.log.warn("[dbg-tcp] writeCallback: error {} (buffer was {d} bytes)", .{ err, wb.slice.len });
+        }
+
+        // Free the WriteRequest now: libxev's queueWrite closure has already
+        // popped it from the channel.write_queue and we don't need it anymore.
+        if (w_ctx.write_request) |req| {
+            loop.allocator.destroy(req);
+        }
+
+        // The user CB cannot be invoked here, because we are running INSIDE
+        // libxev's queueWrite closure (see watcher/stream.zig:queueWrite).
+        // That closure, after our return, executes:
+        //
+        //     if (q_inner.head) |req_next| l_inner.add(&req_next.completion);
+        //
+        // If our user CB synchronously enqueues a new write on the same
+        // channel via queueWrite, it does:
+        //
+        //     if (q.empty()) loop.add(&req.completion);
+        //     q.push(req);
+        //
+        // q.empty() is true at that moment (the closure just popped this
+        // write), so loop.add fires. Then on our return, the closure also
+        // sees q.head non-null and calls loop.add on the SAME completion
+        // again — pushing it into self.submissions a second time. Next
+        // tick's submit() pops the first copy, transitions state to
+        // .active and registers the kevent, then pops the second copy and
+        // finds state=.active, triggering kqueue.zig's
+        // "invalid state in submission queue" log.err.
+        //
+        // Defer the user CB to the next loop iteration via the IOMessage
+        // queue. By the time it runs, libxev's closure has finished
+        // advancing channel.write_queue (it sees q.head=null and does
+        // nothing), and any queueWrite the user CB now performs sees a
+        // clean queue.
+        const deferred = loop.allocator.create(DeferredWriteCb) catch {
+            // Allocation failure: best-effort synchronous invocation.
+            // This violates the invariant above, but only happens on OOM.
+            w_ctx.callback(w_ctx.callback_instance, r);
+            loop.write_ctx_pool.destroy(w_ctx);
+            return .disarm;
+        };
+        deferred.* = .{
+            .callback = w_ctx.callback,
+            .callback_instance = w_ctx.callback_instance,
+            .result = r,
+        };
+        loop.write_ctx_pool.destroy(w_ctx);
+
+        loop.queueCallWithDeinit(
+            DeferredWriteCb,
+            deferred,
+            runDeferredWriteCb,
+            io_loop.ThreadEventLoop.makeDestroyTask(DeferredWriteCb),
+        ) catch {
+            // Could not enqueue: fall back to synchronous invocation and
+            // accept the libxev double-add risk on the next write.
+            deferred.callback(deferred.callback_instance, deferred.result);
+            loop.allocator.destroy(deferred);
+        };
 
         return .disarm;
     }
@@ -209,6 +301,7 @@ pub const XevSocketChannel = struct {
         };
 
         if (read_bytes > 0) {
+            std.log.info("[dbg-tcp] readCB: got {d} bytes from socket", .{read_bytes});
             channel.handlerPipeline().fireRead(rb.slice[0..read_bytes]) catch {
                 transport.io_event_loop.read_buffer_pool.destroy(
                     @alignCast(

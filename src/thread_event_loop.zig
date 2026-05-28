@@ -77,6 +77,8 @@ pub const WriteCtx = struct {
     callback_instance: ?*anyopaque = null,
     /// The callback function to be called when the write operation is complete.
     callback: *const fn (instance: ?*anyopaque, res: anyerror!usize) void,
+    /// The xev WriteRequest for this write — must be freed in the callback.
+    write_request: ?*xev.WriteRequest = null,
 };
 
 /// Represents the context for closing a socket channel in the event loop.

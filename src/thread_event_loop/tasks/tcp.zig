@@ -103,14 +103,31 @@ pub fn extend(
         };
 
         fn runTcpWrite(loop: *Loop, ctx: *TcpWriteTask) void {
-            const c = loop.completion_pool.create() catch unreachable;
+            // Use queueWrite + the channel's per-socket WriteQueue, identical
+            // to the in-loop XevSocketChannel.write path. Mixing plain
+            // socket.write with the in-loop queueWrite caused two independent
+            // EVFILT_WRITE registrations on the same fd, which under kqueue's
+            // EV_ADD-replaces-udata semantics orphaned one completion in
+            // libxev's active set and produced
+            // "[libxev_kqueue] (err): invalid state in submission queue".
+            const channel = ctx.channel;
+            const req = loop.allocator.create(xev.WriteRequest) catch unreachable;
             const write_ctx = loop.write_ctx_pool.create() catch unreachable;
             write_ctx.* = .{
-                .channel = ctx.channel,
+                .channel = channel,
                 .callback_instance = ctx.callback_instance,
                 .callback = ctx.callback,
+                .write_request = req,
             };
-            ctx.channel.socket.write(&loop.loop, c, .{ .slice = ctx.buffer }, WriteCtx, write_ctx, xev_tcp.XevSocketChannel.writeCallback);
+            channel.socket.queueWrite(
+                &loop.loop,
+                &channel.write_queue,
+                req,
+                .{ .slice = ctx.buffer },
+                WriteCtx,
+                write_ctx,
+                xev_tcp.XevSocketChannel.writeCallback,
+            );
         }
 
         pub fn queueTcpWrite(
