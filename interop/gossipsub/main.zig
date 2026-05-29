@@ -73,30 +73,17 @@ const MessageListener = struct {
         const self: *MessageListener = @ptrCast(@alignCast(instance));
         switch (ev) {
             .message => |m| {
-                std.log.info("[dbg-listener] enter node_id={d} data_len={d}", .{ self.node_id, m.message.data.len });
-                if (m.message.data.len < 8) {
-                    std.log.warn("[dbg-listener] data too short ({d} bytes) - dropping", .{m.message.data.len});
-                    return;
-                }
+                if (m.message.data.len < 8) return;
                 const msg_id = std.mem.readInt(u64, m.message.data[0..8], .big);
-                std.log.info("[dbg-listener] decoded msg_id={d}", .{msg_id});
                 var time_buf: [32]u8 = undefined;
                 const time_str = fmtIso8601(&time_buf, std.time.nanoTimestamp());
-                const stdout_file: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
-                var out_buf: [256]u8 = undefined;
-                var w = stdout_file.writer(&out_buf);
-                w.interface.print(
+                var line_buf: [256]u8 = undefined;
+                const line = std.fmt.bufPrint(
+                    &line_buf,
                     "{{\"time\":\"{s}\",\"level\":\"INFO\",\"msg\":\"Received Message\",\"id\":\"{d}\",\"node_id\":{d}}}\n",
                     .{ time_str, msg_id, self.node_id },
-                ) catch |err| {
-                    std.log.warn("[dbg-listener] print FAILED: {} msg_id={d}", .{ err, msg_id });
-                    return;
-                };
-                w.interface.flush() catch |err| {
-                    std.log.warn("[dbg-listener] flush FAILED: {} msg_id={d}", .{ err, msg_id });
-                    return;
-                };
-                std.log.info("[dbg-listener] wrote msg_id={d}", .{msg_id});
+                ) catch return;
+                _ = std.posix.write(std.posix.STDOUT_FILENO, line) catch return;
             },
             else => {},
         }
