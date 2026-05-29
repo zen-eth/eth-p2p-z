@@ -79,17 +79,23 @@ Until this is green, do not start Layer 0.
   QUIC endpoints over loopback (exact(2) + exact(4)), server accept on a fiber,
   full handshake + bidirectional stream echo. Net for L2-L6.
 
-**macOS kqueue limitation (found via E1, important):** Tier B's QUIC *data path*
-(handshake + echo + per-connection teardown) works on kqueue, but
-`endpoint.deinit → router.closeListener → router_future.cancel` **livelocks** on
-the macOS kqueue multi-executor backend — zio does not interrupt a fiber blocked
-in a socket `receive` when its Future is cancelled (staged-logging diagnosis: both
-tests reach the final connection-deinit, then spin in fixture.deinit). The same
-teardown runs cleanly on **Linux epoll/io_uring** (the QUIC interop suite already
-exercises it). So Tier B **skips on macOS** (`requireLinux()`) and runs on
-Linux/Docker/CI. Verification split: **L0/L1 locally (Tier A on kqueue); L2-L6 on
-Linux (Tier B via `-Dzio-backend=epoll`).** This is a second zio kqueue-backend
-upstream finding alongside E7.
+**macOS kqueue limitation (found via E1).** SYMPTOM (verified): Tier B livelocks
+on the macOS kqueue multi-executor backend — 200% CPU spin. LOCALIZATION (verified
+via staged logging): the QUIC data path (handshake + stream echo + per-connection
+teardown) all completes; both tests reach the final connection-deinit, then spin
+in `fixture.deinit → endpoint.deinit → router.closeListener → router_future.cancel`.
+ROOT CAUSE: **UNCONFIRMED.** An earlier draft asserted "kqueue doesn't wake a
+socket-recv-blocked fiber on cancel" — that is REFUTED by the zio source: `loop.zig`
+cancel (lines 339-378) pushes a cross-thread cancel onto the owning loop's lock-free
+`cancel_queue` and wakes it (`target.backend.wake`). So the missing-wake theory is
+wrong; the true cause (it is a spin, not a block — something hot-loops) is not yet
+diagnosed. The same teardown runs cleanly on **Linux epoll/io_uring** (the QUIC
+interop suite already exercises it), so the workaround does not depend on the cause:
+Tier B **skips on macOS** (`requireLinux()`) and runs on Linux/Docker/CI.
+Verification split: **L0/L1 locally (Tier A on kqueue); L2-L6 on Linux (Tier B via
+`-Dzio-backend=epoll`).** Properly root-causing the kqueue spin is a separate
+investigation (deferred); it does not block the refactor since L0/L1 are netted
+locally and L2-L6 on Linux.
 
 NOTE: the native macOS build works (`zig build`, kqueue), so L0/L1 refactor +
 Tier-A verification is a fully local, fast loop.
