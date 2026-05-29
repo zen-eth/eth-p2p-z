@@ -630,6 +630,21 @@ pub fn main() !void {
 
     std.log.info("Phase 2.3 started — node_id={d} peer_id={s} listening on port {d}", .{ node_id, peer_id_str, listen_port });
 
+    // Emit a PeerID stdout line — the test-plans `analyze_message_deliveries.py`
+    // populates `node_id_to_peer_id` from these and uses its size as `total_nodes`.
+    // Without it `total_nodes = 0` and the analyzer hits ZeroDivisionError.
+    {
+        var peerid_buf: [256]u8 = undefined;
+        const peerid_line = std.fmt.bufPrint(
+            &peerid_buf,
+            "{{\"msg\":\"PeerID\",\"id\":\"{s}\",\"node_id\":{d}}}\n",
+            .{ peer_id_str, node_id },
+        ) catch &.{};
+        if (peerid_line.len > 0) {
+            _ = std.posix.write(std.posix.STDOUT_FILENO, peerid_line) catch {};
+        }
+    }
+
     // ------------------------------------------------------------------ //
     // 14. Init DIALER enhancer + XevTransport (reuses same TLS channel)
     // ------------------------------------------------------------------ //
@@ -850,21 +865,17 @@ fn connectToPeer(
     };
     var tcp_ctx = TcpDialCtx{};
     dial_transport.dial(peer_addr, &tcp_ctx, TcpDialCtx.callback);
-    std.log.info("[dbg] waiting on tcp dial to node{d}", .{target_node_id});
     tcp_ctx.event.wait();
     if (tcp_ctx.err) |err| return err;
-    std.log.info("[dbg] tcp dial done; waiting on tls+yamux to node{d}", .{target_node_id});
 
     // Wait for TLS + Yamux.
     dial_slot.event.wait();
     if (dial_slot.err) |err| return err;
-    std.log.info("[dbg] tls+yamux done for node{d}", .{target_node_id});
 
     const yamux = dial_slot.yamux.?;
 
     // Register the Yamux session so switch.newStream can find it by multiaddr.
     sw.registerTcpYamux(peer_ma_str, yamux, gs, Gossipsub.onIncomingNewStream);
-    std.log.info("[dbg] registerTcpYamux done; calling gs.addPeer(node{d})", .{target_node_id});
 
     // Ask Gossipsub to add this peer (opens a gossipsub stream over yamux).
     const AddPeerCtx = struct {
@@ -879,7 +890,6 @@ fn connectToPeer(
     };
     var ap_ctx = AddPeerCtx{};
     gs.addPeer(peer_ma, &ap_ctx, AddPeerCtx.cb);
-    std.log.info("[dbg] waiting on gs.addPeer callback for node{d}", .{target_node_id});
     ap_ctx.event.wait();
     if (ap_ctx.err) |err| {
         std.log.warn("addPeer for node{d} failed: {}", .{ target_node_id, err });

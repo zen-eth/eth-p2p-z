@@ -49,7 +49,6 @@ pub const XevSocketChannel = struct {
 
     /// Write the given buffer to the socket channel asynchronously.
     pub fn write(self: *XevSocketChannel, buffer: []const u8, callback_instance: ?*anyopaque, callback: *const fn (instance: ?*anyopaque, res: anyerror!usize) void) void {
-        std.log.info("[dbg-tcp] XevSocketChannel.write entry: {d} bytes (in_loop={})", .{ buffer.len, self.transport.io_event_loop.inEventLoopThread() });
         if (self.transport.io_event_loop.inEventLoopThread()) {
             const req = self.transport.io_event_loop.allocator.create(xev.WriteRequest) catch unreachable;
             req.* = undefined;
@@ -189,18 +188,12 @@ pub const XevSocketChannel = struct {
         _: *xev.Loop,
         _: *xev.Completion,
         _: xev.TCP,
-        wb: xev.WriteBuffer,
+        _: xev.WriteBuffer,
         r: xev.WriteError!usize,
     ) xev.CallbackAction {
         const w_ctx = instance.?;
         const transport = w_ctx.channel.transport;
         const loop = transport.io_event_loop;
-
-        if (r) |sent| {
-            std.log.info("[dbg-tcp] writeCallback: sent {d} of {d} bytes", .{ sent, wb.slice.len });
-        } else |err| {
-            std.log.warn("[dbg-tcp] writeCallback: error {} (buffer was {d} bytes)", .{ err, wb.slice.len });
-        }
 
         // Free the WriteRequest now: libxev's queueWrite closure has already
         // popped it from the channel.write_queue and we don't need it anymore.
@@ -301,7 +294,6 @@ pub const XevSocketChannel = struct {
         };
 
         if (read_bytes > 0) {
-            std.log.info("[dbg-tcp] readCB: got {d} bytes from socket", .{read_bytes});
             channel.handlerPipeline().fireRead(rb.slice[0..read_bytes]) catch {
                 transport.io_event_loop.read_buffer_pool.destroy(
                     @alignCast(

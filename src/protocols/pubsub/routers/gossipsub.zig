@@ -1853,7 +1853,6 @@ pub const Gossipsub = struct {
 
         switch (validation_result) {
             .valid => |valid_msg| {
-                std.log.info("[dbg-gs] handleMessage VALID topic={s} msg_id_len={d} subscribed={} from_self={}", .{ valid_msg.message.topic, valid_msg.message_id.len, self.subscriptions.contains(valid_msg.message.topic), from.*.eql(&self.peer_id) });
                 // TODO: Change the mcache to store `rpc.MessageReader` to avoid copying data again.
                 // Store the original publish_msg from network, not the transformed one.
                 const rpc_msg = rpc.Message{
@@ -1864,32 +1863,26 @@ pub const Gossipsub = struct {
                     .signature = publish_msg._signature,
                     .key = publish_msg._key,
                 };
-                self.mcache.putWithId(valid_msg.message_id, &rpc_msg) catch |err| {
-                    std.log.warn("[dbg-gs] mcache.putWithId FAILED: {} (msg_id_len={d})", .{ err, valid_msg.message_id.len });
-                    return err;
-                };
-                std.log.info("[dbg-gs] mcache.putWithId OK -> about to emit", .{});
+                try self.mcache.putWithId(valid_msg.message_id, &rpc_msg);
 
                 if (self.subscriptions.contains(valid_msg.message.topic)) {
                     const is_from_self = from.*.eql(&self.peer_id);
                     if (!is_from_self or self.opts.emit_self) {
-                        std.log.info("[dbg-gs] emit fire path: listener_count={d}", .{self.event_emitter.getListenerCount(.message)});
                         self.event_emitter.emit(.{ .message = .{
                             .propagation_source = from.*,
                             .message_id = valid_msg.message_id,
                             .message = &valid_msg.message,
                         } });
-                        std.log.info("[dbg-gs] emit returned", .{});
                     }
                 }
 
                 try self.forwardMessage(arena, valid_msg.message_id, &rpc_msg, from.*, null);
             },
             .invalid => |invalid_msg| {
-                std.log.warn("[dbg-gs] handleMessage INVALID from peer {}: {}", .{ from.*, invalid_msg.err });
+                std.log.warn("Invalid message from peer {}: {}", .{ from.*, invalid_msg.err });
             },
             .duplicate => |dup_msg| {
-                std.log.info("[dbg-gs] handleMessage DUPLICATE from peer {} msg_id_len={d}", .{ from.*, dup_msg.message_id.len });
+                std.log.debug("Duplicate message received from peer {}: ID {any}", .{ from.*, dup_msg.message_id });
             },
         }
     }

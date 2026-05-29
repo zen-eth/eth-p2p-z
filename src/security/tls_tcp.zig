@@ -95,14 +95,6 @@ pub const TlsTcpHandler = struct {
             var tmp: [16384]u8 = undefined;
             const n = ssl.BIO_read(self.write_bio, &tmp, @intCast(tmp.len));
             if (n <= 0) break;
-            var hex_buf: [64]u8 = undefined;
-            const peek = @min(@as(usize, @intCast(n)), 16);
-            var idx: usize = 0;
-            for (tmp[0..peek]) |b| {
-                _ = std.fmt.bufPrint(hex_buf[idx..], "{x:0>2}", .{b}) catch break;
-                idx += 2;
-            }
-            std.log.info("[dbg-tls] drainWriteBio drained {d} bytes first={s}", .{ n, hex_buf[0..idx] });
             const buf = self.allocator.dupe(u8, tmp[0..@intCast(n)]) catch break;
             const wc = self.allocator.create(DrainWriteCtx) catch {
                 self.allocator.free(buf);
@@ -142,7 +134,6 @@ pub const TlsTcpHandler = struct {
     /// Called exactly once when SSL_do_handshake returns 1.
     /// Extracts the remote peer identity from the certificate and calls back.
     fn completeHandshake(self: *Self, ctx: *p2p_conn.ConnHandlerContext) !void {
-        std.log.info("[dbg-tls] completeHandshake start (was_done={})", .{self.handshake_done});
         self.handshake_done = true;
 
         // Flush any final handshake bytes (e.g. Finished message)
@@ -236,14 +227,6 @@ pub const TlsTcpHandler = struct {
     }
 
     pub fn onRead(self: *Self, ctx: *p2p_conn.ConnHandlerContext, data: []const u8) !void {
-        var hex_buf: [64]u8 = undefined;
-        const peek = @min(data.len, 16);
-        var idx: usize = 0;
-        for (data[0..peek]) |b| {
-            _ = std.fmt.bufPrint(hex_buf[idx..], "{x:0>2}", .{b}) catch break;
-            idx += 2;
-        }
-        std.log.info("[dbg-tls] onRead {d} bytes (handshake_done={}) first={s}", .{ data.len, self.handshake_done, hex_buf[0..idx] });
         // Feed incoming bytes into the read BIO
         const written = ssl.BIO_write(self.read_bio, data.ptr, @intCast(data.len));
         if (written <= 0) return error.TlsBioWriteFailed;
@@ -295,7 +278,6 @@ pub const TlsTcpHandler = struct {
         ud: ?*anyopaque,
         cb: *const fn (?*anyopaque, anyerror!usize) void,
     ) void {
-        std.log.info("[dbg-tls] write {d} bytes (handshake_done={})", .{ plaintext.len, self.handshake_done });
         if (!self.handshake_done) {
             // Pass through during handshake (shouldn't happen in normal usage)
             ctx.write(plaintext, ud, cb);
@@ -338,14 +320,6 @@ pub const TlsTcpHandler = struct {
             .user_cb = cb,
         };
         const send_len: usize = @intCast(n);
-        const peek2 = @min(send_len, 16);
-        var hex_buf2: [64]u8 = undefined;
-        var idx2: usize = 0;
-        for (encrypted[0..peek2]) |b| {
-            _ = std.fmt.bufPrint(hex_buf2[idx2..], "{x:0>2}", .{b}) catch break;
-            idx2 += 2;
-        }
-        std.log.info("[dbg-tls] sending encrypted {d} bytes first={s}", .{ send_len, hex_buf2[0..idx2] });
         ctx.write(encrypted[0..send_len], wc, TlsWriteCtx.callback);
     }
 
