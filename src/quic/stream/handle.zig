@@ -143,6 +143,10 @@ pub const Stream = opaque {
     /// Graceful bidirectional close. Schedules FIN on the write side and
     /// STOP_SENDING(0) on the read side. After this returns, subsequent
     /// reads/writes return `error.StreamShutdown`.
+    ///
+    /// Fire-and-forget: returns as soon as the close command is posted; it does
+    /// NOT wait for the FIN to reach the wire. Use `closeWrite` when FIN ordering
+    /// must be observed (it waits for the reply after the FIN is handed to quiche).
     pub fn close(self: *Stream, io: std.Io) CloseError!void {
         const state = self.impl().liveRetained() orelse return;
         defer state.release();
@@ -229,7 +233,7 @@ fn readShared(state: *SharedState, io: std.Io, buf: []u8, opts: ReadOptionsImpl)
         if (state.isInboundResetByPeer()) return error.ResetByPeer;
         return error.StreamShutdown;
     }
-    var queue = if (state.inbound_queue) |*q| q else return error.ConnectionClosed;
+    const queue = if (state.inbound_queue) |*q| q else return error.ConnectionClosed;
 
     const deadline = opts.timeout.toDeadline(io);
     while (true) {
@@ -260,7 +264,7 @@ fn writeShared(state: *SharedState, io: std.Io, buf: []const u8, opts: WriteOpti
     if (state.isOutboundResetByPeer()) return error.ResetByPeer;
     if (state.isClosed()) return error.ConnectionClosed;
     if (state.isWriteShutdown()) return error.StreamShutdown;
-    var queue = if (state.outbound_queue) |*q| q else return error.ConnectionClosed;
+    const queue = if (state.outbound_queue) |*q| q else return error.ConnectionClosed;
 
     const deadline = opts.timeout.toDeadline(io);
     while (true) {

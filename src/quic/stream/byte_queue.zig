@@ -41,6 +41,11 @@ pub const ByteQueue = struct {
     }
 
     pub fn tryPutSome(q: *ByteQueue, io: std.Io, bytes: []const u8) usize {
+        // SINGLE-PRODUCER per queue: available() (lock #1) then reserve() (lock #2,
+        // re-checks capacity) is only safe because one producer writes this queue —
+        // the consumer can only GROW available between the two locks, so reserve can
+        // only succeed more often, never over-commit. Do NOT share a ByteQueue across
+        // writers without rethinking this.
         const len = @min(bytes.len, q.available(io));
         if (len == 0) return 0;
         if (!q.reserve(io, len)) return 0;

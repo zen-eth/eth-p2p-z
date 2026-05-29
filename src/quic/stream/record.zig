@@ -72,7 +72,7 @@ pub const Record = struct {
     pub fn refillPendingOutbound(self: *Record, io: std.Io) bool {
         if (self.pending_send_len != self.pending_send_off) return true;
         if (self.pending_send.len == 0) return false;
-        var queue = if (self.shared.outbound_queue) |*q| q else return false;
+        const queue = if (self.shared.outbound_queue) |*q| q else return false;
         const read_len = queue.tryGet(io, self.pending_send) catch return false;
         self.pending_send_off = 0;
         self.pending_send_len = read_len;
@@ -81,7 +81,7 @@ pub const Record = struct {
 
     pub fn outboundIdle(self: *Record, io: std.Io) bool {
         if (self.pending_send_len != self.pending_send_off) return false;
-        var queue = if (self.shared.outbound_queue) |*q| q else return true;
+        const queue = if (self.shared.outbound_queue) |*q| q else return true;
         return queue.used(io) == 0;
     }
 

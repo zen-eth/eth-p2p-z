@@ -9,9 +9,10 @@
 //!     post commands and signal the actor's wake mechanism without ever
 //!     holding a raw pointer into actor-private memory.
 //!
-//! Refcount initialises to 2: one ref held by the `Stream` handle, one by
-//! the actor's `Record`. Whichever side drops its ref last frees the
-//! allocation. `closeOnHandleDrop` is implemented via a `drop_stream`
+//! Refcount initialises to 1 (the `Stream` handle's ref, returned by `create`).
+//! The actor's `Record` takes a second ref in `StreamRecord.init` and drops it
+//! in its `deinit`; whichever side drops its ref last frees the allocation.
+//! `closeOnHandleDrop` is implemented via a `drop_stream`
 //! command on the connection's inbox — the handle never reaches into the
 //! actor's data structures.
 
@@ -195,14 +196,6 @@ pub const SharedState = struct {
     /// inbound queue so a blocked reader observes EndOfStream.
     pub fn closeInbound(self: *SharedState) void {
         if (self.inbound_queue) |*q| q.close(self.io);
-    }
-
-    /// Actor-side: write capacity check before pulling from the outbound
-    /// queue. Returns true iff a write to the wire would have flow on
-    /// either side (queue has bytes, or FIN is pending).
-    pub fn outboundIdle(self: *SharedState) bool {
-        if (self.outbound_queue) |*q| return q.used(self.io) == 0;
-        return true;
     }
 
     /// Handle-side: tell the actor this stream has new outbound bytes.
