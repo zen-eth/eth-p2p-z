@@ -72,10 +72,13 @@ pub const SharedUdpSocket = struct {
 
 pub const NetworkTransport = struct {
     io: std.Io,
+    /// Retained/released via retainResources()/deinit() (refcounted).
     socket: *SharedUdpSocket,
     local: std.Io.net.IpAddress,
     peer: std.Io.net.IpAddress,
+    /// Retained/released via retainResources()/deinit() (refcounted).
     core: *endpoint_core.EndpointCore,
+    /// BORROWED pointer into `core` (lifetime tied to core); NOT released here.
     route_updates: *route_commands_mod.Queue.State,
     outbound_batch_size: usize = 32,
 

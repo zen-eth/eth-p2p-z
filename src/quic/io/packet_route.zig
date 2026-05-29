@@ -88,8 +88,6 @@ fn routedPacketCost(packet: *const RoutedPacket) usize {
 
 const PacketChannel = channel.Bounded(RoutedPacket, dropRoutedPacket, routedPacketCost);
 
-pub const IncomingPacket = RoutedPacket;
-
 pub const IncomingPacketChannel = struct {
     queue: *PacketChannel.State,
     notify_mutex: std.Io.Mutex = .init,

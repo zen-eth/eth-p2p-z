@@ -38,7 +38,11 @@ pub fn Bounded(
             io: std.Io,
             slots: []T,
             queue: std.Io.Queue(T),
+            /// Pulsed when an item becomes available; consumers wait on it (the
+            /// waitset-integration path; `recv` uses the queue's own blocking get).
             ready: Signal = .{},
+            /// Pulsed when byte budget is freed; senders blocked in
+            /// `reserveBlocking` wait on it. Distinct from `ready` — do not conflate.
             writable: Signal = .{},
             meta_mutex: std.Io.Mutex = .init,
             closed: bool = false,
@@ -140,10 +144,7 @@ pub fn Bounded(
                 try s.reserveBlocking(io, item_cost);
                 errdefer s.releaseCost(io, item_cost);
 
-                s.queue.putOne(io, item) catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    error.Closed => return error.Closed,
-                };
+                try s.queue.putOne(io, item);
                 s.notify(io);
             }
 
@@ -157,9 +158,7 @@ pub fn Bounded(
                 try s.reserveBlockingUncancelable(io, item_cost);
                 errdefer s.releaseCost(io, item_cost);
 
-                s.queue.putOneUncancelable(io, item) catch |err| switch (err) {
-                    error.Closed => return error.Closed,
-                };
+                try s.queue.putOneUncancelable(io, item);
                 s.notify(io);
             }
 
