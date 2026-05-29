@@ -444,6 +444,7 @@ const FrameParser = struct {
 
     /// Feed raw bytes; calls session.dispatchFrame for each complete frame.
     fn feed(self: *FrameParser, data: []const u8, session: *YamuxSession) !void {
+        std.log.info("[dbg-yamux] feed {d} bytes (header_pos={d} payload_have={d} current_header={any})", .{ data.len, self.header_pos, self.payload_buf.items.len, self.current_header != null });
         var pos: usize = 0;
         while (pos < data.len) {
             if (self.current_header == null) {
@@ -595,6 +596,7 @@ pub const YamuxSession = struct {
     // --- Frame dispatch ---
 
     fn dispatchFrame(self: *YamuxSession, frame: YamuxFrame, payload: []const u8) !void {
+        std.log.info("[dbg-yamux] dispatchFrame type={d} flags=0x{x} stream={d} len={d} payload={d}", .{ frame.frame_type, frame.flags, frame.stream_id, frame.length, payload.len });
         switch (frame.frame_type) {
             TYPE_DATA => try self.handleData(frame, payload),
             TYPE_WINDOW_UPDATE => self.handleWindowUpdate(frame),

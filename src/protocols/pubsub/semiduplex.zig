@@ -255,8 +255,10 @@ pub const PubSubPeerResponder = struct {
     }
 
     pub fn onMessage(self: *Self, stream: protocols.AnyStream, message: []const u8) anyerror!void {
+        std.log.info("[dbg-pubsub] PubSubPeerResponder.onMessage incoming={d} buffered_before={d}", .{ message.len, self.received_buffer.readableLength() });
         try self.received_buffer.write(message);
 
+        var frames_decoded: usize = 0;
         while (true) {
             const readable_bytes = self.received_buffer.readableSlice(0);
             const result = uvarint.decode(usize, readable_bytes) catch |err| {
@@ -295,7 +297,12 @@ pub const PubSubPeerResponder = struct {
             };
             // we expect `handleRPC` to process synchronously and not hold onto the `rpc_message`,
             // if it does, it must copy the data out of it.
-            try self.pubsub.handleRPC(arena_allocator, &rpc_message);
+            self.pubsub.handleRPC(arena_allocator, &rpc_message) catch |err| {
+                std.log.info("[dbg-pubsub] PubSubPeerResponder.onMessage handleRPC returned {} after decoding {d} frame(s) (buffered_after={d})", .{ err, frames_decoded + 1, self.received_buffer.readableLength() });
+                return err;
+            };
+            frames_decoded += 1;
+            std.log.info("[dbg-pubsub] PubSubPeerResponder.onMessage decoded frame_count={d} rpc_len={d} buffered_after={d}", .{ frames_decoded, msg_len, self.received_buffer.readableLength() });
             // The `copied_message` and `rpc_reader` will be freed when the arena is deinitialized.
         }
     }
