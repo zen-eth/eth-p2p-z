@@ -79,26 +79,49 @@ Until this is green, do not start Layer 0.
   QUIC endpoints over loopback (exact(2) + exact(4)), server accept on a fiber,
   full handshake + bidirectional stream echo. Net for L2-L6.
 
-**macOS kqueue limitation (found via E1).** SYMPTOM (verified): Tier B livelocks
-on the macOS kqueue multi-executor backend — 200% CPU spin. LOCALIZATION (verified
-via staged logging): the QUIC data path (handshake + stream echo + per-connection
-teardown) all completes; both tests reach the final connection-deinit, then spin
-in `fixture.deinit → endpoint.deinit → router.closeListener → router_future.cancel`.
-ROOT CAUSE: **UNCONFIRMED.** An earlier draft asserted "kqueue doesn't wake a
-socket-recv-blocked fiber on cancel" — that is REFUTED by the zio source: `loop.zig`
-cancel (lines 339-378) pushes a cross-thread cancel onto the owning loop's lock-free
-`cancel_queue` and wakes it (`target.backend.wake`). So the missing-wake theory is
-wrong; the true cause (it is a spin, not a block — something hot-loops) is not yet
-diagnosed. The same teardown runs cleanly on **Linux epoll/io_uring** (the QUIC
-interop suite already exercises it), so the workaround does not depend on the cause:
-Tier B **skips on macOS** (`requireLinux()`) and runs on Linux/Docker/CI.
-Verification split: **L0/L1 locally (Tier A on kqueue); L2-L6 on Linux (Tier B via
-`-Dzio-backend=epoll`).** Properly root-causing the kqueue spin is a separate
-investigation (deferred); it does not block the refactor since L0/L1 are netted
-locally and L2-L6 on Linux.
+**macOS kqueue Tier-B teardown deadlock (found via E1) — MUST FIX (see §1a).**
+SYMPTOM (verified by `sample`): Tier B HANGS on the macOS kqueue multi-executor
+backend — a deadlock (both executor threads idle in `kevent` at 0% CPU; an earlier
+transient phase showed a 200% spin). LOCALIZATION (staged logging): the QUIC data
+path (handshake + stream echo + per-connection teardown) all completes; the root
+fiber then suspends in `fixture.deinit → endpoint.deinit → router.closeListener →
+router_future.cancel` and never wakes.
+INVESTIGATION OUTCOME (2026-05-29): NOT a generic zio bug — four pure-zio repros of
+cross-executor `Future.cancel` (bare recv; `Select(recv,sleep)`; 5 fibers; the
+`receiveManyTimeout`/`operateTimeout` recv path the router uses) ALL pass cleanly on
+kqueue. A 4-agent code review ruled out the weak candidates (`RouteRegistrar` ack;
+`stats_lock`) and produced the LEAD: **`closeListener` (router/loop.zig:159) cancels
+`router_future` FIRST while the UDP socket + `route_commands` are still live**, so the
+router can only exit by cancelling its blocked `select.await()` recv arm, via
+`std.Io.Group.cancel`'s uncancelable shielded wait. CANDIDATE FIX (teardown ORDERING,
+not zio): close the SOURCE first — `route_commands.close` (wakes the command arm) +
+socket `shutdown(SHUT_RD)` (so the recv returns; NOT `release`, to avoid UAF) — THEN
+`router_future.cancel` as a join/backstop. Confidence MEDIUM (the exact mechanism is
+unconfirmed; validate empirically). Tracked on L4 (#31).
+
+## 1a. CROSS-PLATFORM REQUIREMENT (must hold for every layer)
+
+**The QUIC stack MUST work on all three event-loop backends:** macOS **kqueue**,
+Linux **io_uring**, and Linux **epoll**. The current Tier-B `requireLinux()` skip is a
+TEMPORARY workaround for the teardown deadlock above — it is NOT an accepted limitation.
+Definition of done for the teardown fix (folded into L4 / tracked separately):
+1. Apply the `closeListener` source-first reorder.
+2. REMOVE the `requireLinux()` skip in `src/zio_integration_tests.zig`.
+3. Tier B (`zig build zio-integ-test`) passes on: **macOS kqueue** (`-Dzio-backend=kqueue`),
+   **Linux epoll** (`-Dzio-backend=epoll`), and **Linux io_uring** (default, needs
+   `--security-opt seccomp=unconfined` in Docker).
+4. The full interop matrix still passes on Linux io_uring + epoll.
+
+Per-layer verification matrix (apply after each L0-L6 layer):
+| target | how | covers |
+|---|---|---|
+| macOS kqueue | `zig build zio-io-test` (+ Tier-B once unskipped) | local fast loop, L0/L1 |
+| Linux epoll | Docker `-Dzio-backend=epoll` + interop | L2-L6, standard harness |
+| Linux io_uring | Docker default + `seccomp=unconfined` + interop | L2-L6, perf backend |
 
 NOTE: the native macOS build works (`zig build`, kqueue), so L0/L1 refactor +
-Tier-A verification is a fully local, fast loop.
+Tier-A verification is a fully local, fast loop. Until the teardown fix lands, Tier-B
+verification for L2-L6 runs on Linux; after it lands, Tier-B must be green on macOS too.
 
 ## 2. Settle the contract — E2 + C4 (cheap, do after E1)
 
