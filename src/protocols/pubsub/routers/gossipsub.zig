@@ -1853,6 +1853,7 @@ pub const Gossipsub = struct {
 
         switch (validation_result) {
             .valid => |valid_msg| {
+                std.log.info("[dbg-gs] handleMessage VALID topic={s} msg_id_len={d} subscribed={} from_self={}", .{ valid_msg.message.topic, valid_msg.message_id.len, self.subscriptions.contains(valid_msg.message.topic), from.*.eql(&self.peer_id) });
                 // TODO: Change the mcache to store `rpc.MessageReader` to avoid copying data again.
                 // Store the original publish_msg from network, not the transformed one.
                 const rpc_msg = rpc.Message{
@@ -1879,12 +1880,10 @@ pub const Gossipsub = struct {
                 try self.forwardMessage(arena, valid_msg.message_id, &rpc_msg, from.*, null);
             },
             .invalid => |invalid_msg| {
-                // TODO: We don't have topic validator so that no msg_id in invalid message, should we add it?
-                std.log.warn("Invalid message from peer {}: {}", .{ from.*, invalid_msg.err });
+                std.log.warn("[dbg-gs] handleMessage INVALID from peer {}: {}", .{ from.*, invalid_msg.err });
             },
             .duplicate => |dup_msg| {
-                // TODO: When change the `mcache` to store unvalidated message, we can use it here to avoid re-validation.
-                std.log.debug("Duplicate message received from peer {}: ID {any}", .{ from.*, dup_msg.message_id });
+                std.log.info("[dbg-gs] handleMessage DUPLICATE from peer {} msg_id_len={d}", .{ from.*, dup_msg.message_id.len });
             },
         }
     }
