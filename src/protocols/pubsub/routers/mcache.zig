@@ -210,9 +210,16 @@ pub const MessageCache = struct {
         gop.key_ptr.* = cloned_key;
         errdefer _ = self.msgs.remove(gop.key_ptr.*);
 
-        // Add to history[0] (current window)
+        // Use the mcache-owned `cloned_key` for the history entry's `.mid`,
+        // not the caller-provided `mid` slice. Callers (notably
+        // `Gossipsub.handleMessage`) pass a slice that was allocated in a
+        // per-RPC arena (`Allocator` parameter to `handleRPC`), and that
+        // arena is deinit'd as soon as `PubSubPeerResponder.onMessage`
+        // returns. Storing the arena slice here caused the wyhash:134
+        // SIGSEGV: subsequent mcache lookups / heartbeats hashed a
+        // dangling pointer that pointed into freed arena pages.
         const entry: CacheEntry = .{
-            .mid = mid,
+            .mid = cloned_key,
             .topic = cloned_msg.topic orelse return error.MissingTopic,
         };
         try self.history.items[0].?.append(self.allocator, entry);

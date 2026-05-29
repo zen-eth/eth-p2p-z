@@ -1285,10 +1285,32 @@ pub const Gossipsub = struct {
                                 try selected_peers.append(arena, p);
                                 to_send_count.fanout += 1;
                             }
-                            try self.fanout.put(self.allocator, topic, new_fanout);
+                            // Intern `topic` into the topic_pool BEFORE inserting
+                            // into the long-lived `fanout` / `fanout_last_pub`
+                            // HashMaps. `topic` here may be an arena slice owned
+                            // by the caller's per-RPC arena (e.g. routed in from
+                            // `handleMessage` → `forwardMessage`); storing it
+                            // raw causes the same dangling-key wyhash SIGSEGV
+                            // pattern that mcache.putWithId previously had.
+                            //
+                            // Cleanup at `cleanup_fanout` (see addToMesh near
+                            // line 2970) calls unrefTopic twice — once for the
+                            // fanout entry, once for fanout_last_pub — so we
+                            // ref twice here to keep the refcount balanced.
+                            const fanout_topic = try self.refTopic(topic);
+                            errdefer self.unrefTopic(fanout_topic);
+                            self.fanout.put(self.allocator, fanout_topic, new_fanout) catch |err| {
+                                self.unrefTopic(fanout_topic);
+                                return err;
+                            };
                         }
 
-                        try self.fanout_last_pub.put(self.allocator, topic, std.time.milliTimestamp());
+                        const last_pub_topic = try self.refTopic(topic);
+                        errdefer self.unrefTopic(last_pub_topic);
+                        self.fanout_last_pub.put(self.allocator, last_pub_topic, std.time.milliTimestamp()) catch |err| {
+                            self.unrefTopic(last_pub_topic);
+                            return err;
+                        };
                     }
                 }
             }
@@ -2863,7 +2885,18 @@ pub const Gossipsub = struct {
             if (self.fanout_last_pub.getPtr(topic)) |value_ptr| {
                 value_ptr.* = now_ms;
             } else {
-                self.fanout_last_pub.put(self.allocator, topic, now_ms) catch {};
+                // First insert into fanout_last_pub for this topic — ref the
+                // topic so the cleanup at the top of heartbeat (line 2797:
+                // `self.fanout_last_pub.fetchRemove(topic)` followed by
+                // `self.unrefTopic(removed.key)`) has a matching ref to free.
+                // `topic` here is the already-interned key returned by
+                // `self.fanout.iterator()`, but `refTopic` is the right call
+                // either way: for an existing interned topic it just bumps the
+                // refcount, which is exactly what we need.
+                const ref = self.refTopic(topic) catch continue;
+                self.fanout_last_pub.put(self.allocator, ref, now_ms) catch {
+                    self.unrefTopic(ref);
+                };
             }
         }
 
