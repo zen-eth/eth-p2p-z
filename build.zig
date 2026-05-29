@@ -177,10 +177,18 @@ pub fn build(b: *std.Build) void {
     const gossipsub_interop_module = b.createModule(.{
         .root_source_file = b.path("interop/gossipsub/main.zig"),
         .target = target,
-        .optimize = optimize,
-        // Keep debug symbols even under ReleaseFast so the segfault handler's
-        // stack trace under Shadow names actual functions instead of just
-        // addresses. The size cost is negligible for an interop binary.
+        // Override the project-wide -Doptimize: we WANT ReleaseSafe for the
+        // Shadow interop binary specifically. The Makefile in test-plans
+        // hardcodes -Doptimize=ReleaseFast, but ReleaseFast turns Zig's runtime
+        // safety checks (bounds, integer overflow, slice validity, etc.) off
+        // and so it converts use-after-free / dangling-slice bugs into raw
+        // SIGSEGVs whose stack traces dead-end in std lib code (e.g.
+        // wyhash.zig:163). ReleaseSafe keeps the same optimizer level we need
+        // for the binary to run under Shadow within the 10-min sim window,
+        // but emits a proper Zig panic at the actual buggy line.
+        .optimize = .ReleaseSafe,
+        // Keep debug symbols so segfault handler stack traces (and the
+        // ReleaseSafe panics) name actual functions instead of addresses.
         .strip = false,
     });
     gossipsub_interop_module.addImport("zig-libp2p", root_module);

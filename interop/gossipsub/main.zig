@@ -268,19 +268,62 @@ const ListenerUpgradeCtx = struct {
                 return;
             };
 
-            const counter = enh.inbound_counter.fetchAdd(1, .acq_rel);
-            var key_buf: [32]u8 = undefined;
-            const key = std.fmt.bufPrint(&key_buf, "/inbound/{d}", .{counter}) catch {
+            // To match the dialer side, register this inbound yamux session
+            // under the peer's *listening* multiaddr (the same key the dialer
+            // would use for the same peer). That lets the gossipsub side then
+            // call gs.addPeer(peer_ma), which routes through
+            // Switch.newStream → Switch.yamux_sessions.get(addr_str) → reuses
+            // this very session to open the outbound `/meshsub/1.1.0` stream,
+            // instead of attempting a fresh TCP dial. Without this the peer
+            // entry's `initiator` stays null and we log
+            // "No outgoing stream to peer" on every send.
+            const remote_peer_id = yamux.remote_peer_id orelse {
+                std.log.warn("Inbound yamux has no remote peer id; cannot register or addPeer", .{});
                 yamux.deinit();
                 return;
             };
+            var peer_ma = peerListeningMultiaddr(enh.allocator, remote_peer_id) catch |err| {
+                std.log.warn("Failed to build peer listening multiaddr from inbound peer id: {}", .{err});
+                yamux.deinit();
+                return;
+            };
+            // peer_ma will be deinit'd at scope exit; toString gives us an
+            // owned key for registerTcpYamux to copy if needed.
+            defer peer_ma.deinit();
+            _ = enh.inbound_counter.fetchAdd(1, .acq_rel);
+            const peer_ma_str = peer_ma.toString(enh.allocator) catch |err| {
+                std.log.warn("Failed to serialize peer listening multiaddr: {}", .{err});
+                yamux.deinit();
+                return;
+            };
+            defer enh.allocator.free(peer_ma_str);
 
             enh.network_switch.registerTcpYamux(
-                key,
+                peer_ma_str,
                 yamux,
                 enh.gossipsub,
                 Gossipsub.onIncomingNewStream,
             );
+
+            // Now ask gossipsub to open its outbound stream to this peer over
+            // the just-registered session, so the semi-duplex peer entry gets
+            // its `initiator` populated. The dialer side does the same call.
+            const AddPeerCtx = struct {
+                fn cb(ctx: ?*anyopaque, r: anyerror!void) void {
+                    _ = ctx;
+                    if (r) |_| {} else |err| {
+                        std.log.warn("listener-side gs.addPeer failed: {}", .{err});
+                    }
+                }
+            };
+            var peer_ma_for_add = peerListeningMultiaddr(enh.allocator, remote_peer_id) catch |err| {
+                std.log.warn("Failed to rebuild peer listening multiaddr for addPeer: {}", .{err});
+                return;
+            };
+            // gs.addPeer takes ownership of the multiaddr lifetime via
+            // doAddPeer; it parses it and does not retain a reference.
+            defer peer_ma_for_add.deinit();
+            enh.gossipsub.addPeer(peer_ma_for_add, null, AddPeerCtx.cb);
         } else |err| {
             std.log.warn("Inbound TLS failed: {}", .{err});
         }
@@ -328,6 +371,39 @@ fn nodePublicKey(allocator: std.mem.Allocator, node_id: u64) !PeerId {
         .data = &ed_kp.public_key.bytes,
     };
     return PeerId.fromPublicKey(allocator, &pub_key);
+}
+
+/// Reverse `nodePublicKey`: brute-force search for a node_id whose deterministic
+/// PeerId matches `peer_id`. Test scenarios have a small finite node set (search
+/// up to `max_search`), so a linear scan is fine here.
+fn nodeIdFromPeerId(allocator: std.mem.Allocator, peer_id: PeerId, max_search: u64) ?u64 {
+    var i: u64 = 0;
+    while (i < max_search) : (i += 1) {
+        const candidate = nodePublicKey(allocator, i) catch continue;
+        if (candidate.eql(&peer_id)) return i;
+    }
+    return null;
+}
+
+/// Build the listening multiaddr that a remote peer would advertise: the same
+/// `/ip4/<peer_ip>/tcp/9000/p2p/<peer_id>` form the DIALER side constructs. We
+/// register the inbound yamux session under this key so that `gs.addPeer(ma)`
+/// can find the existing session via `Switch.newStream`'s `yamux_sessions.get`
+/// lookup and open the outbound stream — instead of trying to dial again.
+fn peerListeningMultiaddr(allocator: std.mem.Allocator, peer_id: PeerId) !Multiaddr {
+    const node_id = nodeIdFromPeerId(allocator, peer_id, 1024) orelse return error.UnknownPeerId;
+    const peer_addr = try resolveNodeIp(allocator, node_id);
+    const ip_bytes: [4]u8 = @bitCast(peer_addr.in.sa.addr);
+    const peer_port: u16 = if (std.posix.getenv("LIBP2P_LOCAL_DEBUG") != null)
+        TCP_PORT + @as(u16, @intCast(node_id))
+    else
+        TCP_PORT;
+    var ma = Multiaddr.init(allocator);
+    errdefer ma.deinit();
+    try ma.push(.{ .Ip4 = std.net.Ip4Address.init(ip_bytes, 0) });
+    try ma.push(.{ .Tcp = peer_port });
+    try ma.push(.{ .P2P = peer_id });
+    return ma;
 }
 
 /// Map GossipSubParams → Gossipsub.Options.
