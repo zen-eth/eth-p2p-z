@@ -21,6 +21,10 @@ const ConnHandlerVTable = conn_mod.ConnHandlerVTable;
 const AnyConnHandler = conn_mod.AnyConnHandler;
 const libp2p = @import("../root.zig");
 const PeerId = @import("peer_id").PeerId;
+const ProtocolId = libp2p.protocols.ProtocolId;
+const ProtocolDescriptor = @import("../multistream/protocol_descriptor.zig").ProtocolDescriptor;
+const ProtocolMatcher = @import("../multistream/protocol_matcher.zig").ProtocolMatcher;
+const proto_binding = @import("../multistream/protocol_binding.zig");
 
 /// A lightweight data-delivery interface for YamuxStream.
 /// Step 1.2 will bridge this to the full AnyProtocolMessageHandler/AnyStream.
@@ -508,6 +512,10 @@ pub const YamuxSession = struct {
     /// Our own ConnHandlerContext in the pipeline. Set in onActiveImpl.
     /// Used for outbound writes so they pass through TLS (findPrevOutbound).
     handler_ctx: ?*ConnHandlerContext = null,
+    /// Fired once when onActiveImpl runs; used by YamuxBinding to notify
+    /// multistream-select that muxer negotiation is complete.
+    upgrade_callback_ctx: ?*anyopaque = null,
+    upgrade_callback: ?*const fn (?*anyopaque, anyerror!?*anyopaque) void = null,
 
     pub fn init(allocator: Allocator, conn: AnyConn, is_client: bool) !*YamuxSession {
         const s = try allocator.create(YamuxSession);
@@ -670,6 +678,12 @@ pub const YamuxSession = struct {
     fn onActiveImpl(self: *YamuxSession, ctx: *ConnHandlerContext) !void {
         self.handler_ctx = ctx;
         try ctx.fireActive();
+        if (self.upgrade_callback) |cb| {
+            const ud = self.upgrade_callback_ctx;
+            self.upgrade_callback = null;
+            self.upgrade_callback_ctx = null;
+            cb(ud, @as(?*anyopaque, @ptrCast(self)));
+        }
     }
 
     fn onInactiveImpl(self: *YamuxSession, ctx: *ConnHandlerContext) void {
@@ -733,6 +747,99 @@ pub const YamuxSession = struct {
 
     pub fn handler(self: *YamuxSession) AnyConnHandler {
         return .{ .instance = self, .vtable = &vtable };
+    }
+};
+
+/// Multistream-select protocol binding for the yamux muxer (`/yamux/1.0.0`).
+/// On `initConn`, instantiates a YamuxSession, installs it as the next pipeline
+/// handler, and arranges for the user callback to fire once the session is
+/// onActive (i.e. ready to open/accept streams). Used by the connection
+/// upgrader to chain security → muxer multistream rounds the way go-libp2p,
+/// rust-libp2p, and other impls expect.
+pub const YamuxBinding = struct {
+    protocol_descriptor: ProtocolDescriptor,
+    allocator: Allocator,
+
+    const Self = @This();
+    const yamux_protocol_id: ProtocolId = "/yamux/1.0.0";
+    const announcements: []const ProtocolId = &[_]ProtocolId{yamux_protocol_id};
+
+    pub fn init(self: *Self, allocator: Allocator) !void {
+        var proto_matcher: ProtocolMatcher = undefined;
+        try proto_matcher.initAsStrict(allocator, yamux_protocol_id);
+        errdefer proto_matcher.deinit();
+
+        var proto_desc: ProtocolDescriptor = undefined;
+        try proto_desc.init(allocator, announcements, proto_matcher);
+        errdefer proto_desc.deinit();
+
+        self.* = .{
+            .protocol_descriptor = proto_desc,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.protocol_descriptor.deinit();
+    }
+
+    pub fn getProtoDesc(self: *Self) *ProtocolDescriptor {
+        return &self.protocol_descriptor;
+    }
+
+    pub fn initConn(
+        self: *Self,
+        conn: AnyConn,
+        _: ProtocolId,
+        user_data: ?*anyopaque,
+        callback: *const fn (?*anyopaque, anyerror!?*anyopaque) void,
+    ) void {
+        self.initConnImpl(conn, user_data, callback) catch |err| {
+            callback(user_data, err);
+        };
+    }
+
+    fn initConnImpl(
+        self: *Self,
+        conn: AnyConn,
+        user_data: ?*anyopaque,
+        callback: *const fn (?*anyopaque, anyerror!?*anyopaque) void,
+    ) !void {
+        const is_client = conn.direction() == .OUTBOUND;
+        const session = try YamuxSession.init(self.allocator, conn, is_client);
+        errdefer session.deinit();
+
+        if (conn.securitySession()) |sec| {
+            session.remote_peer_id = PeerId.fromBytes(sec.remote_id) catch null;
+        }
+
+        session.upgrade_callback_ctx = user_data;
+        session.upgrade_callback = callback;
+
+        try conn.getPipeline().addLast("yamux", session.handler());
+    }
+
+    fn vtableProtoDescFn(instance: *anyopaque) *ProtocolDescriptor {
+        return @as(*Self, @ptrCast(@alignCast(instance))).getProtoDesc();
+    }
+
+    fn vtableInitConnFn(
+        instance: *anyopaque,
+        conn: AnyConn,
+        protocol_id: ProtocolId,
+        user_data: ?*anyopaque,
+        callback: *const fn (?*anyopaque, anyerror!?*anyopaque) void,
+    ) void {
+        @as(*Self, @ptrCast(@alignCast(instance))).initConn(conn, protocol_id, user_data, callback);
+    }
+
+    const vtable_instance = proto_binding.ProtocolBindingVTable{
+        .initConnFn = vtableInitConnFn,
+        .protoDescFn = vtableProtoDescFn,
+    };
+
+    pub fn any(self: *Self) proto_binding.AnyProtocolBinding {
+        return .{ .instance = self, .vtable = &vtable_instance };
     }
 };
 

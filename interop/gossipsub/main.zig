@@ -119,7 +119,8 @@ const OutboundSlot = struct {
 
 const DialerEnhancer = struct {
     tls_binding: proto_binding_mod.AnyProtocolBinding,
-    bindings_buf: [1]proto_binding_mod.AnyProtocolBinding,
+    yamux_binding: proto_binding_mod.AnyProtocolBinding,
+    tls_bindings_buf: [1]proto_binding_mod.AnyProtocolBinding,
     slot: *OutboundSlot,
     allocator: std.mem.Allocator,
 
@@ -129,15 +130,15 @@ const DialerEnhancer = struct {
 
     fn enhanceConnImpl(instance: *anyopaque, conn: p2p_conn.AnyConn) anyerror!void {
         const self: *DialerEnhancer = @ptrCast(@alignCast(instance));
-        self.bindings_buf = .{self.tls_binding};
+        self.tls_bindings_buf = .{self.tls_binding};
 
         const upgrade_ctx = conn.getPipeline().allocator.create(DialerUpgradeCtx) catch
             return error.OutOfMemory;
         upgrade_ctx.* = .{ .conn = conn, .enhancer = self };
 
         var ms: multistream_mod.Multistream = undefined;
-        try ms.init(10_000, &self.bindings_buf);
-        ms.initConn(conn, upgrade_ctx, DialerUpgradeCtx.callback);
+        try ms.init(10_000, &self.tls_bindings_buf);
+        ms.initConn(conn, upgrade_ctx, DialerUpgradeCtx.tlsCallback);
     }
 
     pub fn any(self: *DialerEnhancer) p2p_conn.AnyConnEnhancer {
@@ -148,47 +149,53 @@ const DialerEnhancer = struct {
 const DialerUpgradeCtx = struct {
     conn: p2p_conn.AnyConn,
     enhancer: *DialerEnhancer,
+    yamux_bindings_buf: [1]proto_binding_mod.AnyProtocolBinding = undefined,
 
-    fn callback(instance: ?*anyopaque, res: anyerror!?*anyopaque) void {
+    fn tlsCallback(instance: ?*anyopaque, res: anyerror!?*anyopaque) void {
+        const self: *DialerUpgradeCtx = @ptrCast(@alignCast(instance.?));
+        const slot = self.enhancer.slot;
+
+        const result = res catch |err| {
+            self.conn.getPipeline().allocator.destroy(self);
+            slot.err = err;
+            slot.event.set();
+            return;
+        };
+
+        const sec_ptr: *p2p_conn.SecuritySession = @ptrCast(@alignCast(result.?));
+        self.conn.setSecuritySession(sec_ptr.*);
+        self.conn.getPipeline().allocator.destroy(sec_ptr);
+
+        self.yamux_bindings_buf = .{self.enhancer.yamux_binding};
+        var ms: multistream_mod.Multistream = undefined;
+        ms.init(10_000, &self.yamux_bindings_buf) catch |err| {
+            self.conn.getPipeline().allocator.destroy(self);
+            slot.err = err;
+            slot.event.set();
+            return;
+        };
+        ms.initConn(self.conn, self, DialerUpgradeCtx.muxerCallback);
+        // Multistream's initConn only addLast's the negotiator; the first
+        // multistream round gets onActive from the transport's pipeline
+        // activation, but this second round is started mid-pipeline and
+        // must be kicked manually.
+        const negotiator_hctx = self.conn.getPipeline().tail.prev_context.?;
+        negotiator_hctx.handler.onActive(negotiator_hctx) catch |err| {
+            self.conn.getPipeline().allocator.destroy(self);
+            slot.err = err;
+            slot.event.set();
+            return;
+        };
+    }
+
+    fn muxerCallback(instance: ?*anyopaque, res: anyerror!?*anyopaque) void {
         const self: *DialerUpgradeCtx = @ptrCast(@alignCast(instance.?));
         defer self.conn.getPipeline().allocator.destroy(self);
 
         const slot = self.enhancer.slot;
 
         if (res) |result| {
-            const sec_ptr: *p2p_conn.SecuritySession = @ptrCast(@alignCast(result.?));
-            self.conn.setSecuritySession(sec_ptr.*);
-            self.conn.getPipeline().allocator.destroy(sec_ptr);
-
-            const yamux = yamux_mod.YamuxSession.init(
-                self.enhancer.allocator,
-                self.conn,
-                true, // is_client = true (dialer)
-            ) catch |err| {
-                slot.err = err;
-                slot.event.set();
-                return;
-            };
-
-            if (self.conn.securitySession()) |sec| {
-                yamux.remote_peer_id = PeerId.fromBytes(sec.remote_id) catch null;
-            }
-
-            self.conn.getPipeline().addLast("yamux", yamux.handler()) catch |err| {
-                yamux.deinit();
-                slot.err = err;
-                slot.event.set();
-                return;
-            };
-
-            const yamux_hctx = self.conn.getPipeline().tail.prev_context.?;
-            yamux_hctx.handler.onActive(yamux_hctx) catch |err| {
-                yamux.deinit();
-                slot.err = err;
-                slot.event.set();
-                return;
-            };
-
+            const yamux: *yamux_mod.YamuxSession = @ptrCast(@alignCast(result.?));
             slot.yamux = yamux;
             slot.event.set();
         } else |err| {
@@ -206,7 +213,8 @@ const DialerUpgradeCtx = struct {
 
 const ListenerEnhancer = struct {
     tls_binding: proto_binding_mod.AnyProtocolBinding,
-    bindings_buf: [1]proto_binding_mod.AnyProtocolBinding,
+    yamux_binding: proto_binding_mod.AnyProtocolBinding,
+    tls_bindings_buf: [1]proto_binding_mod.AnyProtocolBinding,
     allocator: std.mem.Allocator,
     network_switch: *swarm.Switch,
     gossipsub: *Gossipsub,
@@ -218,15 +226,15 @@ const ListenerEnhancer = struct {
 
     fn enhanceConnImpl(instance: *anyopaque, conn: p2p_conn.AnyConn) anyerror!void {
         const self: *ListenerEnhancer = @ptrCast(@alignCast(instance));
-        self.bindings_buf = .{self.tls_binding};
+        self.tls_bindings_buf = .{self.tls_binding};
 
         const upgrade_ctx = conn.getPipeline().allocator.create(ListenerUpgradeCtx) catch
             return error.OutOfMemory;
         upgrade_ctx.* = .{ .conn = conn, .enhancer = self };
 
         var ms: multistream_mod.Multistream = undefined;
-        try ms.init(10_000, &self.bindings_buf);
-        ms.initConn(conn, upgrade_ctx, ListenerUpgradeCtx.callback);
+        try ms.init(10_000, &self.tls_bindings_buf);
+        ms.initConn(conn, upgrade_ctx, ListenerUpgradeCtx.tlsCallback);
     }
 
     pub fn any(self: *ListenerEnhancer) p2p_conn.AnyConnEnhancer {
@@ -237,103 +245,90 @@ const ListenerEnhancer = struct {
 const ListenerUpgradeCtx = struct {
     conn: p2p_conn.AnyConn,
     enhancer: *ListenerEnhancer,
+    yamux_bindings_buf: [1]proto_binding_mod.AnyProtocolBinding = undefined,
 
-    fn callback(instance: ?*anyopaque, res: anyerror!?*anyopaque) void {
+    fn tlsCallback(instance: ?*anyopaque, res: anyerror!?*anyopaque) void {
+        const self: *ListenerUpgradeCtx = @ptrCast(@alignCast(instance.?));
+
+        const result = res catch |err| {
+            std.log.warn("Inbound TLS failed: {}", .{err});
+            self.conn.getPipeline().allocator.destroy(self);
+            return;
+        };
+
+        const sec_ptr: *p2p_conn.SecuritySession = @ptrCast(@alignCast(result.?));
+        self.conn.setSecuritySession(sec_ptr.*);
+        self.conn.getPipeline().allocator.destroy(sec_ptr);
+
+        self.yamux_bindings_buf = .{self.enhancer.yamux_binding};
+        var ms: multistream_mod.Multistream = undefined;
+        ms.init(10_000, &self.yamux_bindings_buf) catch |err| {
+            std.log.warn("Inbound muxer multistream init failed: {}", .{err});
+            self.conn.getPipeline().allocator.destroy(self);
+            return;
+        };
+        ms.initConn(self.conn, self, ListenerUpgradeCtx.muxerCallback);
+        const negotiator_hctx = self.conn.getPipeline().tail.prev_context.?;
+        negotiator_hctx.handler.onActive(negotiator_hctx) catch |err| {
+            std.log.warn("Inbound muxer multistream onActive failed: {}", .{err});
+            self.conn.getPipeline().allocator.destroy(self);
+            return;
+        };
+    }
+
+    fn muxerCallback(instance: ?*anyopaque, res: anyerror!?*anyopaque) void {
         const self: *ListenerUpgradeCtx = @ptrCast(@alignCast(instance.?));
         defer self.conn.getPipeline().allocator.destroy(self);
 
         const enh = self.enhancer;
 
-        if (res) |result| {
-            const sec_ptr: *p2p_conn.SecuritySession = @ptrCast(@alignCast(result.?));
-            self.conn.setSecuritySession(sec_ptr.*);
-            self.conn.getPipeline().allocator.destroy(sec_ptr);
+        const result = res catch |err| {
+            std.log.warn("Inbound muxer negotiation failed: {}", .{err});
+            return;
+        };
 
-            const yamux = yamux_mod.YamuxSession.init(
-                enh.allocator,
-                self.conn,
-                false, // is_client = false (listener)
-            ) catch |err| {
-                std.log.warn("Inbound Yamux init failed: {}", .{err});
-                return;
-            };
+        const yamux: *yamux_mod.YamuxSession = @ptrCast(@alignCast(result.?));
 
-            if (self.conn.securitySession()) |sec| {
-                yamux.remote_peer_id = PeerId.fromBytes(sec.remote_id) catch null;
-            }
+        // Register the inbound yamux session under the peer's listening multiaddr
+        // — the same key the dialer side uses — so Switch.newStream can reuse it
+        // when gs.addPeer opens the responder /meshsub stream.
+        const remote_peer_id = yamux.remote_peer_id orelse {
+            std.log.warn("Inbound yamux has no remote peer id; cannot register or addPeer", .{});
+            return;
+        };
+        var peer_ma = peerListeningMultiaddr(enh.allocator, remote_peer_id) catch |err| {
+            std.log.warn("Failed to build peer listening multiaddr from inbound peer id: {}", .{err});
+            return;
+        };
+        defer peer_ma.deinit();
+        _ = enh.inbound_counter.fetchAdd(1, .acq_rel);
+        const peer_ma_str = peer_ma.toString(enh.allocator) catch |err| {
+            std.log.warn("Failed to serialize peer listening multiaddr: {}", .{err});
+            return;
+        };
+        defer enh.allocator.free(peer_ma_str);
 
-            self.conn.getPipeline().addLast("yamux", yamux.handler()) catch |err| {
-                std.log.warn("Inbound Yamux pipeline addLast failed: {}", .{err});
-                yamux.deinit();
-                return;
-            };
+        enh.network_switch.registerTcpYamux(
+            peer_ma_str,
+            yamux,
+            enh.gossipsub,
+            Gossipsub.onIncomingNewStream,
+        );
 
-            const yamux_hctx = self.conn.getPipeline().tail.prev_context.?;
-            yamux_hctx.handler.onActive(yamux_hctx) catch |err| {
-                std.log.warn("Inbound Yamux onActive failed: {}", .{err});
-                yamux.deinit();
-                return;
-            };
-
-            // To match the dialer side, register this inbound yamux session
-            // under the peer's *listening* multiaddr (the same key the dialer
-            // would use for the same peer). That lets the gossipsub side then
-            // call gs.addPeer(peer_ma), which routes through
-            // Switch.newStream → Switch.yamux_sessions.get(addr_str) → reuses
-            // this very session to open the outbound `/meshsub/1.1.0` stream,
-            // instead of attempting a fresh TCP dial. Without this the peer
-            // entry's `initiator` stays null and we log
-            // "No outgoing stream to peer" on every send.
-            const remote_peer_id = yamux.remote_peer_id orelse {
-                std.log.warn("Inbound yamux has no remote peer id; cannot register or addPeer", .{});
-                yamux.deinit();
-                return;
-            };
-            var peer_ma = peerListeningMultiaddr(enh.allocator, remote_peer_id) catch |err| {
-                std.log.warn("Failed to build peer listening multiaddr from inbound peer id: {}", .{err});
-                yamux.deinit();
-                return;
-            };
-            // peer_ma will be deinit'd at scope exit; toString gives us an
-            // owned key for registerTcpYamux to copy if needed.
-            defer peer_ma.deinit();
-            _ = enh.inbound_counter.fetchAdd(1, .acq_rel);
-            const peer_ma_str = peer_ma.toString(enh.allocator) catch |err| {
-                std.log.warn("Failed to serialize peer listening multiaddr: {}", .{err});
-                yamux.deinit();
-                return;
-            };
-            defer enh.allocator.free(peer_ma_str);
-
-            enh.network_switch.registerTcpYamux(
-                peer_ma_str,
-                yamux,
-                enh.gossipsub,
-                Gossipsub.onIncomingNewStream,
-            );
-
-            // Now ask gossipsub to open its outbound stream to this peer over
-            // the just-registered session, so the semi-duplex peer entry gets
-            // its `initiator` populated. The dialer side does the same call.
-            const AddPeerCtx = struct {
-                fn cb(ctx: ?*anyopaque, r: anyerror!void) void {
-                    _ = ctx;
-                    if (r) |_| {} else |err| {
-                        std.log.warn("listener-side gs.addPeer failed: {}", .{err});
-                    }
+        const AddPeerCtx = struct {
+            fn cb(ctx: ?*anyopaque, r: anyerror!void) void {
+                _ = ctx;
+                if (r) |_| {} else |err| {
+                    std.log.warn("listener-side gs.addPeer failed: {}", .{err});
                 }
-            };
-            var peer_ma_for_add = peerListeningMultiaddr(enh.allocator, remote_peer_id) catch |err| {
-                std.log.warn("Failed to rebuild peer listening multiaddr for addPeer: {}", .{err});
-                return;
-            };
-            // gs.addPeer takes ownership of the multiaddr lifetime via
-            // doAddPeer; it parses it and does not retain a reference.
-            defer peer_ma_for_add.deinit();
-            enh.gossipsub.addPeer(peer_ma_for_add, null, AddPeerCtx.cb);
-        } else |err| {
-            std.log.warn("Inbound TLS failed: {}", .{err});
-        }
+            }
+        };
+        var peer_ma_for_add = peerListeningMultiaddr(enh.allocator, remote_peer_id) catch |err| {
+            std.log.warn("Failed to rebuild peer listening multiaddr for addPeer: {}", .{err});
+            return;
+        };
+        defer peer_ma_for_add.deinit();
+        enh.gossipsub.addPeer(peer_ma_for_add, null, AddPeerCtx.cb);
     }
 };
 
@@ -586,6 +581,10 @@ pub fn main() !void {
     try tls_channel.init(allocator, &host_pub_key, sign_ctx, tls_sec_mod.signDataWithTlsKey);
     defer tls_channel.deinit();
 
+    var yamux_binding: yamux_mod.YamuxBinding = undefined;
+    try yamux_binding.init(allocator);
+    defer yamux_binding.deinit();
+
     // ------------------------------------------------------------------ //
     // 11. Init Gossipsub
     // ------------------------------------------------------------------ //
@@ -615,7 +614,8 @@ pub fn main() !void {
     // ------------------------------------------------------------------ //
     var listener_enhancer = ListenerEnhancer{
         .tls_binding = tls_channel.any(),
-        .bindings_buf = undefined,
+        .yamux_binding = yamux_binding.any(),
+        .tls_bindings_buf = undefined,
         .allocator = allocator,
         .network_switch = &sw,
         .gossipsub = &gs,
@@ -665,7 +665,8 @@ pub fn main() !void {
     var dial_slot = OutboundSlot{};
     var dialer_enhancer = DialerEnhancer{
         .tls_binding = tls_channel.any(),
-        .bindings_buf = undefined,
+        .yamux_binding = yamux_binding.any(),
+        .tls_bindings_buf = undefined,
         .slot = &dial_slot,
         .allocator = allocator,
     };
