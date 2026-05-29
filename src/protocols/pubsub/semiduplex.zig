@@ -248,6 +248,7 @@ pub const PubSubPeerResponder = struct {
     }
 
     pub fn onActivated(self: *Self, stream: protocols.AnyStream) !void {
+        std.log.info("[dbg-resp] PubSubPeerResponder.onActivated proto={?s} remote_peer={?}", .{ stream.getNegotiatedProtocol(), stream.getRemotePeerId() });
         self.stream = stream;
         const instance: *anyopaque = @ptrCast(self);
         self.controller = protocols.initStreamController(instance, &stream_controller_vtable);
@@ -255,6 +256,7 @@ pub const PubSubPeerResponder = struct {
     }
 
     pub fn onMessage(self: *Self, stream: protocols.AnyStream, message: []const u8) anyerror!void {
+        std.log.info("[dbg-resp] onMessage bytes={d} proto={?s} remote_peer={?}", .{ message.len, stream.getNegotiatedProtocol(), stream.getRemotePeerId() });
         try self.received_buffer.write(message);
 
         while (true) {

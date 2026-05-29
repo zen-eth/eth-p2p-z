@@ -1849,10 +1849,12 @@ pub const Gossipsub = struct {
     }
 
     fn handleMessage(self: *Self, arena: Allocator, from: *const PeerId, publish_msg: *const rpc.MessageReader) !void {
+        std.log.info("[dbg-gs] handleMessage from={} data_len={d} from_len={d} seqno_len={d} sig_len={d}", .{ from.*, publish_msg.getData().len, publish_msg.getFrom().len, publish_msg.getSeqno().len, publish_msg.getSignature().len });
         const validation_result = try self.validateReceivedMessage(arena, publish_msg, from.*);
 
         switch (validation_result) {
             .valid => |valid_msg| {
+                std.log.info("[dbg-gs] handleMessage VALID topic={s} subscribed={}", .{ valid_msg.message.topic, self.subscriptions.contains(valid_msg.message.topic) });
                 // TODO: Change the mcache to store `rpc.MessageReader` to avoid copying data again.
                 // Store the original publish_msg from network, not the transformed one.
                 const rpc_msg = rpc.Message{
@@ -1879,10 +1881,10 @@ pub const Gossipsub = struct {
                 try self.forwardMessage(arena, valid_msg.message_id, &rpc_msg, from.*, null);
             },
             .invalid => |invalid_msg| {
-                std.log.warn("Invalid message from peer {}: {}", .{ from.*, invalid_msg.err });
+                std.log.warn("[dbg-gs] handleMessage INVALID from={}: {}", .{ from.*, invalid_msg.err });
             },
             .duplicate => |dup_msg| {
-                std.log.debug("Duplicate message received from peer {}: ID {any}", .{ from.*, dup_msg.message_id });
+                std.log.info("[dbg-gs] handleMessage DUPLICATE from={} msg_id_len={d}", .{ from.*, dup_msg.message_id.len });
             },
         }
     }
