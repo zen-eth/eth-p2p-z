@@ -1864,16 +1864,22 @@ pub const Gossipsub = struct {
                     .signature = publish_msg._signature,
                     .key = publish_msg._key,
                 };
-                try self.mcache.putWithId(valid_msg.message_id, &rpc_msg);
+                self.mcache.putWithId(valid_msg.message_id, &rpc_msg) catch |err| {
+                    std.log.warn("[dbg-gs] mcache.putWithId FAILED: {} (msg_id_len={d})", .{ err, valid_msg.message_id.len });
+                    return err;
+                };
+                std.log.info("[dbg-gs] mcache.putWithId OK -> about to emit", .{});
 
                 if (self.subscriptions.contains(valid_msg.message.topic)) {
                     const is_from_self = from.*.eql(&self.peer_id);
                     if (!is_from_self or self.opts.emit_self) {
+                        std.log.info("[dbg-gs] emit fire path: listener_count={d}", .{self.event_emitter.getListenerCount(.message)});
                         self.event_emitter.emit(.{ .message = .{
                             .propagation_source = from.*,
                             .message_id = valid_msg.message_id,
                             .message = &valid_msg.message,
                         } });
+                        std.log.info("[dbg-gs] emit returned", .{});
                     }
                 }
 
