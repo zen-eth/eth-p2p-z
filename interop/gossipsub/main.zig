@@ -26,10 +26,18 @@ const gossipsub_mod = libp2p.protocols.pubsub.gossipsub;
 const Gossipsub = gossipsub_mod.Gossipsub;
 const PubSubPeerProtocolHandler = gossipsub_mod.PubSubPeerProtocolHandler;
 const event_mod = libp2p.event;
+const pubsub_mod = libp2p.protocols.pubsub.pubsub;
+const rpc = libp2p.protobuf.rpc;
 const instr_mod = @import("instruction.zig");
 const Instruction = instr_mod.Instruction;
 
 const TCP_PORT: u16 = 9000;
+
+fn calcIdFirst8(allocator: std.mem.Allocator, message: *const rpc.Message) anyerror![]const u8 {
+    const data = message.data orelse return error.MissingData;
+    if (data.len < 8) return error.MessageTooShort;
+    return allocator.dupe(u8, data[0..8]);
+}
 
 // ============================================================
 // ISO 8601 timestamp helper (for "Received Message" logs)
@@ -534,6 +542,11 @@ pub fn main() !void {
             break;
         }
     }
+
+    // Match the test-plans go binary's pubsub config (main.go:35-39): StrictNoSign + anonymous + data[0:8] msg-id.
+    gs_opts.global_signature_policy = .StrictNoSign;
+    gs_opts.publish_policy = .anonymous;
+    gs_opts.msg_id_fn = calcIdFirst8;
 
     // ------------------------------------------------------------------ //
     // 7. Init ThreadEventLoop

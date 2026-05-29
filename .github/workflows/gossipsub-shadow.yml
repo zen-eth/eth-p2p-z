@@ -85,6 +85,10 @@ jobs:
         working-directory: test-plans/gossipsub-interop
         run: make test-zig
 
+      - name: Run gossipsub interop tests (Zig + Go)
+        working-directory: test-plans/gossipsub-interop
+        run: make binaries && make test-zig-go
+
       - name: Upload Shadow output
         if: always()
         uses: actions/upload-artifact@v4
