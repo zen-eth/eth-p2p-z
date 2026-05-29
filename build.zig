@@ -172,6 +172,31 @@ pub fn build(b: *std.Build) void {
     const run_zio_io_unit_tests = b.addRunArtifact(zio_io_unit_tests);
     const zio_io_test_step = b.step("zio-io-test", "Run zio multi-executor IO-primitive integration tests");
     zio_io_test_step.dependOn(&run_zio_io_unit_tests.step);
+
+    // End-to-end multi-executor integration tests (Layer 2-6 net): two QUIC
+    // endpoints over loopback on a real zio.Runtime, server accept on a fiber.
+    // Pulls the full deps incl. BoringSSL (reaches internals via relative import
+    // of endpoint/test_support.zig, NOT via "zig-libp2p", to avoid a duplicate
+    // module instance of the quic internals).
+    // Rooted at src/ (not src/quic/) so the transitive internal imports that
+    // escape upward (e.g. quic/endpoint/handle.zig -> ../../security/tls.zig)
+    // stay within the module root path.
+    const zio_integ_test_module = b.createModule(.{
+        .root_source_file = b.path("src/zio_integration_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addImports(zio_integ_test_module, deps);
+    zio_integ_test_module.addImport("zio", zio_dep.module("zio"));
+    // Focus this target on the end-to-end loopback tests (the transitively
+    // reachable std.Io.Threaded unit tests are covered by `zig build test`).
+    const zio_integ_unit_tests = b.addTest(.{
+        .root_module = zio_integ_test_module,
+        .filters = filters orelse &.{"loopback"},
+    });
+    const run_zio_integ_unit_tests = b.addRunArtifact(zio_integ_unit_tests);
+    const zio_integ_test_step = b.step("zio-integ-test", "Run zio multi-executor end-to-end integration tests");
+    zio_integ_test_step.dependOn(&run_zio_integ_unit_tests.step);
 }
 
 const ModuleDeps = struct {
