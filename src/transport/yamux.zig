@@ -457,6 +457,7 @@ const FrameParser = struct {
                 if (self.header_pos == HEADER_LEN) {
                     self.current_header = YamuxFrame.decode(&self.header_buf);
                     self.header_pos = 0;
+                    std.log.info("[dbg-yamux] header decoded type={d} flags=0x{x} stream={d} length={d}", .{ self.current_header.?.frame_type, self.current_header.?.flags, self.current_header.?.stream_id, self.current_header.?.length });
                     if (self.current_header.?.length == 0) {
                         try session.dispatchFrame(self.current_header.?, &.{});
                         self.current_header = null;
