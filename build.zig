@@ -153,6 +153,25 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_libp2p_lib_unit_tests.step);
     test_step.dependOn(&run_libp2p_exe_unit_tests.step);
     test_step.dependOn(&run_interop_unit_tests.step);
+
+    // Multi-executor integration tests for the Layer-0 IO primitives. Runs on a
+    // real zio.Runtime (>=2 executors), unlike the in-file std.Io.Threaded unit
+    // tests. BoringSSL-free: the module imports only `zio` + the io primitives
+    // (reached via relative @import from src/quic/zio_io_tests.zig), so it builds
+    // fast and does not pull the quiche/BoringSSL dependency.
+    const zio_io_test_module = b.createModule(.{
+        .root_source_file = b.path("src/quic/zio_io_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zio_io_test_module.addImport("zio", zio_dep.module("zio"));
+    const zio_io_unit_tests = b.addTest(.{
+        .root_module = zio_io_test_module,
+        .filters = filters orelse &.{},
+    });
+    const run_zio_io_unit_tests = b.addRunArtifact(zio_io_unit_tests);
+    const zio_io_test_step = b.step("zio-io-test", "Run zio multi-executor IO-primitive integration tests");
+    zio_io_test_step.dependOn(&run_zio_io_unit_tests.step);
 }
 
 const ModuleDeps = struct {
