@@ -207,6 +207,11 @@ pub const Publisher = struct {
         return .{ .published = initial };
     }
 
+    /// Reads the latest published snapshot. Logically a const read, but it must
+    /// take the lock — classic interior mutability, so we keep the `*const`
+    /// receiver (callers hold the connection by const ref) and `@constCast` only
+    /// to acquire/release the mutex. Safe: the cast never escapes and the
+    /// underlying `Publisher` is always heap-allocated and mutable.
     pub fn load(p: *const Publisher, io: std.Io) ConnectionStats {
         const mutable: *Publisher = @constCast(p);
         mutable.lock.lockUncancelable(io);

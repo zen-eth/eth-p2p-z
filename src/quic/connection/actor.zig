@@ -1081,8 +1081,8 @@ pub const ConnectionActor = struct {
         if (!queued) self.noteRouteCommandFailure(transport.io);
     }
 
-    fn currentSourceCidKey(self: *ConnectionActor, conn: *quiche.quiche_conn) ?CidKey {
-        _ = self;
+    /// Free function (no actor state): reads quiche's current source CID for `conn`.
+    fn currentSourceCidKey(conn: *quiche.quiche_conn) ?CidKey {
         var source_id_ptr: [*c]const u8 = null;
         var source_id_len: usize = 0;
         quiche.quiche_conn_source_id(conn, &source_id_ptr, &source_id_len);
@@ -1118,7 +1118,7 @@ pub const ConnectionActor = struct {
     fn refreshSourceCids(self: *ConnectionActor) CidRefreshError!usize {
         const conn = self.conn orelse return error.ConnectionClosed;
         const transport = self.transport orelse return 0;
-        const existing_cid = self.currentSourceCidKey(conn) orelse return error.QuicheCidFailed;
+        const existing_cid = currentSourceCidKey(conn) orelse return error.QuicheCidFailed;
         var issued: usize = 0;
         while (quiche.quiche_conn_scids_left(conn) > 0) {
             const cid = cid_gen.randomLocalCid() catch return error.QuicheCidFailed;

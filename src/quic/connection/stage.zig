@@ -108,8 +108,15 @@ test "handshake close wakes waiters as connection closed" {
 pub const HandshakeWaitError = error{ HandshakeFailed, ConnectionClosed } || std.Io.Cancelable;
 
 pub const Handshake = struct {
+    /// Atomic: read by connection handles (via `load`) concurrently with the
+    /// actor fiber's `establish`/`fail` stores.
     state: std.atomic.Value(HandshakeStage) = .init(.idle),
     done: std.Io.Event = .unset,
+    /// Plain (non-atomic) on purpose: written once by `begin`, which `spawn`
+    /// calls strictly before `std.Io.concurrent` creates the main-loop fiber
+    /// (see actor.zig). After that the field is read only by the actor fiber
+    /// (`deadline`/`timedOut`), so there is no concurrent access. If a future
+    /// change ever calls `begin` after the fiber is running, make this atomic.
     deadline_ns: ?i96 = null,
 
     pub fn begin(h: *Handshake, stage: HandshakeStage, deadline_ns: ?i96) void {
