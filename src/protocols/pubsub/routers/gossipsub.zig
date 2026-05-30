@@ -1849,7 +1849,9 @@ pub const Gossipsub = struct {
     }
 
     fn handleMessage(self: *Self, arena: Allocator, from: *const PeerId, publish_msg: *const rpc.MessageReader) !void {
-        std.log.info("[dbg-gs] handleMessage from={} data_len={d} from_len={d} seqno_len={d} sig_len={d}", .{ from.*, publish_msg.getData().len, publish_msg.getFrom().len, publish_msg.getSeqno().len, publish_msg.getSignature().len });
+        const _data = publish_msg.getData();
+        const id_u64 = if (_data.len >= 8) std.mem.readInt(u64, _data[0..8], .big) else 0;
+        std.log.info("[dbg-gs] handleMessage from={} data_len={d} msg_id_be_u64={d} from_len={d} seqno_len={d} sig_len={d}", .{ from.*, _data.len, id_u64, publish_msg.getFrom().len, publish_msg.getSeqno().len, publish_msg.getSignature().len });
         const validation_result = try self.validateReceivedMessage(arena, publish_msg, from.*);
 
         switch (validation_result) {
