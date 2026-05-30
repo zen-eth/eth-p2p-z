@@ -750,6 +750,18 @@ pub const Gossipsub = struct {
     }
 
     pub fn handleRPC(self: *Self, arena: Allocator, rpc_message: *const pubsub.RPC) !void {
+        const raw_src = rpc_message.rpc_reader.sourceBytes();
+        const raw_len = raw_src.len;
+        {
+            var hex_buf: [128]u8 = undefined;
+            const peek = @min(raw_len, 32);
+            var idx: usize = 0;
+            for (raw_src[0..peek]) |b| {
+                _ = std.fmt.bufPrint(hex_buf[idx..], "{x:0>2}", .{b}) catch break;
+                idx += 2;
+            }
+            std.log.info("[dbg-gs] handleRPC raw head[0..{d}]={s} from={}", .{ peek, hex_buf[0..idx], rpc_message.from });
+        }
         if (!self.acceptFrom(rpc_message.from)) {
             std.log.warn("Rejected RPC message from peer: {}", .{rpc_message.from});
             return;
@@ -761,6 +773,7 @@ pub const Gossipsub = struct {
 
         var subscriptions = std.ArrayList(Subscription).empty;
 
+        var sub_count: usize = 0;
         while (reader.subscriptionsNext()) |sub| {
             const topic_id = sub.getTopicid();
             const subscribe_msg = sub.getSubscribe();
@@ -768,6 +781,7 @@ pub const Gossipsub = struct {
             try self.handleSubscription(&rpc_message.from, topic_id, subscribe_msg);
 
             try subscriptions.append(arena, .{ .topic = topic_id, .subscribe = subscribe_msg });
+            sub_count += 1;
         }
 
         self.event_emitter.emit(.{ .subscription_changed = .{
@@ -780,6 +794,7 @@ pub const Gossipsub = struct {
         while (reader.publishNext()) |msg| {
             try publish_msgs.append(arena, msg);
         }
+        std.log.info("[dbg-gs] handleRPC from={} raw_rpc_bytes={d} subs={d} publishes={d}", .{ rpc_message.from, raw_len, sub_count, publish_msgs.items.len });
 
         if (self.opts.max_messages_per_rpc) |max| if (publish_msgs.items.len > max) {
             std.log.warn("Received {} messages, exceeding limit of {}", .{ publish_msgs.items.len, max });
