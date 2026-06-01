@@ -248,3 +248,150 @@ test "Bounded channel: refcount frees exactly once after concurrent retain/relea
         }
     }.root, &ctx);
 }
+
+// ---------------------------------------------------------------------------
+// Regression: zio kqueue completion-lifecycle UAF. N fibers each blocked in a
+// receiveManyTimeout on their own socket, cancelled concurrently cross-executor.
+// On stock zio v0.12.0 this crashed 40/40 (poll() dereferenced a Completion freed
+// by a resumed fiber via a stale kevent udata). The epoll-style fix (lalinsky/zio
+// #443) keys pending completions by (ident,filter) in a loop-owned `poll_queue`
+// and stops storing raw Completion pointers in udata, so stale events can't deref.
+// ---------------------------------------------------------------------------
+const io_time = @import("io/time.zig");
+const ReproFut = std.Io.Future((std.Io.Cancelable || std.Io.ConcurrentError)!void);
+
+fn reproCancelOne(io: std.Io, fut: *ReproFut) void {
+    fut.cancel(io) catch {};
+}
+
+fn reproBareRecv(io: std.Io) (std.Io.Cancelable || std.Io.ConcurrentError)!void {
+    var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const socket = std.Io.net.IpAddress.bind(&addr, io, .{ .mode = .dgram }) catch return;
+    defer socket.close(io);
+    var data_buf: [2048]u8 = undefined;
+    var ctrl_buf: [256]u8 align(8) = undefined;
+    var messages = [_]std.Io.net.IncomingMessage{.{
+        .from = undefined,
+        .data = undefined,
+        .control = &ctrl_buf,
+        .flags = undefined,
+    }};
+    const maybe_err, _ = socket.receiveManyTimeout(io, &messages, &data_buf, .{}, .none);
+    if (maybe_err) |e| switch (e) {
+        error.Canceled => return error.Canceled,
+        else => return,
+    };
+}
+
+test "kqueue: concurrent cross-exec cancel of N recvmsg fibers is UAF-free" {
+    const N = 8;
+    try runRoot(2, struct {
+        fn root(io: std.Io, _: void) !void {
+            var futs: [N]ReproFut = undefined;
+            for (&futs) |*f| f.* = try std.Io.concurrent(io, reproBareRecv, .{io});
+            io_time.ms(150).sleep(io) catch {}; // let all park in recvmsg
+            var group: std.Io.Group = .init;
+            for (&futs) |*f| try group.concurrent(io, reproCancelOne, .{ io, f });
+            group.await(io) catch {};
+        }
+    }.root, {});
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation-wakeup regressions: an outer fiber blocked in `std.Io.Select.await()`
+// over `concurrent` branches (recv, idle timer, futex wait), cancelled via its
+// `Future`. These confirm a fiber parked in recv/futex/Select wakes on cancel and
+// tears down cleanly. (They do NOT reproduce the router's real teardown deadlock,
+// which came from driving teardown off the one-shot `Future.cancel` — see the NOTE
+// at the bottom and `router.closeListener`.)
+// ---------------------------------------------------------------------------
+const SelResult = union(enum) {
+    recv: (std.Io.Cancelable || std.Io.ConcurrentError)!void,
+    idle: std.Io.Cancelable!void,
+};
+const Sel = std.Io.Select(SelResult);
+
+fn selIdle(io: std.Io) std.Io.Cancelable!void {
+    return io_time.ms(60_000).sleep(io);
+}
+
+fn selOuterLoop(io: std.Io) (std.Io.Cancelable || std.Io.ConcurrentError)!void {
+    while (true) {
+        try std.Io.checkCancel(io);
+        var buf: [2]SelResult = undefined;
+        var sel = Sel.init(io, &buf);
+        defer while (sel.cancel()) |_| {};
+        try sel.concurrent(.recv, reproBareRecv, .{io});
+        try sel.concurrent(.idle, selIdle, .{io});
+        _ = try sel.await();
+    }
+}
+
+test "select-nested recv loop: cancelling the outer fiber tears down cleanly" {
+    try runRoot(2, struct {
+        fn root(io: std.Io, _: void) !void {
+            var fut: ReproFut = try std.Io.concurrent(io, selOuterLoop, .{io});
+            io_time.ms(150).sleep(io) catch {}; // let it park in select.await over the blocked recv
+            fut.cancel(io) catch {};
+        }
+    }.root, {});
+}
+
+// The router's SECOND select branch is `route_commands.wait` == `io.futexWait`,
+// not a timer. Cancelling a futex-blocked fiber — directly, then nested in a
+// Select alongside an unbounded recv (the exact router shape) — also wakes it.
+const FutexFut = std.Io.Future(std.Io.Cancelable!void);
+
+fn futexBlockForever(io: std.Io) std.Io.Cancelable!void {
+    var word: std.atomic.Value(u32) = .init(0);
+    return io.futexWait(u32, &word.raw, 0);
+}
+
+test "futex: cancelling a fiber parked in futexWait wakes it" {
+    try runRoot(2, struct {
+        fn root(io: std.Io, _: void) !void {
+            var fut: FutexFut = try std.Io.concurrent(io, futexBlockForever, .{io});
+            io_time.ms(150).sleep(io) catch {};
+            fut.cancel(io) catch {};
+        }
+    }.root, {});
+}
+
+const SelFx = union(enum) {
+    recv: (std.Io.Cancelable || std.Io.ConcurrentError)!void,
+    futex: std.Io.Cancelable!void,
+};
+const SelFxT = std.Io.Select(SelFx);
+
+fn fxWait(io: std.Io) std.Io.Cancelable!void {
+    var word: std.atomic.Value(u32) = .init(0);
+    return io.futexWait(u32, &word.raw, 0);
+}
+
+fn fxOuterLoop(io: std.Io) (std.Io.Cancelable || std.Io.ConcurrentError)!void {
+    while (true) {
+        try std.Io.checkCancel(io);
+        var buf: [2]SelFx = undefined;
+        var sel = SelFxT.init(io, &buf);
+        defer while (sel.cancel()) |_| {};
+        try sel.concurrent(.recv, reproBareRecv, .{io});
+        try sel.concurrent(.futex, fxWait, .{io});
+        _ = try sel.await();
+    }
+}
+
+test "select recv+futex loop: cancelling the outer fiber tears down cleanly" {
+    try runRoot(2, struct {
+        fn root(io: std.Io, _: void) !void {
+            var fut: ReproFut = try std.Io.concurrent(io, fxOuterLoop, .{io});
+            io_time.ms(150).sleep(io) catch {};
+            fut.cancel(io) catch {};
+        }
+    }.root, {});
+}
+
+// NOTE: the router's teardown deadlock was deterministic, not a scheduler race.
+// `std.Io.Future.cancel` is one-shot, so cancel-based teardown of a fiber parked in
+// the router's multi-arm `Select` can lose the single cancellation and re-park with
+// no waker. The router therefore stops off a persistent flag + channel-close, never
+// `cancel` (see `router.closeListener`); these single-cancel cases don't hit it.

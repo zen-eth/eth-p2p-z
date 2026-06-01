@@ -92,6 +92,19 @@ pub const QuicEndpoint = opaque {
     }
 
     pub fn dial(e: *QuicEndpoint, addr: std.Io.net.IpAddress, opts: DialOptions) DialError!*Connection {
+        if (internal(e).socket == null) {
+            const ephemeral: std.Io.net.IpAddress = switch (addr) {
+                .ip4 => .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+                .ip6 => .{ .ip6 = .{ .port = 0, .flow = 0, .bytes = [_]u8{0} ** 16, .interface = .{ .index = 0 } } },
+            };
+            _ = bind(e, ephemeral) catch |err| switch (err) {
+                error.AlreadyBound => {},
+                else => |bind_err| {
+                    std.log.warn("dial: auto-bind of ephemeral endpoint failed: {}", .{bind_err});
+                    return error.EndpointNotBound;
+                },
+            };
+        }
         return dialer.dial(dialerContext(e), addr, opts);
     }
 
@@ -126,15 +139,18 @@ const Impl = struct {
     /// `router/accept_queue.zig:tryReserve`. Initialised to the configured
     /// accept queue capacity on `bind`; reset to 0 on `closeListener`.
     accept_available: std.atomic.Value(usize) = .init(0),
-    /// Router main fiber lifetime. Uses `Future` (not `Group`) so
-    /// `cancel` reliably blocks until the runtime has fully torn down
-    /// the fiber before we free surrounding state.
+    /// Router main fiber lifetime. Uses `Future` (not `Group`) so the teardown
+    /// `await` blocks until the runtime has fully torn down the fiber before we
+    /// free surrounding state. Stopped cooperatively via `router_stopping`.
     router_future: ?std.Io.Future(router.RouterLoopError!void) = null,
     /// Tasks that own per-connection handshake state. Group is fine
     /// here because the tasks are self-cleaning and the surrounding
     /// `Impl` only goes away after `closeListener` has run a blocking
     /// `cancel` on this group, draining all in-flight tasks.
     handshake_waiters: std.Io.Group = .init,
+    /// Cooperative teardown flag for the router fiber. See `router.closeListener`
+    /// for why teardown sets this + closes `route_commands` rather than cancelling.
+    router_stopping: std.atomic.Value(bool) = .init(false),
 };
 
 fn rawContext(e: *QuicEndpoint) raw.Context {
@@ -159,6 +175,7 @@ fn routerContext(e: *QuicEndpoint) router.Context {
         .accept_available = &endpoint.accept_available,
         .router_future_slot = &endpoint.router_future,
         .handshake_waiters = &endpoint.handshake_waiters,
+        .stopping = &endpoint.router_stopping,
         .raw = rawContext(e),
     };
 }

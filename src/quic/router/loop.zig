@@ -46,18 +46,24 @@ pub const Context = struct {
     /// `accept_queue_slot`. Set to `connection_accept_queue_len` on `bind`.
     accept_available: *std.atomic.Value(usize),
     /// Slot for the router's main socket-reader fiber. Owned by the
-    /// endpoint handle. Filled on `bind`, cleared (after cancel) by
+    /// endpoint handle. Filled on `bind`, cleared (after `await`) by
     /// `closeListener`. We use a `Future` (not a `Group`) for the main
     /// router loop because the surrounding endpoint memory is freed
-    /// shortly after `closeListener` returns; `Future.cancel` blocks
-    /// until the runtime has fully torn down the fiber, eliminating the
-    /// race the old `Group`-based scheme was vulnerable to.
+    /// shortly after `closeListener` returns; `Future.await` blocks until
+    /// the runtime has fully torn down the fiber, eliminating the race the
+    /// old `Group`-based scheme was vulnerable to. The loop is stopped via
+    /// the `stopping` flag (not cancellation — see that field).
     router_future_slot: *?std.Io.Future(RouterLoopError!void),
     /// Group for short-lived "handshake waiter" tasks spawned when the router
     /// promotes an Initial packet to a Connection. Lives alongside the main
     /// router future; cancellation is initiated from `closeListener` after the
     /// main router loop exits.
     handshake_waiters: *std.Io.Group,
+    /// Cooperative teardown flag. `closeListener` sets it and closes
+    /// `core.route_commands` to wake the `route_command` select arm; the loop
+    /// observes it and returns. A persistent flag, not `Future.cancel` (which is
+    /// one-shot and unreliable here — see `closeListener`).
+    stopping: *std.atomic.Value(bool),
     raw: endpoint_raw.Context,
 
     pub fn addStat(ctx: Context, comptime field: []const u8, value: u64) void {
@@ -133,6 +139,8 @@ pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAd
         ep.core.route_commands.close(io);
         ep.core.route_commands.discardQueued(io);
     }
+    // Clear any stop signal from a previous listener before (re-)spawning.
+    ep.stopping.store(false, .release);
     ep.router_future_slot.* = try std.Io.concurrent(io, routerSocketLoop, .{ep});
     return shared_socket.address();
 }
@@ -150,20 +158,25 @@ pub fn accept(ep: Context) std.Io.Cancelable!*Connection {
 
 pub fn closeListener(ep: Context) void {
     const io = ep.io;
-    // Cancel the main router fiber first so it stops dereferencing
-    // socket/accept_queue before we tear them down. `Future.cancel`
-    // blocks until the runtime has fully torn down the spawned fiber,
-    // including the post-call cleanup that would have raced with
-    // destroying our own memory under the old `Group`-based scheme.
+    // Stop the router cooperatively: set the flag, close `route_commands` to wake
+    // its `route_command` select arm, then join with `await`. Do NOT `cancel`:
+    // `std.Io.Future.cancel` is one-shot, and using it to unwind a fiber parked in
+    // the multi-arm `Select` deadlocks at teardown — the lone cancellation is lost
+    // and the loop re-parks with no waker. A persistent flag is robust on every
+    // backend. (The loop observes the channel epoch before the flag, so the
+    // close-wake can't be missed.)
+    ep.stopping.store(true, .release);
+    ep.core.route_commands.close(io);
     if (ep.router_future_slot.*) |*future| {
-        future.cancel(io) catch {};
+        // Exits cleanly (void) on `stopping`; surface, don't swallow, any error.
+        future.await(io) catch |err|
+            std.log.warn("router teardown: loop exited with error {}", .{err});
         ep.router_future_slot.* = null;
     }
     // Then drain any handshake waiters spawned by the router accept path. These are
     // self-clearing on success and tracked in a Group; `cancel` blocks
     // until each finishes its post-call cleanup.
     ep.handshake_waiters.cancel(io);
-    ep.core.route_commands.close(io);
     ep.core.route_commands.discardQueued(io);
     if (ep.accept_queue_slot.*) |state| {
         state.close(io);
@@ -192,6 +205,11 @@ fn routerSocketLoop(ep: Context) RouterLoopError!void {
         try std.Io.checkCancel(io);
         _ = drainRouteCommands(ep, &cid_map);
         const observed_commands = ep.core.route_commands.observe();
+        // Observe the route_command epoch before checking `stopping`, so a
+        // concurrent `closeListener` (set flag, then close the channel) can't be
+        // missed: a close before this observe trips the flag check; a close after
+        // it wakes the arm's `wait(observed_commands)` below.
+        if (ep.stopping.load(.acquire)) break;
         if (drainRouteCommands(ep, &cid_map)) continue;
 
         var select_buffer: [2]RouterSelectResult = undefined;
@@ -920,6 +938,7 @@ test "router splits GRO datagrams before CID dispatch" {
     var accept_available: std.atomic.Value(usize) = .init(0);
     var router_future_slot: ?std.Io.Future(RouterLoopError!void) = null;
     var handshake_waiters: std.Io.Group = .init;
+    var stopping: std.atomic.Value(bool) = .init(false);
     const ep = Context{
         .allocator = allocator,
         .io = io,
@@ -930,6 +949,7 @@ test "router splits GRO datagrams before CID dispatch" {
         .accept_available = &accept_available,
         .router_future_slot = &router_future_slot,
         .handshake_waiters = &handshake_waiters,
+        .stopping = &stopping,
         .raw = undefined,
     };
 

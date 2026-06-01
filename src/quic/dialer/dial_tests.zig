@@ -54,7 +54,7 @@ test "client dial routes inbound packets via the shared listen socket" {
     }
 }
 
-test "client dial without bind returns EndpointNotBound" {
+test "client dial without explicit bind auto-binds an ephemeral endpoint" {
     const allocator = std.testing.allocator;
 
     var threaded = std.Io.Threaded.init(allocator, .{});
@@ -66,7 +66,29 @@ test "client dial without bind returns EndpointNotBound" {
 
     const server_addr = try fixture.bindServerLoopback();
 
-    try std.testing.expectError(error.EndpointNotBound, fixture.client.dial(server_addr, .{
+    var accept_ctx = AcceptCtx{ .endpoint = fixture.server };
+    const accept_thread = try std.Thread.spawn(.{}, AcceptCtx.run, .{&accept_ctx});
+
+    const client_conn = try fixture.client.dial(server_addr, .{
         .timeout = receiveTimeout(default_handshake_timeout_ns),
-    }));
+    });
+    defer client_conn.deinit();
+
+    accept_thread.join();
+    if (accept_ctx.err) |err| return err;
+    const server_conn = accept_ctx.conn orelse return error.TestExpectedEqual;
+    defer server_conn.deinit();
+
+    try std.testing.expect(fixture.client.stats().cid_map_entries > 0);
+
+    const outbound = try client_conn.openStream(io);
+    defer outbound.deinit();
+    defer closeStreamForTest(io, outbound);
+    try outbound.writeAll(io, "auto-bind payload", .{});
+    const inbound = try server_conn.acceptStream(io, .{ .timeout = support.timeout_s(1) });
+    defer inbound.deinit();
+    defer closeStreamForTest(io, inbound);
+    var buf: [64]u8 = undefined;
+    try inbound.readAll(io, buf[0..17], .{});
+    try std.testing.expectEqualStrings("auto-bind payload", buf[0..17]);
 }

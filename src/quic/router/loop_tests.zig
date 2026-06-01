@@ -150,7 +150,13 @@ test "ipv6 unspecified listener accepts ipv4 dial via dual-stack socket" {
     defer fixture.deinit();
 
     const server_addr = fixture.server.bind(.{ .ip6 = .unspecified(0) }) catch |err| switch (err) {
-        error.AddressUnavailable, error.AddressFamilyUnsupported => return,
+        // Configuring a dual-stack socket needs the IPV6 socket-option family.
+        // That family is `void` in Zig 0.16 `std.posix` on macOS, so the std
+        // backend returns `OptionUnsupported` for any `ip6_only` bind there;
+        // some sandboxes also lack IPv6 entirely. Skip (rather than fail) where
+        // the platform/std cannot configure the dual-stack listener — the path
+        // is still exercised on Linux.
+        error.AddressUnavailable, error.AddressFamilyUnsupported, error.OptionUnsupported => return error.SkipZigTest,
         else => |e| return e,
     };
 

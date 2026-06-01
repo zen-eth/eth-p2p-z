@@ -168,21 +168,25 @@ pub const Switch = struct {
             conn.deinit();
             return err;
         };
-        errdefer actor.destroyUnspawned();
+        // Exactly one actor-cleanup path may run on the error path. Both
+        // `destroyUnspawned` and `shutdownAndDestroy` free `inbox_storage` and
+        // destroy `actor`, so two stacked errdefers would double-free (and run
+        // the second against freed memory). Guard on whether the main fiber was
+        // spawned: before spawn -> `destroyUnspawned`; after -> `shutdownAndDestroy`.
+        var actor_spawned = false;
+        errdefer if (actor_spawned) actor.shutdownAndDestroy() else actor.destroyUnspawned();
 
         const managed = try sw.allocator.create(SwitchConnection);
+        errdefer sw.allocator.destroy(managed);
         managed.* = .{
             .allocator = sw.allocator,
             .io = sw.io,
             .sw = sw,
             .actor = actor,
         };
-        errdefer {
-            actor.shutdownAndDestroy();
-            sw.allocator.destroy(managed);
-        }
 
         try actor.spawn();
+        actor_spawned = true;
 
         sw.connections_lock.lockUncancelable(sw.io);
         defer sw.connections_lock.unlock(sw.io);

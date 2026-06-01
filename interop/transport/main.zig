@@ -162,10 +162,10 @@ const Env = struct {
     listen_port: u16,
 
     fn load(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) !Env {
-        const transport_owned = try getRequiredOwned(allocator, env_map, "transport");
+        const transport_owned = try getRequiredOwned(allocator, env_map, "TRANSPORT");
         errdefer allocator.free(transport_owned);
 
-        const is_dialer_raw = try getRequiredOwned(allocator, env_map, "is_dialer");
+        const is_dialer_raw = try getRequiredOwned(allocator, env_map, "IS_DIALER");
         defer allocator.free(is_dialer_raw);
         const is_dialer = try parseBool(is_dialer_raw);
 
@@ -173,25 +173,25 @@ const Env = struct {
         defer allocator.free(debug_owned);
         const debug = try parseBool(debug_owned);
 
-        const bind_ip_owned = try getOptionalOwnedOrDefault(allocator, env_map, "ip", "0.0.0.0");
+        const bind_ip_owned = try getOptionalOwnedOrDefault(allocator, env_map, "IP", "0.0.0.0");
         errdefer allocator.free(bind_ip_owned);
 
         const default_publish = if (is_dialer) "dialer" else "listener";
         const publish_host_owned = try getOptionalOwnedOrDefault(allocator, env_map, "publish_host", default_publish);
         errdefer allocator.free(publish_host_owned);
 
-        const muxer_owned = try getOptionalOwned(allocator, env_map, "muxer");
+        const muxer_owned = try getOptionalOwned(allocator, env_map, "MUXER");
         errdefer if (muxer_owned) |value| allocator.free(value);
 
-        const security_owned = try getOptionalOwned(allocator, env_map, "security");
+        const security_owned = try getOptionalOwned(allocator, env_map, "SECURITY");
         errdefer if (security_owned) |value| allocator.free(value);
 
-        const redis_addr_owned = try getOptionalOwnedOrDefault(allocator, env_map, "redis_addr", "redis:6379");
+        const redis_addr_owned = try getOptionalOwnedOrDefault(allocator, env_map, "REDIS_ADDR", "redis:6379");
         defer allocator.free(redis_addr_owned);
         const parsed_redis = try parseHostPort(allocator, redis_addr_owned);
         errdefer allocator.free(parsed_redis.host);
 
-        const timeout_secs = try getOptionalUint(env_map, "test_timeout_seconds", 180);
+        const timeout_secs = try getOptionalUint(env_map, "TEST_TIMEOUT_SECONDS", 180);
         const listen_port_value = try getOptionalUint(env_map, "listen_port", 4001);
         if (listen_port_value > std.math.maxInt(u16)) return error.InvalidPort;
 
@@ -227,7 +227,9 @@ const ParsedHostPort = struct {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const runtime = try zio.Runtime.init(allocator, .{ .executors = .exact(4) });
+    const cpu_count = std.Thread.getCpuCount() catch 2;
+    const executor_count: u8 = @intCast(std.math.clamp(cpu_count, 2, 64));
+    const runtime = try zio.Runtime.init(allocator, .{ .executors = .exact(executor_count) });
     defer runtime.deinit();
     const io = runtime.io();
 
@@ -254,9 +256,6 @@ pub fn main(init: std.process.Init) !void {
     defer redis.deinit();
 
     if (env.is_dialer) {
-        // Dialer must bind a local endpoint before dialing — dial() requires a
-        // bound shared_socket (else error.EndpointNotBound). Bind ephemeral.
-        _ = try endpoint.bind(.{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } });
         try runDialer(allocator, io, switcher, &redis, &env);
     } else {
         try runListener(allocator, io, switcher, &host_key, &redis, &env);

@@ -14,20 +14,13 @@
 //! Pulls BoringSSL (via the quiche dep), so it is a separate, slower-compiling
 //! target from the Layer-0 zio-io-test. Run: `zig build zio-integ-test`.
 //!
-//! PLATFORM NOTE: these tests SKIP on macOS. The QUIC data path (handshake +
-//! stream echo + per-connection teardown) works on the macOS kqueue backend, but
-//! `endpoint.deinit()` -> `router.closeListener()` -> `router_future.cancel()`
-//! LIVELOCKS there: zio's kqueue multi-executor backend does not wake/interrupt a
-//! fiber blocked in a socket `receive` when its Future is cancelled, so the
-//! cancelling fiber spins forever (verified by staged logging: both tests reach
-//! the final connection-deinit, then hang in fixture.deinit). The identical
-//! teardown path tears down cleanly on Linux (epoll / io_uring), where the QUIC
-//! interop suite already exercises it. So the end-to-end net runs on Linux
-//! (Docker / CI); the Layer-0 primitive net (zio-io-test) runs anywhere.
-//! Tracked alongside E7 as a zio kqueue-backend upstream issue.
+//! Runs on every backend (macOS kqueue, Linux epoll / io_uring), including the
+//! teardown path (`endpoint.deinit()` -> `router.closeListener()`). Teardown is
+//! cooperative (a stop flag + closing `route_commands` to wake the router's select
+//! arm), not `router_future.cancel()`: cancel-based teardown of the router's
+//! multi-arm `Select` deadlocks on macOS kqueue. See `router.closeListener`.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const zio = @import("zio");
 const support = @import("quic/endpoint/test_support.zig");
 
@@ -37,12 +30,6 @@ const TwoEndpoints = support.TwoEndpoints;
 const closeStreamForTest = support.closeStreamForTest;
 const receiveTimeout = support.receiveTimeout;
 const default_handshake_timeout_ns = support.default_handshake_timeout_ns;
-
-/// Linux-only: see the PLATFORM NOTE above. Returns `error.SkipZigTest` on macOS
-/// (and any non-Linux host) so `zig build zio-integ-test` is safe to run locally.
-fn requireLinux() !void {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-}
 
 /// Spin a multi-executor zio runtime and run `root(io)` to completion on the
 /// main executor; worker fibers (the server accept loop, the connection actors,
@@ -120,7 +107,6 @@ fn loopbackHandshakeAndEcho(io: std.Io) !void {
 }
 
 test "endpoint loopback: handshake + stream echo on exact(2)" {
-    try requireLinux();
     try runRoot(2, struct {
         fn root(io: std.Io) !void {
             try loopbackHandshakeAndEcho(io);
@@ -129,10 +115,10 @@ test "endpoint loopback: handshake + stream echo on exact(2)" {
 }
 
 test "endpoint loopback: handshake + stream echo on exact(4)" {
-    try requireLinux();
     try runRoot(4, struct {
         fn root(io: std.Io) !void {
             try loopbackHandshakeAndEcho(io);
         }
     }.root);
 }
+
