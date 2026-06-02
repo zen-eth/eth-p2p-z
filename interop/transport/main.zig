@@ -344,22 +344,17 @@ fn runDialer(
     const rtt_ns = try runPing(allocator, io, conn);
     const total_ns = monotonicNs(io) -| total_start_ns;
 
-    // Emit the result JSON with a plain blocking syscall rather than the zio
-    // std.Io file writer: zio's epoll backend fails async writes to the stdout
-    // pipe with error.WriteFailed (the QUIC handshake + ping themselves succeed).
-    // Program output needs no async runtime, so write it directly.
-    var json_buf: [256]u8 = undefined;
-    const json = std.fmt.bufPrint(
-        &json_buf,
+    // Emit the result JSON via the std.Io file writer. stdout is a pipe under the
+    // interop harness; the default positional writer falls back to streaming on a
+    // non-seekable fd (relies on zio's ESPIPE->Unseekable fix, lalinsky/zio#451).
+    const stdout_file: std.Io.File = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
+    var stdout_buf: [256]u8 = undefined;
+    var stdout_writer = stdout_file.writer(io, &stdout_buf);
+    try stdout_writer.interface.print(
         "{{\"handshakePlusOneRTTMillis\":{d:.3},\"pingRTTMilllis\":{d:.3}}}\n",
         .{ nsToMillis(total_ns), nsToMillis(rtt_ns) },
-    ) catch unreachable;
-    var written: usize = 0;
-    while (written < json.len) {
-        const n = std.c.write(std.posix.STDOUT_FILENO, json[written..].ptr, json.len - written);
-        if (n <= 0) return error.StdoutWriteFailed;
-        written += @intCast(n);
-    }
+    );
+    try stdout_writer.interface.flush();
 }
 
 fn waitForListenerMultiaddr(
