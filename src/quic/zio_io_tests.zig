@@ -8,7 +8,7 @@
 //!
 //! These tests spin a REAL `zio.Runtime` with >=2 executors and put producers
 //! and consumers on different executors, so they pin the Invariant-Ledger
-//! contracts (see docs/quiche-refactor-plan.md) before the Layer-0 refactor
+//! contracts before the Layer-0 refactor
 //! touches channel.zig / waitset.zig. BoringSSL-free: imports only zio + the
 //! io primitives, so it compiles in seconds.
 //!

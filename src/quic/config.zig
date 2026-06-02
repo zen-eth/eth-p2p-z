@@ -101,7 +101,7 @@ pub const TransportOptions = struct {
 ///
 /// The queue-length knobs here ARE the cross-fiber backpressure budget — the
 /// bounded credit between producer and consumer fibers. They are validated
-/// non-zero and must stay >= 1 (model_critical; see docs/quiche-refactor-plan.md §0).
+/// non-zero and must stay >= 1 — a model-critical cross-fiber invariant.
 pub const ActorOptions = struct {
     /// Maximum queued inbound UDP payload bytes per connection. Packet metadata
     /// and preallocated queue slots are bounded separately by queue length.

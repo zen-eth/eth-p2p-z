@@ -8,8 +8,8 @@
 //! This exercises the full multi-executor stack the upper-layer refactors touch
 //! — router fiber, per-connection actors, stream byte queues, TLS handshake,
 //! teardown — under genuine cross-executor scheduling (the path that starved
-//! under the historical .exact(1) bug). It is the regression net for refactor
-//! layers L2-L6 (docs/quiche-refactor-plan.md).
+//! under the historical .exact(1) bug). It is the regression net for the
+//! multi-executor refactor of the upper layers.
 //!
 //! Pulls BoringSSL (via the quiche dep), so it is a separate, slower-compiling
 //! target from the Layer-0 zio-io-test. Run: `zig build zio-integ-test`.
