@@ -34,6 +34,15 @@ const quiche_packet_type_initial: u8 = 1;
 // reflectable (e.g., Version Negotiation) so we never amplify a short/spoofed input.
 const min_initial_packet_len: usize = 1200;
 
+// Scratch for the token quiche_header_info() extracts from an incoming Initial.
+// Sized well above our minted retry tokens (retry_token.max_token_len) so an
+// oversized or foreign token does not fail header parsing before we can route.
+const header_info_token_buf_len: usize = 256;
+
+// Output buffer for a Version Negotiation packet — sized to a full datagram (a
+// VN packet itself is small, but this is the scratch we hand quiche).
+const version_negotiation_buf_len: usize = 1500;
+
 pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -98,8 +107,8 @@ pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAd
     if (ep.socket_slot.* != null) return error.AlreadyBound;
     const io = ep.io;
     var bind_addr = addr;
-    // std.Io backends in 0.15.x apply IPV6_V6ONLY=0 (dual-stack) when this flag is
-    // set, which is the inverse of the field's name but matches the implementation
+    // std.Io's `ip6_only` is applied inverted by the backends: setting it yields
+    // IPV6_V6ONLY=0 (dual-stack), the opposite of the field's name, but consistently
     // across Threaded/Kqueue/Uring. We want dual-stack for IPv6 binds so peers can
     // arrive over IPv4-mapped addresses.
     const bind_options: std.Io.net.IpAddress.BindOptions = .{
@@ -398,23 +407,23 @@ pub const RouteRegistrar = struct {
 };
 
 fn mapCidFromExisting(ep: Context, cid_map: *CidMap, existing_cid: CidKey, new_cid: CidKey) void {
-    const sender = cid_map.get(existing_cid) orelse {
+    const channel = cid_map.get(existing_cid) orelse {
         ep.addStat("cid_map_unknown_existing", 1);
         return;
     };
-    _ = mapRoute(ep, cid_map, new_cid, sender);
+    _ = mapRoute(ep, cid_map, new_cid, channel);
 }
 
-/// Insert `cid → sender` into the live router-thread `CidMap`. Only callers
+/// Insert `cid → channel` into the live router-thread `CidMap`. Only callers
 /// with a live `*CidMap` should use this — i.e. the router socket loop and
 /// the server accept path running under it. Cross-thread requests should go through
 /// `RouteRegistrar.register`, which posts a `register_route` command.
-pub fn mapRoute(ep: Context, cid_map: *CidMap, cid: CidKey, sender: *IncomingPacketChannel) bool {
-    if (cid_map.get(cid)) |existing_sender| return existing_sender == sender;
+pub fn mapRoute(ep: Context, cid_map: *CidMap, cid: CidKey, channel: *IncomingPacketChannel) bool {
+    if (cid_map.get(cid)) |existing_channel| return existing_channel == channel;
 
-    sender.retain();
-    cid_map.putNoClobber(cid, sender) catch {
-        sender.release();
+    channel.retain();
+    cid_map.putNoClobber(cid, channel) catch {
+        channel.release();
         ep.addStat("cid_map_command_drops", 1);
         return false;
     };
@@ -431,7 +440,7 @@ fn unmapRoute(ep: Context, cid_map: *CidMap, cid: CidKey) void {
 
 fn clearRouterCidMap(ep: Context, cid_map: *CidMap) void {
     var values = cid_map.valueIterator();
-    while (values.next()) |sender| sender.*.release();
+    while (values.next()) |channel| channel.*.release();
     cid_map.deinit();
     ep.setStat("cid_map_entries", 0);
 }
@@ -475,6 +484,11 @@ fn receiveRouterPacket(ep: Context, timeout: std.Io.Timeout) (error{Timeout} || 
     };
 }
 
+// The local address a packet was actually delivered to, used as the source for
+// our reply. Precedence: the kernel's original destination (IP_ORIGDSTADDR /
+// IPV6_ORIGDSTADDR — survives transparent-proxy / dual-stack rewrites) first, then
+// IP_PKTINFO's destination, and finally the socket's bound address when neither
+// control message is present.
 fn controlDestination(meta: socket_control.ParsedControl, fallback_to: std.Io.net.IpAddress) std.Io.net.IpAddress {
     return meta.orig_dst_to orelse meta.pktinfo_to orelse fallback_to;
 }
@@ -537,7 +551,7 @@ fn processRouterSinglePacket(ep: Context, cid_map: *CidMap, packet: *RoutedPacke
     var scid_len: usize = scid.len;
     var dcid: [quiche.QUICHE_MAX_CONN_ID_LEN]u8 = undefined;
     var dcid_len: usize = dcid.len;
-    var token: [256]u8 = undefined;
+    var token: [header_info_token_buf_len]u8 = undefined;
     var token_len: usize = token.len;
     const rc = quiche.quiche_header_info(
         data.ptr,
@@ -577,7 +591,7 @@ fn processRouterSinglePacket(ep: Context, cid_map: *CidMap, packet: *RoutedPacke
             ep.addStat("router_rejected_initial_packets", 1);
             return;
         }
-        var out: [1500]u8 = undefined;
+        var out: [version_negotiation_buf_len]u8 = undefined;
         const written = quiche.quiche_negotiate_version(&scid, scid_len, &dcid, dcid_len, &out, out.len);
         if (written > 0) {
             const socket = ep.socket_slot.* orelse return error.Canceled;

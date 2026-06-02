@@ -5,6 +5,13 @@ const ssl = @import("ssl").c;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const max_odcid_len: usize = quiche.QUICHE_MAX_CONN_ID_LEN;
 
+// Canonical peer-address encoding: a 1-byte family tag followed by the raw
+// address bytes (4 for IPv4, 16 for IPv6). See `encodePeerAddr`.
+const addr_tag_len: usize = 1;
+const ipv4_encoded_len: usize = addr_tag_len + 4;
+const ipv6_encoded_len: usize = addr_tag_len + 16;
+const max_encoded_addr_len: usize = ipv6_encoded_len;
+
 /// Domain separator mixed into HMAC input so the key cannot collide with any
 /// other HMAC use that might be added later.
 const domain_tag = "eth-p2p-z/quic-retry-token/v1";
@@ -130,7 +137,7 @@ fn computeMac(
 ) void {
     var hmac = HmacSha256.init(key);
     hmac.update(domain_tag);
-    var addr_buf: [17]u8 = undefined;
+    var addr_buf: [max_encoded_addr_len]u8 = undefined;
     const addr_bytes = encodePeerAddr(peer_addr, &addr_buf);
     hmac.update(addr_bytes);
     hmac.update(body);
@@ -141,17 +148,17 @@ fn computeMac(
 /// bytes). Port is intentionally excluded — RFC 9000 §8.1.4 binds the token
 /// to "the address" and most NATs preserve the IP across rebinds, so binding
 /// to IP-only avoids breaking address validation when the source port shifts.
-fn encodePeerAddr(addr: std.Io.net.IpAddress, buf: *[17]u8) []const u8 {
+fn encodePeerAddr(addr: std.Io.net.IpAddress, buf: *[max_encoded_addr_len]u8) []const u8 {
     return switch (addr) {
         .ip4 => |ip4| blk: {
             buf[0] = 0;
-            @memcpy(buf[1..5], &ip4.bytes);
-            break :blk buf[0..5];
+            @memcpy(buf[1..ipv4_encoded_len], &ip4.bytes);
+            break :blk buf[0..ipv4_encoded_len];
         },
         .ip6 => |ip6| blk: {
             buf[0] = 1;
-            @memcpy(buf[1..17], &ip6.bytes);
-            break :blk buf[0..17];
+            @memcpy(buf[1..ipv6_encoded_len], &ip6.bytes);
+            break :blk buf[0..ipv6_encoded_len];
         },
     };
 }
