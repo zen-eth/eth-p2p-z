@@ -353,6 +353,26 @@ pub fn buildCert(
     return cert;
 }
 
+/// Encodes a public key into the libp2p PublicKey protobuf wire format and
+/// returns the raw bytes — the slice variant of `createProtobufEncodedPublicKey`.
+/// The caller owns the returned slice.
+pub fn createProtobufEncodedPublicKeyBuf(allocator: Allocator, pkey: *ssl.EVP_PKEY) ![]const u8 {
+    var public_key_proto = try createProtobufEncodedPublicKey(allocator, pkey);
+    defer allocator.free(public_key_proto.data.?);
+
+    var proto_bytes = try public_key_proto.encode(allocator);
+
+    if (public_key_proto.type == .RSA) {
+        // RSA is the default key type (0) so the encoder omits it. Append the tag/value to
+        // match other implementations when hashing protobuf-encoded keys.
+        const type_field = [_]u8{ 0x08, 0x00 };
+        const augmented = try std.mem.concat(allocator, u8, &.{ &type_field, proto_bytes });
+        allocator.free(proto_bytes);
+        proto_bytes = augmented;
+    }
+    return proto_bytes;
+}
+
 /// Encodes a public key into the libp2p PublicKey protobuf format, returning a
 /// `keys.PublicKey` struct (vs a raw byte slice). The caller owns the returned
 /// struct's `data` slice.
@@ -848,6 +868,26 @@ fn addExtension(cert: *ssl.X509, oid_str: [*:0]const u8, is_critical: bool, der_
     if (ssl.X509_add_ext(cert, ext, -1) <= 0) return error.CertExtSetFailed;
 }
 
+/// Converts an X509 certificate to PEM format using the provided allocator.
+/// The caller owns the returned slice and must free it.
+/// Returns error.OpenSSLFailed on failure.
+fn x509ToPem(allocator: Allocator, cert: *ssl.X509) ![]u8 {
+    const bio = ssl.BIO_new(ssl.BIO_s_mem()) orelse return error.OpenSSLFailed;
+    defer _ = ssl.BIO_free(bio);
+
+    if (ssl.PEM_write_bio_X509(bio, cert) <= 0) {
+        return error.OpenSSLFailed;
+    }
+
+    var data_ptr: [*c]u8 = undefined;
+    const len = ssl.BIO_get_mem_data(bio, &data_ptr);
+    if (len <= 0) {
+        return error.OpenSSLFailed;
+    }
+
+    return allocator.dupe(u8, data_ptr[0..@intCast(len)]);
+}
+
 pub fn alpnSelectCallbackfn(ssl_handle: ?*ssl.SSL, out: [*c][*c]const u8, out_len: [*c]u8, in_protos: [*c]const u8, in_len: c_uint, _: ?*anyopaque) callconv(.c) c_int {
     _ = ssl_handle;
 
@@ -1037,6 +1077,30 @@ fn checkCriticalExtensions(cert: *ssl.X509) !bool {
     return true;
 }
 
+test "Build certificate using Ed25519 keys" {
+    const host_key = try generateKeyPair(.ED25519);
+    defer ssl.EVP_PKEY_free(host_key);
+
+    const subject_key = try generateKeyPair(.ED25519);
+    defer ssl.EVP_PKEY_free(subject_key);
+
+    var host_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(host_pubkey.data.?);
+
+    const cert = try buildCert(
+        std.testing.allocator,
+        &host_pubkey,
+        @as(?*anyopaque, @ptrCast(host_key)),
+        signDataWithTlsKey,
+        subject_key,
+    );
+    defer ssl.X509_free(cert);
+
+    const pem_buf = try x509ToPem(std.testing.allocator, cert);
+    defer std.testing.allocator.free(pem_buf);
+    try std.testing.expect(pem_buf.len > 0);
+}
+
 test "Verify certificate with Ed25519 keys" {
     const host_key = try generateKeyPair(.ED25519);
     defer ssl.EVP_PKEY_free(host_key);
@@ -1068,6 +1132,31 @@ test "Verify certificate with Ed25519 keys" {
     try std.testing.expect(peer_info.peer_id.eql(&expected_peer_id));
 }
 
+test "Build certificate using ECDSA keys" {
+    const host_key = try generateKeyPair(.ECDSA);
+    defer ssl.EVP_PKEY_free(host_key);
+
+    const subject_key = try generateKeyPair(.ECDSA);
+    defer ssl.EVP_PKEY_free(subject_key);
+
+    var host_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(host_pubkey.data.?);
+
+    const cert = try buildCert(
+        std.testing.allocator,
+        &host_pubkey,
+        @as(?*anyopaque, @ptrCast(host_key)),
+        signDataWithTlsKey,
+        subject_key,
+    );
+    defer ssl.X509_free(cert);
+
+    const pem_buf = try x509ToPem(std.testing.allocator, cert);
+    defer std.testing.allocator.free(pem_buf);
+
+    try std.testing.expect(pem_buf.len > 0);
+}
+
 test "Verify certificate with ECDSA keys" {
     const host_key = try generateKeyPair(.ECDSA);
     defer ssl.EVP_PKEY_free(host_key);
@@ -1097,6 +1186,31 @@ test "Verify certificate with ECDSA keys" {
     defer std.testing.allocator.free(expected_pubkey.data.?);
     const expected_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &expected_pubkey);
     try std.testing.expect(peer_info.peer_id.eql(&expected_peer_id));
+}
+
+test "Build certificate using RSA keys" {
+    const host_key = try generateKeyPair(.RSA);
+    defer ssl.EVP_PKEY_free(host_key);
+
+    const subject_key = try generateKeyPair(.RSA);
+    defer ssl.EVP_PKEY_free(subject_key);
+
+    var host_pubkey = try createProtobufEncodedPublicKey(std.testing.allocator, host_key);
+    defer std.testing.allocator.free(host_pubkey.data.?);
+
+    const cert = try buildCert(
+        std.testing.allocator,
+        &host_pubkey,
+        @as(?*anyopaque, @ptrCast(host_key)),
+        signDataWithTlsKey,
+        subject_key,
+    );
+    defer ssl.X509_free(cert);
+
+    const pem_buf = try x509ToPem(std.testing.allocator, cert);
+    defer std.testing.allocator.free(pem_buf);
+
+    try std.testing.expect(pem_buf.len > 0);
 }
 
 test "Verify certificate with RSA keys" {
