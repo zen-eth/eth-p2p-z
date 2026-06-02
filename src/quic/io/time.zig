@@ -7,9 +7,7 @@ pub fn monotonicNsSigned(io: std.Io) i96 {
 pub fn monotonicNs(io: std.Io) u64 {
     const value = monotonicNsSigned(io);
     if (value <= 0) return 0;
-    // Saturate rather than @intCast-panic if the clock ever exceeds u64 ns
-    // (unreachable for the awake clock in practice, but no silent crash).
-    return std.math.cast(u64, value) orelse std.math.maxInt(u64);
+    return @intCast(value);
 }
 
 pub fn receiveTimeout(value: i96) std.Io.Timeout {
