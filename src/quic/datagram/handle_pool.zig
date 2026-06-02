@@ -25,6 +25,10 @@ pub const Datagram = opaque {
 
     pub fn setLen(d: *Datagram, len: usize) void {
         const data = d.impl();
+        // `len` may only narrow within the slice the slot currently holds (the
+        // length it was acquired with) — the handle has no access to the slot's
+        // full backing buffer, so re-slicing past `data.len` is out of bounds.
+        std.debug.assert(len <= data.data.len);
         data.data = data.data[0..len];
     }
 
@@ -113,6 +117,8 @@ pub const Pool = struct {
 
         const start = index * pool.slot_size;
         const buf = pool.storage[start..][0..pool.slot_size];
+        // The slot backs `slot_size` bytes; the returned Datagram is narrowed to
+        // the requested `len`. `setLen` may only re-narrow within that `len`.
         slot.* = .{
             .datagram = .{
                 .pool = pool,

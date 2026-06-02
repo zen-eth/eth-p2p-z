@@ -37,9 +37,7 @@ pub fn createPendingConnection(
         .io = endpoint.io,
         .conn = conn,
         .actor = params,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-    };
+    });
 }
 
 fn createQuicheConn(
@@ -56,9 +54,10 @@ fn createQuicheConn(
     errdefer ssl.SSL_free(ssl_conn);
 
     var generated_scid: cid_gen.LocalCid = undefined;
-    if (server_scid == null) generated_scid = cid_gen.randomLocalCid() catch return error.HandshakeFailed;
-    const scid_ptr = server_scid orelse generated_scid[0..].ptr;
-    const scid_len = if (server_scid != null) server_scid_len else generated_scid.len;
+    const scid: []const u8 = if (server_scid) |ptr| ptr[0..server_scid_len] else blk: {
+        generated_scid = cid_gen.randomLocalCid() catch return error.HandshakeFailed;
+        break :blk &generated_scid;
+    };
 
     var local_storage: address.PosixAddress = undefined;
     var peer_storage: address.PosixAddress = undefined;
@@ -66,8 +65,8 @@ fn createQuicheConn(
     const peer_len = address.addressToPosix(&peer_addr, &peer_storage);
 
     return quiche.quiche_conn_new_with_tls(
-        scid_ptr,
-        scid_len,
+        scid.ptr,
+        scid.len,
         odcid,
         odcid_len,
         @ptrCast(&local_storage.any),

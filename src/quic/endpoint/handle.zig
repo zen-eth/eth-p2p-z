@@ -15,6 +15,14 @@ const log = @import("../log.zig");
 
 pub const EndpointStats = endpoint_core.EndpointStats;
 
+/// Opaque handle over a heap-allocated, stable-address `Impl`. Deliberately
+/// opaque (not a plain struct) because the endpoint is self-referential: the
+/// spawned router fiber borrows interior pointers into `Impl` (see
+/// `routerContext`: `&endpoint.socket`, `&endpoint.router_future`,
+/// `&endpoint.router_stopping`, `&endpoint.accept_available`, ...). It must
+/// therefore never be copied or moved — `opaque` makes "pointer-only, never by
+/// value" a compile-time guarantee. Switching to a struct-behind-pointer would
+/// require auditing those borrows by hand.
 pub const QuicEndpoint = opaque {
     pub const Options = config.Options;
     pub const InitError = config.ConfigError || error{RandomFailed} || std.mem.Allocator.Error;
@@ -37,6 +45,7 @@ pub const QuicEndpoint = opaque {
         errdefer quiche.quiche_config_free(quiche_config);
 
         const endpoint = try allocator.create(Impl);
+        errdefer allocator.destroy(endpoint);
         endpoint.* = .{
             .allocator = allocator,
             .io = io,
@@ -76,6 +85,9 @@ pub const QuicEndpoint = opaque {
         return endpoint;
     }
 
+    /// Safe to call even if `bind()` was never invoked: `closeListener`
+    /// tolerates an unbound endpoint (null socket / router_future / accept
+    /// queue), so this also cleans up an endpoint that failed mid-setup.
     pub fn deinit(e: *QuicEndpoint) void {
         const endpoint = internal(e);
         router.closeListener(routerContext(e));
