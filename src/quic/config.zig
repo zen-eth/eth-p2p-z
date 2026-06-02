@@ -85,7 +85,10 @@ pub const TransportOptions = struct {
     enable_early_data: bool = false,
     /// ACK delay exponent transport parameter. RFC 9000 default is 3.
     ack_delay_exponent: u64 = 3,
-    /// Optional server-side stateless reset token.
+    /// Optional stateless reset token. Server-only in effect: quiche reads this
+    /// from the config only for `is_server` connections (`let reset_token = if
+    /// is_server { ... } else { None }`), so on our dual-role endpoint's shared
+    /// config it is applied to accepted connections and ignored for outbound dials.
     stateless_reset_token: ?[16]u8 = null,
     /// Quiche CUBIC idle restart behavior toggle exposed for parity.
     enable_cubic_idle_restart_fix: bool = false,
@@ -95,6 +98,10 @@ pub const TransportOptions = struct {
 /// batching, per-stream queues, and datagram pools. These never reach the
 /// wire — they only shape how our own actor handles packets it has already
 /// received or queued for send.
+///
+/// The queue-length knobs here ARE the cross-fiber backpressure budget — the
+/// bounded credit between producer and consumer fibers. They are validated
+/// non-zero and must stay >= 1 (model_critical; see docs/quiche-refactor-plan.md §0).
 pub const ActorOptions = struct {
     /// Maximum queued inbound UDP payload bytes per connection. Packet metadata
     /// and preallocated queue slots are bounded separately by queue length.
@@ -152,7 +159,12 @@ pub fn validateOptions(opts: Options) ConfigError!Options {
 fn validateTransport(opts: TransportOptions) ConfigError!void {
     if (opts.max_recv_udp_payload_size > packet_route.max_udp_payload_len) return error.InvalidOptions;
     if (opts.max_send_udp_payload_size > connection_actor.max_flush_packet_len) return error.InvalidOptions;
-    if (opts.max_recv_udp_payload_size == 0 or opts.max_send_udp_payload_size == 0) return error.InvalidOptions;
+    // RFC 9000 §14.1: a QUIC endpoint must support a 1200-byte UDP payload —
+    // Initials are padded to >=1200, and smaller ones are dropped by peers (and
+    // by our own router `min_initial_packet_len`), so sub-1200 sizes silently
+    // break the handshake. (>=1200 also subsumes the non-zero requirement.)
+    if (opts.max_recv_udp_payload_size < 1200) return error.InvalidOptions;
+    if (opts.max_send_udp_payload_size < 1200) return error.InvalidOptions;
     if (opts.max_amplification_factor == 0) return error.InvalidOptions;
     // RFC 9000 §13.2.1 caps `max_ack_delay` at 2^14 - 1 (16383ms).
     if (opts.max_ack_delay_ms >= (1 << 14)) return error.InvalidOptions;
@@ -229,6 +241,8 @@ pub fn buildQuicheConfig(opts: Options) ConfigError!*quiche.quiche_config {
     if (t.stateless_reset_token) |token| {
         quiche.quiche_config_set_stateless_reset_token(cfg, token[0..].ptr);
     }
+    // Datagrams are always enabled for libp2p (the `true` is intentional, not an
+    // Option); only the queue sizes are user-tunable via ActorOptions.
     quiche.quiche_config_enable_dgram(cfg, true, w.recv_datagram_slots, w.send_datagram_queue_len);
     return cfg;
 }
@@ -273,6 +287,10 @@ test "rejects invalid transport options" {
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_send_udp_payload_size = connection_actor.max_flush_packet_len + 1 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_recv_udp_payload_size = 0 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_send_udp_payload_size = 0 } }));
+    // RFC 9000 §14.1: reject just-below the 1200 floor; accept the boundary.
+    try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_recv_udp_payload_size = 1199 } }));
+    try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_send_udp_payload_size = 1199 } }));
+    _ = try validateOptions(.{ .transport = .{ .max_recv_udp_payload_size = 1200, .max_send_udp_payload_size = 1200 } });
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_amplification_factor = 0 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_ack_delay_ms = 1 << 14 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .ack_delay_exponent = 21 } }));
