@@ -41,7 +41,11 @@ WORKDIR /app
 
 COPY . .
 
-RUN zig build -Doptimize=ReleaseFast -Dcpu=x86_64 -Dlog-level=${ZIG_LOG_LEVEL}
+# Build on the epoll backend: io_uring's syscalls are blocked by the default
+# Docker seccomp profile that the libp2p test-plans harness runs containers
+# under, so an io_uring-backed binary dies at startup with PermissionDenied.
+# epoll runs fine under default seccomp (like rust/go's interop binaries).
+RUN zig build -Doptimize=ReleaseFast -Dcpu=x86_64 -Dzio-backend=epoll -Dlog-level=${ZIG_LOG_LEVEL}
 
 FROM debian:bookworm-slim AS runtime
 

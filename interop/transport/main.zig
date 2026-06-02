@@ -162,10 +162,10 @@ const Env = struct {
     listen_port: u16,
 
     fn load(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) !Env {
-        const transport_owned = try getRequiredOwned(allocator, env_map, "TRANSPORT");
+        const transport_owned = try getRequiredOwned(allocator, env_map, "transport");
         errdefer allocator.free(transport_owned);
 
-        const is_dialer_raw = try getRequiredOwned(allocator, env_map, "IS_DIALER");
+        const is_dialer_raw = try getRequiredOwned(allocator, env_map, "is_dialer");
         defer allocator.free(is_dialer_raw);
         const is_dialer = try parseBool(is_dialer_raw);
 
@@ -173,25 +173,25 @@ const Env = struct {
         defer allocator.free(debug_owned);
         const debug = try parseBool(debug_owned);
 
-        const bind_ip_owned = try getOptionalOwnedOrDefault(allocator, env_map, "IP", "0.0.0.0");
+        const bind_ip_owned = try getOptionalOwnedOrDefault(allocator, env_map, "ip", "0.0.0.0");
         errdefer allocator.free(bind_ip_owned);
 
         const default_publish = if (is_dialer) "dialer" else "listener";
         const publish_host_owned = try getOptionalOwnedOrDefault(allocator, env_map, "publish_host", default_publish);
         errdefer allocator.free(publish_host_owned);
 
-        const muxer_owned = try getOptionalOwned(allocator, env_map, "MUXER");
+        const muxer_owned = try getOptionalOwned(allocator, env_map, "muxer");
         errdefer if (muxer_owned) |value| allocator.free(value);
 
-        const security_owned = try getOptionalOwned(allocator, env_map, "SECURITY");
+        const security_owned = try getOptionalOwned(allocator, env_map, "security");
         errdefer if (security_owned) |value| allocator.free(value);
 
-        const redis_addr_owned = try getOptionalOwnedOrDefault(allocator, env_map, "REDIS_ADDR", "redis:6379");
+        const redis_addr_owned = try getOptionalOwnedOrDefault(allocator, env_map, "redis_addr", "redis:6379");
         defer allocator.free(redis_addr_owned);
         const parsed_redis = try parseHostPort(allocator, redis_addr_owned);
         errdefer allocator.free(parsed_redis.host);
 
-        const timeout_secs = try getOptionalUint(env_map, "TEST_TIMEOUT_SECONDS", 180);
+        const timeout_secs = try getOptionalUint(env_map, "test_timeout_seconds", 180);
         const listen_port_value = try getOptionalUint(env_map, "listen_port", 4001);
         if (listen_port_value > std.math.maxInt(u16)) return error.InvalidPort;
 
