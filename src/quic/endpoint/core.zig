@@ -34,7 +34,10 @@ pub const EndpointCore = struct {
     refs: std.atomic.Value(usize) = .init(1),
     route_commands: *route_commands_mod.Queue.State,
     retry_tokens: retry_token.Store,
-    stats_lock: std.Io.Mutex = .init,
+    /// Live, lock-free stat counters. Best-effort observability: written with
+    /// monotonic atomics from any executor (router / connection fibers) and read
+    /// via `stats()`. Monotonic ordering suffices — these counters are not a
+    /// synchronization mechanism, so a reader may observe a slightly stale value.
     stats_snapshot: EndpointStats = .{},
 
     pub const InitError = error{RandomFailed} || std.mem.Allocator.Error;
@@ -69,26 +72,29 @@ pub const EndpointCore = struct {
     }
 
     pub fn stats(core: *EndpointCore) EndpointStats {
-        core.stats_lock.lockUncancelable(core.io);
-        defer core.stats_lock.unlock(core.io);
-        return core.stats_snapshot;
+        var snapshot: EndpointStats = .{};
+        inline for (std.meta.fields(EndpointStats)) |f| {
+            @field(snapshot, f.name) = @atomicLoad(u64, &@field(core.stats_snapshot, f.name), .monotonic);
+        }
+        return snapshot;
     }
 
     pub fn addStat(core: *EndpointCore, comptime field: []const u8, value: u64) void {
-        core.stats_lock.lockUncancelable(core.io);
-        defer core.stats_lock.unlock(core.io);
-        @field(core.stats_snapshot, field) += value;
+        _ = @atomicRmw(u64, &@field(core.stats_snapshot, field), .Add, value, .monotonic);
     }
 
     pub fn subStat(core: *EndpointCore, comptime field: []const u8, value: u64) void {
-        core.stats_lock.lockUncancelable(core.io);
-        defer core.stats_lock.unlock(core.io);
-        @field(core.stats_snapshot, field) -|= value;
+        // Saturating at zero, lock-free: CAS the floored difference so a stray
+        // over-decrement cannot wrap a counter to ~2^64 (matches the old `-|=`).
+        const ptr = &@field(core.stats_snapshot, field);
+        var current = @atomicLoad(u64, ptr, .monotonic);
+        while (true) {
+            const next = current -| value;
+            current = @cmpxchgWeak(u64, ptr, current, next, .monotonic, .monotonic) orelse break;
+        }
     }
 
     pub fn setStat(core: *EndpointCore, comptime field: []const u8, value: u64) void {
-        core.stats_lock.lockUncancelable(core.io);
-        defer core.stats_lock.unlock(core.io);
-        @field(core.stats_snapshot, field) = value;
+        @atomicStore(u64, &@field(core.stats_snapshot, field), value, .monotonic);
     }
 };
