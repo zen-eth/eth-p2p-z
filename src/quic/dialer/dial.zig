@@ -110,8 +110,11 @@ pub fn dial(ep: Context, addr: std.Io.net.IpAddress, opts: DialOptions) DialErro
 
 fn publicKeysEqual(a: *const keys.PublicKey, b: *const keys.PublicKey) bool {
     if (a.type != b.type) return false;
-    const a_data = a.data orelse &.{};
-    const b_data = b.data orelse &.{};
+    // Fail closed: a key with no bytes is not a valid identity. Coercing null to
+    // an empty slice would let two data-less keys (or null-vs-empty) compare equal
+    // and satisfy a pinned `expected_peer_key` against an unverified peer.
+    const a_data = a.data orelse return false;
+    const b_data = b.data orelse return false;
     return std.mem.eql(u8, a_data, b_data);
 }
 
