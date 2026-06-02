@@ -8,6 +8,11 @@ const tls = @import("../security/tls.zig");
 pub const ConfigError = error{ QuicheConfigFailed, InvalidOptions };
 pub const default_handshake_timeout_ns: u64 = 10 * std.time.ns_per_s;
 
+/// RFC 9000 §14.1: a QUIC endpoint must support a 1200-byte UDP payload. Initials
+/// are padded to >=1200 and smaller ones are dropped by compliant peers (and by
+/// the router's min-Initial gate), so sub-1200 sizes silently break the handshake.
+const min_udp_payload_size: usize = 1200;
+
 pub const CongestionControl = enum {
     reno,
     cubic,
@@ -159,12 +164,9 @@ pub fn validateOptions(opts: Options) ConfigError!Options {
 fn validateTransport(opts: TransportOptions) ConfigError!void {
     if (opts.max_recv_udp_payload_size > packet_route.max_udp_payload_len) return error.InvalidOptions;
     if (opts.max_send_udp_payload_size > connection_actor.max_flush_packet_len) return error.InvalidOptions;
-    // RFC 9000 §14.1: a QUIC endpoint must support a 1200-byte UDP payload —
-    // Initials are padded to >=1200, and smaller ones are dropped by peers (and
-    // by our own router `min_initial_packet_len`), so sub-1200 sizes silently
-    // break the handshake. (>=1200 also subsumes the non-zero requirement.)
-    if (opts.max_recv_udp_payload_size < 1200) return error.InvalidOptions;
-    if (opts.max_send_udp_payload_size < 1200) return error.InvalidOptions;
+    // >= min_udp_payload_size also subsumes the old non-zero requirement.
+    if (opts.max_recv_udp_payload_size < min_udp_payload_size) return error.InvalidOptions;
+    if (opts.max_send_udp_payload_size < min_udp_payload_size) return error.InvalidOptions;
     if (opts.max_amplification_factor == 0) return error.InvalidOptions;
     // RFC 9000 §13.2.1 caps `max_ack_delay` at 2^14 - 1 (16383ms).
     if (opts.max_ack_delay_ms >= (1 << 14)) return error.InvalidOptions;
@@ -287,10 +289,10 @@ test "rejects invalid transport options" {
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_send_udp_payload_size = connection_actor.max_flush_packet_len + 1 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_recv_udp_payload_size = 0 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_send_udp_payload_size = 0 } }));
-    // RFC 9000 §14.1: reject just-below the 1200 floor; accept the boundary.
-    try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_recv_udp_payload_size = 1199 } }));
-    try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_send_udp_payload_size = 1199 } }));
-    _ = try validateOptions(.{ .transport = .{ .max_recv_udp_payload_size = 1200, .max_send_udp_payload_size = 1200 } });
+    // Reject just-below the min_udp_payload_size floor; accept the boundary.
+    try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_recv_udp_payload_size = min_udp_payload_size - 1 } }));
+    try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_send_udp_payload_size = min_udp_payload_size - 1 } }));
+    _ = try validateOptions(.{ .transport = .{ .max_recv_udp_payload_size = min_udp_payload_size, .max_send_udp_payload_size = min_udp_payload_size } });
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_amplification_factor = 0 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .max_ack_delay_ms = 1 << 14 } }));
     try std.testing.expectError(error.InvalidOptions, validateOptions(.{ .transport = .{ .ack_delay_exponent = 21 } }));
