@@ -8,15 +8,24 @@ const Signal = channel.Signal;
 /// stream-handler fibers (E3) and composes with the cooperative
 /// single-executor-per-fiber teardown model:
 ///
-///   - `acquire` is a CANCEL POINT (so `Group.cancel` at teardown unwinds a
-///     fiber parked waiting for a permit), and returns `error.Closed` once
-///     `close` has been called.
+///   - `acquire` is a CANCEL POINT, and cancellation is the PRIMARY way a
+///     parked waiter is unwound at teardown (the dispatcher loop via
+///     `Group.cancel`, the one-shot command path via the actor's main-future
+///     cancel). `close()`/`error.Closed` is a secondary, belt-and-suspenders
+///     PERSISTENT wake — used for the aggregate gate at `Switch.deinit`, where
+///     no fiber is actually parked by then.
 ///   - `release` never blocks or allocates, so it is safe to run from a
 ///     handler's cleanup `defer` even while that handler is being canceled.
 ///
 /// `permits` is the number of currently-available slots; it never goes
 /// negative (acquire only decrements when > 0). Multi-producer / multi-consumer
 /// safe: state is a single atomic + the futex-backed `Signal`.
+///
+/// Deliberately NOT `std.Io.Semaphore`: that one is `Mutex`+`Condition` based,
+/// while this project's cross-fiber comms invariant restricts blocking
+/// coordination to lock-free `std.Io.Queue`/atomics and the futex-backed
+/// `Signal`. This gate follows that invariant (and adds `close()`, which
+/// `std.Io.Semaphore` lacks).
 pub const Semaphore = struct {
     permits: std.atomic.Value(usize),
     signal: Signal = .{},

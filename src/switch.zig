@@ -25,8 +25,13 @@ const command_queue_capacity = 32;
 /// (system + peer scopes) and rust-libp2p (per-connection + ConnectionLimits):
 /// a PER-CONNECTION cap (per-peer fairness) and an AGGREGATE cap (total
 /// exhaustion across all connections). Both default conservative + tunable via
-/// `Switch.Options`. Per-conn defaults below QUIC stream-credit (100) so it
-/// actually binds.
+/// `Switch.Options`. The per-conn default (32) sits below the typical QUIC
+/// stream-credit (initial_max_streams_bidi = 100) so the gate is the binding
+/// limit in practice — but this is a sensible default, NOT an enforced
+/// invariant: the two knobs live in different subsystems and can be tuned
+/// independently. The gate bounds concurrent handler *fibers*; the memory of
+/// admitted-but-undispatched inbound streams is bounded separately by the QUIC
+/// accept/overflow queues, not by this gate.
 const default_max_inflight_handlers_per_conn: usize = 32;
 const default_max_inflight_handlers_total: usize = 256;
 const default_negotiation_timeout: std.Io.Timeout = .{
@@ -132,9 +137,16 @@ pub const Switch = struct {
         }
         sw.connections.deinit(sw.allocator);
 
-        // All connections (hence their dispatchers/handlers) are torn down above,
-        // so nobody is parked on the aggregate gate; close() is a harmless
-        // belt-and-suspenders wake before the Switch (and its gate) are freed.
+        // Closing (and below, freeing) the aggregate gate here is safe ONLY
+        // because the per-connection teardown loop above JOINS every handler
+        // fiber before we reach this point: each managed.deinit() ->
+        // shutdownAndDestroy cancels+awaits actorMain, whose cleanup() calls
+        // handler_group.cancel() (blocks until all handlers finish). So every
+        // handler's `defer sw.handler_gate_total.release(io)` has already run
+        // against a still-valid gate, and nobody is parked on it now. close() is
+        // thus a harmless belt-and-suspenders wake. A future fire-and-forget
+        // teardown (cancel without join, or moving this close() before the loop)
+        // would let an in-flight handler touch a freed gate -> use-after-free.
         sw.handler_gate_total.close(sw.io);
 
         sw.services_lock.lockUncancelable(sw.io);
@@ -508,7 +520,12 @@ const SwitchConnectionActor = struct {
             .conn = conn,
             .inbox_storage = inbox_storage,
             .inbox = std.Io.Queue(Command).init(inbox_storage),
-            .handler_gate_conn = Semaphore.init(sw.max_inflight_handlers_per_conn),
+            // `validateOptions` rejects a zero cap on the Options path, but
+            // `max_inflight_handlers_per_conn` is a public field a caller can set
+            // to 0 directly. Clamp to >=1 here as a last-resort backstop so a 0
+            // can never seed a zero-permit gate (whose first acquire would park
+            // forever — the very deadlock validateOptions guards against).
+            .handler_gate_conn = Semaphore.init(@max(@as(usize, 1), sw.max_inflight_handlers_per_conn)),
             .peer_id = try Switch.connectionPeerId(allocator, conn),
             .remote_addr = conn.remoteAddress(),
         };
@@ -532,6 +549,21 @@ const SwitchConnectionActor = struct {
                 actor.inbox.putOneUncancelable(actor.io, .{ .shutdown = &reply }) catch break :blk false;
                 break :blk true;
             };
+            // `.shutdown` + inbox.close() is the persistent teardown signal, but
+            // actorMain only observes it BETWEEN commands. A command handler can
+            // park actorMain on a cancel point the inbox can't reach: an untimed
+            // acceptStream, or an E3 admission acquire blocked on the *aggregate*
+            // gate (which we must NOT close() here — it is shared by other live
+            // connections). Cancel the main future as a backstop, exactly as the
+            // QUIC ConnectionActor does for its own main loop: every blocking
+            // point in actorMain's call tree is a cancel point and every command
+            // handler propagates Canceled straight to fiber exit (it never
+            // re-parks), so the single Canceled cleanly unwinds it — this is not
+            // the router's re-park-after-cancel hazard. cancel MUST precede the
+            // reply wait: a parked actorMain would otherwise never complete the
+            // reply, which completePending() (in actorMain's defer) does once the
+            // cancel unparks it.
+            future.cancel(actor.io) catch {};
             if (sent) reply.event.waitUncancelable(actor.io);
             _ = future.await(actor.io) catch {};
             actor.main_future = null;
@@ -605,9 +637,12 @@ const SwitchConnectionActor = struct {
         // aggregate permit (total). Consistent acquire order => deadlock-free.
         // Placed AFTER acceptStream so no earlier-return path holds a permit; the
         // dispatcher blocking here IS the back-pressure. A parked acquire is a
-        // cancel point, so dispatcher_group.cancel unwinds it at teardown. The
-        // handler releases both in its cleanup defers; the errdefers below only
-        // cover the window before the spawn hands ownership to the handler.
+        // cancel point, so it is unwound at teardown via dispatcher_group.cancel
+        // on the loop path (inboundDispatcher) and via the main-future cancel in
+        // shutdownAndDestroy on the one-shot command path (this runs on the
+        // uncancelable actorMain fiber, which no Group cancels). The handler
+        // releases both in its cleanup defers; the errdefers below only cover the
+        // window before the spawn hands ownership to the handler.
         actor.handler_gate_conn.acquire(actor.io) catch |err| switch (err) {
             error.Closed => return error.ConnectionClosed,
             error.Canceled => return error.Canceled,
@@ -748,6 +783,18 @@ fn inboundDispatcher(actor: *SwitchConnectionActor, opts: Switch.DispatchOptions
                 return;
             },
             error.OutOfMemory => return,
+            error.ConcurrencyUnavailable => {
+                // Handler spawn failed under fiber/thread exhaustion (the same
+                // OOM / thread-cap condition std.Io.Threaded surfaces as
+                // OutOfMemory). Continuing would tight-spin: acceptStream returns
+                // a queued stream instantly and the gate acquire is non-blocking
+                // with permits free, so each turn would re-accept, acquire then
+                // errdefer-release both admission permits (churning two futex
+                // wakes), and immediately retry. Exit like OutOfMemory rather
+                // than burn CPU; the connection stays up, inbound dispatch stops.
+                std.log.warn("switch dispatcher exiting: cannot spawn handler (concurrency unavailable)", .{});
+                return;
+            },
             else => |e| {
                 std.log.debug("switch dispatcher: per-stream error: {}", .{e});
                 continue;
