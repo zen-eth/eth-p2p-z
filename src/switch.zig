@@ -1268,9 +1268,22 @@ test "switch caps concurrent inbound handlers per connection (E3 gate)" {
     // and parked on `release`. A correct gate never exceeds 2; an uncapped gate
     // would let all 6 in (caught by the peak assertion below).
     var attempts: usize = 0;
-    while (ctx.inflight.load(.acquire) < 2 and attempts < 600) : (attempts += 1) {
+    while (ctx.inflight.load(.acquire) < 2) {
+        if (attempts >= 600) {
+            // Distinguish a slow-setup timeout from a genuine cap violation: a
+            // bare `expectEqual` here would report a misleading "expected 2,
+            // found 1" on a starved runner.
+            std.debug.print(
+                "E3 gate never saturated within ~3s: inflight={d}, expected the cap (2)\n",
+                .{ctx.inflight.load(.acquire)},
+            );
+            return error.SaturationTimeout;
+        }
+        attempts += 1;
         io_time.ms(5).sleep(io) catch {};
     }
+    // Saturated: a correct gate admits exactly the cap and no more (an uncapped
+    // gate races past 2 here -> expectEqual catches "expected 2, found 3+").
     try std.testing.expectEqual(@as(usize, 2), ctx.inflight.load(.acquire));
 
     // Release every handler; the gated opens now complete in waves of 2.
@@ -1278,7 +1291,15 @@ test "switch caps concurrent inbound handlers per connection (E3 gate)" {
     group.await(io) catch {};
 
     attempts = 0;
-    while (ctx.completed.load(.acquire) < stream_count and attempts < 600) : (attempts += 1) {
+    while (ctx.completed.load(.acquire) < stream_count) {
+        if (attempts >= 600) {
+            std.debug.print(
+                "not all handlers completed within ~3s: completed={d}, expected {d}\n",
+                .{ ctx.completed.load(.acquire), stream_count },
+            );
+            return error.CompletionTimeout;
+        }
+        attempts += 1;
         io_time.ms(5).sleep(io) catch {};
     }
     try std.testing.expectEqual(@as(usize, stream_count), ctx.completed.load(.acquire));

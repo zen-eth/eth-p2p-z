@@ -449,4 +449,9 @@ test "Semaphore: caps concurrent holders at N across executors" {
     try testing.expect(ctx.peak.load(.acquire) <= ctx.capacity);
     // And it did exercise real concurrency (not a vacuous serialized run).
     try testing.expect(ctx.peak.load(.acquire) >= 2);
+    // Deterministic invariant on the semaphore's OWN state (the inflight side
+    // counter can lag true occupancy): every acquire was paired with exactly one
+    // release, so all permits are back. A lost or doubled wake-one would surface
+    // as a worker that never completed (caught above) or a permit imbalance here.
+    try testing.expectEqual(ctx.capacity, ctx.sem.permits.load(.acquire));
 }

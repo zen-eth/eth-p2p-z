@@ -54,15 +54,9 @@ pub const Permit = struct {
 /// caller owns a slot until `publish` (transfers it to a queued item) or
 /// `cancel` (releases it).
 pub fn tryReserve(ch: *Channel.State, available: *std.atomic.Value(usize)) ?Permit {
-    var current = available.load(.acquire);
-    while (true) {
-        if (current == 0) return null;
-        if (available.cmpxchgWeak(current, current - 1, .acq_rel, .acquire)) |actual| {
-            current = actual;
-        } else {
-            return .{ .channel = ch, .available = available };
-        }
-    }
+    // CAS-decrement-to-floor admission idiom, shared with the E3 handler gate.
+    if (!channel.tryDecrementToFloor(available)) return null;
+    return .{ .channel = ch, .available = available };
 }
 
 test "tryReserve caps in-flight admissions at capacity" {

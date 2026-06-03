@@ -51,30 +51,16 @@ pub const Semaphore = struct {
         }
     }
 
-    /// Non-blocking acquire: true if a permit was taken, false if none free or
-    /// the semaphore is closed.
-    pub fn tryAcquire(s: *Semaphore) bool {
-        if (s.closed.load(.acquire)) return false;
-        return s.tryClaim();
-    }
-
     fn tryClaim(s: *Semaphore) bool {
-        var cur = s.permits.load(.acquire);
-        while (cur > 0) {
-            if (s.permits.cmpxchgWeak(cur, cur - 1, .acq_rel, .acquire)) |actual| {
-                cur = actual; // contended or spurious; retry with the fresh value
-            } else {
-                return true;
-            }
-        }
-        return false;
+        return channel.tryDecrementToFloor(&s.permits);
     }
 
-    /// Return one permit and wake a waiter. Non-blocking; safe during cancel
-    /// unwinding.
+    /// Return one permit and wake a single waiter. Non-blocking; safe during
+    /// cancel unwinding. Wakes exactly one (release frees exactly one permit);
+    /// `close` below wakes all.
     pub fn release(s: *Semaphore, io: std.Io) void {
         _ = s.permits.fetchAdd(1, .release);
-        s.signal.notify(io);
+        s.signal.notifyOne(io);
     }
 
     /// Wake all waiters with `error.Closed` (teardown). Idempotent.
@@ -93,12 +79,13 @@ test "Semaphore: claim up to capacity, release, and close (non-blocking paths)" 
     // permits available → acquire returns immediately (no block).
     try sem.acquire(io); // 2 -> 1
     try sem.acquire(io); // 1 -> 0
-    // exhausted → a blocking acquire would park; assert via the non-blocking probe.
-    try std.testing.expect(!sem.tryAcquire());
+    // exhausted: no permits left, so a blocking acquire would now park.
+    try std.testing.expectEqual(@as(usize, 0), sem.permits.load(.acquire));
     sem.release(io); // 0 -> 1
-    try std.testing.expect(sem.tryAcquire()); // 1 -> 0
+    try std.testing.expectEqual(@as(usize, 1), sem.permits.load(.acquire));
+    try sem.acquire(io); // 1 -> 0: claims the released permit without blocking.
+    try std.testing.expectEqual(@as(usize, 0), sem.permits.load(.acquire));
     // once closed, acquire returns Closed without blocking.
     sem.close(io);
     try std.testing.expectError(error.Closed, sem.acquire(io));
-    try std.testing.expect(!sem.tryAcquire());
 }
