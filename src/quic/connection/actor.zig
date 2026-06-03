@@ -824,7 +824,21 @@ pub const ConnectionActor = struct {
             if (batch_len > 0) {
                 transport.socket.sendMany(transport.io, messages[0..batch_len], .{}) catch |err| {
                     self.stats_snapshot.write_errors += 1;
-                    return err;
+                    switch (err) {
+                        // Transient path errors — e.g. the peer's UDP socket
+                        // isn't bound yet (a startup race under parallel load
+                        // hits ECONNREFUSED via ICMP port-unreachable). quiche
+                        // already advanced its send state, so its loss
+                        // detection / PTO retransmits these packets once the
+                        // peer is reachable. Drop this batch instead of failing
+                        // the whole connection; the handshake deadline still
+                        // bounds a peer that never comes up.
+                        error.ConnectionRefused, error.NetworkUnreachable => {
+                            std.log.debug("quic send: transient {s}, dropping batch (quiche PTO will retransmit)", .{@errorName(err)});
+                            return false;
+                        },
+                        else => return err,
+                    }
                 };
                 self.stats_snapshot.write_batches += 1;
                 self.stats_snapshot.write_packets += @intCast(batch_len);
