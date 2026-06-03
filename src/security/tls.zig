@@ -798,7 +798,11 @@ fn verifySecp256k1Signature(pubkey_bytes: []const u8, data: []const u8, signatur
 
     const message = secp.Message{ .inner = digest };
 
-    const sig = secp.ecdsa.Signature.fromDer(signature) catch return error.InvalidData;
+    var sig = secp.ecdsa.Signature.fromDer(signature) catch return error.InvalidData;
+    // go-libp2p / rust-libp2p accept high-S signatures on verify, but
+    // secp256k1_ecdsa_verify rejects them — normalize to low-S first so we are no
+    // stricter than the reference impls (idempotent for already-low-S input).
+    sig.normalizeS();
 
     context.verifyEcdsa(message, sig, public_key) catch {
         return false;
@@ -1242,4 +1246,28 @@ test "Verify certificate with RSA keys" {
     defer std.testing.allocator.free(expected_pubkey.data.?);
     const expected_peer_id = try PeerId.fromPublicKey(std.testing.allocator, &expected_pubkey);
     try std.testing.expect(peer_info.peer_id.eql(&expected_peer_id));
+}
+
+test "verifySecp256k1Signature round-trips and rejects a tampered payload" {
+    // Direct round-trip over the secp256k1 verify path: sign the libp2p
+    // handshake payload with a fresh secp256k1 key, then verify. The cert/peer
+    // plumbing (buildCert/verifyAndExtractPeerInfo) only handles BoringSSL key
+    // types, so this exercises verifySecp256k1Signature on its own.
+    const ctx = secp_context.get();
+    const sk = secp.SecretKey.generate();
+    const pk = secp.PublicKey.fromSecretKey(ctx.*, sk);
+    const pubkey_bytes = pk.serialize(); // 33-byte compressed point
+
+    const data = "libp2p-tls-handshake:dummy-spki-der";
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(data);
+    const digest = hasher.finalResult();
+    const message = secp.Message{ .inner = digest };
+    const sig = ctx.signEcdsa(&message, &sk);
+    const der = sig.serializeDer();
+
+    // Correct signature over the correct payload verifies.
+    try std.testing.expect(try verifySecp256k1Signature(&pubkey_bytes, data, der.data[0..der.len]));
+    // Same signature over a different payload must be rejected (not errored).
+    try std.testing.expect(!try verifySecp256k1Signature(&pubkey_bytes, "libp2p-tls-handshake:other", der.data[0..der.len]));
 }
