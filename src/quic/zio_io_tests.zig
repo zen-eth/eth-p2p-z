@@ -18,18 +18,11 @@ const std = @import("std");
 const zio = @import("zio");
 const channel = @import("io/channel.zig");
 const waitset_mod = @import("io/waitset.zig");
-const semaphore = @import("io/semaphore.zig");
 
 const testing = std.testing;
 const Signal = channel.Signal;
 const WaitSet = waitset_mod.WaitSet;
 const Ready = waitset_mod.Ready;
-const Semaphore = semaphore.Semaphore;
-
-// Pull in semaphore.zig's own (non-blocking-path) unit test under this target too.
-test {
-    _ = @import("io/semaphore.zig");
-}
 
 /// Spin a multi-executor zio runtime, run `root(io, ctx)` as the root fiber on
 /// the main executor, and block until it completes. Worker fibers spawned via
@@ -402,56 +395,3 @@ test "select recv+futex loop: cancelling the outer fiber tears down cleanly" {
 // the router's multi-arm `Select` can lose the single cancellation and re-park with
 // no waker. The router therefore stops off a persistent flag + channel-close, never
 // `cancel` (see `router.closeListener`); these single-cancel cases don't hit it.
-
-// ---------------------------------------------------------------------------
-// Semaphore — counting admission gate (E3). Caps concurrent permit-holders at N
-// across executors via the observe-before-wait Signal; blocked acquirers wake
-// on a cross-executor release.
-// ---------------------------------------------------------------------------
-
-const SemCtx = struct {
-    sem: Semaphore,
-    capacity: usize,
-    workers: usize,
-    inflight: std.atomic.Value(usize) = .init(0),
-    peak: std.atomic.Value(usize) = .init(0),
-    completed: std.atomic.Value(usize) = .init(0),
-};
-
-fn semWorker(io: std.Io, ctx: *SemCtx) void {
-    ctx.sem.acquire(io) catch return;
-    defer ctx.sem.release(io);
-    const now = ctx.inflight.fetchAdd(1, .acq_rel) + 1;
-    var p = ctx.peak.load(.acquire);
-    while (now > p) {
-        if (ctx.peak.cmpxchgWeak(p, now, .acq_rel, .acquire)) |actual| p = actual else break;
-    }
-    // Hold the permit briefly so workers actually overlap and contend for slots.
-    io_time.ms(2).sleep(io) catch {};
-    _ = ctx.inflight.fetchSub(1, .acq_rel);
-    _ = ctx.completed.fetchAdd(1, .acq_rel);
-}
-
-test "Semaphore: caps concurrent holders at N across executors" {
-    var ctx = SemCtx{ .sem = Semaphore.init(3), .capacity = 3, .workers = 20 };
-    try runRoot(4, struct {
-        fn root(io: std.Io, c: *SemCtx) !void {
-            var group: std.Io.Group = .init;
-            var i: usize = 0;
-            while (i < c.workers) : (i += 1) {
-                try group.concurrent(io, semWorker, .{ io, c });
-            }
-            try group.await(io);
-        }
-    }.root, &ctx);
-    // All admitted eventually; the gate NEVER let more than `capacity` run at once.
-    try testing.expectEqual(ctx.workers, ctx.completed.load(.acquire));
-    try testing.expect(ctx.peak.load(.acquire) <= ctx.capacity);
-    // And it did exercise real concurrency (not a vacuous serialized run).
-    try testing.expect(ctx.peak.load(.acquire) >= 2);
-    // Deterministic invariant on the semaphore's OWN state (the inflight side
-    // counter can lag true occupancy): every acquire was paired with exactly one
-    // release, so all permits are back. A lost or doubled wake-one would surface
-    // as a worker that never completed (caught above) or a permit imbalance here.
-    try testing.expectEqual(ctx.capacity, ctx.sem.permits.load(.acquire));
-}
