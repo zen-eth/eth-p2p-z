@@ -397,7 +397,13 @@ pub fn createProtobufEncodedPublicKey(allocator: Allocator, pkey: *ssl.EVP_PKEY)
 
             const curve_nid = ssl.EC_GROUP_get_curve_name(group);
             switch (curve_nid) {
-                // TODO: BoringSSL does not support SECP256K1
+                // secp256k1 is out of scope for the *certificate* key by design,
+                // not unfinished work: TLS 1.3 has no signature scheme for it
+                // (only secp256r1/384r1/521r1), so no libp2p impl uses it for the
+                // cert — they all use ECDSA P-256 / Ed25519, independent of the
+                // host key. secp256k1 only ever appears as a host *identity*,
+                // which is verified in software via the vendored secp lib
+                // (verifyHostSignature -> verifySecp256k1Signature), never here.
                 ssl.NID_secp256k1 => return error.UnsupportedKeyType,
                 ssl.NID_X9_62_prime256v1 => break :blk 3,
                 else => return error.UnsupportedKeyType,

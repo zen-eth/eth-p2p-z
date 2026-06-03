@@ -1,5 +1,9 @@
 const std = @import("std");
 const support = @import("test_support.zig");
+const tls = @import("../../security/tls.zig");
+const identity = @import("../../identity.zig");
+const keys = @import("peer_id").keys;
+const PeerId = @import("peer_id").PeerId;
 
 const AcceptCtx = support.AcceptCtx;
 const TwoEndpoints = support.TwoEndpoints;
@@ -208,4 +212,32 @@ test "quic endpoint idle timeout closes and publishes stats" {
     try std.testing.expectEqual(.idle_timeout, client_conn.stats().close_reason);
     try std.testing.expectEqual(.idle_timeout, server_conn.stats().close_reason);
     try std.testing.expectError(error.ConnectionClosed, client_conn.openStream(io));
+}
+
+test "secp256k1 host identity round-trips through cert build + verify (ECDSA cert key)" {
+    // Proves a secp256k1 *identity* is fully supported end-to-end: the
+    // production cert path (Context.create with an ECDSA P-256 cert key + the
+    // secp256k1 host key signing the libp2p extension) builds a cert, and
+    // verifyAndExtractPeerInfo extracts + verifies it. secp256k1 lives only in
+    // the host identity (verified in software via the vendored secp lib), never
+    // in the TLS cert key — so it never touches BoringSSL's EVP path. This also
+    // exercises PeerId.fromPublicKey for secp256k1.
+    const allocator = std.testing.allocator;
+
+    var host = try identity.KeyPair.generate(.SECP256K1);
+    defer host.deinit();
+
+    var ctx = try tls.Context.create(allocator, &host, .ECDSA, @ptrCast(&host), identity.signWithKeyPair);
+    defer ctx.deinit();
+
+    const info = try tls.verifyAndExtractPeerInfo(allocator, ctx.subject_cert);
+    defer allocator.free(info.host_pubkey.data.?);
+
+    try std.testing.expect(info.is_valid);
+    try std.testing.expectEqual(keys.KeyType.SECP256K1, info.host_pubkey.type);
+
+    var expected_pub = try host.publicKey(allocator);
+    defer allocator.free(expected_pub.data.?);
+    const expected_pid = try PeerId.fromPublicKey(allocator, &expected_pub);
+    try std.testing.expect(info.peer_id.eql(&expected_pid));
 }
