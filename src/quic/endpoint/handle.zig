@@ -72,7 +72,16 @@ pub const QuicEndpoint = opaque {
         var owned_tls = try tls.Context.create(
             allocator,
             host_key,
-            .ED25519,
+            // ECDSA P-256 for the ephemeral TLS certificate key: its scheme
+            // (ecdsa_secp256r1_sha256) is mandatory-to-implement in TLS 1.3
+            // (RFC 8446 §9.1), so every peer advertises it in
+            // signature_algorithms. ed25519 is only optional there — some
+            // stacks (e.g. jvm-libp2p / netty-quiche's BoringSSL) do not
+            // advertise it, which made our CertificateVerify unverifiable and
+            // failed the handshake with NO_COMMON_SIGNATURE_ALGORITHMS. The
+            // libp2p identity (host) key type is unaffected — it signs the
+            // libp2p extension, not the certificate.
+            .ECDSA,
             @ptrCast(host_key),
             identity.signWithKeyPair,
         );
@@ -220,4 +229,27 @@ fn internal(e: *QuicEndpoint) *Impl {
 
 fn constInternal(e: *const QuicEndpoint) *const Impl {
     return @ptrCast(@alignCast(e));
+}
+
+test "production endpoint certificate uses the TLS-MTI ECDSA P-256 scheme" {
+    // Regression guard for cross-impl interop: the ephemeral TLS certificate key
+    // must stay ECDSA P-256 so our CertificateVerify uses ecdsa_secp256r1_sha256,
+    // the TLS 1.3 mandatory-to-implement scheme every peer advertises. ed25519
+    // is optional in TLS 1.3 and is NOT advertised by some stacks (jvm-libp2p /
+    // netty-quiche), which fails the handshake with NO_COMMON_SIGNATURE_ALGORITHMS.
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    const endpoint = try QuicEndpoint.initWithIdentity(std.testing.allocator, io, &host_key, .{});
+    defer endpoint.deinit();
+
+    const cert_key = internal(endpoint).owned_tls.?.subject_keypair;
+    try std.testing.expectEqual(ssl.EVP_PKEY_EC, ssl.EVP_PKEY_base_id(cert_key));
+    const ec_key = ssl.EVP_PKEY_get0_EC_KEY(cert_key) orelse return error.TestUnexpectedResult;
+    const group = ssl.EC_KEY_get0_group(ec_key) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(ssl.NID_X9_62_prime256v1, ssl.EC_GROUP_get_curve_name(group));
 }
