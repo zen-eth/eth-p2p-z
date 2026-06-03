@@ -10,5 +10,6 @@ pub const DialError = dial_mod.DialError;
 pub const dial = dial_mod.dial;
 
 test {
+    _ = @import("dial.zig");
     _ = @import("dial_tests.zig");
 }

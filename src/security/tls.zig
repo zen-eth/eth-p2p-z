@@ -528,16 +528,24 @@ pub fn extractPublicKey(allocator: Allocator, conn: *quiche.quiche_conn) !keys.P
     var cert_ptr: [*c]const u8 = null;
     var cert_len: usize = 0;
     quiche.quiche_conn_peer_cert(conn, &cert_ptr, &cert_len);
-    if (cert_ptr == null or cert_len == 0) return error.HandshakeFailed;
+    // Missing/parse-failed cert and a failed signature check are all the same
+    // thing to the caller: the peer's libp2p identity could not be verified.
+    // Surface a distinct error (not the opaque HandshakeFailed) so the actor
+    // can record `peer_verify_failed` and the dialer can report it. OOM is
+    // preserved as itself — it is not a verification verdict.
+    if (cert_ptr == null or cert_len == 0) return error.PeerVerifyFailed;
 
     var der_ptr = cert_ptr;
-    const cert = ssl.d2i_X509(null, &der_ptr, @intCast(cert_len)) orelse return error.HandshakeFailed;
+    const cert = ssl.d2i_X509(null, &der_ptr, @intCast(cert_len)) orelse return error.PeerVerifyFailed;
     defer ssl.X509_free(cert);
 
-    const info = verifyAndExtractPeerInfo(allocator, cert) catch return error.HandshakeFailed;
+    const info = verifyAndExtractPeerInfo(allocator, cert) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.PeerVerifyFailed,
+    };
     if (!info.is_valid) {
         if (info.host_pubkey.data) |data| allocator.free(data);
-        return error.HandshakeFailed;
+        return error.PeerVerifyFailed;
     }
     return info.host_pubkey;
 }

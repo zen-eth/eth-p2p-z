@@ -182,6 +182,13 @@ pub const Connection = opaque {
         return state.currentStats();
     }
 
+    /// Structured reason the handshake failed, derived from the published stats
+    /// snapshot. Meaningful after `waitHandshake` returns an error; on a healthy
+    /// or established connection it reports `.none`/`.unknown`.
+    pub fn failReason(self: *const Connection) conn_stats.HandshakeFailure {
+        return conn_stats.classifyHandshakeFailure(self.stats());
+    }
+
     /// Returns the verified libp2p public key extracted from the peer's TLS
     /// certificate. The returned value borrows memory owned by the
     /// connection; do not free its `data` slice.

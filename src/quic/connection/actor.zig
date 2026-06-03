@@ -689,7 +689,7 @@ pub const ConnectionActor = struct {
         if (self.lifecycle.isHandshake() and self.handshakeTimedOut(transport.io)) {
             const empty: [0]u8 = .{};
             _ = quiche.quiche_conn_close(conn, false, 0, empty[0..].ptr, 0);
-            self.failHandshakeAndStamp(transport.io);
+            self.failHandshakeAndStamp(transport.io, .handshake_timeout);
             return;
         }
         if (quicheTimeoutExpired(conn)) {
@@ -944,7 +944,12 @@ pub const ConnectionActor = struct {
         if (self.stats_snapshot.close_reason == .none or self.stats_snapshot.close_reason == .closed) {
             self.stats_snapshot.close_reason = .actor_error;
         }
-        if (self.shared.handshake.isHandshaking()) self.failHandshake();
+        if (self.shared.handshake.isHandshaking()) {
+            // Publish the fatal-error stats before waking waitHandshake so the
+            // dialer's conn.stats() read sees last_actor_error/close_reason.
+            self.publishStats();
+            self.failHandshake();
+        }
         self.closeApplicationQueues();
         self.notifyShutdown();
     }
@@ -1003,24 +1008,30 @@ pub const ConnectionActor = struct {
         if (self.handshakeTimedOut(io)) {
             const empty: [0]u8 = .{};
             _ = quiche.quiche_conn_close(conn, false, 0, empty[0..].ptr, 0);
-            self.failHandshakeAndStamp(io);
+            self.failHandshakeAndStamp(io, .handshake_timeout);
             return;
         }
 
         if (quiche.quiche_conn_is_draining(conn)) {
-            self.failHandshakeAndStamp(io);
+            // Defer to quiche's CONNECTION_CLOSE codes (peer/local error).
+            self.failHandshakeAndStamp(io, null);
             return;
         }
 
         if (quiche.quiche_conn_is_closed(conn)) {
             const empty: [0]u8 = .{};
             _ = quiche.quiche_conn_close(conn, false, 0, empty[0..].ptr, 0);
-            self.failHandshakeAndStamp(io);
+            self.failHandshakeAndStamp(io, null);
             return;
         }
 
         if (quiche.quiche_conn_is_established(conn) or quiche.quiche_conn_is_in_early_data(conn)) {
-            self.completeHandshake(io) catch self.failHandshakeAndStamp(io);
+            // Record the specific cause (e.g. PeerVerifyFailed) before failing so
+            // the dialer can surface it instead of an opaque HandshakeFailed.
+            self.completeHandshake(io) catch |err| {
+                self.stats_snapshot.last_actor_error = conn_stats.ActorError.fromError(err);
+                self.failHandshakeAndStamp(io, null);
+            };
         }
     }
 
@@ -1042,13 +1053,30 @@ pub const ConnectionActor = struct {
         self.lifecycle.running();
     }
 
-    fn failHandshakeAndStamp(self: *ConnectionActor, io: std.Io) void {
+    /// Fail the handshake, recording why. `explicit_reason`, when given, is the
+    /// caller's definitive cause (e.g. `.handshake_timeout`) and overrides any
+    /// quiche-derived reason; `null` defers to quiche's CONNECTION_CLOSE codes
+    /// (falling back to `.handshake_failed`).
+    fn failHandshakeAndStamp(self: *ConnectionActor, io: std.Io, explicit_reason: ?conn_stats.CloseReason) void {
         self.shared.markClosed();
-        self.stats_snapshot.close_reason = .handshake_failed;
+        // Capture quiche's peer/local CONNECTION_CLOSE codes so the dialer can
+        // tell a TLS alert (CRYPTO_ERROR) from a transport-parameter error.
+        // refreshCloseErrorStats only fills close_reason when it is still
+        // .none/.closed, so an explicit caller reason still wins below.
+        if (self.conn) |conn| refreshCloseErrorStats(conn, &self.stats_snapshot);
+        if (explicit_reason) |reason| {
+            self.stats_snapshot.close_reason = reason;
+        } else if (self.stats_snapshot.close_reason == .none) {
+            self.stats_snapshot.close_reason = .handshake_failed;
+        }
         self.stats_snapshot.last_updated_mono_ns = io_time.monotonicNs(io);
-        self.shared.handshake.fail(io);
         self.lifecycle.fail();
+        // Publish BEFORE signalling: waitHandshake wakes on handshake.fail()'s
+        // event and the dialer reads conn.stats() immediately after, so the
+        // published snapshot must already carry the reason (happens-before via
+        // the stats mutex + the handshake event).
         self.publishStats();
+        self.shared.handshake.fail(io);
     }
 
     // ----- CID lifecycle -------------------------------------------------

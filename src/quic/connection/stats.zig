@@ -10,6 +10,9 @@ pub const ActorError = enum(u8) {
     socket_recv_failed,
     concurrent_failed,
     canceled,
+    /// libp2p peer-certificate / SignedKey verification rejected the peer after
+    /// the QUIC handshake established (see tls.extractPublicKey).
+    peer_verify_failed,
     unknown,
 
     pub fn fromError(err: anyerror) ActorError {
@@ -17,6 +20,7 @@ pub const ActorError = enum(u8) {
             error.AddressInvalid => .address_invalid,
             error.QuicheSendFailed => .quiche_send_failed,
             error.QuicheRecvFailed => .quiche_recv_failed,
+            error.PeerVerifyFailed => .peer_verify_failed,
             error.Canceled => .canceled,
             error.SocketNotBound,
             error.MessageTooBig,
@@ -44,6 +48,9 @@ pub const CloseReason = enum(u8) {
     none,
     application_close_requested,
     handshake_failed,
+    /// The handshake deadline elapsed before the connection established
+    /// (distinct from `idle_timeout`, which is quiche's post-handshake idle).
+    handshake_timeout,
     actor_error,
     idle_timeout,
     peer_error,
@@ -51,6 +58,89 @@ pub const CloseReason = enum(u8) {
     draining,
     closed,
 };
+
+/// Structured reason a handshake failed, derived from a published
+/// `ConnectionStats` snapshot by `classifyHandshakeFailure`. Lets dialers
+/// surface *why* a handshake failed (TLS alert vs transport param vs timeout
+/// vs peer-identity rejection) instead of an opaque `HandshakeFailed`.
+pub const HandshakeFailure = struct {
+    kind: Kind = .none,
+    /// QUIC CONNECTION_CLOSE error code when `kind` is `.crypto_error` or
+    /// `.transport_error`; otherwise 0. For `.crypto_error` the TLS alert is the
+    /// low byte (`error_code & 0xff`), per RFC 9000 §20.1.
+    error_code: u64 = 0,
+    /// True when the close came from the peer's CONNECTION_CLOSE rather than a
+    /// locally detected fault.
+    from_peer: bool = false,
+
+    pub const Kind = enum {
+        none,
+        /// Handshake deadline elapsed before establishing.
+        timeout,
+        /// libp2p cert / SignedKey verification rejected the peer's identity.
+        peer_verify_failed,
+        /// QUIC CRYPTO_ERROR (TLS alert), error code 0x0100-0x01ff.
+        crypto_error,
+        /// QUIC transport error (0x00-0xff) or a local I/O fault.
+        transport_error,
+        /// Connection closed/draining without a more specific cause.
+        closed,
+        /// No attributable cause found in the published stats.
+        unknown,
+    };
+};
+
+/// Map a QUIC CONNECTION_CLOSE error code to crypto- vs transport-error.
+/// RFC 9000 §20.1: 0x0100-0x01ff is CRYPTO_ERROR (TLS alert in the low byte).
+fn classifyCloseCode(code: u64, from_peer: bool) HandshakeFailure {
+    if (code >= 0x100 and code <= 0x1ff)
+        return .{ .kind = .crypto_error, .error_code = code, .from_peer = from_peer };
+    return .{ .kind = .transport_error, .error_code = code, .from_peer = from_peer };
+}
+
+/// Derive a structured handshake-failure reason from a published stats
+/// snapshot. Pure function (no I/O) so it is unit-testable without driving a
+/// real handshake. Order matters: most-specific attribution wins.
+pub fn classifyHandshakeFailure(s: ConnectionStats) HandshakeFailure {
+    // 1. libp2p peer-identity rejection, recorded by the actor when
+    //    tls.extractPublicKey fails on an otherwise-established connection.
+    if (s.last_actor_error == .peer_verify_failed) return .{ .kind = .peer_verify_failed };
+
+    // 2. Handshake/idle deadline.
+    if (s.close_reason == .handshake_timeout or s.close_reason == .idle_timeout)
+        return .{ .kind = .timeout };
+
+    // 3. A QUIC CONNECTION_CLOSE carrying a non-zero error code. The peer's
+    //    close takes precedence (it tells us why *they* rejected us). `is_app`
+    //    closes are application-level, not handshake faults, so skip them.
+    if (!s.peer_close_is_app and s.peer_close_error_code != 0)
+        return classifyCloseCode(s.peer_close_error_code, true);
+    if (!s.local_close_is_app and s.local_close_error_code != 0)
+        return classifyCloseCode(s.local_close_error_code, false);
+
+    // 4. A local I/O / quiche fault surfaced by the actor.
+    switch (s.last_actor_error) {
+        .quiche_send_failed,
+        .quiche_recv_failed,
+        .socket_send_failed,
+        .socket_recv_failed,
+        => return .{ .kind = .transport_error },
+        else => {},
+    }
+
+    // 5. A plain close / drain with no attributable error code.
+    switch (s.close_reason) {
+        .draining,
+        .closed,
+        .application_close_requested,
+        .peer_error,
+        .local_error,
+        => return .{ .kind = .closed },
+        else => {},
+    }
+
+    return .{ .kind = .unknown };
+}
 
 pub const PathStats = struct {
     rtt_ns: u64 = 0,
@@ -225,3 +315,54 @@ pub const Publisher = struct {
         p.published = stats;
     }
 };
+
+const testing = std.testing;
+
+test "classifyHandshakeFailure: peer-identity rejection wins over a close code" {
+    // Even with a peer close code present, an actor-recorded verify failure is
+    // the real cause and must take precedence.
+    const f = classifyHandshakeFailure(.{
+        .last_actor_error = .peer_verify_failed,
+        .peer_close_error_code = 0x12a,
+    });
+    try testing.expectEqual(HandshakeFailure.Kind.peer_verify_failed, f.kind);
+}
+
+test "classifyHandshakeFailure: handshake and idle deadlines map to timeout" {
+    try testing.expectEqual(HandshakeFailure.Kind.timeout, classifyHandshakeFailure(.{ .close_reason = .handshake_timeout }).kind);
+    try testing.expectEqual(HandshakeFailure.Kind.timeout, classifyHandshakeFailure(.{ .close_reason = .idle_timeout }).kind);
+}
+
+test "classifyHandshakeFailure: peer CRYPTO_ERROR decodes to crypto_error + TLS alert byte" {
+    // 0x12a = CRYPTO_ERROR base (0x100) + TLS alert 0x2a (certificate_unknown).
+    const f = classifyHandshakeFailure(.{ .peer_close_error_code = 0x12a });
+    try testing.expectEqual(HandshakeFailure.Kind.crypto_error, f.kind);
+    try testing.expectEqual(@as(u64, 0x12a), f.error_code);
+    try testing.expect(f.from_peer);
+    try testing.expectEqual(@as(u8, 0x2a), @as(u8, @truncate(f.error_code & 0xff)));
+}
+
+test "classifyHandshakeFailure: transport-parameter error maps to transport_error" {
+    // 0x8 = TRANSPORT_PARAMETER_ERROR, surfaced via our local close.
+    const f = classifyHandshakeFailure(.{ .local_close_error_code = 0x8 });
+    try testing.expectEqual(HandshakeFailure.Kind.transport_error, f.kind);
+    try testing.expectEqual(@as(u64, 0x8), f.error_code);
+    try testing.expect(!f.from_peer);
+}
+
+test "classifyHandshakeFailure: application close codes are not handshake faults" {
+    const f = classifyHandshakeFailure(.{ .peer_close_is_app = true, .peer_close_error_code = 0x42 });
+    try testing.expectEqual(HandshakeFailure.Kind.unknown, f.kind);
+}
+
+test "classifyHandshakeFailure: local I/O fault maps to transport_error" {
+    try testing.expectEqual(HandshakeFailure.Kind.transport_error, classifyHandshakeFailure(.{ .last_actor_error = .quiche_recv_failed }).kind);
+}
+
+test "classifyHandshakeFailure: a plain drain/close maps to closed" {
+    try testing.expectEqual(HandshakeFailure.Kind.closed, classifyHandshakeFailure(.{ .close_reason = .draining }).kind);
+}
+
+test "classifyHandshakeFailure: nothing attributable maps to unknown" {
+    try testing.expectEqual(HandshakeFailure.Kind.unknown, classifyHandshakeFailure(.{}).kind);
+}

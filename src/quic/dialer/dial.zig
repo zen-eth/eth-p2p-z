@@ -22,10 +22,47 @@ pub const DialOptions = struct {
 pub const DialError = error{
     AddressFamilyMismatch,
     EndpointNotBound,
+    /// Handshake failed for an unattributable reason (catch-all).
     HandshakeFailed,
+    /// Handshake deadline elapsed before the connection established.
+    HandshakeTimeout,
+    /// Peer closed / drained the connection without a specific error code.
+    ConnectionClosed,
+    /// The peer's libp2p identity (cert / SignedKey) failed verification.
+    PeerVerifyFailed,
+    /// Peer/we sent a QUIC CRYPTO_ERROR (TLS alert) during the handshake.
+    CryptoError,
+    /// A QUIC transport error or local I/O fault aborted the handshake.
+    TransportError,
+    /// The verified peer key did not match `DialOptions.expected_peer_key`.
     PeerIdentityMismatch,
     RouteRegistrationFailed,
 } || std.Io.Cancelable || std.Io.Timeout.Error || std.Io.UnexpectedError || std.Io.ConcurrentError || std.mem.Allocator.Error;
+
+/// Map the connection's structured handshake-failure reason to a `DialError`,
+/// so callers learn *why* the handshake failed instead of an opaque
+/// `HandshakeFailed`.
+fn dialErrorFromFailure(failure: connection_mod.HandshakeFailure) DialError {
+    return switch (failure.kind) {
+        .timeout => error.HandshakeTimeout,
+        .peer_verify_failed => error.PeerVerifyFailed,
+        .crypto_error => error.CryptoError,
+        .transport_error => error.TransportError,
+        .closed => error.ConnectionClosed,
+        .none, .unknown => error.HandshakeFailed,
+    };
+}
+
+test "dialErrorFromFailure maps each handshake-failure kind to a distinct DialError" {
+    const HF = connection_mod.HandshakeFailure;
+    try std.testing.expectEqual(DialError.HandshakeTimeout, dialErrorFromFailure(HF{ .kind = .timeout }));
+    try std.testing.expectEqual(DialError.PeerVerifyFailed, dialErrorFromFailure(HF{ .kind = .peer_verify_failed }));
+    try std.testing.expectEqual(DialError.CryptoError, dialErrorFromFailure(HF{ .kind = .crypto_error }));
+    try std.testing.expectEqual(DialError.TransportError, dialErrorFromFailure(HF{ .kind = .transport_error }));
+    try std.testing.expectEqual(DialError.ConnectionClosed, dialErrorFromFailure(HF{ .kind = .closed }));
+    try std.testing.expectEqual(DialError.HandshakeFailed, dialErrorFromFailure(HF{ .kind = .unknown }));
+    try std.testing.expectEqual(DialError.HandshakeFailed, dialErrorFromFailure(HF{ .kind = .none }));
+}
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -91,9 +128,16 @@ pub fn dial(ep: Context, addr: std.Io.net.IpAddress, opts: DialOptions) DialErro
     errdefer conn.deinit();
     conn.waitHandshake(io) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        else => {
+        error.ConnectionClosed => {
             ep.addStat("failed_handshakes", 1);
-            return error.HandshakeFailed;
+            return error.ConnectionClosed;
+        },
+        error.HandshakeFailed => {
+            ep.addStat("failed_handshakes", 1);
+            // Refine the opaque failure into a specific cause from the
+            // connection's published stats (TLS alert / transport error /
+            // timeout / peer-verify rejection).
+            return dialErrorFromFailure(conn.failReason());
         },
     };
     if (opts.expected_peer_key) |expected| {
