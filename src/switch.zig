@@ -17,8 +17,17 @@ const protocols = @import("protocols.zig");
 const quic = @import("quic.zig");
 const PeerId = @import("peer_id").PeerId;
 const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
+const Semaphore = @import("quic/io/semaphore.zig").Semaphore;
 
 const command_queue_capacity = 32;
+/// E3 inbound stream-handler concurrency caps. Two layers, like go-libp2p
+/// (system + peer scopes) and rust-libp2p (per-connection + ConnectionLimits):
+/// a PER-CONNECTION cap (per-peer fairness) and an AGGREGATE cap (total
+/// exhaustion across all connections). Both default conservative + tunable via
+/// `Switch.Options`. Per-conn defaults below QUIC stream-credit (100) so it
+/// actually binds.
+const default_max_inflight_handlers_per_conn: usize = 32;
+const default_max_inflight_handlers_total: usize = 256;
 const default_negotiation_timeout: std.Io.Timeout = .{
     .duration = .{ .raw = .fromNanoseconds(10 * std.time.ns_per_s), .clock = .awake },
 };
@@ -33,6 +42,23 @@ pub const Switch = struct {
     registry_frozen: bool = false,
     connections: std.ArrayList(*SwitchConnection) = .empty,
     connections_lock: std.Io.Mutex = .init,
+    /// Per-connection handler-fiber cap; each actor seeds its own gate from this.
+    max_inflight_handlers_per_conn: usize = default_max_inflight_handlers_per_conn,
+    /// Aggregate handler-fiber gate, shared by every connection's dispatcher.
+    handler_gate_total: Semaphore = Semaphore.init(default_max_inflight_handlers_total),
+
+    pub const Options = struct {
+        max_inflight_handlers_per_conn: usize = default_max_inflight_handlers_per_conn,
+        max_inflight_handlers_total: usize = default_max_inflight_handlers_total,
+    };
+    pub const OptionsError = error{InvalidOptions};
+
+    fn validateOptions(opts: Options) OptionsError!void {
+        // Like every cross-fiber backpressure-budget knob, a zero cap would
+        // deadlock the gate — reject it rather than silently clamp.
+        if (opts.max_inflight_handlers_per_conn == 0) return error.InvalidOptions;
+        if (opts.max_inflight_handlers_total == 0) return error.InvalidOptions;
+    }
 
     pub const InitError = std.mem.Allocator.Error;
     pub const DispatchError = error{
@@ -70,6 +96,26 @@ pub const Switch = struct {
         return sw;
     }
 
+    /// Like `init`, but with custom E3 handler-concurrency caps.
+    pub fn initWithOptions(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        endpoint: *quic.QuicEndpoint,
+        opts: Options,
+    ) (InitError || OptionsError)!*Switch {
+        try validateOptions(opts);
+        const sw = try allocator.create(Switch);
+        sw.* = .{
+            .allocator = allocator,
+            .io = io,
+            .endpoint = endpoint,
+            .services = std.StringHashMap(protocols.AnyProtocolService).init(allocator),
+            .max_inflight_handlers_per_conn = opts.max_inflight_handlers_per_conn,
+            .handler_gate_total = Semaphore.init(opts.max_inflight_handlers_total),
+        };
+        return sw;
+    }
+
     pub fn deinit(sw: *Switch) void {
         while (true) {
             sw.connections_lock.lockUncancelable(sw.io);
@@ -84,6 +130,11 @@ pub const Switch = struct {
             }
         }
         sw.connections.deinit(sw.allocator);
+
+        // All connections (hence their dispatchers/handlers) are torn down above,
+        // so nobody is parked on the aggregate gate; close() is a harmless
+        // belt-and-suspenders wake before the Switch (and its gate) are freed.
+        sw.handler_gate_total.close(sw.io);
 
         sw.services_lock.lockUncancelable(sw.io);
         var it = sw.services.iterator();
@@ -428,6 +479,10 @@ const SwitchConnectionActor = struct {
     main_future: ?std.Io.Future(std.Io.Cancelable!void) = null,
     dispatcher_group: std.Io.Group = .init,
     handler_group: std.Io.Group = .init,
+    /// Per-connection handler admission gate (E3 fairness layer), seeded from
+    /// sw.max_inflight_handlers_per_conn. Acquired before spawning a handler,
+    /// released in the handler's cleanup defer.
+    handler_gate_conn: Semaphore,
     dispatcher_running: bool = false,
     closing: bool = false,
     peer_id: PeerId,
@@ -452,6 +507,7 @@ const SwitchConnectionActor = struct {
             .conn = conn,
             .inbox_storage = inbox_storage,
             .inbox = std.Io.Queue(Command).init(inbox_storage),
+            .handler_gate_conn = Semaphore.init(sw.max_inflight_handlers_per_conn),
             .peer_id = try Switch.connectionPeerId(allocator, conn),
             .remote_addr = conn.remoteAddress(),
         };
@@ -544,12 +600,37 @@ const SwitchConnectionActor = struct {
             stream.deinit();
         };
 
+        // Two-layer admission gate (E3): per-connection permit (fairness) THEN
+        // aggregate permit (total). Consistent acquire order => deadlock-free.
+        // Placed AFTER acceptStream so no earlier-return path holds a permit; the
+        // dispatcher blocking here IS the back-pressure. A parked acquire is a
+        // cancel point, so dispatcher_group.cancel unwinds it at teardown. The
+        // handler releases both in its cleanup defers; the errdefers below only
+        // cover the window before the spawn hands ownership to the handler.
+        actor.handler_gate_conn.acquire(actor.io) catch |err| switch (err) {
+            error.Closed => return error.ConnectionClosed,
+            error.Canceled => return error.Canceled,
+        };
+        var conn_permit_held = true;
+        errdefer if (conn_permit_held) actor.handler_gate_conn.release(actor.io);
+
+        actor.sw.handler_gate_total.acquire(actor.io) catch |err| switch (err) {
+            error.Closed => return error.ConnectionClosed,
+            error.Canceled => return error.Canceled,
+        };
+        var total_permit_held = true;
+        errdefer if (total_permit_held) actor.sw.handler_gate_total.release(actor.io);
+
         try actor.handler_group.concurrent(
             actor.io,
             runNegotiatedProtocolHandler,
-            .{ actor.sw, actor.io, stream, supported, opts.negotiation_timeout, actor.peer_id, actor.remote_addr },
+            .{ actor.sw, actor.io, stream, supported, opts.negotiation_timeout, actor.peer_id, actor.remote_addr, &actor.handler_gate_conn },
         );
+        // Spawn succeeded: the handler now owns the stream + both permits and
+        // releases them in its defers, so disarm the pre-spawn cleanup here.
         stream_live = false;
+        conn_permit_held = false;
+        total_permit_held = false;
     }
 
     fn startInboundDispatch(actor: *SwitchConnectionActor, opts: Switch.DispatchOptions) Switch.StartInboundDispatchError!void {
@@ -682,7 +763,14 @@ fn runNegotiatedProtocolHandler(
     timeout: std.Io.Timeout,
     peer_id: PeerId,
     remote_addr: std.Io.net.IpAddress,
+    conn_gate: *Semaphore,
 ) std.Io.Cancelable!void {
+    // Release both admission permits LAST — registered first so they run after
+    // the stream is fully torn down, freeing a slot only once this handler is
+    // done. release is non-blocking + allocation-free, safe during cancel
+    // unwinding (no swapCancelProtection needed; it never parks).
+    defer sw.handler_gate_total.release(io);
+    defer conn_gate.release(io);
     defer sw.allocator.free(supported);
     defer {
         const prev = io.swapCancelProtection(.blocked);
