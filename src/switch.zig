@@ -18,6 +18,7 @@ const quic = @import("quic.zig");
 const PeerId = @import("peer_id").PeerId;
 const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 const Semaphore = @import("quic/io/semaphore.zig").Semaphore;
+const io_time = @import("quic/io/time.zig");
 
 const command_queue_capacity = 32;
 /// E3 inbound stream-handler concurrency caps. Two layers, like go-libp2p
@@ -1125,4 +1126,122 @@ test "switch dispatches inbound streams to registered protocol handlers" {
     client_conn_live = false;
     server_conn.deinit();
     server_conn_live = false;
+}
+
+test "switch caps concurrent inbound handlers per connection (E3 gate)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    // Per-connection cap = 2.
+    const server = try Switch.initWithOptions(allocator, io, server_endpoint, .{ .max_inflight_handlers_per_conn = 2 });
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    const GateCtx = struct {
+        inflight: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        completed: std.atomic.Value(usize) = .init(0),
+        release: std.Io.Event = .unset,
+    };
+    const GatedHandler = struct {
+        ctx: *GateCtx,
+        // Records peak concurrency, then PARKS on `release` so the gate-saturated
+        // state is stable to observe (no sleep/timing race). release is set by
+        // the test once the gate has filled.
+        fn run(self: *@This(), handler_io: std.Io, stream: *quic.Stream) anyerror!void {
+            _ = stream;
+            const now = self.ctx.inflight.fetchAdd(1, .acq_rel) + 1;
+            var p = self.ctx.peak.load(.acquire);
+            while (now > p) {
+                if (self.ctx.peak.cmpxchgWeak(p, now, .acq_rel, .acquire)) |actual| p = actual else break;
+            }
+            self.ctx.release.wait(handler_io) catch {};
+            _ = self.ctx.inflight.fetchSub(1, .acq_rel);
+            _ = self.ctx.completed.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var ctx = GateCtx{};
+    var handler = GatedHandler{ .ctx = &ctx };
+    try server.addProtocolService(
+        "/test/gate/1.0.0",
+        protocols.streamHandlerService(GatedHandler, GatedHandler.run, &handler),
+    );
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |a| allocator.free(a);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    defer client_conn.deinit();
+    const server_conn = try server.accept();
+    defer server_conn.deinit();
+    try server_conn.startInboundDispatcher(.{});
+
+    const stream_count = 6;
+    const OpenCtx = struct {
+        conn: *SwitchConnection,
+        streams: [stream_count]?*quic.Stream = [_]?*quic.Stream{null} ** stream_count,
+        // Each fiber writes its own slot (no contention). openProtocolStream
+        // blocks until its handler negotiates, so the gated opens (3..) only
+        // complete after `release` frees the first wave.
+        fn open(self: *@This(), idx: usize) void {
+            self.streams[idx] = self.conn.openProtocolStream("/test/gate/1.0.0", .{}) catch null;
+        }
+    };
+    var open_ctx = OpenCtx{ .conn = client_conn };
+    var group: std.Io.Group = .init;
+    var i: usize = 0;
+    while (i < stream_count) : (i += 1) {
+        try group.concurrent(io, OpenCtx.open, .{ &open_ctx, i });
+    }
+
+    // Wait until the gate is saturated: exactly `cap` (=2) handlers have entered
+    // and parked on `release`. A correct gate never exceeds 2; an uncapped gate
+    // would let all 6 in (caught by the peak assertion below).
+    var attempts: usize = 0;
+    while (ctx.inflight.load(.acquire) < 2 and attempts < 600) : (attempts += 1) {
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 2), ctx.inflight.load(.acquire));
+
+    // Release every handler; the gated opens now complete in waves of 2.
+    ctx.release.set(io);
+    group.await(io) catch {};
+
+    attempts = 0;
+    while (ctx.completed.load(.acquire) < stream_count and attempts < 600) : (attempts += 1) {
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, stream_count), ctx.completed.load(.acquire));
+    // The gate NEVER let more than the per-connection cap run concurrently.
+    try std.testing.expectEqual(@as(usize, 2), ctx.peak.load(.acquire));
+
+    for (open_ctx.streams) |maybe_stream| {
+        if (maybe_stream) |s| {
+            closeStreamForCleanup(io, s);
+            s.deinit();
+        }
+    }
 }
