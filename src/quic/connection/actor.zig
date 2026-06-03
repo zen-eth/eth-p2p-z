@@ -133,9 +133,6 @@ pub const ConnectionActor = struct {
     ready_outbound_streams: ArrayList(*StreamRecord) = .empty,
     ready_outbound_head: usize = 0,
     force_outbound_stream_scan: bool = false,
-    /// Reused scratch for the forced outbound scan: stream ids collected during
-    /// `self.streams` iteration, reaped (collectFinishedStream) afterwards.
-    finished_scan_ids: ArrayList(u64) = .empty,
     pending_accept_streams: ArrayList(*StreamHandle) = .empty,
     pending_accept_head: usize = 0,
     pending_accept_cap: usize = 0,
@@ -243,7 +240,6 @@ pub const ConnectionActor = struct {
         self.cids.deinit(allocator);
         self.streams.deinit();
         self.ready_outbound_streams.deinit(allocator);
-        self.finished_scan_ids.deinit(allocator);
         self.pending_accept_streams.deinit(allocator);
         self.write.deinit();
         if (self.conn) |conn| {
@@ -1579,20 +1575,18 @@ pub const ConnectionActor = struct {
             self.ready_outbound_streams.clearRetainingCapacity();
             self.ready_outbound_head = 0;
             var work_remains = false;
-            // Record every stream id so finished ones can be reaped AFTER the
-            // iteration (collectFinishedStream mutates self.streams, which is
-            // unsafe mid-iteration). A reusable growable list: the old fixed
-            // [256] buffer set collect_pass and then skipped reaping ENTIRELY
-            // once a connection held >256 streams, leaking finished-stream
-            // records. On OOM, re-arm a scan to reap the remainder next pass
-            // rather than dropping it.
-            self.finished_scan_ids.clearRetainingCapacity();
+            var stream_ids_buf: [256]u64 = undefined;
+            var ids_len: usize = 0;
+            var collect_pass = false;
             var iter = self.streams.valueIterator();
             while (iter.next()) |slot| {
                 const record = slot.*;
-                self.finished_scan_ids.append(self.allocator, record.streamId()) catch {
-                    self.force_outbound_stream_scan = true;
-                };
+                if (ids_len < stream_ids_buf.len) {
+                    stream_ids_buf[ids_len] = record.streamId();
+                    ids_len += 1;
+                } else {
+                    collect_pass = true;
+                }
                 const result = if (record.needsOutboundDrain(io))
                     try self.drainOneStreamOutbound(conn, record, io)
                 else
@@ -1605,7 +1599,9 @@ pub const ConnectionActor = struct {
                     };
                 }
             }
-            for (self.finished_scan_ids.items) |stream_id| self.collectFinishedStream(conn, stream_id);
+            if (!collect_pass) {
+                for (stream_ids_buf[0..ids_len]) |stream_id| self.collectFinishedStream(conn, stream_id);
+            }
             return work_remains;
         }
 
