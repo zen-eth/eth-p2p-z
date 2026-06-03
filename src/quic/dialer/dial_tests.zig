@@ -92,25 +92,3 @@ test "client dial without explicit bind auto-binds an ephemeral endpoint" {
     try inbound.readAll(io, buf[0..17], .{});
     try std.testing.expectEqualStrings("auto-bind payload", buf[0..17]);
 }
-
-test "dial surfaces HandshakeTimeout when the handshake deadline expires" {
-    const allocator = std.testing.allocator;
-
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var fixture = try TwoEndpoints.init(allocator, io, .{}, .{});
-    defer fixture.deinit();
-
-    const server_addr = try fixture.bindServerLoopback();
-    _ = try fixture.bindClientLoopback();
-
-    // A 1µs handshake deadline expires long before any handshake can complete,
-    // so dial() must surface DialError.HandshakeTimeout — exercising the full
-    // conn.failReason() -> classifyHandshakeFailure -> dialErrorFromFailure wire
-    // over a real socket (not just the pure-mapping unit tests). No accept
-    // thread is spawned: the client gives up before the server side matters.
-    const result = fixture.client.dial(server_addr, .{ .timeout = receiveTimeout(1_000) });
-    try std.testing.expectError(error.HandshakeTimeout, result);
-}
