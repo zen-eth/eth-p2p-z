@@ -130,7 +130,18 @@ pub fn dial(ep: Context, addr: std.Io.net.IpAddress, opts: DialOptions) DialErro
         error.Canceled => return error.Canceled,
         error.ConnectionClosed => {
             ep.addStat("failed_handshakes", 1);
-            return error.ConnectionClosed;
+            // A .closed handshake can still carry a specific local cause — e.g.
+            // our own BoringSSL aborting the TLS handshake closes the connection
+            // with a CRYPTO_ERROR. Refine from the published close code; fall
+            // back to ConnectionClosed for a plain peer drain / no attributable
+            // code (unlike the HandshakeFailed arm, unknown stays ConnectionClosed).
+            return switch (conn.failReason().kind) {
+                .crypto_error => error.CryptoError,
+                .transport_error => error.TransportError,
+                .timeout => error.HandshakeTimeout,
+                .peer_verify_failed => error.PeerVerifyFailed,
+                .closed, .none, .unknown => error.ConnectionClosed,
+            };
         },
         error.HandshakeFailed => {
             ep.addStat("failed_handshakes", 1);
