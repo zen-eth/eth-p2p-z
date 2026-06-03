@@ -931,24 +931,26 @@ pub const ConnectionActor = struct {
     }
 
     fn closeFromActorErrorCode(self: *ConnectionActor, actor_error: conn_stats.ActorError) void {
-        if (!self.shared.isClosed()) {
-            if (self.conn) |conn| {
-                const empty: [0]u8 = .{};
-                _ = quiche.quiche_conn_close(conn, false, 0x1, empty[0..].ptr, 0);
-            }
-            self.shared.markClosed();
-        }
         if (self.lifecycle.closeResult() == .none) self.lifecycle.closing(.failed);
         self.stats_snapshot.actor_fatal_errors += 1;
         self.stats_snapshot.last_actor_error = actor_error;
         if (self.stats_snapshot.close_reason == .none or self.stats_snapshot.close_reason == .closed) {
             self.stats_snapshot.close_reason = .actor_error;
         }
-        if (self.shared.handshake.isHandshaking()) {
-            // Publish the fatal-error stats before waking waitHandshake so the
-            // dialer's conn.stats() read sees last_actor_error/close_reason.
-            self.publishStats();
-            self.failHandshake();
+        // Publish the fully-stamped fatal-error stats BEFORE the wake. markClosed()
+        // below calls handshake.close() -> done.set, waking a dialer parked in
+        // waitHandshake; its failReason()/classifyHandshakeFailure must see
+        // last_actor_error + close_reason=.actor_error or it reports an opaque
+        // error. (This publish previously sat behind `if (isHandshaking())` AFTER
+        // markClosed had already flipped the stage to .closed — it was dead code
+        // and never ran, so the fatal-error cause was silently dropped.)
+        if (self.shared.handshake.isHandshaking()) self.publishStats();
+        if (!self.shared.isClosed()) {
+            if (self.conn) |conn| {
+                const empty: [0]u8 = .{};
+                _ = quiche.quiche_conn_close(conn, false, 0x1, empty[0..].ptr, 0);
+            }
+            self.shared.markClosed();
         }
         self.closeApplicationQueues();
         self.notifyShutdown();
@@ -1030,6 +1032,13 @@ pub const ConnectionActor = struct {
             // the dialer can surface it instead of an opaque HandshakeFailed.
             self.completeHandshake(io) catch |err| {
                 self.stats_snapshot.last_actor_error = conn_stats.ActorError.fromError(err);
+                // The connection is already established at the quiche/TLS layer, so
+                // this is our own libp2p-identity rejection (or a local fault while
+                // completing). Tell the peer with a CONNECTION_CLOSE instead of
+                // letting it wait out its idle timeout — the timeout/closed branches
+                // above already close; this one must too.
+                const empty: [0]u8 = .{};
+                _ = quiche.quiche_conn_close(conn, false, 0x1, empty[0..].ptr, 0);
                 self.failHandshakeAndStamp(io, null);
             };
         }
@@ -1058,11 +1067,12 @@ pub const ConnectionActor = struct {
     /// quiche-derived reason; `null` defers to quiche's CONNECTION_CLOSE codes
     /// (falling back to `.handshake_failed`).
     fn failHandshakeAndStamp(self: *ConnectionActor, io: std.Io, explicit_reason: ?conn_stats.CloseReason) void {
-        self.shared.markClosed();
         // Capture quiche's peer/local CONNECTION_CLOSE codes so the dialer can
         // tell a TLS alert (CRYPTO_ERROR) from a transport-parameter error.
-        // refreshCloseErrorStats only fills close_reason when it is still
-        // .none/.closed, so an explicit caller reason still wins below.
+        // NOTE: refreshCloseErrorStats can set close_reason itself (e.g.
+        // .idle_timeout UNCONDITIONALLY on a timed-out conn, plus draining/closed),
+        // so the explicit caller reason below MUST run after it to win — do not
+        // reorder them or add an early return.
         if (self.conn) |conn| refreshCloseErrorStats(conn, &self.stats_snapshot);
         if (explicit_reason) |reason| {
             self.stats_snapshot.close_reason = reason;
@@ -1071,11 +1081,14 @@ pub const ConnectionActor = struct {
         }
         self.stats_snapshot.last_updated_mono_ns = io_time.monotonicNs(io);
         self.lifecycle.fail();
-        // Publish BEFORE signalling: waitHandshake wakes on handshake.fail()'s
-        // event and the dialer reads conn.stats() immediately after, so the
-        // published snapshot must already carry the reason (happens-before via
-        // the stats mutex + the handshake event).
+        // Publish BEFORE any wake. Both markClosed() (handshake.close -> done.set)
+        // and handshake.fail() wake a dialer parked in waitHandshake, which reads
+        // conn.stats() immediately. markClosed() previously ran at the TOP of this
+        // function, so a multi-executor dialer could wake on its done.set (stage
+        // .closed) and read the snapshot before this publish. Publish first, then
+        // markClosed + fail (happens-before via the stats mutex + handshake event).
         self.publishStats();
+        self.shared.markClosed();
         self.shared.handshake.fail(io);
     }
 

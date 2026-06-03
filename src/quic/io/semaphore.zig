@@ -55,12 +55,18 @@ pub const Semaphore = struct {
         return channel.tryDecrementToFloor(&s.permits);
     }
 
-    /// Return one permit and wake a single waiter. Non-blocking; safe during
-    /// cancel unwinding. Wakes exactly one (release frees exactly one permit);
-    /// `close` below wakes all.
+    /// Return one permit and wake parked waiters. Non-blocking; safe during
+    /// cancel unwinding.
     pub fn release(s: *Semaphore, io: std.Io) void {
         _ = s.permits.fetchAdd(1, .release);
-        s.signal.notifyOne(io);
+        // Wake ALL waiters, not one. A wake-one strands the freed permit when the
+        // single woken acquirer is canceled before it re-runs tryClaim: acquire's
+        // `try s.signal.wait(...)` returns Canceled WITHOUT claiming, so the wake
+        // is spent yet the permit stays free while other acquirers remain parked
+        // on a now-stale epoch — a lost-wakeup stall on the shared aggregate gate.
+        // Wake-all costs an O(waiters) re-park under saturation but cannot lose a
+        // permit; a wake-one would need a FIFO waiter hand-off (not worth it here).
+        s.signal.notify(io);
     }
 
     /// Wake all waiters with `error.Closed` (teardown). Idempotent.

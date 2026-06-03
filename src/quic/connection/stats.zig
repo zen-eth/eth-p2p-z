@@ -139,6 +139,13 @@ pub fn classifyHandshakeFailure(s: ConnectionStats) HandshakeFailure {
         else => {},
     }
 
+    // 6. A fatal local actor fault during handshake (closeFromActorErrorCode set
+    //    close_reason=.actor_error). The peer_verify_failed / quiche / socket
+    //    cases are already handled by steps 1 and 4; anything else reaching here
+    //    (e.g. .concurrent_failed, .address_invalid) is a local transport-layer
+    //    fault, not an opaque unknown.
+    if (s.close_reason == .actor_error) return .{ .kind = .transport_error };
+
     return .{ .kind = .unknown };
 }
 
@@ -361,6 +368,15 @@ test "classifyHandshakeFailure: local I/O fault maps to transport_error" {
 
 test "classifyHandshakeFailure: a plain drain/close maps to closed" {
     try testing.expectEqual(HandshakeFailure.Kind.closed, classifyHandshakeFailure(.{ .close_reason = .draining }).kind);
+}
+
+test "classifyHandshakeFailure: a fatal local actor fault maps to transport_error" {
+    // closeFromActorErrorCode stamps close_reason=.actor_error for faults that
+    // aren't peer_verify_failed (step 1) or quiche/socket I/O (step 4), e.g.
+    // .concurrent_failed / .address_invalid. These are local transport faults,
+    // not opaque unknowns.
+    try testing.expectEqual(HandshakeFailure.Kind.transport_error, classifyHandshakeFailure(.{ .close_reason = .actor_error, .last_actor_error = .concurrent_failed }).kind);
+    try testing.expectEqual(HandshakeFailure.Kind.transport_error, classifyHandshakeFailure(.{ .close_reason = .actor_error, .last_actor_error = .address_invalid }).kind);
 }
 
 test "classifyHandshakeFailure: nothing attributable maps to unknown" {

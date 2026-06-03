@@ -639,10 +639,11 @@ const SwitchConnectionActor = struct {
         // dispatcher blocking here IS the back-pressure. A parked acquire is a
         // cancel point, so it is unwound at teardown via dispatcher_group.cancel
         // on the loop path (inboundDispatcher) and via the main-future cancel in
-        // shutdownAndDestroy on the one-shot command path (this runs on the
-        // uncancelable actorMain fiber, which no Group cancels). The handler
-        // releases both in its cleanup defers; the errdefers below only cover the
-        // window before the spawn hands ownership to the handler.
+        // shutdownAndDestroy on the one-shot command path (which runs on the
+        // actorMain fiber — held by a Future, not a Group, so NO Group cancels it;
+        // only that future.cancel does). The handler releases both in its cleanup
+        // defers; the errdefers below only cover the window before the spawn hands
+        // ownership to the handler.
         actor.handler_gate_conn.acquire(actor.io) catch |err| switch (err) {
             error.Closed => return error.ConnectionClosed,
             error.Canceled => return error.Canceled,

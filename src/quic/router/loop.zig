@@ -263,7 +263,7 @@ fn discardPendingRouterSelect(ep: Context, select: *RouterSelect) void {
                 // A dropped Initial/handshake datagram otherwise manifests as a
                 // silently stalled connection (the failure class behind the
                 // teardown-deadlock hunt) — log it so the loss is visible.
-                std.log.debug("router: dropping pending select packet on cancel ({} bytes)", .{value.bytes().len});
+                std.log.debug("router: dropping pending select packet on cancel ({} bytes)", .{value.data.len});
                 value.deinit();
                 ep.addStat("router_packet_drops", 1);
             }
@@ -295,7 +295,7 @@ fn collectRouterSelectResult(
             const value = maybe_packet orelse return;
             if (packet.* != null) {
                 var duplicate = value;
-                std.log.debug("router: dropping duplicate select packet ({} bytes)", .{duplicate.bytes().len});
+                std.log.debug("router: dropping duplicate select packet ({} bytes)", .{duplicate.data.len});
                 duplicate.deinit();
                 ep.addStat("router_packet_drops", 1);
                 return;

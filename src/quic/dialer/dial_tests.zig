@@ -23,9 +23,16 @@ test "client dial routes inbound packets via the shared listen socket" {
     var accept_ctx = AcceptCtx{ .endpoint = fixture.server };
     const accept_thread = try std.Thread.spawn(.{}, AcceptCtx.run, .{&accept_ctx});
 
-    const client_conn = try fixture.client.dial(server_addr, .{
+    const client_conn = fixture.client.dial(server_addr, .{
         .timeout = receiveTimeout(default_handshake_timeout_ns),
-    });
+    }) catch |err| {
+        // Join the accept thread before propagating: on dial failure the deferred
+        // fixture.deinit() frees the server endpoint the thread is still reading
+        // (blocked in accept()), so skipping the join here would leak the thread
+        // into teardown -> use-after-free.
+        accept_thread.join();
+        return err;
+    };
     defer client_conn.deinit();
 
     accept_thread.join();
@@ -69,9 +76,14 @@ test "client dial without explicit bind auto-binds an ephemeral endpoint" {
     var accept_ctx = AcceptCtx{ .endpoint = fixture.server };
     const accept_thread = try std.Thread.spawn(.{}, AcceptCtx.run, .{&accept_ctx});
 
-    const client_conn = try fixture.client.dial(server_addr, .{
+    const client_conn = fixture.client.dial(server_addr, .{
         .timeout = receiveTimeout(default_handshake_timeout_ns),
-    });
+    }) catch |err| {
+        // Join before propagating: a dial failure must not leak the accept thread
+        // into the deferred fixture.deinit() that frees the endpoint it reads.
+        accept_thread.join();
+        return err;
+    };
     defer client_conn.deinit();
 
     accept_thread.join();

@@ -109,22 +109,40 @@ pub const QuicEndpoint = opaque {
     /// Bind to `addr`. Returns the actual local address (the OS may pick a
     /// port if `addr` had port 0).
     pub fn bind(e: *QuicEndpoint, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAddress {
+        const ep = internal(e);
+        ep.bind_lock.lockUncancelable(ep.io);
+        defer ep.bind_lock.unlock(ep.io);
         return router.bind(routerContext(e), addr);
     }
 
     pub fn dial(e: *QuicEndpoint, addr: std.Io.net.IpAddress, opts: DialOptions) DialError!*Connection {
-        if (internal(e).socket == null) {
+        const ep = internal(e);
+        if (ep.socket == null) {
             const ephemeral: std.Io.net.IpAddress = switch (addr) {
                 .ip4 => .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
                 .ip6 => .{ .ip6 = .{ .port = 0, .flow = 0, .bytes = [_]u8{0} ** 16, .interface = .{ .index = 0 } } },
             };
-            _ = bind(e, ephemeral) catch |err| switch (err) {
-                error.AlreadyBound => {},
-                else => |bind_err| {
-                    std.log.warn("dial: auto-bind of ephemeral endpoint failed: {}", .{bind_err});
-                    return error.EndpointNotBound;
-                },
-            };
+            // Auto-bind an ephemeral local socket for a dial-only endpoint. Hold
+            // bind_lock and re-check under it: concurrent first-dials must not both
+            // run router.bind (its check/bind/store is not atomic across a suspend)
+            // — the loser observes socket != null and skips. Call router.bind
+            // directly, not the locking `bind`, to avoid re-entering bind_lock.
+            ep.bind_lock.lockUncancelable(ep.io);
+            defer ep.bind_lock.unlock(ep.io);
+            if (ep.socket == null) {
+                _ = router.bind(routerContext(e), ephemeral) catch |err| switch (err) {
+                    error.AlreadyBound => {},
+                    // Forward the causes DialError shares; map genuine bind/config
+                    // faults (AddressInUse, fd-quota, ...) to TransportError rather
+                    // than the misleading "never bound" error.EndpointNotBound.
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ConcurrencyUnavailable => return error.ConcurrencyUnavailable,
+                    else => |bind_err| {
+                        std.log.warn("dial: auto-bind of ephemeral endpoint failed: {}", .{bind_err});
+                        return error.TransportError;
+                    },
+                };
+            }
         }
         return dialer.dial(dialerContext(e), addr, opts);
     }
@@ -155,6 +173,11 @@ const Impl = struct {
     /// remains responsible for the TLS context lifetime.
     owned_tls: ?tls.Context = null,
     socket: ?*transport_mod.SharedUdpSocket = null,
+    /// Serializes bind() (including dial()'s auto-bind). router.bind's
+    /// null-check / socket-bind / slot-store is not atomic across its internal
+    /// suspend, so concurrent first-binds would each spawn a router fiber and the
+    /// second would orphan the first's socket + fiber (leak + teardown UAF).
+    bind_lock: std.Io.Mutex = .init,
     accept_queue: ?*router.AcceptChannel.State = null,
     /// In-flight admission counter shared with the router fiber. See
     /// `router/accept_queue.zig:tryReserve`. Initialised to the configured

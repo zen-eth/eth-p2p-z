@@ -23,27 +23,18 @@ pub const Signal = struct {
         _ = s.epoch.fetchAdd(1, .release);
         io.futexWake(u32, &s.epoch.raw, std.math.maxInt(u32));
     }
-
-    /// Like `notify`, but wakes at most ONE parked waiter. Use when each event
-    /// frees exactly one unit of a contended resource (e.g. one semaphore
-    /// permit): a wake-all would be an O(waiters) thundering herd where all but
-    /// one waiter re-park after losing the single claim. Still bumps the epoch,
-    /// so the observe-before-wait contract holds — a waiter that observed the
-    /// old epoch but has not yet slept will not sleep — and successive
-    /// `notifyOne`s pair one-to-one with freed units (each wakes a fresh
-    /// waiter), so no waiter starves while a unit is free.
-    pub fn notifyOne(s: *Signal, io: std.Io) void {
-        _ = s.epoch.fetchAdd(1, .release);
-        io.futexWake(u32, &s.epoch.raw, 1);
-    }
 };
 
 /// Atomically decrement `counter` by one iff it is > 0, returning whether a
 /// decrement happened. This is the lock-free counted-slot admission idiom
 /// shared by the router's accept-queue reservation (`accept_queue.tryReserve`)
 /// and the E3 handler gate (`Semaphore.tryClaim`): a CAS loop that never lets
-/// the counter underflow past zero. Centralized so the memory orderings live in
-/// exactly one place.
+/// the counter underflow past zero. Centralized so the (single) synchronizing
+/// operation — the cmpxchg — lives in one place. The initial `.acquire` load is
+/// only the CAS's expected-value hint; the cmpxchgWeak (.acq_rel success /
+/// .acquire failure) is what establishes the happens-before edge against a
+/// releaser's `.release` store, so a stale initial read is harmless (the loop
+/// or the caller's observe-before-wait retries).
 pub fn tryDecrementToFloor(counter: *std.atomic.Value(usize)) bool {
     var cur = counter.load(.acquire);
     while (cur > 0) {
