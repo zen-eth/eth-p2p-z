@@ -1,6 +1,8 @@
 const std = @import("std");
 const channel = @import("../../quic/io/channel.zig");
 const io_time = @import("../../quic/io/time.zig");
+const pubsub = @import("pubsub.zig");
+const PeerId = @import("peer_id").PeerId;
 
 /// The lane an outbound frame travels on, in decreasing priority.
 /// subscribe is highest (subscriptions are rare and critical),
@@ -255,6 +257,126 @@ pub const OutboundQueue = struct {
         return null;
     }
 };
+
+/// Drains an OutboundQueue onto a peer's outbound stream, decoupled from the
+/// stream's lifetime. The queue outlives any single stream: when a write fails
+/// mid-frame we drop only that one in-flight frame, tear the stream down, and
+/// lazily re-open a fresh stream on the next iteration to keep draining the
+/// surviving queue (rust-libp2p semantics — go drops the whole queue instead).
+///
+/// Generic over a duck-typed `Sink` so it can be exercised with fakes here and
+/// adapted to the real QUIC stream later. The sink must provide:
+///   fn open(self: *Sink, io: std.Io) anyerror!void
+///       (re)establish the current outbound stream.
+///   fn writeFrame(self: *Sink, io: std.Io, bytes: []const u8) anyerror!void
+///       write framed bytes to the current stream.
+///   fn close(self: *Sink, io: std.Io) void
+///       tear down the current stream; safe to call when none is open.
+pub fn PeerWriter(comptime Sink: type) type {
+    return struct {
+        const Self = @This();
+
+        queue: *OutboundQueue,
+        sink: *Sink,
+        allocator: std.mem.Allocator,
+        /// Open attempts before giving up on the peer (each followed by backoff).
+        max_open_retries: usize = 5,
+        /// Sleep between open attempts, in milliseconds.
+        reopen_backoff_ms: u64 = 50,
+        /// Invoked once if open retries are exhausted, so the router can tear the
+        /// peer down. The writer never touches the queue lifecycle itself.
+        on_disconnect: ?*const fn (?*anyopaque) void = null,
+        disconnect_ctx: ?*anyopaque = null,
+        /// Whether the sink currently holds an open stream.
+        have_stream: bool = false,
+
+        /// Fiber body. Pops frames in priority order and writes them, re-opening
+        /// the stream as needed, until the queue is closed/drained or cancelled.
+        /// Always releases the current stream on exit.
+        pub fn run(self: *Self, io: std.Io) void {
+            defer self.sink.close(io);
+            while (true) {
+                var frame = self.queue.popBlocking(io) catch return; // Closed/Canceled
+                if (!self.have_stream) {
+                    if (!self.ensureStream(io)) {
+                        // Open retries exhausted: drop the popped frame and hand
+                        // the peer back to the router via on_disconnect.
+                        frame.deinit(self.allocator);
+                        if (self.on_disconnect) |cb| cb(self.disconnect_ctx);
+                        return;
+                    }
+                }
+                self.sink.writeFrame(io, frame.bytes) catch {
+                    // The stream died mid-write. Lose only this in-flight frame,
+                    // close the stream, and re-open lazily next iteration so the
+                    // surviving queue drains onto a fresh stream.
+                    self.sink.close(io);
+                    self.have_stream = false;
+                    frame.deinit(self.allocator);
+                    continue;
+                };
+                frame.deinit(self.allocator);
+            }
+        }
+
+        /// Open the stream with bounded retries and backoff. Returns true once a
+        /// stream is open, false after exhausting retries (or on cancellation
+        /// during backoff). Sets have_stream on success.
+        fn ensureStream(self: *Self, io: std.Io) bool {
+            var attempt: usize = 0;
+            while (attempt < self.max_open_retries) : (attempt += 1) {
+                if (self.sink.open(io)) |_| {
+                    self.have_stream = true;
+                    return true;
+                } else |_| {
+                    io_time.ms(self.reopen_backoff_ms).sleep(io) catch return false;
+                }
+            }
+            return false;
+        }
+    };
+}
+
+/// An inbound RPC tagged with the peer that sent it, handed to the router's
+/// inbox. The consumer that drains the inbox owns each rpc and must deinit it.
+pub const InboundRpc = struct {
+    peer: PeerId,
+    rpc: pubsub.OwnedRpc,
+};
+
+/// Reads parsed RPCs off a peer's inbound stream and posts them, tagged with
+/// the sender's PeerId, to a shared inbox. A clean EOF or a broken stream is
+/// signalled by `read` returning an error, on which the reader simply exits —
+/// the router replaces it when a new inbound stream arrives.
+///
+/// Generic over a duck-typed `Source`, which must provide:
+///   fn read(self: *Source, allocator: std.mem.Allocator, io: std.Io)
+///       anyerror!pubsub.OwnedRpc
+///       return the next parsed RPC, or an error on EOF/shutdown/broken stream.
+pub fn PeerReader(comptime Source: type) type {
+    return struct {
+        const Self = @This();
+
+        source: *Source,
+        peer: PeerId,
+        inbox: *std.Io.Queue(InboundRpc),
+        allocator: std.mem.Allocator,
+
+        /// Fiber body. Reads RPCs and hands each to the inbox until the stream
+        /// ends/breaks or the inbox closes. Ownership of each rpc transfers to
+        /// the inbox consumer; an rpc that cannot be handed off is freed here.
+        pub fn run(self: *Self, io: std.Io) void {
+            while (true) {
+                var owned = self.source.read(self.allocator, io) catch return;
+                self.inbox.putOne(io, .{ .peer = self.peer, .rpc = owned }) catch {
+                    // Inbox closed or cancelled: we still own the rpc, so free it.
+                    owned.deinit(self.allocator);
+                    return;
+                };
+            }
+        }
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -707,4 +829,324 @@ test "close wakes a blocked popper which then returns Closed" {
     fut.await(io);
 
     try std.testing.expect(ctx.got_closed.load(.acquire));
+}
+
+// --- PeerWriter / PeerReader fakes + tests ---------------------------------
+
+/// A test Sink that records every byte written to each "stream" it opens. Each
+/// open appends a fresh buffer; writes land in the current buffer. It can be
+/// configured to fail the first `fail_open_count` opens and to fail the
+/// `fail_on_write_n`-th write (1-based; 0 = never), so the writer's open-retry
+/// and mid-write re-open paths can be exercised. Owns all buffers.
+const FakeSink = struct {
+    allocator: std.mem.Allocator,
+    streams: std.ArrayList(std.ArrayList(u8)) = .empty,
+    /// Number of leading open() calls that should fail.
+    fail_open_count: usize = 0,
+    open_calls: usize = 0,
+    /// The 1-based write index that should fail; 0 disables write failures.
+    fail_on_write_n: usize = 0,
+    write_calls: usize = 0,
+    /// Set true while a stream is open (cleared by close).
+    open_now: bool = false,
+
+    fn deinit(self: *FakeSink) void {
+        for (self.streams.items) |*buf| buf.deinit(self.allocator);
+        self.streams.deinit(self.allocator);
+    }
+
+    fn open(self: *FakeSink, io: std.Io) anyerror!void {
+        _ = io;
+        self.open_calls += 1;
+        if (self.open_calls <= self.fail_open_count) return error.OpenFailed;
+        try self.streams.append(self.allocator, .empty);
+        self.open_now = true;
+    }
+
+    fn writeFrame(self: *FakeSink, io: std.Io, bytes: []const u8) anyerror!void {
+        _ = io;
+        self.write_calls += 1;
+        if (self.fail_on_write_n != 0 and self.write_calls == self.fail_on_write_n) {
+            return error.StreamShutdown;
+        }
+        try self.streams.items[self.streams.items.len - 1].appendSlice(self.allocator, bytes);
+    }
+
+    fn close(self: *FakeSink, io: std.Io) void {
+        _ = io;
+        self.open_now = false;
+    }
+
+    /// Number of streams that were successfully opened.
+    fn streamCount(self: *const FakeSink) usize {
+        return self.streams.items.len;
+    }
+
+    /// The bytes written to the i-th opened stream.
+    fn streamBytes(self: *const FakeSink, i: usize) []const u8 {
+        return self.streams.items[i].items;
+    }
+};
+
+/// Build an owned frame whose single byte is `byte`, matching what the writer
+/// pops and writes to the sink. (One byte per frame keeps the assertions about
+/// which bytes landed on which stream trivially readable.)
+fn writerFrame(allocator: std.mem.Allocator, byte: u8) !OutboundFrame {
+    return testFrame(allocator, byte);
+}
+
+test "PeerWriter happy path: all frames written to a single stream in order" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var q = OutboundQueue.init(allocator, .{});
+    defer q.deinit(io);
+
+    try q.push(io, .data, try writerFrame(allocator, 1));
+    try q.push(io, .data, try writerFrame(allocator, 2));
+    try q.push(io, .data, try writerFrame(allocator, 3));
+    q.close(io);
+
+    var sink = FakeSink{ .allocator = allocator };
+    defer sink.deinit();
+
+    var writer = PeerWriter(FakeSink){ .queue = &q, .sink = &sink, .allocator = allocator };
+    writer.run(io);
+
+    // One stream opened, holding all three frames in order.
+    try std.testing.expectEqual(@as(usize, 1), sink.streamCount());
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, sink.streamBytes(0));
+}
+
+test "PeerWriter re-opens on write failure, dropping only the in-flight frame" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var q = OutboundQueue.init(allocator, .{});
+    defer q.deinit(io);
+
+    // Five distinguishable frames; the queue is closed so run() terminates.
+    try q.push(io, .data, try writerFrame(allocator, 1));
+    try q.push(io, .data, try writerFrame(allocator, 2));
+    try q.push(io, .data, try writerFrame(allocator, 3));
+    try q.push(io, .data, try writerFrame(allocator, 4));
+    try q.push(io, .data, try writerFrame(allocator, 5));
+    q.close(io);
+
+    // The second write fails: frame #2 is the in-flight casualty.
+    var sink = FakeSink{ .allocator = allocator, .fail_on_write_n = 2 };
+    defer sink.deinit();
+
+    var writer = PeerWriter(FakeSink){ .queue = &q, .sink = &sink, .allocator = allocator };
+    writer.run(io);
+
+    // The surviving queue drained onto a fresh stream: frame #1 on the first
+    // stream, frame #2 dropped, frames #3,#4,#5 on the second stream — no
+    // duplication, order preserved.
+    try std.testing.expectEqual(@as(usize, 2), sink.streamCount());
+    try std.testing.expectEqualSlices(u8, &.{1}, sink.streamBytes(0));
+    try std.testing.expectEqualSlices(u8, &.{ 3, 4, 5 }, sink.streamBytes(1));
+}
+
+/// Flag context for the open-exhaustion test's on_disconnect callback.
+const DisconnectFlag = struct {
+    fired: usize = 0,
+    fn cb(ctx: ?*anyopaque) void {
+        const self: *DisconnectFlag = @ptrCast(@alignCast(ctx.?));
+        self.fired += 1;
+    }
+};
+
+test "PeerWriter open exhaustion calls on_disconnect once and frees the frame" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var q = OutboundQueue.init(allocator, .{});
+    defer q.deinit(io);
+
+    try q.push(io, .data, try writerFrame(allocator, 7));
+    q.close(io);
+
+    // Every open fails, so ensureStream exhausts its retries.
+    var sink = FakeSink{ .allocator = allocator, .fail_open_count = std.math.maxInt(usize) };
+    defer sink.deinit();
+
+    var flag = DisconnectFlag{};
+    var writer = PeerWriter(FakeSink){
+        .queue = &q,
+        .sink = &sink,
+        .allocator = allocator,
+        .max_open_retries = 3,
+        .reopen_backoff_ms = 0,
+        .on_disconnect = DisconnectFlag.cb,
+        .disconnect_ctx = &flag,
+    };
+    writer.run(io);
+
+    // on_disconnect fired exactly once; the popped frame was freed (no leak);
+    // no stream was ever opened.
+    try std.testing.expectEqual(@as(usize, 1), flag.fired);
+    try std.testing.expectEqual(@as(usize, 0), sink.streamCount());
+}
+
+test "PeerWriter returns immediately when the queue is already closed and empty" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var q = OutboundQueue.init(allocator, .{});
+    defer q.deinit(io);
+    q.close(io);
+
+    var sink = FakeSink{ .allocator = allocator };
+    defer sink.deinit();
+
+    var writer = PeerWriter(FakeSink){ .queue = &q, .sink = &sink, .allocator = allocator };
+    writer.run(io); // popBlocking → Closed; defer sink.close runs, no stream opened.
+
+    try std.testing.expectEqual(@as(usize, 0), sink.streamCount());
+}
+
+/// Build an OwnedRpc carrying a single subscription to `topic`, so the reader
+/// tests can verify ordering by reading the topic id back out, and so
+/// OwnedRpc.deinit has real heap bytes to free.
+fn subscriptionRpc(allocator: std.mem.Allocator, topic: []const u8) !pubsub.OwnedRpc {
+    const rpc_pb = @import("../../protobuf.zig").rpc;
+    const sub = rpc_pb.RPC{
+        .subscriptions = &[_]?rpc_pb.RPC.SubOpts{.{ .subscribe = true, .topicid = topic }},
+    };
+    // encode yields a const slice; OwnedRpc owns a mutable []u8 (matching the
+    // heap buffer readRpc allocates), so copy into one the reader can borrow.
+    const encoded = try sub.encode(allocator);
+    defer if (encoded.len > 0) allocator.free(encoded);
+    const payload = try allocator.dupe(u8, encoded);
+    errdefer allocator.free(payload);
+    return .{ .bytes = payload, .reader = try rpc_pb.RPCReader.init(payload) };
+}
+
+/// Read back the topic id of the first subscription in an OwnedRpc.
+fn rpcTopic(owned: *pubsub.OwnedRpc) []const u8 {
+    var reader = owned.reader;
+    const sub = reader.subscriptionsNext() orelse return "";
+    return sub.getTopicid();
+}
+
+/// A test Source that yields pre-built OwnedRpcs in order, then returns a
+/// terminal error to signal EOF/shutdown. It owns any rpcs not yet read and
+/// frees them on deinit.
+const FakeSource = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList(pubsub.OwnedRpc) = .empty,
+    next: usize = 0,
+    terminal: anyerror = error.EndOfStream,
+
+    fn deinit(self: *FakeSource) void {
+        // Free only rpcs the reader never consumed.
+        for (self.items.items[self.next..]) |*owned| owned.deinit(self.allocator);
+        self.items.deinit(self.allocator);
+    }
+
+    fn push(self: *FakeSource, owned: pubsub.OwnedRpc) !void {
+        try self.items.append(self.allocator, owned);
+    }
+
+    fn read(self: *FakeSource, allocator: std.mem.Allocator, io: std.Io) anyerror!pubsub.OwnedRpc {
+        _ = allocator;
+        _ = io;
+        if (self.next >= self.items.items.len) return self.terminal;
+        const owned = self.items.items[self.next];
+        self.next += 1;
+        return owned;
+    }
+};
+
+test "PeerReader posts each RPC tagged with the peer id, in order, then exits" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var source = FakeSource{ .allocator = allocator };
+    defer source.deinit();
+    try source.push(try subscriptionRpc(allocator, "t1"));
+    try source.push(try subscriptionRpc(allocator, "t2"));
+    try source.push(try subscriptionRpc(allocator, "t3"));
+
+    var buffer: [4]InboundRpc = undefined;
+    var inbox = std.Io.Queue(InboundRpc).init(&buffer);
+
+    const peer = try PeerId.random();
+    var reader = PeerReader(FakeSource){
+        .source = &source,
+        .peer = peer,
+        .inbox = &inbox,
+        .allocator = allocator,
+    };
+    reader.run(io); // drains the source, posts 3 items, then EndOfStream → exit.
+
+    const topics = [_][]const u8{ "t1", "t2", "t3" };
+    for (topics) |want| {
+        var item = try inbox.getOne(io);
+        defer item.rpc.deinit(allocator);
+        try std.testing.expect(item.peer.eql(&peer));
+        try std.testing.expectEqualSlices(u8, want, rpcTopic(&item.rpc));
+    }
+}
+
+test "PeerReader posts nothing and exits on an immediately broken stream" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // No items, terminal error simulating a broken stream.
+    var source = FakeSource{ .allocator = allocator, .terminal = error.StreamShutdown };
+    defer source.deinit();
+
+    var buffer: [4]InboundRpc = undefined;
+    var inbox = std.Io.Queue(InboundRpc).init(&buffer);
+
+    var reader = PeerReader(FakeSource){
+        .source = &source,
+        .peer = try PeerId.random(),
+        .inbox = &inbox,
+        .allocator = allocator,
+    };
+    reader.run(io);
+
+    // Nothing was posted: closing the inbox lets a getOne report Closed.
+    inbox.close(io);
+    try std.testing.expectError(error.Closed, inbox.getOne(io));
+}
+
+test "PeerReader frees an undelivered RPC when the inbox is closed" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var source = FakeSource{ .allocator = allocator };
+    defer source.deinit();
+    try source.push(try subscriptionRpc(allocator, "t1"));
+
+    var buffer: [4]InboundRpc = undefined;
+    var inbox = std.Io.Queue(InboundRpc).init(&buffer);
+    inbox.close(io); // closed before run: putOne fails on the first item.
+
+    var reader = PeerReader(FakeSource){
+        .source = &source,
+        .peer = try PeerId.random(),
+        .inbox = &inbox,
+        .allocator = allocator,
+    };
+    // putOne fails → the reader frees the un-handed-off rpc and exits. The
+    // testing allocator confirms the errdefer path leaked nothing.
+    reader.run(io);
 }
