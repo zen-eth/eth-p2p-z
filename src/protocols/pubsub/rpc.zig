@@ -222,6 +222,7 @@ test "message round-trip via RpcOut.publish" {
     var reader = try rpc_pb.RPCReader.init(encoded);
     const got = reader.publishNext() orelse return error.MissingMessage;
     try std.testing.expectEqualSlices(u8, "sender", got.getFrom());
+    try std.testing.expectEqualSlices(u8, "\x00\x01", got.getSeqno());
     try std.testing.expectEqualSlices(u8, "hello", got.getData());
     try std.testing.expectEqualSlices(u8, "topic-x", got.getTopic());
 }

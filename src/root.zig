@@ -29,4 +29,5 @@ test {
     _ = @import("quic/io/socket_control.zig");
     _ = @import("quic/router/retry_token.zig");
     _ = @import("switch.zig");
+    _ = @import("protocols/pubsub/pubsub.zig");
 }

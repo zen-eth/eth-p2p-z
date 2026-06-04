@@ -98,3 +98,10 @@ fn readUvarint(io: std.Io, stream: *Stream) !usize {
     }
     return error.VarintTooLong;
 }
+
+// Aggregate test blocks for all files in this subdirectory so that their
+// test {} blocks are reachable from the root test aggregator. Add each new
+// pubsub source file here as `_ = @import("filename.zig");`.
+test {
+    _ = @import("rpc.zig");
+}
