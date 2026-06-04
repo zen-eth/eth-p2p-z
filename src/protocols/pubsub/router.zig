@@ -188,8 +188,7 @@ pub fn Router(comptime Transport: type) type {
         const Writer = peer_io.PeerWriter(Sink);
 
         /// A command posted to the router's single inbox. Producers post; the
-        /// router fiber processes. (subscribe/publish/heartbeat variants arrive
-        /// in later layers.) Generic in the transport's connection handle.
+        /// router fiber processes. Generic in the transport's connection handle.
         pub const Command = union(enum) {
             /// A peer's connection is up (handshake done, peer id known). The
             /// `conn` handle stays valid until the matching `peer_disconnected`.
@@ -500,11 +499,16 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Back `peer` off for `topic` for `ticks` heartbeats from now (the expiry
-        /// tick is `heartbeat_tick + ticks`). Creates the topic's BackoffSet (with
-        /// an owned topic-key copy) on first use. A later/larger expiry already
-        /// stored is kept (never shortened). Best-effort on allocation failure.
+        /// tick is `heartbeat_tick +| ticks`, saturating). Creates the topic's
+        /// BackoffSet (with an owned topic-key copy) on first use. A later/larger
+        /// expiry already stored is kept (never shortened). Best-effort on
+        /// allocation failure. `ticks` can be an attacker-controlled wire value
+        /// (PRUNE backoff seconds): the saturating add can never overflow, so a
+        /// peer sending a huge backoff only locks itself out (its own loss) rather
+        /// than crashing us (Debug/safe builds) or wrapping to a near-zero expiry
+        /// that would silently disable the backoff (release builds).
         fn setBackoff(router: *Self, topic: []const u8, peer: PeerId, ticks: u64) void {
-            const expiry = router.heartbeat_tick + ticks;
+            const expiry = router.heartbeat_tick +| ticks;
             const gop = router.backoff.getOrPut(router.allocator, topic) catch return;
             if (!gop.found_existing) {
                 const owned = router.allocator.dupe(u8, topic) catch {
@@ -841,16 +845,20 @@ pub fn Router(comptime Transport: type) type {
 
         /// Handle an inbound GRAFT(topic) from `source`: add the peer to the
         /// topic's mesh iff we subscribe to the topic, the peer is not in backoff
-        /// for it, and the mesh has room (below D_high). Otherwise reply with a
-        /// PRUNE (default backoff, no PX yet) on the peer's control lane and back
-        /// the peer off so we do not immediately re-accept. Untracked source is
-        /// ignored.
+        /// for it, and the mesh has room (below D_high). A GRAFT from a peer that
+        /// is already a mesh member is an idempotent accept (no self-eviction):
+        /// without this short-circuit a re-GRAFT while the mesh is at D_high would
+        /// fail the room check and wrongly PRUNE + back off a valid member.
+        /// Otherwise reply with a PRUNE (default backoff, no PX yet) on the peer's
+        /// control lane and back the peer off so we do not immediately re-accept.
+        /// Untracked source is ignored.
         fn handleGraft(router: *Self, source: PeerId, topic: []const u8) void {
             if (!router.peers.contains(peerKey(&source))) return;
 
-            const accept = router.my_topics.contains(topic) and
-                !router.inBackoff(topic, source) and
-                router.meshSize(topic) < mesh_params.d_high;
+            const accept = router.meshContains(topic, source) or
+                (router.my_topics.contains(topic) and
+                    !router.inBackoff(topic, source) and
+                    router.meshSize(topic) < mesh_params.d_high);
 
             if (accept) {
                 router.meshAdd(topic, source);
@@ -2059,4 +2067,91 @@ test "peer disconnect cleans the peer out of mesh and backoff" {
     try std.testing.expect(!router.inBackoff("t2", peer));
     // The testing allocator's end-of-test leak check confirms destroy() freed the
     // (now peer-less) mesh/backoff topic entries with no leak.
+}
+
+test "PRUNE with a max-u64 backoff does not crash and actually backs the peer off" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // P joins the mesh, then PRUNEs us with an attacker-controlled max-u64 backoff.
+    // Computing the expiry as heartbeat_tick + backoff would overflow: a panic in
+    // this Debug build, or (in release) a wrap to a near-zero expiry that silently
+    // disables the backoff. The saturating add must avoid both.
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
+    try router.inbox.putOne(io, .{
+        .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundPrune(allocator, "t", std.math.maxInt(u64)) },
+    });
+
+    // Wait for the prune to take effect (peer removed from mesh) — proves we did
+    // not crash processing it.
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (!router.meshContains("t", peer)) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(!router.meshContains("t", peer));
+
+    // The backoff must be set (not wrapped to immediately-expired): a subsequent
+    // GRAFT from P is rejected → PRUNE back.
+    const outcome = try graftAndWait(io, allocator, router, conn, peer, "t");
+    try std.testing.expectEqual(GraftOutcome.rejected, outcome);
+    try std.testing.expect(!router.meshContains("t", peer));
+    try std.testing.expect(waitPruneSent(io, conn, "t"));
+}
+
+test "re-GRAFT from an existing mesh member at D_high is an idempotent accept (no self-eviction)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    // Fill the mesh to D_high with distinct peers, each via an accepted GRAFT.
+    const d_high = mesh_params.d_high;
+    var conns: [mesh_params.d_high]*FakeTransport.FakeConn = undefined;
+    var peers: [mesh_params.d_high]PeerId = undefined;
+    var filled: usize = 0;
+    defer for (conns[0..filled]) |c| destroyFakeConn(allocator, c);
+    var i: usize = 0;
+    while (i < d_high) : (i += 1) {
+        const p = testPeer(@intCast(10 + i));
+        const c = try connectFakePeer(io, allocator, router, p);
+        conns[i] = c;
+        peers[i] = p;
+        filled += 1;
+        try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, c, p, "t"));
+    }
+    try std.testing.expectEqual(d_high, router.meshSize("t"));
+
+    // An existing member re-GRAFTs while the mesh is at D_high. This must be an
+    // idempotent accept: the member stays in the mesh and gets no PRUNE back.
+    // (graftAndWait would short-circuit to .accepted just because the member is
+    // already present, so we instead post the GRAFT directly and then drive one
+    // heartbeat: the inbox is a single-fiber FIFO, so once the later heartbeat is
+    // processed the GRAFT is fully handled and any spurious PRUNE would be visible.)
+    const member = peers[0];
+    const member_conn = conns[0];
+    const prunes_before = recordCountPrunes(member_conn.record.written.items, "t");
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = member, .rpc = try buildInboundGraft(allocator, "t") } });
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expect(router.meshContains("t", member));
+    try std.testing.expectEqual(d_high, router.meshSize("t"));
+    try std.testing.expectEqual(prunes_before, recordCountPrunes(member_conn.record.written.items, "t"));
 }
