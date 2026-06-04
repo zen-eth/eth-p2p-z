@@ -361,32 +361,44 @@ pub const InboundRpc = struct {
     rpc: pubsub.OwnedRpc,
 };
 
-/// Reads parsed RPCs off a peer's inbound stream and posts them, tagged with
-/// the sender's PeerId, to a shared inbox. A clean EOF or a broken stream is
-/// signalled by `read` returning an error, on which the reader simply exits —
-/// the router replaces it when a new inbound stream arrives.
+/// Reads parsed RPCs off a peer's inbound stream and posts each, tagged with
+/// the sender's PeerId, through a duck-typed `Poster`. A clean EOF or a broken
+/// stream is signalled by `read` returning an error, on which the reader simply
+/// exits — the router replaces it when a new inbound stream arrives.
 ///
-/// Generic over a duck-typed `Source`, which must provide:
-///   fn read(self: *Source, allocator: std.mem.Allocator, io: std.Io)
-///       anyerror!pubsub.OwnedRpc
-///       return the next parsed RPC, or an error on EOF/shutdown/broken stream.
-pub fn PeerReader(comptime Source: type) type {
+/// The reader is generic over both ends so it can be exercised with fakes and
+/// adapted to the real QUIC stream + a single-inbox router. It is decoupled from
+/// the router's Command inbox: the router supplies a Poster that wraps each
+/// InboundRpc into its own Command variant and posts it to the one inbox, so the
+/// router keeps a single ordered queue for every event it processes.
+///
+///   `Source` must provide:
+///     fn read(self: *Source, allocator: std.mem.Allocator, io: std.Io)
+///         anyerror!pubsub.OwnedRpc
+///         return the next parsed RPC, or an error on EOF/shutdown/broken stream.
+///   `Poster` must provide:
+///     fn post(self: *Poster, io: std.Io, rpc: InboundRpc) anyerror!void
+///         hand off one inbound rpc. On a returned error the reader still owns
+///         the rpc and frees it before exiting (the post failed to take it).
+pub fn PeerReader(comptime Source: type, comptime Poster: type) type {
     return struct {
         const Self = @This();
 
         source: *Source,
+        poster: *Poster,
         peer: PeerId,
-        inbox: *std.Io.Queue(InboundRpc),
         allocator: std.mem.Allocator,
 
-        /// Fiber body. Reads RPCs and hands each to the inbox until the stream
-        /// ends/breaks or the inbox closes. Ownership of each rpc transfers to
-        /// the inbox consumer; an rpc that cannot be handed off is freed here.
+        /// Fiber body. Reads RPCs and hands each to the poster until the stream
+        /// ends/breaks or the poster rejects (closed inbox / cancelled).
+        /// Ownership of each rpc transfers to the poster on success; an rpc that
+        /// cannot be handed off is freed here.
         pub fn run(self: *Self, io: std.Io) void {
             while (true) {
                 var owned = self.source.read(self.allocator, io) catch return;
-                self.inbox.putOne(io, .{ .peer = self.peer, .rpc = owned }) catch {
-                    // Inbox closed or cancelled: we still own the rpc, so free it.
+                self.poster.post(io, .{ .peer = self.peer, .rpc = owned }) catch {
+                    // Post failed (inbox closed or cancelled): we still own the
+                    // rpc, so free it.
                     owned.deinit(self.allocator);
                     return;
                 };
@@ -1084,6 +1096,20 @@ const FakeSource = struct {
     }
 };
 
+/// A test Poster that forwards each posted InboundRpc to a real std.Io.Queue,
+/// mirroring how the router's poster will wrap an InboundRpc into a Command and
+/// post it to the single router inbox. When `reject` is true every post fails so
+/// the reader's free-on-rejection path can be exercised.
+const FakePoster = struct {
+    inbox: *std.Io.Queue(InboundRpc),
+    reject: bool = false,
+
+    fn post(self: *FakePoster, io: std.Io, rpc: InboundRpc) anyerror!void {
+        if (self.reject) return error.Closed;
+        try self.inbox.putOne(io, rpc);
+    }
+};
+
 test "PeerReader posts each RPC tagged with the peer id, in order, then exits" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
@@ -1098,12 +1124,13 @@ test "PeerReader posts each RPC tagged with the peer id, in order, then exits" {
 
     var buffer: [4]InboundRpc = undefined;
     var inbox = std.Io.Queue(InboundRpc).init(&buffer);
+    var poster = FakePoster{ .inbox = &inbox };
 
     const peer = try PeerId.random();
-    var reader = PeerReader(FakeSource){
+    var reader = PeerReader(FakeSource, FakePoster){
         .source = &source,
+        .poster = &poster,
         .peer = peer,
-        .inbox = &inbox,
         .allocator = allocator,
     };
     reader.run(io); // drains the source, posts 3 items, then EndOfStream → exit.
@@ -1129,11 +1156,12 @@ test "PeerReader posts nothing and exits on an immediately broken stream" {
 
     var buffer: [4]InboundRpc = undefined;
     var inbox = std.Io.Queue(InboundRpc).init(&buffer);
+    var poster = FakePoster{ .inbox = &inbox };
 
-    var reader = PeerReader(FakeSource){
+    var reader = PeerReader(FakeSource, FakePoster){
         .source = &source,
+        .poster = &poster,
         .peer = try PeerId.random(),
-        .inbox = &inbox,
         .allocator = allocator,
     };
     reader.run(io);
@@ -1143,7 +1171,7 @@ test "PeerReader posts nothing and exits on an immediately broken stream" {
     try std.testing.expectError(error.Closed, inbox.getOne(io));
 }
 
-test "PeerReader frees an undelivered RPC when the inbox is closed" {
+test "PeerReader frees an undelivered RPC when the poster rejects" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -1155,15 +1183,15 @@ test "PeerReader frees an undelivered RPC when the inbox is closed" {
 
     var buffer: [4]InboundRpc = undefined;
     var inbox = std.Io.Queue(InboundRpc).init(&buffer);
-    inbox.close(io); // closed before run: putOne fails on the first item.
+    var poster = FakePoster{ .inbox = &inbox, .reject = true };
 
-    var reader = PeerReader(FakeSource){
+    var reader = PeerReader(FakeSource, FakePoster){
         .source = &source,
+        .poster = &poster,
         .peer = try PeerId.random(),
-        .inbox = &inbox,
         .allocator = allocator,
     };
-    // putOne fails → the reader frees the un-handed-off rpc and exits. The
-    // testing allocator confirms the errdefer path leaked nothing.
+    // post fails on the first item → the reader frees the un-handed-off rpc and
+    // exits. The testing allocator confirms nothing leaked.
     reader.run(io);
 }

@@ -8,6 +8,10 @@ pub const protocols = @import("protocols.zig");
 pub const protobuf = @import("protobuf.zig");
 pub const secp_context = @import("secp_context.zig");
 pub const swarm = @import("switch.zig");
+// gossipsub lives on the root import path (NOT routed through protocols.zig):
+// it imports switch.zig, which imports protocols.zig, so exporting it through
+// the protocols chain would risk an import cycle.
+pub const gossipsub = @import("protocols/pubsub/gossipsub.zig");
 
 pub const Connection = quic.Connection;
 pub const ConnectionStats = quic.ConnectionStats;
@@ -30,4 +34,5 @@ test {
     _ = @import("quic/router/retry_token.zig");
     _ = @import("switch.zig");
     _ = @import("protocols/pubsub/pubsub.zig");
+    _ = @import("protocols/pubsub/router.zig");
 }
