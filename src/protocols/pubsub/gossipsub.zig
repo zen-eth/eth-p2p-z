@@ -178,6 +178,14 @@ pub const Gossipsub = struct {
     /// endpoint does not even retain the host KeyPair), so the caller — which owns
     /// the KeyPair — passes it in (e.g. `try key.peerId(allocator)`).
     ///
+    /// `host_key` selects the signature policy. Pass the node's host KeyPair (the
+    /// same one used for the endpoint identity) to enable StrictSign: outbound
+    /// messages are signed and inbound messages are verified + rejected if their
+    /// signature is invalid or absent — required for interop with go-libp2p
+    /// (whose default is StrictSign). The key is BORROWED and must outlive this
+    /// Gossipsub. Pass null for the none policy (from+seqno, no signature, no
+    /// verification). When a key is given the router derives `local_peer` from it.
+    ///
     /// `message_handler` (optional) receives messages delivered on topics this
     /// node subscribes to; see router's MessageHandler for the call contract.
     pub fn init(
@@ -185,9 +193,10 @@ pub const Gossipsub = struct {
         io: std.Io,
         sw: *Switch,
         local_peer: PeerId,
+        host_key: ?*const identity.KeyPair,
         message_handler: ?MessageHandler,
     ) !*Gossipsub {
-        const router = try Router.create(allocator, io, .{}, local_peer, message_handler, heartbeat_interval_ms);
+        const router = try Router.create(allocator, io, .{}, local_peer, message_handler, heartbeat_interval_ms, host_key);
         errdefer router.destroy();
 
         try router.start();
@@ -369,10 +378,10 @@ test "two gossipsub nodes wire up per-peer I/O on connect and tear down on disco
 
     // Construct a gossipsub on each switch BEFORE dialing so each one's peer-event
     // callback is registered when the connection comes up.
-    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, null);
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, null, null);
     var server_gs_live = true;
     defer if (server_gs_live) server_gs.deinit();
-    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, null);
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, null, null);
     var client_gs_live = true;
     defer if (client_gs_live) client_gs.deinit();
 
@@ -509,10 +518,13 @@ test "two gossipsub nodes: subscribe propagates and a publish is delivered end t
     var rec = DeliveryRecorder{ .allocator = allocator, .io = io };
     defer rec.deinit();
 
-    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, rec.handler());
+    // StrictSign on BOTH sides (pass each node's host key): the publisher signs
+    // and the subscriber verifies, exercising the full sign->verify path over
+    // real QUIC. The subscriber must accept the publisher's signed message.
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, &server_key, rec.handler());
     var server_gs_live = true;
     defer if (server_gs_live) server_gs.deinit();
-    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, null);
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, &client_key, null);
     var client_gs_live = true;
     defer if (client_gs_live) client_gs.deinit();
 

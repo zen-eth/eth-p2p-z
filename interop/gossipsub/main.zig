@@ -174,8 +174,10 @@ pub fn main(init: std.process.Init) !void {
 
     var recorder = Recorder{ .io = io };
     // Construct gossipsub BEFORE any dial/accept so its peer-event callback is
-    // registered when the connection comes up.
-    const gs = try gossipsub.Gossipsub.init(allocator, io, switcher, local_peer, recorder.handler());
+    // registered when the connection comes up. Pass the host key to enable
+    // StrictSign (sign outbound, verify inbound) so go-libp2p — which defaults to
+    // StrictSign — accepts our published messages and we accept its signed ones.
+    const gs = try gossipsub.Gossipsub.init(allocator, io, switcher, local_peer, &host_key, recorder.handler());
     var gs_live = true;
     defer if (gs_live) gs.deinit();
 

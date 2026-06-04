@@ -8,11 +8,11 @@
 #     exercises negotiation, RPC framing, subscription propagation, GRAFT/PRUNE,
 #     and message receipt with go-libp2p's signed Message on the wire.
 #
-#   REVERSE (zig -> go), diagnostic only: the GO node listens + subscribes; the
-#     ZIG node dials + publishes UNSIGNED. go-libp2p in default StrictSign mode
-#     rejects unsigned messages, so this is EXPECTED to fail; we capture the
-#     outcome (whether go received) and do not block on it. Run go with
-#     sign=nosign to flip the policy for comparison.
+#   REVERSE (zig -> go): the GO node listens + subscribes; the ZIG node dials +
+#     publishes SIGNED (StrictSign). go-libp2p in its default StrictSign mode now
+#     ACCEPTS the zig message because zig signs per the libp2p pubsub scheme.
+#     Asserts go logs received:true. This proves the zig-side signing matches
+#     libp2p byte-for-byte (go verifies the signature + the from/key binding).
 #
 # Everything is bounded by duration and leftover processes are killed on exit.
 
@@ -152,13 +152,13 @@ else
 fi
 
 # ===========================================================================
-# REVERSE (diagnostic): zig publishes -> go subscribes. Expected to FAIL in
-# go's default StrictSign mode (zig publishes unsigned). Not fatal.
+# REVERSE: zig publishes (StrictSign) -> go subscribes. With zig-side signing
+# go's default StrictSign mode now ACCEPTS the message. This is the acceptance
+# test proving zig's signing matches libp2p.
 # ===========================================================================
 echo
 echo "############################################################"
-echo "# REVERSE scenario (diagnostic): zig publishes -> go receives"
-echo "# (expected FAIL: go default StrictSign rejects unsigned)"
+echo "# REVERSE scenario: zig publishes (signed) -> go receives"
 echo "############################################################"
 
 GO_ADDR_FILE="$(mktmp)"
@@ -180,8 +180,9 @@ PIDS+=("$GO_PID2")
 echo "==> Waiting for go listener address"
 GO_ADDR="$(wait_for_addr "$GO_ADDR_FILE" "$GO_PID2")"
 if [ -z "$GO_ADDR" ]; then
-    echo "WARN: go listener never published its address; skipping reverse diagnostic" >&2
+    echo "FAIL (REVERSE): go listener never published its address" >&2
     cat "$GO_LOG2" >&2
+    OVERALL=1
 else
     echo "    go address: $GO_ADDR"
     echo "==> Starting ZIG node (role=dial mode=pub) -> go"
@@ -205,18 +206,19 @@ else
     cat "$ZIG_LOG2"
     echo
 
-    if grep -q '"role":"listen".*"received":true' "$GO_LOG2"; then
-        echo "REVERSE: go RECEIVED the zig message (unexpected with StrictSign)"
+    if grep -q "RECV topic=$TOPIC.*data=hello-from-zig" "$GO_LOG2" \
+       && grep -q '"role":"listen".*"received":true' "$GO_LOG2"; then
+        echo "PASS (REVERSE): go-libp2p (StrictSign) accepted the zig-published signed message"
     else
-        echo "REVERSE: go did NOT receive the zig message (expected: StrictSign rejects unsigned)."
-        echo "         This confirms zig->go needs zig-side message signing (deferred follow-up)."
+        echo "FAIL (REVERSE): go did NOT receive the zig signed message" >&2
+        OVERALL=1
     fi
 fi
 
 echo
 if [ "$OVERALL" -eq 0 ]; then
-    echo "OVERALL: PASS (primary go->zig receipt verified)"
+    echo "OVERALL: PASS (both directions: go<->zig signed message receipt verified)"
 else
-    echo "OVERALL: FAIL (primary go->zig receipt did not succeed)"
+    echo "OVERALL: FAIL (a direction did not succeed)"
 fi
 exit "$OVERALL"

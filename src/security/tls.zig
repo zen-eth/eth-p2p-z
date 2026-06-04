@@ -789,7 +789,11 @@ pub fn verifySignature(pkey: *ssl.EVP_PKEY, data: []const u8, signature: []const
     }
 }
 
-fn verifyHostSignature(host_pubkey: *const keys.PublicKey, data: []const u8, signature: []const u8) !bool {
+/// Verify a libp2p host signature over `data` using `host_pubkey`, dispatching
+/// to the software secp256k1 path for secp256k1 keys and to BoringSSL's EVP
+/// verify (Ed25519 / ECDSA / RSA) otherwise. Reused by the gossipsub message
+/// signer to verify a publisher's signature against the key carried on the wire.
+pub fn verifyHostSignature(host_pubkey: *const keys.PublicKey, data: []const u8, signature: []const u8) !bool {
     switch (host_pubkey.type) {
         .SECP256K1 => return verifySecp256k1Signature(host_pubkey.data orelse return error.InvalidData, data, signature),
         else => {

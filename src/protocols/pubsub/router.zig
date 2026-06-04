@@ -33,6 +33,8 @@ const peer_io = @import("peer_io.zig");
 const mcache = @import("mcache.zig");
 const rpc = @import("rpc.zig");
 const rpc_pb = @import("../../protobuf.zig").rpc;
+const signing = @import("signing.zig");
+const identity = @import("../../identity.zig");
 const io_time = @import("../../quic/io/time.zig");
 const PeerId = @import("peer_id").PeerId;
 
@@ -353,6 +355,13 @@ pub fn Router(comptime Transport: type) type {
         seqno: u64 = 0,
         /// Our own peer id, used as Message.from on publish.
         local_peer: PeerId,
+        /// Signature policy. When set (StrictSign), every published message is
+        /// signed and every inbound published message is verified — invalid or
+        /// unsigned inbound messages are rejected (dropped, never delivered or
+        /// forwarded). When null (none), messages carry from+seqno with no
+        /// signature and no inbound verification (the de-risk / fake-transport
+        /// behaviour). Owns its cached pubkey bytes; freed on destroy.
+        signer: ?signing.Signer,
         /// Optional sink for messages delivered on topics we subscribe to.
         message_handler: ?MessageHandler,
         main_future: ?std.Io.Future(void) = null,
@@ -363,6 +372,12 @@ pub fn Router(comptime Transport: type) type {
         /// Number of live peers, published for observers (e.g. tests).
         peer_count: std.atomic.Value(usize) = .init(0),
 
+        /// `host_key` selects the signature policy: non-null enables StrictSign
+        /// (sign outbound, verify inbound) and the router derives + uses the
+        /// key's peer-id as `local_peer` (ignoring the passed `local_peer`, which
+        /// must match — they are the same node); null keeps the none policy and
+        /// uses `local_peer` as given. The KeyPair is borrowed and must outlive
+        /// the router.
         pub fn create(
             allocator: std.mem.Allocator,
             io: std.Io,
@@ -370,12 +385,20 @@ pub fn Router(comptime Transport: type) type {
             local_peer: PeerId,
             message_handler: ?MessageHandler,
             heartbeat_interval_ms: u64,
+            host_key: ?*const identity.KeyPair,
         ) !*Self {
             const inbox_storage = try allocator.alloc(Command, inbox_capacity);
             errdefer allocator.free(inbox_storage);
 
             var seen = try SeenCache.init(allocator);
             errdefer seen.deinit();
+
+            // StrictSign when a host key is supplied: the Signer caches the
+            // marshaled pubkey + peer-id once so per-publish signing is cheap.
+            // The signer's peer-id is authoritative for `from` on publish.
+            var signer: ?signing.Signer = if (host_key) |k| try signing.Signer.init(allocator, k) else null;
+            errdefer if (signer) |*s| s.deinit();
+            const effective_peer = if (signer) |*s| s.from_peer else local_peer;
 
             const router = try allocator.create(Self);
             router.* = .{
@@ -387,7 +410,8 @@ pub fn Router(comptime Transport: type) type {
                 .peers = std.AutoHashMap(PeerKey, *PeerState).init(allocator),
                 .seen = seen,
                 .message_cache = mcache.MessageCache.init(allocator),
-                .local_peer = local_peer,
+                .local_peer = effective_peer,
+                .signer = signer,
                 .message_handler = message_handler,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
             };
@@ -464,6 +488,7 @@ pub fn Router(comptime Transport: type) type {
             router.freeFanout();
             router.seen.deinit();
             router.message_cache.deinit();
+            if (router.signer) |*s| s.deinit();
             router.allocator.free(router.inbox_storage);
             router.allocator.destroy(router);
         }
@@ -1162,6 +1187,8 @@ pub fn Router(comptime Transport: type) type {
                     msg.getSeqno(),
                     msg.getTopic(),
                     msg.getData(),
+                    msg.getSignature(),
+                    msg.getKey(),
                 );
             }
 
@@ -1330,7 +1357,22 @@ pub fn Router(comptime Transport: type) type {
             seqno: []const u8,
             topic: []const u8,
             data: []const u8,
+            signature: []const u8,
+            key: []const u8,
         ) void {
+            // StrictSign: reject (drop — no deliver, no cache, no forward) any
+            // message whose signature does not verify against the key carried on
+            // the wire AND whose `from` is not that key's peer-id. An unsigned
+            // message (empty signature/key) also fails verification, so it is
+            // dropped. Under the none policy we accept everything (current
+            // behaviour) and the message's signature/key — if any — pass through
+            // unchanged on forward.
+            if (router.signer != null) {
+                if (!signing.verifyMessage(router.allocator, from, seqno, topic, data, signature, key)) {
+                    return;
+                }
+            }
+
             var id = rpc.messageId(router.allocator, from, seqno) catch return;
             defer id.deinit(router.allocator);
             if (router.seen.contains(id.bytes)) return;
@@ -1342,6 +1384,8 @@ pub fn Router(comptime Transport: type) type {
             // heartbeat IHAVE can advertise it) and forward it over the topic's
             // mesh, minus the sender. Caching is independent of forwarding: a
             // message accepted on a topic with no mesh members is still cached.
+            // Forward the ORIGINAL signature/key so relayed copies keep the
+            // publisher's signature (empty slices map to null = field absent).
             router.cacheAndForward(
                 router.mesh.getPtr(topic),
                 exclude,
@@ -1349,6 +1393,8 @@ pub fn Router(comptime Transport: type) type {
                 seqno,
                 topic,
                 data,
+                if (signature.len > 0) signature else null,
+                if (key.len > 0) key else null,
                 id.bytes,
             );
         }
@@ -1386,6 +1432,8 @@ pub fn Router(comptime Transport: type) type {
             seqno: []const u8,
             topic: []const u8,
             data: []const u8,
+            signature: ?[]const u8,
+            key: ?[]const u8,
             id: []const u8,
         ) void {
             // The data frame carries one message id (owned by the frame, for a
@@ -1395,7 +1443,11 @@ pub fn Router(comptime Transport: type) type {
                 router.allocator.free(ids);
                 return;
             };
-            const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data };
+            // The cached/forwarded frame carries whatever signature/key the
+            // message was published or relayed with (null under the none policy),
+            // so IWANT-served and mesh-forwarded copies stay byte-identical and
+            // keep the original publisher's signature.
+            const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data, .signature = signature, .key = key };
             const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .publish = &.{msg} }).toRpc()) catch {
                 router.allocator.free(ids[0]);
                 router.allocator.free(ids);
@@ -1515,6 +1567,22 @@ pub fn Router(comptime Transport: type) type {
             router.seqno += 1;
             const seqno = seqno_buf[0..];
 
+            // Under StrictSign, sign the message and attach the signature + the
+            // marshaled libp2p public key. A signing failure drops the publish (we
+            // must not emit an unsigned message a StrictSign peer would reject).
+            // Under the none policy both stay null. `sig` is owned here and freed
+            // after framing (cacheAndForward copies the bytes into the frame).
+            var sig: ?[]u8 = null;
+            defer if (sig) |s| router.allocator.free(s);
+            var key: ?[]const u8 = null;
+            if (router.signer) |*s| {
+                sig = s.sign(from, seqno, topic, data) catch |err| {
+                    std.log.warn("gossipsub: signing publish failed: {any}", .{err});
+                    return;
+                };
+                key = s.keyBytes();
+            }
+
             var id = rpc.messageId(router.allocator, from, seqno) catch return;
             defer id.deinit(router.allocator);
             router.seen.add(id.bytes);
@@ -1528,7 +1596,7 @@ pub fn Router(comptime Transport: type) type {
             if (router.my_topics.contains(topic)) {
                 // Subscribed: cache + forward over the topic's mesh (may be empty
                 // or absent — no source to exclude).
-                router.cacheAndForward(router.mesh.getPtr(topic), null, from, seqno, topic, data, id.bytes);
+                router.cacheAndForward(router.mesh.getPtr(topic), null, from, seqno, topic, data, sig, key, id.bytes);
             } else if (router.fanoutGetOrCreate(topic)) |set| {
                 // Not subscribed: cache + forward over the fanout set, topping it
                 // up to D first, and refresh the last-publish tick (the entry
@@ -1537,11 +1605,11 @@ pub fn Router(comptime Transport: type) type {
                 // from the most recent publish.
                 router.fanoutReplenish(topic, set);
                 if (router.fanout_last_pub.getPtr(topic)) |last| last.* = router.heartbeat_tick;
-                router.cacheAndForward(set, null, from, seqno, topic, data, id.bytes);
+                router.cacheAndForward(set, null, from, seqno, topic, data, sig, key, id.bytes);
             } else {
                 // Not subscribed and the fanout set could not be created (OOM):
                 // still cache the message so it is gossipable/servable.
-                router.cacheAndForward(null, null, from, seqno, topic, data, id.bytes);
+                router.cacheAndForward(null, null, from, seqno, topic, data, sig, key, id.bytes);
             }
         }
 
@@ -1817,7 +1885,7 @@ test "router peer lifecycle: connect makes a sink + writer, disconnect tears dow
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -1841,7 +1909,7 @@ test "router dedups a second peer_connected for the same peer id" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -1879,7 +1947,7 @@ test "router tears the peer down when the writer exhausts open retries" {
     // Every open fails → the writer's ensureStream exhausts retries → it fires
     // on_disconnect → the router posts peer_disconnected → the peer is torn down
     // and peerCount drops back to 0. Tiny retry/backoff so the give-up is fast.
-    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -1907,7 +1975,7 @@ test "router frees an inbound RPC (peer tracked and peer absent)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -1936,7 +2004,7 @@ test "router clean shutdown tears down registered peers" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     // Tear the router down on every exit (not just the happy path): an early
     // assertion failure must NOT leave the main + writer fibers orphaned, or
     // threaded.deinit() would hang joining them.
@@ -2234,7 +2302,7 @@ test "subscribe announces the subscription to a connected peer" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2261,7 +2329,7 @@ test "inbound subscription is tracked on the source peer" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2295,7 +2363,7 @@ test "received message forwards over the mesh, not to all subscribers" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2347,7 +2415,7 @@ test "mesh forwarding dedups a repeated publish (same from+seqno) to forward onc
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2393,7 +2461,7 @@ test "publish to a subscribed topic forwards over the mesh and delivers locally"
     var rec = RecordingHandler{ .allocator = allocator };
     defer rec.deinit();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2433,7 +2501,7 @@ test "a forwarded message lands in the message cache and is evicted after histor
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2571,7 +2639,7 @@ test "GRAFT accepted: subscribed topic, peer joins the mesh, no PRUNE back" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2594,7 +2662,7 @@ test "GRAFT rejected when we do not subscribe: PRUNE sent, peer not in mesh" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2616,7 +2684,7 @@ test "GRAFT can push the mesh past D_high; the heartbeat prunes it back to D" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2685,7 +2753,7 @@ test "heartbeat grafts up to D candidate peers when the mesh is below D_low" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2738,7 +2806,7 @@ test "heartbeat grafts only up to D, not beyond, when many candidates exist" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2792,7 +2860,7 @@ test "PRUNE removes peer from mesh and backs it off (a later GRAFT is rejected)"
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2827,7 +2895,7 @@ test "backoff expires after prune_backoff_ticks heartbeats, then GRAFT is accept
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2857,7 +2925,7 @@ test "peer disconnect cleans the peer out of mesh and backoff" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2891,7 +2959,7 @@ test "PRUNE with a max-u64 backoff does not crash and actually backs the peer of
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2933,7 +3001,7 @@ test "re-GRAFT from an existing mesh member at D_high is an idempotent accept (n
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -2982,7 +3050,7 @@ test "publish to an UNSUBSCRIBED topic forms a fanout, forwards, then expires" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -3043,7 +3111,7 @@ test "subscribe JOINs the mesh (eager GRAFTs); unsubscribe LEAVEs it (PRUNEs)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -3105,7 +3173,7 @@ test "cache-on-accept: an accepted message with an EMPTY mesh is still cached" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -3146,7 +3214,7 @@ test "IHAVE emission: heartbeat advertises cached ids to a non-mesh subscriber" 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -3208,7 +3276,7 @@ test "inbound IHAVE: unseen id triggers an IWANT; a seen id triggers none" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -3263,7 +3331,7 @@ test "inbound IWANT: a cached id is served as the full publish; an unknown id is
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
     defer router.destroy();
     try router.start();
 
@@ -3317,7 +3385,7 @@ test "recovery: IHAVE -> IWANT -> served publish is delivered to a node that mis
     var rec = RecordingHandler{ .allocator = allocator };
     defer rec.deinit();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null);
     defer router.destroy();
     try router.start();
 
