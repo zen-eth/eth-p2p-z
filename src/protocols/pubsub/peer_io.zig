@@ -269,9 +269,21 @@ pub const OutboundQueue = struct {
 ///   fn open(self: *Sink, io: std.Io) anyerror!void
 ///       (re)establish the current outbound stream.
 ///   fn writeFrame(self: *Sink, io: std.Io, bytes: []const u8) anyerror!void
-///       write framed bytes to the current stream.
+///       write framed bytes to the current stream. A failure may leave a partial
+///       (truncated) length-prefixed frame on the wire: an implementation over
+///       stream.writeAll can error after some bytes have already gone out. The
+///       writer's response is to close/reset the stream and re-open, so the
+///       partial frame is never completed; the peer discards the malformed RPC
+///       and gossip redundancy covers the lost message.
 ///   fn close(self: *Sink, io: std.Io) void
 ///       tear down the current stream; safe to call when none is open.
+///
+/// Lifetime: the `Sink` (and any stream it holds) MUST stay valid until the
+/// writer fiber has fully exited. `run` may invoke `on_disconnect` and then its
+/// top-level `defer sink.close(io)` still fires on the way out, so an
+/// `on_disconnect` handler MUST NOT synchronously free or destroy the sink or
+/// its stream — that trailing `close` would be a use-after-free. The owner must
+/// join/await the writer fiber before freeing the sink.
 pub fn PeerWriter(comptime Sink: type) type {
     return struct {
         const Self = @This();
@@ -284,7 +296,12 @@ pub fn PeerWriter(comptime Sink: type) type {
         /// Sleep between open attempts, in milliseconds.
         reopen_backoff_ms: u64 = 50,
         /// Invoked once if open retries are exhausted, so the router can tear the
-        /// peer down. The writer never touches the queue lifecycle itself.
+        /// peer down. The writer never touches the queue lifecycle itself: on
+        /// disconnect it frees only the in-flight popped frame and returns —
+        /// frames still queued stay in the (owner-held) OutboundQueue. The owner
+        /// is responsible for draining/deinit-ing the queue after the disconnect,
+        /// otherwise those unsent frames leak. The handler must also not free the
+        /// sink/stream synchronously (see the Sink lifetime note above).
         on_disconnect: ?*const fn (?*anyopaque) void = null,
         disconnect_ctx: ?*anyopaque = null,
         /// Whether the sink currently holds an open stream.
