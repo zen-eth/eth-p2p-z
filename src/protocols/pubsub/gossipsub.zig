@@ -60,7 +60,31 @@ pub const Gossipsub = struct {
     /// Call before deiniting the Switch: the Switch cancels the inbound handler
     /// fibers on connection teardown, and the router's peer state borrows the
     /// Switch connections, so the router must stop while the Switch is still live.
+    ///
+    /// PRECONDITION (closes the router↔Switch lifetime hole): before this runs,
+    /// every connection on this Switch that uses gossipsub must already be torn
+    /// down (or be torn down with no inbound `/meshsub` RPC in flight), OR this
+    /// Gossipsub must be deinited before any such connection outlives it.
+    ///
+    /// The Switch holds three references that point at the router we are about to
+    /// free: (a) the peer-event callback's `ctx`, (b) the registered `/meshsub`
+    /// inbound-service instance's `router` field, and (c) any live Switch-owned
+    /// inbound handler fiber holding `*Router`. We close all three holes here:
+    ///   - First `clearPeerEventCallback`: after this, no connect/disconnect can
+    ///     post into the router, so freeing it cannot be raced by a peer event.
+    ///     (Per its contract this assumes no concurrent connect/disconnect is in
+    ///     flight — the precondition above.)
+    ///   - Then `router.destroy`: it tears down every peer (closing each peer's
+    ///     sink/stream while the connections are still alive) and frees.
+    /// The inbound-handler hole (b)/(c) is closed by the Switch's own teardown
+    /// property: inbound handler fibers are Switch-owned and the Switch cancels
+    /// them on connection teardown, so once a connection is closed no handler can
+    /// post to the router. Given the precondition (connections torn down first),
+    /// no handler survives to touch the freed router; the dangling service-object
+    /// `router` field is likewise only reached via `openInbound` on a new inbound
+    /// stream, which cannot arrive once the connections are gone.
     pub fn deinit(self: *Gossipsub) void {
+        self.router.sw.clearPeerEventCallback();
         self.router.destroy();
         self.allocator.destroy(self);
     }
@@ -71,8 +95,13 @@ pub const Gossipsub = struct {
         return self.router.peerCount();
     }
 
-    // The Switch peer-event callbacks: ctx is the *Router. They only post to the
-    // router inbox (non-blocking, dropping on a closed/full inbox) and return.
+    // The Switch peer-event callbacks: ctx is the *Router. Each posts one Command
+    // to the router inbox and returns. `putOne` blocks only if the inbox is full
+    // (it never drops): the inbox is sized large enough that a full inbox is not
+    // expected in practice, so the post is effectively non-blocking, but the
+    // blocking variant is the safe choice — dropping a `peer_disconnected` would
+    // leak a peer. The callbacks must stay cheap (just this post); on a closed
+    // inbox the post fails and is swallowed (the router is shutting down anyway).
 
     fn onConnected(ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection, remote_addr: std.Io.net.IpAddress) void {
         const router: *Router = @ptrCast(@alignCast(ctx));

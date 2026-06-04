@@ -47,7 +47,7 @@ fn peerKey(peer: *const PeerId) PeerKey {
 /// Drains a peer's OutboundQueue onto its `/meshsub/1.1.0` stream. The sink owns
 /// the current QUIC stream and re-opens it lazily; it satisfies the PeerWriter
 /// Sink contract (open / writeFrame / close, with close idempotent).
-pub const StreamSink = struct {
+const StreamSink = struct {
     conn: *SwitchConnection,
     proto: ProtocolId,
     /// The currently-open outbound stream, or null when none is open.
@@ -81,7 +81,7 @@ pub const StreamSink = struct {
 /// Reads parsed RPCs off a peer's inbound `/meshsub/1.1.0` stream. Satisfies the
 /// PeerReader Source contract; surfaces EOF / shutdown / connection-closed as
 /// errors so the reader loop exits.
-pub const StreamSource = struct {
+const StreamSource = struct {
     stream: *Stream,
 
     pub fn read(self: *StreamSource, allocator: std.mem.Allocator, io: std.Io) !pubsub.OwnedRpc {
@@ -140,16 +140,12 @@ const InboundService = struct {
         handler.* = .{ .router = self.router, .peer = ctx.peer_id };
         return protocols.ownedProtocolStreamHandler(InboundHandler, InboundHandler.run, handler);
     }
-
-    fn service(self: *InboundService) protocols.AnyProtocolService {
-        return protocols.protocolService(InboundService, openInbound, self);
-    }
 };
 
 /// A command posted to the router's single inbox. Producers post; the router
 /// fiber processes. (subscribe/publish/heartbeat variants arrive in later
 /// layers.)
-pub const Command = union(enum) {
+const Command = union(enum) {
     /// A peer's connection is up (handshake done, peer id known). The
     /// `*SwitchConnection` stays valid until the matching `peer_disconnected`.
     peer_connected: struct {
@@ -168,7 +164,7 @@ pub const Command = union(enum) {
 
 /// All state for one connected peer, owned by the router fiber. The writer fiber
 /// drains `queue` through `sink`; the writer's lifetime is the `writer_future`.
-pub const PeerState = struct {
+const PeerState = struct {
     peer: PeerId,
     /// Borrowed; valid until peer_disconnected (the Switch owns it).
     conn: *SwitchConnection,
@@ -181,7 +177,8 @@ pub const PeerState = struct {
     writer_future: std.Io.Future(void),
     /// Back-pointer for the writer's on_disconnect callback, which receives this
     /// PeerState as its context and needs the router to post peer_disconnected.
-    router_for_disconnect: *Router = undefined,
+    /// Set in the initializer below so it is valid before the writer fiber spawns.
+    router_for_disconnect: *Router,
 };
 
 const Writer = peer_io.PeerWriter(StreamSink);
@@ -333,6 +330,9 @@ pub const Router = struct {
             .sink = sink,
             .writer = writer,
             .writer_future = undefined,
+            // Set up-front (not on a later line) so the back-pointer is valid
+            // before the writer fiber spawns and can fire on_disconnect.
+            .router_for_disconnect = router,
         };
         // Past this point `state.queue` is initialised; deinit it on any failure
         // before the writer fiber takes ownership of draining it.
@@ -346,10 +346,9 @@ pub const Router = struct {
             .on_disconnect = onWriterDisconnect,
             .disconnect_ctx = state,
         };
-        // The writer needs to reach the router (to post peer_disconnected) and
-        // its own peer id (to tag that command). Stash the router on the state so
-        // the on_disconnect callback can recover both from `disconnect_ctx`.
-        state.router_for_disconnect = router;
+        // The writer reaches the router via `state.router_for_disconnect` (set in
+        // the PeerState initializer above) and tags peer_disconnected with
+        // `state.peer`, recovering both from `disconnect_ctx`.
 
         const future = std.Io.concurrent(router.io, Writer.run, .{ writer, router.io }) catch return;
 
@@ -358,10 +357,13 @@ pub const Router = struct {
         state.writer_future = future;
         router.peers.put(key, state) catch {
             // The map insert failed after the writer fiber started. Tear the
-            // writer down cleanly (close queue, await fiber) before freeing, so
-            // we don't leak the fiber or use-after-free the sink.
+            // writer down cleanly (close queue, cancel+await fiber) before
+            // freeing, so we don't leak the fiber or use-after-free the sink.
+            // Cancel before await so a writer parked in its reopen backoff does
+            // not stall this fiber; the backoff sleep is a cancellation point.
             state.queue.close(router.io);
             var f = future;
+            f.cancel(router.io);
             f.await(router.io);
             state.sink.close(router.io);
             return; // defers free writer/sink/state; queue deinit fires too
@@ -391,11 +393,25 @@ pub const Router = struct {
     }
 
     /// Tear down one peer's state. Order matters: close the queue (the writer
-    /// drains remaining frames and exits), AWAIT the writer fiber BEFORE freeing
-    /// the sink (the writer's trailing `sink.close` must not race a freed sink),
-    /// then close the sink, deinit the queue, and free the heap allocations.
+    /// drains remaining frames and exits), then CANCEL+AWAIT the writer fiber
+    /// BEFORE freeing the sink (the writer's trailing `sink.close` must not race a
+    /// freed sink), then close the sink, deinit the queue, and free the heap
+    /// allocations.
+    ///
+    /// Cancel before await so a writer parked in `ensureStream`'s reopen backoff
+    /// does not stall this single router fiber for up to
+    /// max_open_retries × reopen_backoff_ms (which would serialize every peer's
+    /// teardown). The backoff `sleep` is a cancellation point, so cancel collapses
+    /// the wait; await then joins. cancel+await on the same Future is safe here:
+    /// cancel is idempotent and clears the future, so the following await returns
+    /// the cached result without double-consuming. Under cancellation the writer
+    /// unwinds cleanly — popBlocking returns Closed (queue already closed) or
+    /// Canceled, or a Cancelable surfaces from open/writeFrame/sleep — runs its
+    /// `defer sink.close`, and returns; the router's own `sink.close` below is
+    /// idempotent.
     fn teardownPeer(router: *Router, state: *PeerState) void {
         state.queue.close(router.io);
+        state.writer_future.cancel(router.io);
         state.writer_future.await(router.io);
         state.sink.close(router.io);
         state.queue.deinit(router.io);
@@ -547,6 +563,13 @@ test "two gossipsub nodes wire up per-peer I/O on connect and tear down on disco
 
     // Shut the routers down before the switches/endpoints (the deinit order the
     // gossipsub service requires). The remaining `defer`s free switches/endpoints.
+    //
+    // Order matters and satisfies Gossipsub.deinit's precondition: both
+    // connections were already torn down above (peerCount dropped to 0 on both
+    // sides), so by the time we deinit each gossipsub no inbound `/meshsub`
+    // handler fiber is alive and no connect/disconnect can fire. Gossipsub.deinit
+    // then clears the Switch peer-event callback before freeing the router, so the
+    // Switch holds no live reference to the freed router.
     server_gs.deinit();
     server_gs_live = false;
     client_gs.deinit();

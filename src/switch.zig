@@ -144,6 +144,17 @@ pub const Switch = struct {
         sw.peer_event_callback = cb;
     }
 
+    /// Unregisters the peer connect/disconnect observer. The observing service
+    /// (e.g. a gossipsub router about to be freed) MUST call this before freeing
+    /// the object the callback's `ctx` points at, so no later connect/disconnect
+    /// fires into freed memory. Like `setPeerEventCallback`, this writes the
+    /// `?PeerEventCallback` field without synchronization, so the caller must
+    /// ensure no concurrent connect/disconnect (dial/accept/SwitchConnection.deinit
+    /// firing the callback) is in flight when it runs.
+    pub fn clearPeerEventCallback(sw: *Switch) void {
+        sw.peer_event_callback = null;
+    }
+
     pub fn deinit(sw: *Switch) void {
         while (true) {
             sw.connections_lock.lockUncancelable(sw.io);
