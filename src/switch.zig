@@ -47,6 +47,25 @@ pub const Switch = struct {
     /// Available slots in the aggregate handler cap, shared by every connection's
     /// dispatcher. Claimed non-blockingly via `channel.tryDecrementToFloor`.
     handler_slots_total: std.atomic.Value(usize) = .init(default_max_inflight_handlers_total),
+    /// Optional observer of peer-level connect/disconnect. Set via
+    /// `setPeerEventCallback`; null until then. The callbacks fire OUTSIDE
+    /// `connections_lock` (see `manageConnection` / `unregisterConnection`).
+    peer_event_callback: ?PeerEventCallback = null,
+
+    /// Observer of peer-level lifecycle: a peer connected (handshake done, peer
+    /// id known) or disconnected. The intended consumer is a gossipsub router
+    /// that opens/closes its per-peer outbound stream + state.
+    ///
+    /// The callbacks run on the fiber that called `dial`/`accept` (connected) or
+    /// `SwitchConnection.deinit` (disconnected), and ALWAYS outside the Switch's
+    /// `connections_lock`. They must be cheap and non-blocking (the intended use
+    /// just posts to a queue) and must not re-enter Switch connection management
+    /// (dial/accept/deinit) in a way that could block or deadlock.
+    pub const PeerEventCallback = struct {
+        ctx: *anyopaque,
+        on_connected: *const fn (ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection, remote_addr: std.Io.net.IpAddress) void,
+        on_disconnected: *const fn (ctx: *anyopaque, peer: PeerId) void,
+    };
 
     pub const Options = struct {
         max_inflight_handlers_total: usize = default_max_inflight_handlers_total,
@@ -116,6 +135,13 @@ pub const Switch = struct {
             .handler_slots_total = .init(opts.max_inflight_handlers_total),
         };
         return sw;
+    }
+
+    /// Registers (or replaces) the peer connect/disconnect observer. Intended to
+    /// be called once after construction, before any dial/accept, by the service
+    /// that wants the events (e.g. a gossipsub router registering itself).
+    pub fn setPeerEventCallback(sw: *Switch, cb: PeerEventCallback) void {
+        sw.peer_event_callback = cb;
     }
 
     pub fn deinit(sw: *Switch) void {
@@ -242,26 +268,55 @@ pub const Switch = struct {
         try actor.spawn();
         actor_spawned = true;
 
-        sw.connections_lock.lockUncancelable(sw.io);
-        defer sw.connections_lock.unlock(sw.io);
-        try sw.connections.append(sw.allocator, managed);
-        managed.registered = true;
+        // Register under the lock, then fire the connect event OUTSIDE it: the
+        // observer (a router) may post to its own inbox, and holding
+        // connections_lock across that risks lock-ordering / blocking issues.
+        // Capture the peer id + remote address while registered so the values
+        // are valid even though we fire after unlocking. Both peer_id and
+        // remote_addr are set in the actor's init before it spawns, so they are
+        // already valid here.
+        {
+            sw.connections_lock.lockUncancelable(sw.io);
+            defer sw.connections_lock.unlock(sw.io);
+            try sw.connections.append(sw.allocator, managed);
+            managed.registered = true;
+        }
+
+        // Only a genuinely-registered connection reaches here: the append above
+        // is the last fallible step, so there is no error path between
+        // registration and firing.
+        if (sw.peer_event_callback) |cb| {
+            cb.on_connected(cb.ctx, managed.peerId(), managed, managed.remoteAddress());
+        }
         return managed;
     }
 
     fn unregisterConnection(sw: *Switch, conn: *SwitchConnection) void {
-        sw.connections_lock.lockUncancelable(sw.io);
-        defer sw.connections_lock.unlock(sw.io);
+        // Capture the peer id while still registered, perform the removal under
+        // the lock, then fire the disconnect event OUTSIDE the lock (same reason
+        // as the connect event in `manageConnection`). `did_unregister` guards
+        // against a double-fire: this returns early without firing when called
+        // on an already-unregistered connection.
+        var did_unregister = false;
+        const peer_id = conn.peerId();
+        {
+            sw.connections_lock.lockUncancelable(sw.io);
+            defer sw.connections_lock.unlock(sw.io);
 
-        if (!conn.registered) return;
-        for (sw.connections.items, 0..) |item, index| {
-            if (item == conn) {
-                _ = sw.connections.swapRemove(index);
-                conn.registered = false;
-                return;
+            if (!conn.registered) return;
+            for (sw.connections.items, 0..) |item, index| {
+                if (item == conn) {
+                    _ = sw.connections.swapRemove(index);
+                    break;
+                }
             }
+            conn.registered = false;
+            did_unregister = true;
         }
-        conn.registered = false;
+
+        if (did_unregister) {
+            if (sw.peer_event_callback) |cb| cb.on_disconnected(cb.ctx, peer_id);
+        }
     }
 
     fn supportedProtocolIds(sw: *Switch) std.mem.Allocator.Error![][]const u8 {
@@ -1135,6 +1190,124 @@ test "switch dispatches inbound streams to registered protocol handlers" {
     client_conn_live = false;
     server_conn.deinit();
     server_conn_live = false;
+}
+
+test "switch fires peer connect and disconnect events on both ends" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_peer_id = try server_key.peerId(allocator);
+    const client_peer_id = try client_key.peerId(allocator);
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    // Records every peer-event the Switch fires. A mutex keeps the recorder
+    // sound even though connect/disconnect events run on whichever fiber called
+    // dial/accept/deinit (which need not be the test fiber).
+    const Recorder = struct {
+        io: std.Io,
+        lock: std.Io.Mutex = .init,
+        connected: std.ArrayList(PeerId) = .empty,
+        disconnected: std.ArrayList(PeerId) = .empty,
+
+        fn onConnected(ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection, remote_addr: std.Io.net.IpAddress) void {
+            _ = conn;
+            _ = remote_addr;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+            self.connected.append(std.testing.allocator, peer) catch unreachable;
+        }
+
+        fn onDisconnected(ctx: *anyopaque, peer: PeerId) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+            self.disconnected.append(std.testing.allocator, peer) catch unreachable;
+        }
+
+        fn callback(self: *@This()) Switch.PeerEventCallback {
+            return .{
+                .ctx = self,
+                .on_connected = onConnected,
+                .on_disconnected = onDisconnected,
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.connected.deinit(std.testing.allocator);
+            self.disconnected.deinit(std.testing.allocator);
+        }
+    };
+
+    var server_recorder = Recorder{ .io = io };
+    defer server_recorder.deinit();
+    var client_recorder = Recorder{ .io = io };
+    defer client_recorder.deinit();
+
+    server.setPeerEventCallback(server_recorder.callback());
+    client.setPeerEventCallback(client_recorder.callback());
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    var client_conn_live = true;
+    errdefer if (client_conn_live) client_conn.deinit();
+
+    const server_conn = try server.accept();
+    var server_conn_live = true;
+    errdefer if (server_conn_live) server_conn.deinit();
+
+    // manageConnection fires on_connected synchronously before dial/accept
+    // returns, so the records are visible now. The client learns the server's
+    // peer id; the server learns the client's.
+    try std.testing.expectEqual(@as(usize, 1), client_recorder.connected.items.len);
+    try std.testing.expect(client_recorder.connected.items[0].eql(&server_peer_id));
+    try std.testing.expectEqual(@as(usize, 1), server_recorder.connected.items.len);
+    try std.testing.expect(server_recorder.connected.items[0].eql(&client_peer_id));
+
+    try std.testing.expectEqual(@as(usize, 0), client_recorder.disconnected.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server_recorder.disconnected.items.len);
+
+    // Tearing down the client connection fires on_disconnected with the
+    // server's peer id on the client side.
+    client_conn.deinit();
+    client_conn_live = false;
+    try std.testing.expectEqual(@as(usize, 1), client_recorder.disconnected.items.len);
+    try std.testing.expect(client_recorder.disconnected.items[0].eql(&server_peer_id));
+
+    server_conn.deinit();
+    server_conn_live = false;
+    try std.testing.expectEqual(@as(usize, 1), server_recorder.disconnected.items.len);
+    try std.testing.expect(server_recorder.disconnected.items[0].eql(&client_peer_id));
 }
 
 test "switch rejects inbound handlers past the aggregate cap, recycling slots" {
