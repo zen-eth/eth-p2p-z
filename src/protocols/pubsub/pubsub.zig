@@ -136,6 +136,7 @@ fn readUvarint(io: std.Io, stream: *Stream) (Stream.ReadError || error{VarintToo
 test {
     _ = @import("rpc.zig");
     _ = @import("peer_io.zig");
+    _ = @import("mcache.zig");
 }
 
 test "frameRpc length prefix matches payload length" {

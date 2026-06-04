@@ -30,6 +30,7 @@
 const std = @import("std");
 const pubsub = @import("pubsub.zig");
 const peer_io = @import("peer_io.zig");
+const mcache = @import("mcache.zig");
 const rpc = @import("rpc.zig");
 const rpc_pb = @import("../../protobuf.zig").rpc;
 const io_time = @import("../../quic/io/time.zig");
@@ -324,6 +325,13 @@ pub fn Router(comptime Transport: type) type {
         heartbeat_future: ?std.Io.Future(void) = null,
         /// Bounded dedup window over recently-seen message ids.
         seen: SeenCache,
+        /// Windowed cache of recently-forwarded/published messages (keyed by
+        /// message id), holding one reference on each message's shared frame.
+        /// Serves later gossip needs — IWANT (the full message via `get`) and
+        /// IHAVE (recent ids per topic via `getGossipIDs`). Distinct from `seen`
+        /// (which only remembers ids for dedup). The window slides once per
+        /// heartbeat (`shift`).
+        message_cache: mcache.MessageCache,
         /// Monotonic sequence number for messages WE originate; encoded big-endian
         /// into Message.seqno so (from, seqno) is a unique message id.
         seqno: u64 = 0,
@@ -362,6 +370,7 @@ pub fn Router(comptime Transport: type) type {
                 .inbox = std.Io.Queue(Command).init(inbox_storage),
                 .peers = std.AutoHashMap(PeerKey, *PeerState).init(allocator),
                 .seen = seen,
+                .message_cache = mcache.MessageCache.init(allocator),
                 .local_peer = local_peer,
                 .message_handler = message_handler,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
@@ -438,6 +447,7 @@ pub fn Router(comptime Transport: type) type {
             router.freeBackoff();
             router.freeFanout();
             router.seen.deinit();
+            router.message_cache.deinit();
             router.allocator.free(router.inbox_storage);
             router.allocator.destroy(router);
         }
@@ -836,7 +846,18 @@ pub fn Router(comptime Transport: type) type {
             // Builder reference dropped at the end; queues hold the rest. If no
             // queue accepted a push this release frees the whole frame.
             defer frame.release();
+            router.fanOutFrame(lane, frame, targets);
+        }
 
+        /// Fan an already-built shared frame out to `targets` on `lane`, handing
+        /// one reference to each resolved peer's queue (`pushTo` retains before
+        /// the push and releases on a rejected push). The CALLER owns its builder
+        /// reference and must release it afterward — this does NOT consume one.
+        /// Lets a caller that built a frame once (e.g. the message forward path,
+        /// which also stores the frame in the message cache) reuse it across both
+        /// the cache and the fan-out without re-framing. The set, when given, is
+        /// borrowed and read on this fiber, so it cannot mutate underneath us.
+        fn fanOutFrame(router: *Self, lane: peer_io.Lane, frame: *peer_io.OutboundFrame, targets: Targets) void {
             switch (targets) {
                 .one => |peer| {
                     const state = router.peers.get(peerKey(&peer)) orelse return;
@@ -936,6 +957,11 @@ pub fn Router(comptime Transport: type) type {
 
             router.maintainMeshes();
             router.maintainFanout();
+
+            // Slide the message-cache window once per heartbeat so it retains the
+            // last history_length heartbeats' worth of messages (the oldest is
+            // evicted, a fresh newest window opens).
+            router.message_cache.shift();
         }
 
         /// Mesh maintenance for every subscribed topic: graft new peers in when
@@ -1166,10 +1192,18 @@ pub fn Router(comptime Transport: type) type {
             if (router.message_handler) |h| h.on_message(h.ctx, topic, from, data);
         }
 
-        /// Frame a single message ONCE and hand it to every still-tracked peer in
-        /// `set` (a mesh or fanout PeerSet), optionally excluding one peer (the
-        /// relay source). The shared frame carries the message id for a later
-        /// IDONTWANT purge. Fanned out on the `.data` lane (see `fanOut`).
+        /// Frame a single message ONCE, store it in the message cache (so a later
+        /// IWANT can be served without a second copy), and hand one reference to
+        /// every still-tracked peer in `set` (a mesh or fanout PeerSet), optionally
+        /// excluding one peer (the relay source). The shared frame carries the
+        /// message id for a later IDONTWANT purge. Fanned out on the `.data` lane.
+        ///
+        /// Builds the frame here (ref = 1, the builder reference) rather than via
+        /// `fanOut` so the single allocation can be shared with the cache: `put`
+        /// retains it (the cache then holds a reference for ~history_length
+        /// heartbeats), `fanOutFrame` retains it per target, and the trailing
+        /// `release` drops the builder reference — leaving exactly the cache's and
+        /// the accepting queues' references live.
         fn forwardToPeerSet(
             router: *Self,
             set: *const PeerSet,
@@ -1180,17 +1214,35 @@ pub fn Router(comptime Transport: type) type {
             data: []const u8,
             id: []const u8,
         ) void {
-            // The data frame carries one message id (owned); `fanOut` takes
-            // ownership and frees it if framing fails.
+            // The data frame carries one message id (owned by the frame, for a
+            // later IDONTWANT purge); free it on any pre-frame failure.
             const ids = router.allocator.alloc([]u8, 1) catch return;
             ids[0] = router.allocator.dupe(u8, id) catch {
                 router.allocator.free(ids);
                 return;
             };
             const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data };
-            router.fanOut(.data, (rpc.RpcOut{ .publish = &.{msg} }).toRpc(), ids, .{
-                .peer_set = .{ .set = set, .exclude = exclude },
-            });
+            const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .publish = &.{msg} }).toRpc()) catch {
+                router.allocator.free(ids[0]);
+                router.allocator.free(ids);
+                return;
+            };
+            const frame = peer_io.OutboundFrame.create(router.allocator, framed, ids, 1) catch {
+                router.allocator.free(framed);
+                router.allocator.free(ids[0]);
+                router.allocator.free(ids);
+                return;
+            };
+            // Builder reference dropped at the end; the cache and any accepting
+            // queues hold the rest. If none keeps a reference this frees the frame.
+            defer frame.release();
+
+            // Cache the message (retains the frame) so an IWANT can later be
+            // served by retaining + pushing it; `put` dedups so the same id is
+            // never stored or retained twice.
+            router.message_cache.put(id, topic, frame) catch {};
+
+            router.fanOutFrame(.data, frame, .{ .peer_set = .{ .set = set, .exclude = exclude } });
         }
 
         /// Local subscribe: record the topic, announce it to every peer, then JOIN
@@ -2134,6 +2186,69 @@ test "publish to a subscribed topic forwards over the mesh and delivers locally"
     try std.testing.expectEqualSlices(u8, "hello", rec.data.?);
     // The delivered `from` is our own peer id (the publish origin).
     try std.testing.expectEqualSlices(u8, local_test_peer.bytes[0..local_test_peer.len], rec.from.?);
+}
+
+test "a forwarded message lands in the message cache and is evicted after history_length heartbeats" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    // Subscribe to "t" and graft a mesh member so a received publish is forwarded
+    // (the forward path is what populates the message cache).
+    try subscribeAndWait(io, allocator, router, "t");
+    const peer_a = testPeer(1);
+    const source = testPeer(2);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+
+    // Source relays a publish; once mesh member A has recorded the forward the
+    // router fiber is parked, so reading its message_cache is race-free (the same
+    // pattern the mesh-state assertions use).
+    const from = "origin";
+    const seqno = "\x00\x00\x00\x05";
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, from, seqno, "t", "cached"),
+    } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(conn_a.record.written.items, "t", "cached") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "cached"));
+
+    // The message id is from ++ seqno (the default libp2p id).
+    var id = try rpc.messageId(allocator, from, seqno);
+    defer id.deinit(allocator);
+
+    // It is in the cache: get() returns the frame and getGossipIDs("t") lists it.
+    try std.testing.expect(router.message_cache.get(id.bytes) != null);
+    const ids = try router.message_cache.getGossipIDs(allocator, "t");
+    defer allocator.free(ids);
+    var listed = false;
+    for (ids) |gid| if (std.mem.eql(u8, gid, id.bytes)) {
+        listed = true;
+    };
+    try std.testing.expect(listed);
+
+    // After history_length heartbeat shifts the message is evicted. Use the
+    // mcache's own history_length so the test tracks the source of truth.
+    const history_length = @import("mcache.zig").historyLengthForTest();
+    try beatHeartbeats(io, router, history_length);
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (router.message_cache.get(id.bytes) == null) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(router.message_cache.get(id.bytes) == null);
 }
 
 // --- mesh: GRAFT / PRUNE / backoff / heartbeat fake tests ------------------
