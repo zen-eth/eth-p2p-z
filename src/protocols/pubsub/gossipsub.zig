@@ -103,6 +103,11 @@ pub const SwitchTransport = struct {
 
 const Router = router_mod.Router(SwitchTransport);
 
+/// The gossipsub heartbeat period (go-libp2p default: one second). The router
+/// runs a heartbeat fiber on this interval to age out backoffs (and, in later
+/// layers, to maintain the mesh).
+const heartbeat_interval_ms: u64 = 1000;
+
 /// Re-export so callers construct a handler without importing router.zig.
 pub const MessageHandler = router_mod.MessageHandler;
 
@@ -177,7 +182,7 @@ pub const Gossipsub = struct {
         local_peer: PeerId,
         message_handler: ?MessageHandler,
     ) !*Gossipsub {
-        const router = try Router.create(allocator, io, .{}, local_peer, message_handler);
+        const router = try Router.create(allocator, io, .{}, local_peer, message_handler, heartbeat_interval_ms);
         errdefer router.destroy();
 
         try router.start();

@@ -122,6 +122,34 @@ fn peerKey(peer: *const PeerId) PeerKey {
     return key;
 }
 
+/// The mesh sizing parameters (go-libp2p defaults). The mesh for a topic is the
+/// set of peers we exchange full messages with directly; the heartbeat keeps its
+/// size between `d_low` and `d_high` around the target degree `d`. (Scoring-aware
+/// degrees and the gossip-only fanout degree arrive with later layers.)
+const MeshParams = struct {
+    /// Target mesh degree per topic.
+    d: usize = 6,
+    /// Lower bound: below this the heartbeat grafts more peers in.
+    d_low: usize = 5,
+    /// Upper bound: at or above this we reject inbound GRAFTs and the heartbeat
+    /// prunes peers out.
+    d_high: usize = 12,
+    /// Minimum outbound peers kept in a topic mesh (used by later maintenance).
+    d_out: usize = 2,
+    /// How long (in heartbeat ticks; one tick is one second) a PRUNE keeps us
+    /// from re-grafting the pruned peer for that topic.
+    prune_backoff_ticks: u64 = 60,
+};
+
+const mesh_params: MeshParams = .{};
+
+/// A set of peers (mesh membership), keyed by the zero-padded peer bytes.
+const PeerSet = std.AutoHashMapUnmanaged(PeerKey, void);
+
+/// A set of backed-off peers for one topic: peer → the heartbeat tick at which
+/// the backoff expires (the peer becomes graftable again once the tick passes).
+const BackoffSet = std.AutoHashMapUnmanaged(PeerKey, u64);
+
 /// The single-fiber gossipsub router, generic over a comptime `Transport` that
 /// supplies the per-peer outbound sink (and the opaque connection handle the
 /// `peer_connected` command carries). The router owns the peer map and inbox;
@@ -186,6 +214,10 @@ pub fn Router(comptime Transport: type) type {
             /// to every subscribed peer (and deliver locally if we subscribe).
             /// Owns `topic` and `data`; both freed once processed.
             publish: struct { topic: []u8, data: []u8 },
+            /// One heartbeat tick: advance the tick counter and expire stale
+            /// backoff entries. Posted by the heartbeat fiber on its interval (or
+            /// directly by tests when the interval is disabled).
+            heartbeat,
             /// Stop the router: tear down every peer, then exit the main fiber.
             shutdown,
             /// Test-only: enqueue a frame reference onto a tracked peer's outbound
@@ -253,6 +285,24 @@ pub fn Router(comptime Transport: type) type {
         /// own subscribe, and to each newly-connected peer) and deliver matching
         /// inbound/published messages to `message_handler`.
         my_topics: std.StringHashMapUnmanaged(void) = .empty,
+        /// Per-topic mesh membership: topic → set of peers we exchange full
+        /// messages with for that topic. Topic keys are owned copies (freed on
+        /// teardown); the nested PeerSet holds zero-padded peer keys.
+        mesh: std.StringHashMapUnmanaged(PeerSet) = .empty,
+        /// Per-topic graft backoff: topic → (peer → expiry tick). A peer is in
+        /// backoff for a topic while its expiry tick is still in the future
+        /// (`> heartbeat_tick`); we will not re-graft it until then. Topic keys
+        /// are owned copies (freed on teardown).
+        backoff: std.StringHashMapUnmanaged(BackoffSet) = .empty,
+        /// Monotonic heartbeat counter (one tick per heartbeat). Backoff expiry is
+        /// measured against this.
+        heartbeat_tick: u64 = 0,
+        /// Heartbeat period in milliseconds. Zero disables the heartbeat fiber
+        /// (tests then drive ticks by posting `Command{.heartbeat}` directly).
+        heartbeat_interval_ms: u64,
+        /// The heartbeat fiber's future, when one was spawned. Cancelled + awaited
+        /// on destroy (mirrors the per-peer writer teardown).
+        heartbeat_future: ?std.Io.Future(void) = null,
         /// Bounded dedup window over recently-seen message ids.
         seen: SeenCache,
         /// Monotonic sequence number for messages WE originate; encoded big-endian
@@ -276,6 +326,7 @@ pub fn Router(comptime Transport: type) type {
             transport: Transport,
             local_peer: PeerId,
             message_handler: ?MessageHandler,
+            heartbeat_interval_ms: u64,
         ) !*Self {
             const inbox_storage = try allocator.alloc(Command, inbox_capacity);
             errdefer allocator.free(inbox_storage);
@@ -294,13 +345,30 @@ pub fn Router(comptime Transport: type) type {
                 .seen = seen,
                 .local_peer = local_peer,
                 .message_handler = message_handler,
+                .heartbeat_interval_ms = heartbeat_interval_ms,
             };
             return router;
         }
 
-        /// Spawn the main fiber. Call once after `create`.
+        /// Spawn the main fiber (and, when the heartbeat interval is non-zero, the
+        /// heartbeat fiber). Call once after `create`.
         pub fn start(router: *Self) std.Io.ConcurrentError!void {
             router.main_future = try std.Io.concurrent(router.io, mainLoop, .{router});
+            if (router.heartbeat_interval_ms > 0) {
+                router.heartbeat_future = try std.Io.concurrent(router.io, heartbeatLoop, .{router});
+            }
+        }
+
+        /// Heartbeat fiber body: post a `heartbeat` command every interval until
+        /// the router is stopping (or the inbox closes). The interval `sleep` is a
+        /// cancellation point, so `destroy`'s cancel collapses the wait. The post
+        /// is uncancelable + best-effort: a closed inbox (shutdown) just ends the
+        /// loop. Only spawned when `heartbeat_interval_ms > 0`.
+        fn heartbeatLoop(router: *Self) void {
+            while (!router.stopping.load(.acquire)) {
+                io_time.ms(router.heartbeat_interval_ms).sleep(router.io) catch break;
+                router.inbox.putOneUncancelable(router.io, .heartbeat) catch break;
+            }
         }
 
         /// Stop the router and free all of its resources. Sets the persistent
@@ -310,6 +378,18 @@ pub fn Router(comptime Transport: type) type {
         /// peer on its way out, so this is safe to call from any other fiber.
         pub fn destroy(router: *Self) void {
             router.stopping.store(true, .release);
+
+            // Stop the heartbeat fiber before draining the main loop: it posts to
+            // the inbox, so it must be joined before the inbox storage is freed.
+            // Cancel collapses any in-flight interval `sleep` (a cancellation
+            // point); await then joins. cancel+await on one Future is safe (cancel
+            // is idempotent and clears the future, so await returns the cached
+            // result). Mirrors the per-peer writer teardown.
+            if (router.heartbeat_future) |*future| {
+                future.cancel(router.io);
+                future.await(router.io);
+                router.heartbeat_future = null;
+            }
 
             // Post shutdown first (so a main loop parked in getOne wakes and runs
             // the peer teardown on its own fiber), then close the inbox. close()
@@ -335,6 +415,8 @@ pub fn Router(comptime Transport: type) type {
 
             router.peers.deinit();
             router.freeMyTopics();
+            router.freeMesh();
+            router.freeBackoff();
             router.seen.deinit();
             router.allocator.free(router.inbox_storage);
             router.allocator.destroy(router);
@@ -347,6 +429,105 @@ pub fn Router(comptime Transport: type) type {
             var it = router.my_topics.keyIterator();
             while (it.next()) |key| router.allocator.free(key.*);
             router.my_topics.deinit(router.allocator);
+        }
+
+        /// Free every topic key + nested PeerSet in the mesh map and the map
+        /// itself. The main fiber is joined by the time this runs, so the map is
+        /// quiescent.
+        fn freeMesh(router: *Self) void {
+            var it = router.mesh.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(router.allocator);
+                router.allocator.free(entry.key_ptr.*);
+            }
+            router.mesh.deinit(router.allocator);
+        }
+
+        /// Free every topic key + nested BackoffSet in the backoff map and the map
+        /// itself.
+        fn freeBackoff(router: *Self) void {
+            var it = router.backoff.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(router.allocator);
+                router.allocator.free(entry.key_ptr.*);
+            }
+            router.backoff.deinit(router.allocator);
+        }
+
+        // ----- mesh + backoff helpers -------------------------------------
+
+        /// Whether `topic`'s mesh contains `peer`.
+        fn meshContains(router: *Self, topic: []const u8, peer: PeerId) bool {
+            const set = router.mesh.getPtr(topic) orelse return false;
+            return set.contains(peerKey(&peer));
+        }
+
+        /// Add `peer` to `topic`'s mesh, creating the topic's PeerSet (with an
+        /// owned topic-key copy) on first use. Best-effort: an allocation failure
+        /// silently leaves the peer out of the mesh.
+        fn meshAdd(router: *Self, topic: []const u8, peer: PeerId) void {
+            const gop = router.mesh.getOrPut(router.allocator, topic) catch return;
+            if (!gop.found_existing) {
+                const owned = router.allocator.dupe(u8, topic) catch {
+                    router.mesh.removeByPtr(gop.key_ptr);
+                    return;
+                };
+                gop.key_ptr.* = owned;
+                gop.value_ptr.* = .empty;
+            }
+            gop.value_ptr.put(router.allocator, peerKey(&peer), {}) catch {};
+        }
+
+        /// Remove `peer` from `topic`'s mesh (no-op if absent). The empty PeerSet
+        /// is kept (cheap; reused on the next graft).
+        fn meshRemove(router: *Self, topic: []const u8, peer: PeerId) void {
+            const set = router.mesh.getPtr(topic) orelse return;
+            _ = set.remove(peerKey(&peer));
+        }
+
+        /// Number of peers in `topic`'s mesh (zero if the topic has no mesh yet).
+        fn meshSize(router: *Self, topic: []const u8) usize {
+            const set = router.mesh.getPtr(topic) orelse return 0;
+            return set.count();
+        }
+
+        /// Whether `peer` is currently backed off for `topic` (its expiry tick is
+        /// still in the future).
+        fn inBackoff(router: *Self, topic: []const u8, peer: PeerId) bool {
+            const set = router.backoff.getPtr(topic) orelse return false;
+            const expiry = set.get(peerKey(&peer)) orelse return false;
+            return expiry > router.heartbeat_tick;
+        }
+
+        /// Back `peer` off for `topic` for `ticks` heartbeats from now (the expiry
+        /// tick is `heartbeat_tick + ticks`). Creates the topic's BackoffSet (with
+        /// an owned topic-key copy) on first use. A later/larger expiry already
+        /// stored is kept (never shortened). Best-effort on allocation failure.
+        fn setBackoff(router: *Self, topic: []const u8, peer: PeerId, ticks: u64) void {
+            const expiry = router.heartbeat_tick + ticks;
+            const gop = router.backoff.getOrPut(router.allocator, topic) catch return;
+            if (!gop.found_existing) {
+                const owned = router.allocator.dupe(u8, topic) catch {
+                    router.backoff.removeByPtr(gop.key_ptr);
+                    return;
+                };
+                gop.key_ptr.* = owned;
+                gop.value_ptr.* = .empty;
+            }
+            const peer_gop = gop.value_ptr.getOrPut(router.allocator, peerKey(&peer)) catch return;
+            if (!peer_gop.found_existing or peer_gop.value_ptr.* < expiry) {
+                peer_gop.value_ptr.* = expiry;
+            }
+        }
+
+        /// Drop `peer` from every topic's mesh and every topic's backoff set.
+        /// Called when a peer disconnects so no stale membership survives it.
+        fn dropPeerFromMeshAndBackoff(router: *Self, peer: PeerId) void {
+            const key = peerKey(&peer);
+            var mesh_it = router.mesh.valueIterator();
+            while (mesh_it.next()) |set| _ = set.remove(key);
+            var backoff_it = router.backoff.valueIterator();
+            while (backoff_it.next()) |set| _ = set.remove(key);
         }
 
         pub fn peerCount(router: *const Self) usize {
@@ -388,6 +569,7 @@ pub fn Router(comptime Transport: type) type {
                     .unsubscribe => |u| router.onUnsubscribe(u.topic),
                     .publish => |p| router.onPublish(p.topic, p.data),
                     .enqueue_for_test => |e| router.onEnqueueForTest(e.peer, e.frame, e.reply),
+                    .heartbeat => router.onHeartbeat(),
                     .shutdown => return,
                 }
             }
@@ -477,6 +659,77 @@ pub fn Router(comptime Transport: type) type {
             router.sendCurrentSubscriptions(state);
         }
 
+        /// Which peers a `fanOut` hands a shared frame to. The frame is built once
+        /// and one reference is pushed per resolved target.
+        const Targets = union(enum) {
+            /// Every tracked peer.
+            all,
+            /// Every tracked peer whose announced topics include `topic`, except
+            /// `exclude` (the relay source) when set.
+            subscribers: struct { topic: []const u8, exclude: ?PeerId = null },
+            /// A single peer; a no-op if it is not tracked.
+            one: PeerId,
+        };
+
+        /// Frame `rpc` ONCE into a refcounted shared `OutboundFrame` and hand one
+        /// reference to each resolved target's `lane` queue — the single home of
+        /// the builder-reference protocol (frame once, hold the builder reference,
+        /// `retain` before every push and `release` on a rejected push, then drop
+        /// the builder reference at the end so the frame frees itself iff no queue
+        /// kept a copy). No per-peer copy of the (up-to-1 MiB) wire bytes.
+        ///
+        /// Takes ownership of `ids` (the message ids carried in the frame for a
+        /// later IDONTWANT purge; pass an empty owned slice for non-data frames):
+        /// on success the frame owns them; on a framing/allocation failure they are
+        /// freed here. Best-effort throughout (a void return): a framing failure or
+        /// a per-peer push failure logs nothing and simply drops that copy.
+        fn fanOut(router: *Self, lane: peer_io.Lane, rpc_frame: rpc_pb.RPC, ids: [][]u8, targets: Targets) void {
+            const framed = pubsub.frameRpc(router.allocator, rpc_frame) catch {
+                for (ids) |id| router.allocator.free(id);
+                router.allocator.free(ids);
+                return;
+            };
+            const frame = peer_io.OutboundFrame.create(router.allocator, framed, ids, 1) catch {
+                router.allocator.free(framed);
+                for (ids) |id| router.allocator.free(id);
+                router.allocator.free(ids);
+                return;
+            };
+            // Builder reference dropped at the end; queues hold the rest. If no
+            // queue accepted a push this release frees the whole frame.
+            defer frame.release();
+
+            switch (targets) {
+                .one => |peer| {
+                    const state = router.peers.get(peerKey(&peer)) orelse return;
+                    frame.retain();
+                    state.queue.push(router.io, lane, frame) catch frame.release();
+                },
+                .all, .subscribers => {
+                    var it = router.peers.iterator();
+                    while (it.next()) |entry| {
+                        const state = entry.value_ptr.*;
+                        switch (targets) {
+                            .subscribers => |s| {
+                                if (s.exclude) |ex| if (state.peer.eql(&ex)) continue;
+                                if (!state.topics.contains(s.topic)) continue;
+                            },
+                            else => {},
+                        }
+                        frame.retain();
+                        state.queue.push(router.io, lane, frame) catch frame.release();
+                    }
+                },
+            }
+        }
+
+        /// Allocate an empty owned id slice for a frame that carries no message
+        /// ids (every lane except data forwards). Returns null on OOM so the
+        /// caller can bail before framing.
+        fn emptyIds(router: *Self) ?[][]u8 {
+            return router.allocator.alloc([]u8, 0) catch null;
+        }
+
         /// Send the local node's full current subscription set to one peer's
         /// `.subscribe` lane as a single subscription RPC. No-op when we have no
         /// subscriptions. Best-effort: drops the frame on a push failure.
@@ -484,8 +737,6 @@ pub fn Router(comptime Transport: type) type {
         /// The transient SubOpts array (one entry per local topic) is the only
         /// genuinely multi-allocation scratch on this path, so it goes in a
         /// per-command arena that is freed in one shot — no per-entry bookkeeping.
-        /// The shared frame itself stays gpa-owned (it outlives this call inside
-        /// the peer's queue).
         fn sendCurrentSubscriptions(router: *Self, state: *PeerState) void {
             if (router.my_topics.count() == 0) return;
 
@@ -499,26 +750,8 @@ pub fn Router(comptime Transport: type) type {
                 subs.append(scratch, rpc.buildSubscription(key.*, true)) catch return;
             }
 
-            const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .subscriptions = subs.items }).toRpc()) catch return;
-            const frame = makeSubscribeFrame(router.allocator, framed) orelse return;
-            defer frame.release(); // builder reference
-            frame.retain();
-            state.queue.push(router.io, .subscribe, frame) catch frame.release();
-        }
-
-        /// Build a refcounted shared subscribe frame (empty message_ids) taking
-        /// ownership of `framed`, with one builder reference. Returns null (after
-        /// freeing `framed`) on allocation failure.
-        fn makeSubscribeFrame(allocator: std.mem.Allocator, framed: []u8) ?*peer_io.OutboundFrame {
-            const ids = allocator.alloc([]u8, 0) catch {
-                allocator.free(framed);
-                return null;
-            };
-            return peer_io.OutboundFrame.create(allocator, framed, ids, 1) catch {
-                allocator.free(framed);
-                allocator.free(ids);
-                return null;
-            };
+            const ids = router.emptyIds() orelse return;
+            router.fanOut(.subscribe, (rpc.RpcOut{ .subscriptions = subs.items }).toRpc(), ids, .{ .one = state.peer });
         }
 
         /// Handle a peer disconnecting: look up, tear down its writer + state.
@@ -527,8 +760,38 @@ pub fn Router(comptime Transport: type) type {
         fn onPeerDisconnected(router: *Self, peer: PeerId) void {
             const key = peerKey(&peer);
             const entry = router.peers.fetchRemove(key) orelse return;
+            router.dropPeerFromMeshAndBackoff(peer);
             router.teardownPeer(entry.value);
             _ = router.peer_count.fetchSub(1, .release);
+        }
+
+        /// Handle one heartbeat tick: advance the tick counter and drop every
+        /// backoff entry whose expiry has passed (so a previously pruned peer
+        /// becomes graftable again). Mesh graft/prune maintenance — deciding which
+        /// peers to add to or remove from each topic's mesh — happens here in a
+        /// later change; this layer only advances time and expires backoffs.
+        fn onHeartbeat(router: *Self) void {
+            router.heartbeat_tick += 1;
+            const tick = router.heartbeat_tick;
+            var topic_it = router.backoff.valueIterator();
+            while (topic_it.next()) |set| {
+                // Restart the scan after each removal: removing during iteration
+                // can move the unscanned tail in an open-addressing map, so a
+                // single pass could skip an entry. Backoff sets are small (peers
+                // pruned for one topic), so the restart is cheap.
+                var changed = true;
+                while (changed) {
+                    changed = false;
+                    var entry_it = set.iterator();
+                    while (entry_it.next()) |entry| {
+                        if (entry.value_ptr.* <= tick) {
+                            _ = set.remove(entry.key_ptr.*);
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         /// Handle an inbound RPC from a peer: apply its subscription changes to
@@ -559,8 +822,64 @@ pub fn Router(comptime Transport: type) type {
                     msg.getData(),
                 );
             }
-            // getControl() is intentionally not consumed: mesh/gossip control is a
-            // later layer; floodsub ignores it.
+
+            // Mesh control: GRAFT/PRUNE move the source peer in/out of a topic's
+            // mesh. IHAVE/IWANT/IDONTWANT belong to later layers and stay ignored.
+            // Any control replies (a PRUNE rejecting a GRAFT) are built + framed
+            // inside the handlers, which copy the bytes, so freeing the OwnedRpc
+            // after this returns is safe.
+            if (reader.getControl()) |ctrl_reader| {
+                var control = ctrl_reader;
+                while (control.graftNext()) |graft| {
+                    router.handleGraft(source, graft.getTopicID());
+                }
+                while (control.pruneNext()) |prune| {
+                    router.handlePrune(source, prune.getTopicID(), prune.getBackoff());
+                }
+            } else |_| {}
+        }
+
+        /// Handle an inbound GRAFT(topic) from `source`: add the peer to the
+        /// topic's mesh iff we subscribe to the topic, the peer is not in backoff
+        /// for it, and the mesh has room (below D_high). Otherwise reply with a
+        /// PRUNE (default backoff, no PX yet) on the peer's control lane and back
+        /// the peer off so we do not immediately re-accept. Untracked source is
+        /// ignored.
+        fn handleGraft(router: *Self, source: PeerId, topic: []const u8) void {
+            if (!router.peers.contains(peerKey(&source))) return;
+
+            const accept = router.my_topics.contains(topic) and
+                !router.inBackoff(topic, source) and
+                router.meshSize(topic) < mesh_params.d_high;
+
+            if (accept) {
+                router.meshAdd(topic, source);
+            } else {
+                router.setBackoff(topic, source, mesh_params.prune_backoff_ticks);
+                router.sendPrune(source, topic);
+            }
+        }
+
+        /// Handle an inbound PRUNE(topic) from `source`: drop the peer from the
+        /// topic's mesh and back it off. The wire `backoff` is in seconds (≈ ticks
+        /// at one tick per second); use the larger of it and the default so a peer
+        /// cannot shorten our backoff below the floor. Untracked source is ignored.
+        /// (PX peers are ignored for now.)
+        fn handlePrune(router: *Self, source: PeerId, topic: []const u8, backoff_secs: u64) void {
+            if (!router.peers.contains(peerKey(&source))) return;
+            router.meshRemove(topic, source);
+            const ticks = @max(backoff_secs, mesh_params.prune_backoff_ticks);
+            router.setBackoff(topic, source, ticks);
+        }
+
+        /// Send a PRUNE(topic) to `peer` on its control lane, carrying the default
+        /// backoff (in seconds, ≈ ticks) and no PX peers. Framed once via `fanOut`
+        /// to the single target.
+        fn sendPrune(router: *Self, peer: PeerId, topic: []const u8) void {
+            const ids = router.emptyIds() orelse return;
+            const prune = rpc.buildPrune(topic, &.{}, mesh_params.prune_backoff_ticks);
+            const ctrl = rpc_pb.ControlMessage{ .prune = &.{prune} };
+            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), ids, .{ .one = peer });
         }
 
         /// Apply one inbound SUBSCRIBE/UNSUBSCRIBE from `source` to that peer's
@@ -600,7 +919,7 @@ pub fn Router(comptime Transport: type) type {
             router.seen.add(id.bytes);
 
             router.deliverLocal(topic, from, data);
-            router.forwardMessage(.{ .peer = exclude }, from, seqno, topic, data, id.bytes);
+            router.forwardMessage(exclude, from, seqno, topic, data, id.bytes);
         }
 
         /// Invoke the message handler if the local node subscribes to `topic`.
@@ -611,57 +930,29 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Floodsub-forward a single message to every peer whose announced topics
-        /// include `topic`, optionally excluding one peer (the relay source).
-        /// Frames the message ONCE into a single refcounted shared frame (carrying
-        /// the message id for later IDONTWANT purge), then hands one reference to
-        /// each target's `.data` lane — no per-peer copy of the (up-to-1 MiB) wire
-        /// bytes. The builder holds the initial reference and drops it at the end;
-        /// each accepted push consumes a `retain`, each rejected push releases its
-        /// retain, and the final builder release frees the frame iff no queue kept
-        /// a reference.
+        /// include `topic`, optionally excluding one peer (the relay source). The
+        /// shared frame carries the message id for a later IDONTWANT purge. Built
+        /// once and fanned out to the matching peers' `.data` lane (see `fanOut`).
         fn forwardMessage(
             router: *Self,
-            exclude: ?struct { peer: PeerId },
+            exclude: ?PeerId,
             from: []const u8,
             seqno: []const u8,
             topic: []const u8,
             data: []const u8,
             id: []const u8,
         ) void {
-            const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data };
-            const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .publish = &.{msg} }).toRpc()) catch return;
-            // `framed`/`ids` are handed to the frame on a successful create; a
-            // failure before that frees whatever is already allocated. (This fn
-            // returns void, so explicit cleanup — not errdefer — handles the
-            // partial-allocation paths.)
-            const ids = router.allocator.alloc([]u8, 1) catch {
-                router.allocator.free(framed);
-                return;
-            };
+            // The data frame carries one message id (owned); `fanOut` takes
+            // ownership and frees it if framing fails.
+            const ids = router.allocator.alloc([]u8, 1) catch return;
             ids[0] = router.allocator.dupe(u8, id) catch {
                 router.allocator.free(ids);
-                router.allocator.free(framed);
                 return;
             };
-
-            const frame = peer_io.OutboundFrame.create(router.allocator, framed, ids, 1) catch {
-                router.allocator.free(ids[0]);
-                router.allocator.free(ids);
-                router.allocator.free(framed);
-                return;
-            };
-            // Builder reference dropped at the end; queues hold the rest. If no
-            // queue accepted a push this release frees the whole frame.
-            defer frame.release();
-
-            var it = router.peers.iterator();
-            while (it.next()) |entry| {
-                const state = entry.value_ptr.*;
-                if (exclude) |e| if (state.peer.eql(&e.peer)) continue;
-                if (!state.topics.contains(topic)) continue;
-                frame.retain();
-                state.queue.push(router.io, .data, frame) catch frame.release();
-            }
+            const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data };
+            router.fanOut(.data, (rpc.RpcOut{ .publish = &.{msg} }).toRpc(), ids, .{
+                .subscribers = .{ .topic = topic, .exclude = exclude },
+            });
         }
 
         /// Local subscribe: record the topic and announce it to every peer.
@@ -687,21 +978,12 @@ pub fn Router(comptime Transport: type) type {
             router.announceSubscription(topic, false);
         }
 
-        /// Frame a single (un)subscription RPC ONCE into a refcounted shared frame
-        /// and hand one reference to every peer's `.subscribe` lane — no per-peer
-        /// copy. Builder holds the initial reference and drops it at the end; each
-        /// accepted push consumes a `retain`, each rejected push releases it.
+        /// Announce a single (un)subscription to every peer's `.subscribe` lane:
+        /// framed once and fanned out (see `fanOut`).
         fn announceSubscription(router: *Self, topic: []const u8, subscribe: bool) void {
+            const ids = router.emptyIds() orelse return;
             const sub = rpc.buildSubscription(topic, subscribe);
-            const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .subscriptions = &.{sub} }).toRpc()) catch return;
-            const frame = makeSubscribeFrame(router.allocator, framed) orelse return;
-            defer frame.release(); // builder reference
-
-            var it = router.peers.iterator();
-            while (it.next()) |entry| {
-                frame.retain();
-                entry.value_ptr.*.queue.push(router.io, .subscribe, frame) catch frame.release();
-            }
+            router.fanOut(.subscribe, (rpc.RpcOut{ .subscriptions = &.{sub} }).toRpc(), ids, .all);
         }
 
         /// Local publish: build a Message from us, dedup it, deliver locally if we
@@ -999,7 +1281,7 @@ test "router peer lifecycle: connect makes a sink + writer, disconnect tears dow
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
     defer router.destroy();
     try router.start();
 
@@ -1023,7 +1305,7 @@ test "router dedups a second peer_connected for the same peer id" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
     defer router.destroy();
     try router.start();
 
@@ -1061,7 +1343,7 @@ test "router tears the peer down when the writer exhausts open retries" {
     // Every open fails → the writer's ensureStream exhausts retries → it fires
     // on_disconnect → the router posts peer_disconnected → the peer is torn down
     // and peerCount drops back to 0. Tiny retry/backoff so the give-up is fast.
-    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null);
+    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null, 0);
     defer router.destroy();
     try router.start();
 
@@ -1089,7 +1371,7 @@ test "router frees an inbound RPC (peer tracked and peer absent)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
     defer router.destroy();
     try router.start();
 
@@ -1118,7 +1400,7 @@ test "router clean shutdown tears down registered peers" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
     // Tear the router down on every exit (not just the happy path): an early
     // assertion failure must NOT leave the main + writer fibers orphaned, or
     // threaded.deinit() would hang joining them.
@@ -1193,6 +1475,19 @@ fn buildInboundPublish(
     return ownedFromRpc(allocator, frame);
 }
 
+/// Build an OwnedRpc carrying a single control GRAFT for `topic`.
+fn buildInboundGraft(allocator: std.mem.Allocator, topic: []const u8) !pubsub.OwnedRpc {
+    const ctrl = rpc_pb.ControlMessage{ .graft = &[_]?rpc_pb.ControlGraft{rpc.buildGraft(topic)} };
+    return ownedFromRpc(allocator, rpc_pb.RPC{ .control = ctrl });
+}
+
+/// Build an OwnedRpc carrying a single control PRUNE for `topic` with `backoff`
+/// (seconds on the wire) and no PX peers.
+fn buildInboundPrune(allocator: std.mem.Allocator, topic: []const u8, backoff: u64) !pubsub.OwnedRpc {
+    const ctrl = rpc_pb.ControlMessage{ .prune = &[_]?rpc_pb.ControlPrune{rpc.buildPrune(topic, &.{}, backoff)} };
+    return ownedFromRpc(allocator, rpc_pb.RPC{ .control = ctrl });
+}
+
 /// Encode `frame` into a heap buffer the RPCReader can borrow, wrapped as an
 /// OwnedRpc (matching what readRpc produces). The bytes are the raw protobuf
 /// payload — NOT length-prefixed — which is what RPCReader.init expects.
@@ -1256,6 +1551,24 @@ fn recordCountPublishes(written: []const u8, topic: []const u8, data: []const u8
     return count;
 }
 
+/// Count recorded frames carrying a control PRUNE for `topic`. Walks every
+/// recorded frame and every prune in each frame's control message.
+fn recordCountPrunes(written: []const u8, topic: []const u8) usize {
+    var count: usize = 0;
+    var rest = written;
+    while (decodeFrame(rest)) |decoded| {
+        var reader = decoded.reader;
+        if (reader.getControl()) |ctrl_reader| {
+            var control = ctrl_reader;
+            while (control.pruneNext()) |prune| {
+                if (std.mem.eql(u8, prune.getTopicID(), topic)) count += 1;
+            }
+        } else |_| {}
+        rest = rest[decoded.total_len..];
+    }
+    return count;
+}
+
 /// A recording message handler: captures the last (topic, from, data) delivered
 /// to the local node, into testing-allocator-owned buffers it frees on deinit.
 const RecordingHandler = struct {
@@ -1313,7 +1626,7 @@ test "subscribe announces the subscription to a connected peer" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
     defer router.destroy();
     try router.start();
 
@@ -1340,7 +1653,7 @@ test "inbound subscription is tracked on the source peer" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
     defer router.destroy();
     try router.start();
 
@@ -1374,7 +1687,7 @@ test "floodsub forwards an inbound publish to subscribed peers, not the source" 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
     defer router.destroy();
     try router.start();
 
@@ -1417,7 +1730,7 @@ test "floodsub dedups a repeated publish (same from+seqno) to forward once" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
     defer router.destroy();
     try router.start();
 
@@ -1466,7 +1779,7 @@ test "local publish forwards to subscribers and delivers to the local handler" {
     var rec = RecordingHandler{ .allocator = allocator };
     defer rec.deinit();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler());
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0);
     defer router.destroy();
     try router.start();
 
@@ -1501,4 +1814,249 @@ test "local publish forwards to subscribers and delivers to the local handler" {
     try std.testing.expectEqualSlices(u8, "hello", rec.data.?);
     // The delivered `from` is our own peer id (the publish origin).
     try std.testing.expectEqualSlices(u8, local_test_peer.bytes[0..local_test_peer.len], rec.from.?);
+}
+
+// --- mesh: GRAFT / PRUNE / backoff / heartbeat fake tests ------------------
+
+/// Subscribe the local node to `topic` and spin (bounded) until the router has
+/// recorded it in `my_topics`. The router processes the subscribe on its fiber,
+/// so the GRAFT handler's `my_topics.contains` check is only meaningful once this
+/// has landed.
+fn subscribeAndWait(io: std.Io, allocator: std.mem.Allocator, router: *FakeRouter, topic: []const u8) !void {
+    try router.inbox.putOne(io, .{ .subscribe = .{ .topic = try allocator.dupe(u8, topic) } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (router.my_topics.contains(topic)) return;
+        io_time.ms(5).sleep(io) catch {};
+    }
+}
+
+/// Spin (bounded) until P's recorded outbound bytes contain at least one PRUNE
+/// for `topic`. Returns whether it held.
+fn waitPruneSent(io: std.Io, conn: *FakeTransport.FakeConn, topic: []const u8) bool {
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPrunes(conn.record.written.items, topic) >= 1) return true;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    return recordCountPrunes(conn.record.written.items, topic) >= 1;
+}
+
+/// Post a GRAFT(topic) inbound from `peer` and wait until the router has applied
+/// its effect: either the mesh now contains `peer` (accepted) or a PRUNE was sent
+/// back (rejected). Returns the observed outcome.
+const GraftOutcome = enum { accepted, rejected };
+fn graftAndWait(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    router: *FakeRouter,
+    conn: *FakeTransport.FakeConn,
+    peer: PeerId,
+    topic: []const u8,
+) !GraftOutcome {
+    const prunes_before = recordCountPrunes(conn.record.written.items, topic);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundGraft(allocator, topic) } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (router.meshContains(topic, peer)) return .accepted;
+        if (recordCountPrunes(conn.record.written.items, topic) > prunes_before) return .rejected;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    return if (router.meshContains(topic, peer)) .accepted else .rejected;
+}
+
+/// Drive `n` heartbeat ticks and wait until the router's tick counter has
+/// advanced by at least `n` (each posted heartbeat advances it by one on the
+/// router fiber). Used to age out backoffs deterministically with the fiber
+/// disabled (interval 0).
+fn beatHeartbeats(io: std.Io, router: *FakeRouter, n: u64) !void {
+    const target = router.heartbeat_tick + n;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) try router.inbox.putOne(io, .heartbeat);
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (router.heartbeat_tick >= target) return;
+        io_time.ms(5).sleep(io) catch {};
+    }
+}
+
+test "GRAFT accepted: subscribed topic, peer joins the mesh, no PRUNE back" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    const outcome = try graftAndWait(io, allocator, router, conn, peer, "t");
+    try std.testing.expectEqual(GraftOutcome.accepted, outcome);
+    try std.testing.expect(router.meshContains("t", peer));
+    // Accept sends nothing back: no PRUNE on the peer's recorded stream.
+    try std.testing.expectEqual(@as(usize, 0), recordCountPrunes(conn.record.written.items, "t"));
+}
+
+test "GRAFT rejected when we do not subscribe: PRUNE sent, peer not in mesh" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    // We do NOT subscribe to "t".
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    const outcome = try graftAndWait(io, allocator, router, conn, peer, "t");
+    try std.testing.expectEqual(GraftOutcome.rejected, outcome);
+    try std.testing.expect(!router.meshContains("t", peer));
+    try std.testing.expect(waitPruneSent(io, conn, "t"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPrunes(conn.record.written.items, "t"));
+}
+
+test "GRAFT rejected when the mesh is full (D_high): PRUNE back" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    // Fill the mesh to D_high with distinct peers, each via an accepted GRAFT.
+    const d_high = mesh_params.d_high;
+    var conns: [mesh_params.d_high]*FakeTransport.FakeConn = undefined;
+    var filled: usize = 0;
+    defer for (conns[0..filled]) |c| destroyFakeConn(allocator, c);
+    var i: usize = 0;
+    while (i < d_high) : (i += 1) {
+        const p = testPeer(@intCast(10 + i));
+        const c = try connectFakePeer(io, allocator, router, p);
+        conns[i] = c;
+        filled += 1;
+        try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, c, p, "t"));
+    }
+    try std.testing.expectEqual(d_high, router.meshSize("t"));
+
+    // One more peer GRAFTs: the mesh is full, so it is rejected with a PRUNE.
+    const extra = testPeer(99);
+    const extra_conn = try connectFakePeer(io, allocator, router, extra);
+    defer destroyFakeConn(allocator, extra_conn);
+    const outcome = try graftAndWait(io, allocator, router, extra_conn, extra, "t");
+    try std.testing.expectEqual(GraftOutcome.rejected, outcome);
+    try std.testing.expect(!router.meshContains("t", extra));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPrunes(extra_conn.record.written.items, "t"));
+}
+
+test "PRUNE removes peer from mesh and backs it off (a later GRAFT is rejected)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // P joins the mesh, then PRUNEs us (with a small backoff < default floor).
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundPrune(allocator, "t", 5) } });
+
+    // Wait for the prune to take effect (peer removed from mesh).
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (!router.meshContains("t", peer)) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(!router.meshContains("t", peer));
+
+    // A subsequent GRAFT from P is rejected because P is in backoff → PRUNE back.
+    const outcome = try graftAndWait(io, allocator, router, conn, peer, "t");
+    try std.testing.expectEqual(GraftOutcome.rejected, outcome);
+    try std.testing.expect(!router.meshContains("t", peer));
+    try std.testing.expect(waitPruneSent(io, conn, "t"));
+}
+
+test "backoff expires after prune_backoff_ticks heartbeats, then GRAFT is accepted" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // PRUNE from P (default-floor backoff) backs P off for prune_backoff_ticks.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundPrune(allocator, "t", 0) } });
+    // A GRAFT now is rejected (still in backoff).
+    try std.testing.expectEqual(GraftOutcome.rejected, try graftAndWait(io, allocator, router, conn, peer, "t"));
+
+    // Age the backoff out with exactly prune_backoff_ticks heartbeats.
+    try beatHeartbeats(io, router, mesh_params.prune_backoff_ticks);
+
+    // A GRAFT is now accepted: P joins the mesh.
+    const outcome = try graftAndWait(io, allocator, router, conn, peer, "t");
+    try std.testing.expectEqual(GraftOutcome.accepted, outcome);
+    try std.testing.expect(router.meshContains("t", peer));
+}
+
+test "peer disconnect cleans the peer out of mesh and backoff" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    // We subscribe to "t" (so a GRAFT(t) is accepted into the mesh) but NOT to
+    // "t2" (so a GRAFT(t2) is rejected, which backs P off for "t2"). After this P
+    // has an entry in BOTH mesh["t"] and backoff["t2"].
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
+    try std.testing.expectEqual(GraftOutcome.rejected, try graftAndWait(io, allocator, router, conn, peer, "t2"));
+    try std.testing.expect(router.meshContains("t", peer));
+    try std.testing.expect(router.inBackoff("t2", peer));
+
+    // Disconnect P: it must be removed from every mesh and every backoff set.
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try std.testing.expect(waitFor(io, peerCountIsZero, router));
+
+    try std.testing.expect(!router.meshContains("t", peer));
+    try std.testing.expect(!router.inBackoff("t2", peer));
+    // The testing allocator's end-of-test leak check confirms destroy() freed the
+    // (now peer-less) mesh/backoff topic entries with no leak.
 }
