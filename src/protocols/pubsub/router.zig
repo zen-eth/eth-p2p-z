@@ -6,12 +6,14 @@
 //! they never touch router state, so the single fiber serialises all mutation
 //! with no locks.
 //!
-//! This layer is lifecycle + per-peer I/O wiring only: on connect it opens a
-//! per-peer outbound stream (lazily, via a writer fiber draining an
+//! This layer handles per-peer I/O lifecycle plus floodsub pub/sub: on connect
+//! it opens a per-peer outbound stream (lazily, via a writer fiber draining an
 //! OutboundQueue) and starts reading the peer's inbound stream; on disconnect it
-//! tears that down cleanly. There is no subscribe/publish/forwarding/mesh logic
-//! here — inbound RPCs are currently freed on arrival. Message handling is a
-//! later layer that will dispatch on the command in `inbound_rpc`.
+//! tears that down cleanly. On top of that it implements floodsub — the local
+//! node subscribes to topics and publishes messages; inbound subscriptions are
+//! tracked per peer and published messages are forwarded to EVERY peer that
+//! subscribes to the topic (no mesh/gossip/scoring yet — those are later layers).
+//! Control messages (GRAFT/PRUNE/IHAVE/IWANT/IDONTWANT) are parsed-but-ignored.
 //!
 //! The Router is generic over a comptime `Transport` so its lifecycle logic can
 //! be unit-tested against an in-memory fake (no real QUIC), exactly how
@@ -23,8 +25,85 @@
 const std = @import("std");
 const pubsub = @import("pubsub.zig");
 const peer_io = @import("peer_io.zig");
+const rpc = @import("rpc.zig");
+const rpc_pb = @import("../../protobuf.zig").rpc;
 const io_time = @import("../../quic/io/time.zig");
 const PeerId = @import("peer_id").PeerId;
+
+/// Upper bound on remembered message-ids in the seen-cache (loop/duplicate
+/// suppression). A bounded FIFO of owned id copies: once full, inserting a new id
+/// evicts the oldest. This is a deliberately minimal dedup window — a proper
+/// time-bounded seen-cache (with per-entry expiry, as go-libp2p-pubsub keeps)
+/// arrives with the message cache in a later phase. The bound guarantees no
+/// unbounded growth.
+const seen_cache_capacity = 1024;
+
+/// Invoked on the router fiber for each delivered message on a topic WE
+/// subscribe to. The `topic`/`from`/`data` slices are only valid for the
+/// duration of the call; a handler that needs to retain them must copy. Keep it
+/// cheap: it runs inline on the single router fiber and stalls every other event
+/// while it executes.
+pub const MessageHandler = struct {
+    ctx: *anyopaque,
+    on_message: *const fn (ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void,
+};
+
+/// A bounded FIFO set of owned message-id byte copies, used to suppress
+/// duplicate/looping messages. Membership is a hash set; eviction order is a ring
+/// of the same owned id slices. Inserting past `capacity` evicts (and frees) the
+/// oldest id. Owns every id copy; `deinit` frees them all.
+const SeenCache = struct {
+    allocator: std.mem.Allocator,
+    /// Set of currently-remembered ids. Keys are owned copies (the same slices
+    /// stored in `ring`), so freeing happens exactly once, on eviction/deinit.
+    set: std.StringHashMapUnmanaged(void) = .empty,
+    /// Insertion-ordered ring of the owned id slices, for oldest-first eviction.
+    ring: []?[]u8,
+    head: usize = 0,
+    count: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!SeenCache {
+        const ring = try allocator.alloc(?[]u8, seen_cache_capacity);
+        @memset(ring, null);
+        return .{ .allocator = allocator, .ring = ring };
+    }
+
+    fn deinit(self: *SeenCache) void {
+        var it = self.set.keyIterator();
+        while (it.next()) |key| self.allocator.free(key.*);
+        self.set.deinit(self.allocator);
+        self.allocator.free(self.ring);
+        self.* = undefined;
+    }
+
+    /// Whether `id` was seen recently (still in the bounded window).
+    fn contains(self: *const SeenCache, id: []const u8) bool {
+        return self.set.contains(id);
+    }
+
+    /// Remember `id` (copying it). No-op if already present. On capacity the
+    /// oldest id is evicted and freed first. On OOM the id is simply not
+    /// remembered (dedup degrades to forwarding a possible duplicate — safe, and
+    /// the only alternative is to drop the message, which is worse).
+    fn add(self: *SeenCache, id: []const u8) void {
+        if (self.set.contains(id)) return;
+        const owned = self.allocator.dupe(u8, id) catch return;
+        self.set.put(self.allocator, owned, {}) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        // Evict the slot we are about to overwrite (the oldest) before storing.
+        if (self.ring[self.head]) |old| {
+            std.debug.assert(self.count == self.ring.len);
+            _ = self.set.remove(old);
+            self.allocator.free(old);
+            self.count -= 1;
+        }
+        self.ring[self.head] = owned;
+        self.head = (self.head + 1) % self.ring.len;
+        self.count += 1;
+    }
+};
 
 /// The router inbox holds at most this many un-processed commands. The single
 /// fiber drains it continuously, so this only needs to absorb bursts of
@@ -94,8 +173,19 @@ pub fn Router(comptime Transport: type) type {
             /// A peer's connection is gone. Tear the peer down.
             peer_disconnected: struct { peer: PeerId },
             /// An RPC arrived on a peer's inbound stream. The router owns it and
-            /// must free it (no forwarding yet).
+            /// must free it after parsing + forward-frame construction.
             inbound_rpc: peer_io.InboundRpc,
+            /// Subscribe the local node to a topic: announce it to every peer and
+            /// start delivering matching messages to the message handler. Owns
+            /// `topic`; the router frees it once processed.
+            subscribe: struct { topic: []u8 },
+            /// Unsubscribe the local node from a topic: announce the withdrawal to
+            /// every peer. Owns `topic`; freed once processed.
+            unsubscribe: struct { topic: []u8 },
+            /// Publish application data on a topic from the local node: forward it
+            /// to every subscribed peer (and deliver locally if we subscribe).
+            /// Owns `topic` and `data`; both freed once processed.
+            publish: struct { topic: []u8, data: []u8 },
             /// Stop the router: tear down every peer, then exit the main fiber.
             shutdown,
             /// Test-only: enqueue an owned frame onto a tracked peer's outbound
@@ -117,6 +207,11 @@ pub fn Router(comptime Transport: type) type {
         const PeerState = struct {
             peer: PeerId,
             queue: peer_io.OutboundQueue,
+            /// Topics this peer announced it subscribes to (its SUBSCRIBE
+            /// SubOpts). Keys are owned copies; freed on remove and on teardown.
+            /// Floodsub forwards a message to every peer whose set contains the
+            /// message's topic.
+            topics: std.StringHashMapUnmanaged(void) = .empty,
             /// Heap-owned (Transport-allocated) so its address is stable while
             /// the writer fiber holds it. The sink (and its stream) MUST outlive
             /// the writer fiber — torn down only after the writer is awaited.
@@ -138,8 +233,8 @@ pub fn Router(comptime Transport: type) type {
         pub const InboxPoster = struct {
             router: *Self,
 
-            pub fn post(self: *InboxPoster, io: std.Io, rpc: peer_io.InboundRpc) anyerror!void {
-                return self.router.inbox.putOne(io, .{ .inbound_rpc = rpc });
+            pub fn post(self: *InboxPoster, io: std.Io, in: peer_io.InboundRpc) anyerror!void {
+                return self.router.inbox.putOne(io, .{ .inbound_rpc = in });
             }
         };
 
@@ -152,6 +247,20 @@ pub fn Router(comptime Transport: type) type {
         inbox: std.Io.Queue(Command),
         /// Keyed by zero-padded peer bytes (see PeerKey). Values are heap-owned.
         peers: std.AutoHashMap(PeerKey, *PeerState),
+        /// Topics the local node subscribes to. Keys are owned copies; freed on
+        /// unsubscribe and on teardown. We announce these to every peer (on our
+        /// own subscribe, and to each newly-connected peer) and deliver matching
+        /// inbound/published messages to `message_handler`.
+        my_topics: std.StringHashMapUnmanaged(void) = .empty,
+        /// Bounded dedup window over recently-seen message ids.
+        seen: SeenCache,
+        /// Monotonic sequence number for messages WE originate; encoded big-endian
+        /// into Message.seqno so (from, seqno) is a unique message id.
+        seqno: u64 = 0,
+        /// Our own peer id, used as Message.from on publish.
+        local_peer: PeerId,
+        /// Optional sink for messages delivered on topics we subscribe to.
+        message_handler: ?MessageHandler,
         main_future: ?std.Io.Future(void) = null,
         /// Set once when teardown begins so the main loop stops after the inbox
         /// drains/closes. Atomic because it is read on the main fiber but set on
@@ -160,9 +269,18 @@ pub fn Router(comptime Transport: type) type {
         /// Number of live peers, published for observers (e.g. tests).
         peer_count: std.atomic.Value(usize) = .init(0),
 
-        pub fn create(allocator: std.mem.Allocator, io: std.Io, transport: Transport) !*Self {
+        pub fn create(
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            transport: Transport,
+            local_peer: PeerId,
+            message_handler: ?MessageHandler,
+        ) !*Self {
             const inbox_storage = try allocator.alloc(Command, inbox_capacity);
             errdefer allocator.free(inbox_storage);
+
+            var seen = try SeenCache.init(allocator);
+            errdefer seen.deinit();
 
             const router = try allocator.create(Self);
             router.* = .{
@@ -172,6 +290,9 @@ pub fn Router(comptime Transport: type) type {
                 .inbox_storage = inbox_storage,
                 .inbox = std.Io.Queue(Command).init(inbox_storage),
                 .peers = std.AutoHashMap(PeerKey, *PeerState).init(allocator),
+                .seen = seen,
+                .local_peer = local_peer,
+                .message_handler = message_handler,
             };
             return router;
         }
@@ -212,8 +333,19 @@ pub fn Router(comptime Transport: type) type {
             }
 
             router.peers.deinit();
+            router.freeMyTopics();
+            router.seen.deinit();
             router.allocator.free(router.inbox_storage);
             router.allocator.destroy(router);
+        }
+
+        /// Free every key in `my_topics` and the map itself. The main fiber is no
+        /// longer running by the time this is called (destroy joined it), so the
+        /// map is quiescent.
+        fn freeMyTopics(router: *Self) void {
+            var it = router.my_topics.keyIterator();
+            while (it.next()) |key| router.allocator.free(key.*);
+            router.my_topics.deinit(router.allocator);
         }
 
         pub fn peerCount(router: *const Self) usize {
@@ -250,7 +382,10 @@ pub fn Router(comptime Transport: type) type {
                 switch (command) {
                     .peer_connected => |c| router.onPeerConnected(c.peer, c.conn, c.remote_addr),
                     .peer_disconnected => |c| router.onPeerDisconnected(c.peer),
-                    .inbound_rpc => |rpc| router.onInboundRpc(rpc),
+                    .inbound_rpc => |in| router.onInboundRpc(in),
+                    .subscribe => |s| router.onSubscribe(s.topic),
+                    .unsubscribe => |u| router.onUnsubscribe(u.topic),
+                    .publish => |p| router.onPublish(p.topic, p.data),
                     .enqueue_for_test => |e| router.onEnqueueForTest(e.peer, e.frame, e.reply),
                     .shutdown => return,
                 }
@@ -333,6 +468,45 @@ pub fn Router(comptime Transport: type) type {
             writer_live = true;
             queue_live = true;
             _ = router.peer_count.fetchAdd(1, .release);
+
+            // Tell the new peer which topics we already subscribe to, so it can
+            // start forwarding matching messages to us right away (mirrors how
+            // go-libp2p-pubsub sends the full current subscription set on a new
+            // connection). Best-effort: a framing/push failure just means the peer
+            // learns our subscriptions on our next subscribe/unsubscribe.
+            router.sendCurrentSubscriptions(state);
+        }
+
+        /// Send the local node's full current subscription set to one peer's
+        /// `.subscribe` lane as a single subscription RPC. No-op when we have no
+        /// subscriptions. Best-effort: frees the frame on a push failure.
+        fn sendCurrentSubscriptions(router: *Self, state: *PeerState) void {
+            if (router.my_topics.count() == 0) return;
+
+            var subs: std.ArrayListUnmanaged(?rpc_pb.RPC.SubOpts) = .empty;
+            defer subs.deinit(router.allocator);
+            var it = router.my_topics.keyIterator();
+            while (it.next()) |key| {
+                subs.append(router.allocator, rpc.buildSubscription(key.*, true)) catch return;
+            }
+
+            const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .subscriptions = subs.items }).toRpc()) catch return;
+            defer router.allocator.free(framed);
+            router.pushSubscribeFrame(state, framed);
+        }
+
+        /// Push an owned copy of `framed` onto a peer's `.subscribe` lane. Each
+        /// pushed frame owns its own byte copy (the caller keeps `framed` as a
+        /// template). On allocation or push failure the copy is freed and the peer
+        /// is left untouched.
+        fn pushSubscribeFrame(router: *Self, state: *PeerState, framed: []const u8) void {
+            const copy = router.allocator.dupe(u8, framed) catch return;
+            const ids = router.allocator.alloc([]u8, 0) catch {
+                router.allocator.free(copy);
+                return;
+            };
+            var frame = peer_io.OutboundFrame{ .bytes = copy, .message_ids = ids };
+            state.queue.push(router.io, .subscribe, frame) catch frame.deinit(router.allocator);
         }
 
         /// Handle a peer disconnecting: look up, tear down its writer + state.
@@ -345,12 +519,184 @@ pub fn Router(comptime Transport: type) type {
             _ = router.peer_count.fetchSub(1, .release);
         }
 
-        /// Handle an inbound RPC: no forwarding yet, so just free it. Freed
-        /// whether or not the peer is still tracked (proves the reader runs +
-        /// posts without leaking).
-        fn onInboundRpc(router: *Self, rpc: peer_io.InboundRpc) void {
-            var owned = rpc;
-            owned.rpc.deinit(router.allocator);
+        /// Handle an inbound RPC from a peer: apply its subscription changes to
+        /// the SOURCE peer's announced-topics set, then floodsub-forward each
+        /// published message to every OTHER subscribed peer (and deliver locally
+        /// if we subscribe). Control messages are parsed-but-ignored in this
+        /// floodsub layer. The OwnedRpc is freed only after all parsing AND
+        /// forward-frame construction, since its bytes back the readers and are
+        /// copied by frameRpc.
+        fn onInboundRpc(router: *Self, in: peer_io.InboundRpc) void {
+            var owned = in;
+            defer owned.rpc.deinit(router.allocator);
+            const source = owned.peer;
+            var reader = owned.rpc.reader;
+
+            // Subscription changes update the source peer's announced topics.
+            while (reader.subscriptionsNext()) |sub| {
+                router.applyPeerSubscription(source, sub.getTopicid(), sub.getSubscribe());
+            }
+
+            // Published messages: dedup, deliver locally, floodsub-forward.
+            while (reader.publishNext()) |msg| {
+                router.handleIncomingMessage(
+                    source,
+                    msg.getFrom(),
+                    msg.getSeqno(),
+                    msg.getTopic(),
+                    msg.getData(),
+                );
+            }
+            // getControl() is intentionally not consumed: mesh/gossip control is a
+            // later layer; floodsub ignores it.
+        }
+
+        /// Apply one inbound SUBSCRIBE/UNSUBSCRIBE from `source` to that peer's
+        /// announced-topics set. Untracked source → ignored. Subscribe inserts an
+        /// owned key copy (no-op if already present); unsubscribe removes + frees
+        /// the stored key.
+        fn applyPeerSubscription(router: *Self, source: PeerId, topic: []const u8, subscribe: bool) void {
+            const state = router.peers.get(peerKey(&source)) orelse return;
+            if (subscribe) {
+                if (state.topics.contains(topic)) return;
+                const key = router.allocator.dupe(u8, topic) catch return;
+                state.topics.put(router.allocator, key, {}) catch {
+                    router.allocator.free(key);
+                    return;
+                };
+            } else if (state.topics.fetchRemove(topic)) |kv| {
+                router.allocator.free(kv.key);
+            }
+        }
+
+        /// Process one incoming published message: dedup on its id, deliver to the
+        /// local handler if we subscribe, and floodsub-forward to every peer
+        /// (optionally excluding `exclude`) whose announced topics include the
+        /// message's topic. `exclude` is the source peer for relayed messages (no
+        /// echo back to sender); null for locally-originated publishes.
+        fn handleIncomingMessage(
+            router: *Self,
+            exclude: PeerId,
+            from: []const u8,
+            seqno: []const u8,
+            topic: []const u8,
+            data: []const u8,
+        ) void {
+            var id = rpc.messageId(router.allocator, from, seqno) catch return;
+            defer id.deinit(router.allocator);
+            if (router.seen.contains(id.bytes)) return;
+            router.seen.add(id.bytes);
+
+            router.deliverLocal(topic, from, data);
+            router.forwardMessage(.{ .peer = exclude }, from, seqno, topic, data, id.bytes);
+        }
+
+        /// Invoke the message handler if the local node subscribes to `topic`.
+        /// The slices are valid only for the call (the handler copies to retain).
+        fn deliverLocal(router: *Self, topic: []const u8, from: []const u8, data: []const u8) void {
+            if (!router.my_topics.contains(topic)) return;
+            if (router.message_handler) |h| h.on_message(h.ctx, topic, from, data);
+        }
+
+        /// Floodsub-forward a single message to every peer whose announced topics
+        /// include `topic`, optionally excluding one peer (the relay source).
+        /// Frames the message once into a template, then pushes an independent
+        /// owned copy (with a dup'd message id) onto each target's `.data` lane.
+        fn forwardMessage(
+            router: *Self,
+            exclude: ?struct { peer: PeerId },
+            from: []const u8,
+            seqno: []const u8,
+            topic: []const u8,
+            data: []const u8,
+            id: []const u8,
+        ) void {
+            const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data };
+            const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .publish = &.{msg} }).toRpc()) catch return;
+            defer router.allocator.free(framed);
+
+            var it = router.peers.iterator();
+            while (it.next()) |entry| {
+                const state = entry.value_ptr.*;
+                if (exclude) |e| if (state.peer.eql(&e.peer)) continue;
+                if (!state.topics.contains(topic)) continue;
+                router.pushDataFrame(state, framed, id);
+            }
+        }
+
+        /// Push an owned copy of a framed publish (with a dup'd message id) onto a
+        /// peer's `.data` lane. The pushed frame owns both copies; on allocation or
+        /// push failure everything allocated here is freed and the peer is skipped.
+        fn pushDataFrame(router: *Self, state: *PeerState, framed: []const u8, id: []const u8) void {
+            const copy = router.allocator.dupe(u8, framed) catch return;
+            errdefer router.allocator.free(copy);
+
+            const ids = router.allocator.alloc([]u8, 1) catch return;
+            errdefer router.allocator.free(ids);
+            ids[0] = router.allocator.dupe(u8, id) catch {
+                router.allocator.free(ids);
+                return;
+            };
+
+            var frame = peer_io.OutboundFrame{ .bytes = copy, .message_ids = ids };
+            state.queue.push(router.io, .data, frame) catch frame.deinit(router.allocator);
+        }
+
+        /// Local subscribe: record the topic and announce it to every peer.
+        /// Owns `topic` (frees it); the stored key is a separate copy.
+        fn onSubscribe(router: *Self, topic: []u8) void {
+            defer router.allocator.free(topic);
+            if (router.my_topics.contains(topic)) return;
+
+            const key = router.allocator.dupe(u8, topic) catch return;
+            router.my_topics.put(router.allocator, key, {}) catch {
+                router.allocator.free(key);
+                return;
+            };
+            router.announceSubscription(topic, true);
+        }
+
+        /// Local unsubscribe: drop the topic and announce the withdrawal to every
+        /// peer. Owns `topic` (frees it). No-op if we were not subscribed.
+        fn onUnsubscribe(router: *Self, topic: []u8) void {
+            defer router.allocator.free(topic);
+            const removed = router.my_topics.fetchRemove(topic) orelse return;
+            router.allocator.free(removed.key);
+            router.announceSubscription(topic, false);
+        }
+
+        /// Frame a single (un)subscription RPC once and push an owned copy onto
+        /// every peer's `.subscribe` lane.
+        fn announceSubscription(router: *Self, topic: []const u8, subscribe: bool) void {
+            const sub = rpc.buildSubscription(topic, subscribe);
+            const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .subscriptions = &.{sub} }).toRpc()) catch return;
+            defer router.allocator.free(framed);
+
+            var it = router.peers.iterator();
+            while (it.next()) |entry| router.pushSubscribeFrame(entry.value_ptr.*, framed);
+        }
+
+        /// Local publish: build a Message from us, dedup it, deliver locally if we
+        /// subscribe, and floodsub-forward to every subscribed peer. Owns `topic`
+        /// and `data` (frees both AFTER framing/handler, since frameRpc copies
+        /// them and the handler reads them).
+        fn onPublish(router: *Self, topic: []u8, data: []u8) void {
+            defer router.allocator.free(topic);
+            defer router.allocator.free(data);
+
+            const from = router.local_peer.bytes[0..router.local_peer.len];
+
+            var seqno_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &seqno_buf, router.seqno, .big);
+            router.seqno += 1;
+            const seqno = seqno_buf[0..];
+
+            var id = rpc.messageId(router.allocator, from, seqno) catch return;
+            defer id.deinit(router.allocator);
+            router.seen.add(id.bytes);
+
+            router.deliverLocal(topic, from, data);
+            router.forwardMessage(null, from, seqno, topic, data, id.bytes);
         }
 
         /// Test-only: push an owned frame onto a tracked peer's outbound queue,
@@ -391,9 +737,17 @@ pub fn Router(comptime Transport: type) type {
             state.writer_future.await(router.io);
             state.sink.close(router.io);
             state.queue.deinit(router.io);
+            router.freePeerTopics(state);
             router.allocator.destroy(state.writer);
             router.allocator.destroy(state.sink);
             router.allocator.destroy(state);
+        }
+
+        /// Free every key in a peer's announced-topics map and the map itself.
+        fn freePeerTopics(router: *Self, state: *PeerState) void {
+            var it = state.topics.keyIterator();
+            while (it.next()) |key| router.allocator.free(key.*);
+            state.topics.deinit(router.allocator);
         }
 
         fn teardownAllPeers(router: *Self) void {
@@ -415,9 +769,15 @@ pub fn Router(comptime Transport: type) type {
                 const n = router.inbox.getUncancelable(router.io, &buf, 0) catch return;
                 if (n == 0) return;
                 for (buf[0..n]) |command| switch (command) {
-                    .inbound_rpc => |rpc| {
-                        var owned = rpc;
+                    .inbound_rpc => |in| {
+                        var owned = in;
                         owned.rpc.deinit(router.allocator);
+                    },
+                    .subscribe => |s| router.allocator.free(s.topic),
+                    .unsubscribe => |u| router.allocator.free(u.topic),
+                    .publish => |p| {
+                        router.allocator.free(p.topic);
+                        router.allocator.free(p.data);
                     },
                     .enqueue_for_test => |e| {
                         // The peer map is already torn down; free the frame and
@@ -448,8 +808,6 @@ pub fn Router(comptime Transport: type) type {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-const rpc_pb = @import("../../protobuf.zig").rpc;
 
 test "peerKey distinguishes peers and matches equal ids" {
     const a = try PeerId.random();
@@ -558,6 +916,33 @@ fn destroyFakeConn(allocator: std.mem.Allocator, conn: *FakeTransport.FakeConn) 
 
 const FakeRouter = Router(FakeTransport);
 
+/// Build a deterministic, distinct test PeerId. `PeerId.random()` is seeded with
+/// a fixed constant (so it returns the same id every call); `testPeer(seed)`
+/// stamps `seed` into the digest so each value is unique, which the floodsub
+/// tests need to track several peers at once.
+fn testPeer(seed: u8) PeerId {
+    var id = PeerId.random() catch unreachable;
+    id.bytes[2] = seed;
+    return id;
+}
+
+/// A local peer id distinct from every `testPeer` seed used below, so a
+/// forwarded message's `from` (our id) never collides with a peer's id.
+const local_test_peer = blk: {
+    var id = PeerId{ .bytes = [_]u8{0} ** 64, .len = 34 };
+    id.bytes[0] = 0x00;
+    id.bytes[1] = 32;
+    id.bytes[2] = 0xff;
+    break :blk id;
+};
+
+/// Whether `state.topics` for the peer tracked under `peer` contains `topic`.
+/// Reads private router/peer state directly (the tests are in-file).
+fn peerTracksTopic(router: *FakeRouter, peer: PeerId, topic: []const u8) bool {
+    const state = router.peers.get(peerKey(&peer)) orelse return false;
+    return state.topics.contains(topic);
+}
+
 /// Spin until `pred()` holds or the bounded wait elapses, yielding the fiber
 /// between checks (so the router's own fiber can make progress). Mirrors the
 /// poll loop the real 2-node test uses. Returns whether the predicate held.
@@ -588,7 +973,7 @@ test "router peer lifecycle: connect makes a sink + writer, disconnect tears dow
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{});
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
     defer router.destroy();
     try router.start();
 
@@ -612,7 +997,7 @@ test "router dedups a second peer_connected for the same peer id" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{});
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
     defer router.destroy();
     try router.start();
 
@@ -650,7 +1035,7 @@ test "router tears the peer down when the writer exhausts open retries" {
     // Every open fails → the writer's ensureStream exhausts retries → it fires
     // on_disconnect → the router posts peer_disconnected → the peer is torn down
     // and peerCount drops back to 0. Tiny retry/backoff so the give-up is fast.
-    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) });
+    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null);
     defer router.destroy();
     try router.start();
 
@@ -678,7 +1063,7 @@ test "router frees an inbound RPC (peer tracked and peer absent)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{});
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
     defer router.destroy();
     try router.start();
 
@@ -707,7 +1092,7 @@ test "router clean shutdown tears down registered peers" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{});
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
     // Tear the router down on every exit (not just the happy path): an early
     // assertion failure must NOT leave the main + writer fibers orphaned, or
     // threaded.deinit() would hang joining them.
@@ -755,12 +1140,337 @@ fn testDataFrame(allocator: std.mem.Allocator) !peer_io.OutboundFrame {
 /// Build a real OwnedRpc carrying a single subscription, mirroring what the
 /// inbound reader produces, so onInboundRpc has genuine heap bytes to free.
 fn buildInboundRpc(allocator: std.mem.Allocator, topic: []const u8) !pubsub.OwnedRpc {
+    return buildInboundSub(allocator, topic, true);
+}
+
+/// Build an OwnedRpc carrying a single SUBSCRIBE/UNSUBSCRIBE SubOpts for `topic`.
+fn buildInboundSub(allocator: std.mem.Allocator, topic: []const u8, subscribe: bool) !pubsub.OwnedRpc {
     const sub = rpc_pb.RPC{
-        .subscriptions = &[_]?rpc_pb.RPC.SubOpts{.{ .subscribe = true, .topicid = topic }},
+        .subscriptions = &[_]?rpc_pb.RPC.SubOpts{.{ .subscribe = subscribe, .topicid = topic }},
     };
-    const encoded = try sub.encode(allocator);
+    return ownedFromRpc(allocator, sub);
+}
+
+/// Build an OwnedRpc carrying a single published Message, mirroring what an
+/// inbound reader yields for a peer relaying/originating a message.
+fn buildInboundPublish(
+    allocator: std.mem.Allocator,
+    from: []const u8,
+    seqno: []const u8,
+    topic: []const u8,
+    data: []const u8,
+) !pubsub.OwnedRpc {
+    const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data };
+    const frame = rpc_pb.RPC{ .publish = &[_]?rpc_pb.Message{msg} };
+    return ownedFromRpc(allocator, frame);
+}
+
+/// Encode `frame` into a heap buffer the RPCReader can borrow, wrapped as an
+/// OwnedRpc (matching what readRpc produces). The bytes are the raw protobuf
+/// payload — NOT length-prefixed — which is what RPCReader.init expects.
+fn ownedFromRpc(allocator: std.mem.Allocator, frame: rpc_pb.RPC) !pubsub.OwnedRpc {
+    const encoded = try frame.encode(allocator);
     defer if (encoded.len > 0) allocator.free(encoded);
     const payload = try allocator.dupe(u8, encoded);
     errdefer allocator.free(payload);
     return .{ .bytes = payload, .reader = try rpc_pb.RPCReader.init(payload) };
+}
+
+/// Decode a length-prefixed RPC frame at the front of `written` (the byte stream
+/// a FakeSink records). Returns the parsed RPCReader plus the slice consumed, so
+/// a multi-frame stream can be walked. Frames are `uvarint(len) || payload`.
+const DecodedFrame = struct { reader: rpc_pb.RPCReader, total_len: usize };
+
+fn decodeFrame(written: []const u8) ?DecodedFrame {
+    var len: usize = 0;
+    var shift: u6 = 0;
+    var i: usize = 0;
+    while (i < written.len) : (i += 1) {
+        len |= @as(usize, written[i] & 0x7f) << shift;
+        if ((written[i] & 0x80) == 0) {
+            i += 1;
+            break;
+        }
+        shift += 7;
+    } else return null;
+    if (i + len > written.len) return null;
+    const payload = written[i .. i + len];
+    const reader = rpc_pb.RPCReader.init(payload) catch return null;
+    return .{ .reader = reader, .total_len = i + len };
+}
+
+/// Whether `written` contains a frame whose first subscription matches
+/// (`topic`, `subscribe`). Walks every recorded frame.
+fn recordHasSubscription(written: []const u8, topic: []const u8, subscribe: bool) bool {
+    var rest = written;
+    while (decodeFrame(rest)) |decoded| {
+        var reader = decoded.reader;
+        while (reader.subscriptionsNext()) |sub| {
+            if (sub.getSubscribe() == subscribe and std.mem.eql(u8, sub.getTopicid(), topic)) return true;
+        }
+        rest = rest[decoded.total_len..];
+    }
+    return false;
+}
+
+/// Count recorded frames carrying a published Message on `topic` with the given
+/// `data`. Used to assert exactly-once forwarding (dedup).
+fn recordCountPublishes(written: []const u8, topic: []const u8, data: []const u8) usize {
+    var count: usize = 0;
+    var rest = written;
+    while (decodeFrame(rest)) |decoded| {
+        var reader = decoded.reader;
+        while (reader.publishNext()) |msg| {
+            if (std.mem.eql(u8, msg.getTopic(), topic) and std.mem.eql(u8, msg.getData(), data)) count += 1;
+        }
+        rest = rest[decoded.total_len..];
+    }
+    return count;
+}
+
+/// A recording message handler: captures the last (topic, from, data) delivered
+/// to the local node, into testing-allocator-owned buffers it frees on deinit.
+const RecordingHandler = struct {
+    allocator: std.mem.Allocator,
+    calls: usize = 0,
+    topic: ?[]u8 = null,
+    from: ?[]u8 = null,
+    data: ?[]u8 = null,
+
+    fn deinit(self: *RecordingHandler) void {
+        if (self.topic) |t| self.allocator.free(t);
+        if (self.from) |f| self.allocator.free(f);
+        if (self.data) |d| self.allocator.free(d);
+    }
+
+    fn handler(self: *RecordingHandler) MessageHandler {
+        return .{ .ctx = self, .on_message = onMessage };
+    }
+
+    fn onMessage(ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void {
+        const self: *RecordingHandler = @ptrCast(@alignCast(ctx));
+        // Replace any prior capture (the tests deliver once); copy the borrowed
+        // slices, which are only valid for this call.
+        if (self.topic) |t| self.allocator.free(t);
+        if (self.from) |f| self.allocator.free(f);
+        if (self.data) |d| self.allocator.free(d);
+        self.topic = self.allocator.dupe(u8, topic) catch null;
+        self.from = self.allocator.dupe(u8, from) catch null;
+        self.data = self.allocator.dupe(u8, data) catch null;
+        self.calls += 1;
+    }
+};
+
+// --- floodsub pub/sub fake tests -------------------------------------------
+
+/// Connect a fake peer to a running router and wait until it is tracked. Returns
+/// the conn (owned by the caller; free with destroyFakeConn after teardown).
+fn connectFakePeer(io: std.Io, allocator: std.mem.Allocator, router: *FakeRouter, peer: PeerId) !*FakeTransport.FakeConn {
+    const conn = try makeFakeConn(allocator);
+    errdefer destroyFakeConn(allocator, conn);
+    const before = router.peerCount();
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
+    // Spin until the count rises (peer fully wired) with a bounded wait.
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (router.peerCount() > before) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    return conn;
+}
+
+test "subscribe announces the subscription to a connected peer" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // Subscribe locally; the router announces it to every peer on the subscribe
+    // lane. The writer fiber opens the fake stream and records the framed RPC.
+    const topic = try allocator.dupe(u8, "t");
+    try router.inbox.putOne(io, .{ .subscribe = .{ .topic = topic } });
+
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordHasSubscription(conn.record.written.items, "t", true)) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(recordHasSubscription(conn.record.written.items, "t", true));
+}
+
+test "inbound subscription is tracked on the source peer" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // Peer X announces it subscribes to "t"; the router records it on X's state.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, "t", true) } });
+
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (peerTracksTopic(router, peer, "t")) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(peerTracksTopic(router, peer, "t"));
+
+    // And an unsubscribe removes it.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, "t", false) } });
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (!peerTracksTopic(router, peer, "t")) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(!peerTracksTopic(router, peer, "t"));
+}
+
+test "floodsub forwards an inbound publish to subscribed peers, not the source" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    defer router.destroy();
+    try router.start();
+
+    const peer_x = testPeer(1);
+    const peer_y = testPeer(2);
+    const conn_x = try connectFakePeer(io, allocator, router, peer_x);
+    defer destroyFakeConn(allocator, conn_x);
+    const conn_y = try connectFakePeer(io, allocator, router, peer_y);
+    defer destroyFakeConn(allocator, conn_y);
+
+    // Both peers announce they subscribe to "t".
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_x, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_y, .rpc = try buildInboundSub(allocator, "t", true) } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (peerTracksTopic(router, peer_x, "t") and peerTracksTopic(router, peer_y, "t")) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(peerTracksTopic(router, peer_x, "t") and peerTracksTopic(router, peer_y, "t"));
+
+    // X publishes a message on "t". It must be forwarded to Y but NOT echoed to X.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_x,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x01", "t", "hello"),
+    } });
+
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(conn_y.record.written.items, "t", "hello") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_y.record.written.items, "t", "hello"));
+    // No echo back to the source peer X.
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(conn_x.record.written.items, "t", "hello"));
+}
+
+test "floodsub dedups a repeated publish (same from+seqno) to forward once" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null);
+    defer router.destroy();
+    try router.start();
+
+    const peer_x = testPeer(1);
+    const peer_y = testPeer(2);
+    const conn_x = try connectFakePeer(io, allocator, router, peer_x);
+    defer destroyFakeConn(allocator, conn_x);
+    const conn_y = try connectFakePeer(io, allocator, router, peer_y);
+    defer destroyFakeConn(allocator, conn_y);
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_y, .rpc = try buildInboundSub(allocator, "t", true) } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (peerTracksTopic(router, peer_y, "t")) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(peerTracksTopic(router, peer_y, "t"));
+
+    // Post the identical publish (same from + seqno) twice. The seen-cache must
+    // suppress the second so Y receives exactly one forward.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_x,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x07", "t", "dup"),
+    } });
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_x,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x07", "t", "dup"),
+    } });
+
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(conn_y.record.written.items, "t", "dup") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    // Give the (suppressed) second a chance to wrongly land before asserting.
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_y.record.written.items, "t", "dup"));
+}
+
+test "local publish forwards to subscribers and delivers to the local handler" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler());
+    defer router.destroy();
+    try router.start();
+
+    // Subscribe locally so the publish is delivered to our own handler too.
+    try router.inbox.putOne(io, .{ .subscribe = .{ .topic = try allocator.dupe(u8, "t") } });
+
+    const peer_y = testPeer(2);
+    const conn_y = try connectFakePeer(io, allocator, router, peer_y);
+    defer destroyFakeConn(allocator, conn_y);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_y, .rpc = try buildInboundSub(allocator, "t", true) } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (peerTracksTopic(router, peer_y, "t")) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(peerTracksTopic(router, peer_y, "t"));
+
+    // Publish locally: Y gets the forwarded frame and our handler fires.
+    try router.inbox.putOne(io, .{ .publish = .{
+        .topic = try allocator.dupe(u8, "t"),
+        .data = try allocator.dupe(u8, "hello"),
+    } });
+
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (rec.calls > 0 and recordCountPublishes(conn_y.record.written.items, "t", "hello") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_y.record.written.items, "t", "hello"));
+    try std.testing.expectEqual(@as(usize, 1), rec.calls);
+    try std.testing.expectEqualSlices(u8, "t", rec.topic.?);
+    try std.testing.expectEqualSlices(u8, "hello", rec.data.?);
+    // The delivered `from` is our own peer id (the publish origin).
+    try std.testing.expectEqualSlices(u8, local_test_peer.bytes[0..local_test_peer.len], rec.from.?);
 }

@@ -103,6 +103,9 @@ pub const SwitchTransport = struct {
 
 const Router = router_mod.Router(SwitchTransport);
 
+/// Re-export so callers construct a handler without importing router.zig.
+pub const MessageHandler = router_mod.MessageHandler;
+
 /// Per-stream inbound handler. The Switch's dispatcher creates one of these per
 /// inbound `/meshsub/1.1.0` stream (capturing the sender's peer id) and runs it
 /// on a handler fiber the Switch owns and cancels on connection teardown. The
@@ -159,8 +162,22 @@ pub const Gossipsub = struct {
     /// Construct the router, start its fiber, register the inbound service and
     /// the peer-event callback on the Switch. On any failure the router is torn
     /// down so nothing leaks.
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, sw: *Switch) !*Gossipsub {
-        const router = try Router.create(allocator, io, .{});
+    ///
+    /// `local_peer` is this node's own peer id (used as Message.from on publish).
+    /// The Switch/QuicEndpoint here does not expose a local-peer-id accessor (the
+    /// endpoint does not even retain the host KeyPair), so the caller — which owns
+    /// the KeyPair — passes it in (e.g. `try key.peerId(allocator)`).
+    ///
+    /// `message_handler` (optional) receives messages delivered on topics this
+    /// node subscribes to; see router's MessageHandler for the call contract.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        sw: *Switch,
+        local_peer: PeerId,
+        message_handler: ?MessageHandler,
+    ) !*Gossipsub {
+        const router = try Router.create(allocator, io, .{}, local_peer, message_handler);
         errdefer router.destroy();
 
         try router.start();
@@ -241,6 +258,50 @@ pub const Gossipsub = struct {
         return self.router.peerCount();
     }
 
+    /// Subscribe the local node to `topic`. Dups the topic into an owned payload
+    /// and posts a `subscribe` command; the router announces the subscription to
+    /// every peer and begins delivering matching messages to the handler. On a
+    /// closed inbox (shutting down) the dup is freed and the call is a no-op.
+    pub fn subscribe(self: *Gossipsub, topic: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(owned);
+        self.router.inbox.putOne(self.router.io, .{ .subscribe = .{ .topic = owned } }) catch |err| switch (err) {
+            error.Closed => self.allocator.free(owned),
+            else => return err,
+        };
+    }
+
+    /// Unsubscribe the local node from `topic`. Dups the topic and posts an
+    /// `unsubscribe` command; the router announces the withdrawal to every peer.
+    pub fn unsubscribe(self: *Gossipsub, topic: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(owned);
+        self.router.inbox.putOne(self.router.io, .{ .unsubscribe = .{ .topic = owned } }) catch |err| switch (err) {
+            error.Closed => self.allocator.free(owned),
+            else => return err,
+        };
+    }
+
+    /// Publish `data` on `topic` from the local node. Dups both into owned
+    /// payloads and posts a `publish` command; the router forwards the message to
+    /// every subscribed peer (and delivers locally if we subscribe to `topic`).
+    pub fn publish(self: *Gossipsub, topic: []const u8, data: []const u8) !void {
+        const owned_topic = try self.allocator.dupe(u8, topic);
+        errdefer self.allocator.free(owned_topic);
+        const owned_data = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(owned_data);
+        self.router.inbox.putOne(self.router.io, .{ .publish = .{
+            .topic = owned_topic,
+            .data = owned_data,
+        } }) catch |err| switch (err) {
+            error.Closed => {
+                self.allocator.free(owned_topic);
+                self.allocator.free(owned_data);
+            },
+            else => return err,
+        };
+    }
+
     // The Switch peer-event callbacks: ctx is the *Router. Each posts one Command
     // to the router inbox and returns. `putOne` blocks only if the inbox is full
     // (it never drops): the inbox is sized large enough that a full inbox is not
@@ -293,12 +354,15 @@ test "two gossipsub nodes wire up per-peer I/O on connect and tear down on disco
     const client = try Switch.init(allocator, io, client_endpoint);
     defer client.deinit();
 
+    const server_peer = try server_key.peerId(allocator);
+    const client_peer = try client_key.peerId(allocator);
+
     // Construct a gossipsub on each switch BEFORE dialing so each one's peer-event
     // callback is registered when the connection comes up.
-    const server_gs = try Gossipsub.init(allocator, io, server);
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, null);
     var server_gs_live = true;
     defer if (server_gs_live) server_gs.deinit();
-    const client_gs = try Gossipsub.init(allocator, io, client);
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, null);
     var client_gs_live = true;
     defer if (client_gs_live) client_gs.deinit();
 
@@ -367,4 +431,178 @@ test "two gossipsub nodes wire up per-peer I/O on connect and tear down on disco
     server_gs_live = false;
     client_gs.deinit();
     client_gs_live = false;
+}
+
+/// A thread-safe recording handler for the end-to-end delivery test: the
+/// router fiber (on a worker thread) calls `onMessage`; the test fiber polls
+/// `received`. The captured slices are copied under a mutex; freed on deinit.
+const DeliveryRecorder = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    io: std.Io,
+    received: std.atomic.Value(bool) = .init(false),
+    topic: ?[]u8 = null,
+    from: ?[]u8 = null,
+    data: ?[]u8 = null,
+
+    fn deinit(self: *DeliveryRecorder) void {
+        if (self.topic) |t| self.allocator.free(t);
+        if (self.from) |f| self.allocator.free(f);
+        if (self.data) |d| self.allocator.free(d);
+    }
+
+    fn handler(self: *DeliveryRecorder) MessageHandler {
+        return .{ .ctx = self, .on_message = onMessage };
+    }
+
+    fn onMessage(ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void {
+        const self: *DeliveryRecorder = @ptrCast(@alignCast(ctx));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        // First delivery wins; ignore any later duplicate so the captured slices
+        // stay stable for the test's assertions.
+        if (self.received.load(.acquire)) return;
+        self.topic = self.allocator.dupe(u8, topic) catch null;
+        self.from = self.allocator.dupe(u8, from) catch null;
+        self.data = self.allocator.dupe(u8, data) catch null;
+        self.received.store(true, .release);
+    }
+};
+
+test "two gossipsub nodes: subscribe propagates and a publish is delivered end to end" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    const server_peer = try server_key.peerId(allocator);
+    const client_peer = try client_key.peerId(allocator);
+
+    // The client (A) is the publisher; the server (B) subscribes and records.
+    // Construct both gossipsubs BEFORE dialing so the peer-event callbacks are
+    // registered when the connection comes up.
+    var rec = DeliveryRecorder{ .allocator = allocator, .io = io };
+    defer rec.deinit();
+
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, rec.handler());
+    var server_gs_live = true;
+    defer if (server_gs_live) server_gs.deinit();
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, null);
+    var client_gs_live = true;
+    defer if (client_gs_live) client_gs.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    var client_conn_live = true;
+    defer if (client_conn_live) client_conn.deinit();
+
+    const server_conn = try server.accept();
+    var server_conn_live = true;
+    defer if (server_conn_live) server_conn.deinit();
+
+    // Start inbound stream dispatch on BOTH connections so each side's
+    // `/meshsub` inbound handler runs (the Switch does not auto-dispatch). Without
+    // this the peers wire up but never exchange RPCs, so subscriptions/publishes
+    // never reach the other router.
+    try client_conn.startInboundDispatcher(.{});
+    try server_conn.startInboundDispatcher(.{});
+
+    // Wait for both sides to wire up the peer.
+    var waited_ms: u64 = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (server_gs.peerCount() == 1 and client_gs.peerCount() == 1) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), server_gs.peerCount());
+    try std.testing.expectEqual(@as(usize, 1), client_gs.peerCount());
+
+    // B subscribes to "t"; the subscription must propagate to A so A learns B is
+    // interested (A's router tracks B under its peer_topics). Poll for that.
+    try server_gs.subscribe("t");
+
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state| {
+            if (state.topics.contains("t")) break;
+        }
+        io_time.ms(10).sleep(io) catch {};
+    }
+    {
+        const tracked = if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state|
+            state.topics.contains("t")
+        else
+            false;
+        try std.testing.expect(tracked);
+    }
+
+    // A publishes on "t"; B's handler must receive ("t", A's id, "hello").
+    try client_gs.publish("t", "hello");
+
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (rec.received.load(.acquire)) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+    try std.testing.expect(rec.received.load(.acquire));
+    try std.testing.expectEqualSlices(u8, "t", rec.topic.?);
+    try std.testing.expectEqualSlices(u8, "hello", rec.data.?);
+    try std.testing.expectEqualSlices(u8, client_peer.bytes[0..client_peer.len], rec.from.?);
+
+    // Tear down in the gossipsub-required order: close connections first (so no
+    // inbound /meshsub handler survives and no peer event can fire), then deinit
+    // each gossipsub (clears the Switch callback + frees the router) before the
+    // switches/endpoints are freed by the remaining defers.
+    client_conn.deinit();
+    client_conn_live = false;
+    server_conn.deinit();
+    server_conn_live = false;
+
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (server_gs.peerCount() == 0 and client_gs.peerCount() == 0) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+
+    server_gs.deinit();
+    server_gs_live = false;
+    client_gs.deinit();
+    client_gs_live = false;
+}
+
+/// The Router's PeerKey for a PeerId (zero-padded bytes). Mirrors router.zig's
+/// private `peerKey`, reproduced here so this test can index the router's peer
+/// map directly to assert the subscription propagated.
+fn peerKeyOf(peer: PeerId) [64]u8 {
+    var key: [64]u8 = [_]u8{0} ** 64;
+    @memcpy(key[0..peer.len], peer.bytes[0..peer.len]);
+    return key;
 }
