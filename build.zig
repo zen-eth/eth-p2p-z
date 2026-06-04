@@ -116,6 +116,29 @@ pub fn build(b: *std.Build) void {
     const transport_interop_step = b.step("transport-interop", "Run the transport interop binary");
     transport_interop_step.dependOn(&transport_interop_run_cmd.step);
 
+    const gossipsub_interop_module = b.createModule(.{
+        .root_source_file = b.path("interop/gossipsub/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addImports(gossipsub_interop_module, deps);
+    gossipsub_interop_module.addImport("zig-libp2p", root_module);
+    gossipsub_interop_module.addImport("zio", zio_dep.module("zio"));
+
+    const gossipsub_interop_exe = b.addExecutable(.{
+        .name = "libp2p-gossipsub-interop",
+        .root_module = gossipsub_interop_module,
+    });
+    b.installArtifact(gossipsub_interop_exe);
+
+    const gossipsub_interop_run_cmd = b.addRunArtifact(gossipsub_interop_exe);
+    gossipsub_interop_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        gossipsub_interop_run_cmd.addArgs(args);
+    }
+    const gossipsub_interop_step = b.step("gossipsub-interop", "Run the gossipsub interop binary");
+    gossipsub_interop_step.dependOn(&gossipsub_interop_run_cmd.step);
+
     const run_cmd = b.addRunArtifact(libp2p_exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
