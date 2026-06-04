@@ -49,14 +49,23 @@ pub fn writePublish(allocator: std.mem.Allocator, io: std.Io, stream: *Stream, m
     try writeRpc(allocator, io, stream, frame);
 }
 
-pub fn writeRpc(allocator: std.mem.Allocator, io: std.Io, stream: *Stream, frame: rpc_pb.RPC) !void {
-    const payload = try frame.encode(allocator);
+/// Encodes `msg` and returns owned, length-prefixed wire bytes (uvarint length || payload).
+/// Caller owns the returned slice and must free it.
+pub fn frameRpc(allocator: std.mem.Allocator, msg: rpc_pb.RPC) ![]u8 {
+    const payload = try msg.encode(allocator);
     defer if (payload.len > 0) allocator.free(payload);
-
     var len_buf: [max_varint_len]u8 = undefined;
     const len_len = encodeUvarint(&len_buf, payload.len);
-    try stream.writeAll(io, len_buf[0..len_len], .{});
-    try stream.writeAll(io, payload, .{});
+    const framed = try allocator.alloc(u8, len_len + payload.len);
+    @memcpy(framed[0..len_len], len_buf[0..len_len]);
+    @memcpy(framed[len_len..], payload);
+    return framed;
+}
+
+pub fn writeRpc(allocator: std.mem.Allocator, io: std.Io, stream: *Stream, frame: rpc_pb.RPC) !void {
+    const framed = try frameRpc(allocator, frame);
+    defer allocator.free(framed);
+    try stream.writeAll(io, framed, .{});
 }
 
 pub fn readRpc(allocator: std.mem.Allocator, io: std.Io, stream: *Stream) !OwnedRpc {
@@ -104,4 +113,31 @@ fn readUvarint(io: std.Io, stream: *Stream) !usize {
 // pubsub source file here as `_ = @import("filename.zig");`.
 test {
     _ = @import("rpc.zig");
+    _ = @import("peer_io.zig");
+}
+
+test "frameRpc length prefix matches payload length" {
+    const allocator = std.testing.allocator;
+    const sub = rpc_pb.RPC{ .subscriptions = &[_]?rpc_pb.RPC.SubOpts{.{ .subscribe = true, .topicid = "t" }} };
+
+    const framed = try frameRpc(allocator, sub);
+    defer allocator.free(framed);
+
+    // The first bytes must be a valid uvarint that equals the remaining payload length.
+    var shift: usize = 0;
+    var prefix_len: usize = 0;
+    var i: usize = 0;
+    while (i < framed.len) : (i += 1) {
+        prefix_len |= (@as(usize, framed[i] & 0x7f) << @intCast(shift));
+        shift += 7;
+        if ((framed[i] & 0x80) == 0) { i += 1; break; }
+    }
+    const payload_slice = framed[i..];
+    try std.testing.expectEqual(prefix_len, payload_slice.len);
+
+    // The payload must round-trip: parse it and find the subscription.
+    var reader = try rpc_pb.RPCReader.init(payload_slice);
+    const got = reader.subscriptionsNext() orelse return error.MissingSub;
+    try std.testing.expect(got.getSubscribe());
+    try std.testing.expectEqualSlices(u8, "t", got.getTopicid());
 }
