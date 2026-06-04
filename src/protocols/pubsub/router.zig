@@ -149,6 +149,22 @@ const MeshParams = struct {
     /// Once `heartbeat_tick - fanout_last_pub[topic]` exceeds this the fanout
     /// peer set is dropped (we stopped publishing to a topic we don't subscribe).
     fanout_ttl_ticks: u64 = 60,
+    /// Number of gossip (IHAVE) targets per topic per heartbeat: peers subscribed
+    /// to the topic but NOT in its mesh/fanout, picked up to this many. (go-libp2p
+    /// `D_lazy`; go also uses `max(D_lazy, GossipFactor*eligible)` — the
+    /// GossipFactor scaling is a future refinement.)
+    d_lazy: usize = 6,
+    /// Upper bound on message-ids advertised in a single IHAVE; a longer id list
+    /// is truncated. (go-libp2p `MaxIHaveLength`.)
+    max_ihave_length: usize = 5000,
+    /// Upper bound on message-ids we will request (in one IWANT) in response to a
+    /// single inbound IHAVE. A simple per-IHAVE cap; finer rate-limiting and
+    /// IWANT-promise tracking (for scoring) are a future refinement.
+    max_iwant_request_ids: usize = 5000,
+    /// Upper bound on messages we will serve from the cache in response to a
+    /// single inbound IWANT. Bounds the work one peer can ask of us per request;
+    /// finer rate-limiting is a future refinement.
+    max_iwant_to_serve: usize = 5000,
 };
 
 const mesh_params: MeshParams = .{};
@@ -958,10 +974,92 @@ pub fn Router(comptime Transport: type) type {
             router.maintainMeshes();
             router.maintainFanout();
 
+            // Advertise recently-cached message ids (IHAVE) to gossip-eligible
+            // non-mesh peers BEFORE sliding the window: emission reads the
+            // gossipable windows, and the shift below evicts the oldest, so
+            // emitting first advertises everything still in the window.
+            router.emitGossip();
+
             // Slide the message-cache window once per heartbeat so it retains the
             // last history_length heartbeats' worth of messages (the oldest is
             // evicted, a fresh newest window opens).
             router.message_cache.shift();
+        }
+
+        /// Emit IHAVE gossip for every topic we participate in. For each topic
+        /// (subscribed topics, plus active fanout topics) advertise the message ids
+        /// in the cache's gossipable windows to up to `d_lazy` peers that subscribe
+        /// to the topic but are NOT in its mesh (and, for a fanout topic, not in its
+        /// fanout set) — the "lazy" peers that get gossip rather than full messages.
+        ///
+        /// Selection is deterministic (peer-map iteration order); a random shuffle
+        /// for anti-eclipse fairness, and `GossipFactor`-scaled fan-out, are future
+        /// refinements. Score-gated emission arrives with peer scoring.
+        fn emitGossip(router: *Self) void {
+            var topic_it = router.my_topics.keyIterator();
+            while (topic_it.next()) |key| router.emitGossipForTopic(key.*);
+
+            var fanout_it = router.fanout.iterator();
+            while (fanout_it.next()) |entry| {
+                // A subscribed topic also living in fanout cannot happen (subscribe
+                // drops the fanout entry), so this never double-emits.
+                router.emitGossipForTopic(entry.key_ptr.*);
+            }
+        }
+
+        /// Emit IHAVE for a single topic: gather the cache's gossipable ids for it
+        /// (truncated at `max_ihave_length`), then send an IHAVE carrying them to up
+        /// to `d_lazy` gossip-eligible peers. No-op if the cache has nothing for the
+        /// topic. The borrowed ids stay valid through the sends (no `shift` happens
+        /// before this returns) and `frameRpc` copies them into each frame.
+        fn emitGossipForTopic(router: *Self, topic: []const u8) void {
+            const ids = router.message_cache.getGossipIDs(router.allocator, topic) catch return;
+            defer router.allocator.free(ids);
+            if (ids.len == 0) return;
+
+            // Cap the advertised id count. The borrowed `[]const u8` ids are passed
+            // straight to the builder (frameRpc copies them), so a sub-slice is fine.
+            const capped = ids[0..@min(ids.len, mesh_params.max_ihave_length)];
+
+            var targets: std.ArrayListUnmanaged(PeerId) = .empty;
+            defer targets.deinit(router.allocator);
+            router.selectGossipTargets(topic, &targets);
+
+            for (targets.items) |peer| router.sendIHave(peer, topic, capped);
+        }
+
+        /// Append up to `d_lazy` gossip targets for `topic` to `out`: peers that
+        /// announced they subscribe to `topic` but are NOT in its mesh and NOT in
+        /// its fanout set (those already get full messages). Peer-map iteration
+        /// order is the selection order (deterministic; shuffle is a refinement).
+        fn selectGossipTargets(router: *Self, topic: []const u8, out: *std.ArrayListUnmanaged(PeerId)) void {
+            const mesh_set = router.mesh.getPtr(topic);
+            const fanout_set = router.fanout.getPtr(topic);
+            var it = router.peers.iterator();
+            while (it.next()) |entry| {
+                if (out.items.len >= mesh_params.d_lazy) break;
+                const peer = entry.value_ptr.*.peer;
+                if (!entry.value_ptr.*.topics.contains(topic)) continue;
+                const key = peerKey(&peer);
+                if (mesh_set) |s| if (s.contains(key)) continue;
+                if (fanout_set) |s| if (s.contains(key)) continue;
+                out.append(router.allocator, peer) catch break;
+            }
+        }
+
+        /// Send an IHAVE(topic, ids) to `peer` on its control lane. The borrowed
+        /// `ids` are copied by `frameRpc`, so they need only outlive this call. The
+        /// IHAVE builder takes `[]const ?[]const u8`, so the ids are wrapped through
+        /// a small scratch array of optionals (freed once the frame is built).
+        fn sendIHave(router: *Self, peer: PeerId, topic: []const u8, ids: []const []const u8) void {
+            const opt_ids = router.allocator.alloc(?[]const u8, ids.len) catch return;
+            defer router.allocator.free(opt_ids);
+            for (ids, 0..) |id, i| opt_ids[i] = id;
+
+            const empty_ids = router.emptyIds() orelse return;
+            const ihave = rpc.buildIHave(topic, opt_ids);
+            const ctrl = rpc_pb.ControlMessage{ .ihave = &.{ihave} };
+            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), empty_ids, .{ .one = peer });
         }
 
         /// Mesh maintenance for every subscribed topic: graft new peers in when
@@ -1067,11 +1165,13 @@ pub fn Router(comptime Transport: type) type {
                 );
             }
 
-            // Mesh control: GRAFT/PRUNE move the source peer in/out of a topic's
-            // mesh. IHAVE/IWANT/IDONTWANT belong to later layers and stay ignored.
-            // Any control replies (a PRUNE rejecting a GRAFT) are built + framed
-            // inside the handlers, which copy the bytes, so freeing the OwnedRpc
-            // after this returns is safe.
+            // Mesh + gossip control. GRAFT/PRUNE move the source peer in/out of a
+            // topic's mesh. IHAVE makes us reply with an IWANT for the ids we have
+            // not seen; IWANT makes us serve the requested messages from the cache.
+            // IDONTWANT belongs to a later layer and stays ignored. Any control
+            // replies (a PRUNE rejecting a GRAFT, an IWANT, a served message) are
+            // built + framed inside the handlers, which copy the bytes, so freeing
+            // the OwnedRpc after this returns is safe.
             if (reader.getControl()) |ctrl_reader| {
                 var control = ctrl_reader;
                 while (control.graftNext()) |graft| {
@@ -1080,7 +1180,67 @@ pub fn Router(comptime Transport: type) type {
                 while (control.pruneNext()) |prune| {
                     router.handlePrune(source, prune.getTopicID(), prune.getBackoff());
                 }
+                while (control.ihaveNext()) |ihave| {
+                    var ih = ihave;
+                    router.handleIHave(source, &ih);
+                }
+                while (control.iwantNext()) |iwant| {
+                    var iw = iwant;
+                    router.handleIWant(source, &iw);
+                }
             } else |_| {}
+        }
+
+        /// Handle an inbound IHAVE: the source peer announces it holds the listed
+        /// message ids for a topic. Request (in ONE IWANT, on the control lane) the
+        /// ids we have NOT already seen — capped at `max_iwant_request_ids` so one
+        /// peer's IHAVE cannot make us request an unbounded set. The unseen ids are
+        /// copied into a transient owned list (the wire-borrowed ids back the reader
+        /// bytes, which `frameRpc` copies, but a local list keeps the call simple
+        /// and lets us dedup within the IHAVE). We do NOT mark these ids seen — that
+        /// happens only on actual receipt of the message (via the normal inbound
+        /// path), so a dropped IWANT/serve does not permanently suppress the id.
+        ///
+        /// Finer rate-limiting and IWANT-promise tracking (so a peer that fails to
+        /// deliver what it advertised is penalised) arrive with peer scoring.
+        fn handleIHave(router: *Self, source: PeerId, ihave: *rpc_pb.ControlIHaveReader) void {
+            if (!router.peers.contains(peerKey(&source))) return;
+
+            var wanted: std.ArrayListUnmanaged(?[]const u8) = .empty;
+            defer wanted.deinit(router.allocator);
+            while (ihave.messageIDsNext()) |id| {
+                if (wanted.items.len >= mesh_params.max_iwant_request_ids) break;
+                if (router.seen.contains(id)) continue;
+                wanted.append(router.allocator, id) catch break;
+            }
+            if (wanted.items.len == 0) return;
+
+            const ids = router.emptyIds() orelse return;
+            const iwant = rpc.buildIWant(wanted.items);
+            const ctrl = rpc_pb.ControlMessage{ .iwant = &.{iwant} };
+            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), ids, .{ .one = source });
+        }
+
+        /// Handle an inbound IWANT: the source peer requests the listed message
+        /// ids. For each id still in the cache, retain its frame and push it onto
+        /// the source's `.data` lane — the cached frame is already a complete
+        /// single-message publish RPC, so the served message re-enters the peer's
+        /// normal inbound path on the other side (dedup, deliver, cache, forward).
+        /// Ids we do not have are ignored. Capped at `max_iwant_to_serve` messages
+        /// per request so one peer cannot make us serve an unbounded set; finer
+        /// rate-limiting is a future refinement.
+        fn handleIWant(router: *Self, source: PeerId, iwant: *rpc_pb.ControlIWantReader) void {
+            const state = router.peers.get(peerKey(&source)) orelse return;
+            var served: usize = 0;
+            while (iwant.messageIDsNext()) |id| {
+                if (served >= mesh_params.max_iwant_to_serve) break;
+                const frame = router.message_cache.get(id) orelse continue;
+                // Retain before pushing (the queue holds the reference; the cache
+                // keeps its own). `pushTo` releases on a rejected push, so a full
+                // queue does not leak the retained reference.
+                router.pushTo(state, .data, frame);
+                served += 1;
+            }
         }
 
         /// Handle an inbound GRAFT(topic) from `source`: add the peer to the
@@ -1178,11 +1338,19 @@ pub fn Router(comptime Transport: type) type {
 
             router.deliverLocal(topic, from, data);
 
-            // Forward to the topic's mesh members, minus the sender. No mesh for
-            // the topic → nothing to forward.
-            if (router.mesh.getPtr(topic)) |set| {
-                router.forwardToPeerSet(set, exclude, from, seqno, topic, data, id.bytes);
-            }
+            // Cache EVERY accepted message (so a later IWANT can be served and a
+            // heartbeat IHAVE can advertise it) and forward it over the topic's
+            // mesh, minus the sender. Caching is independent of forwarding: a
+            // message accepted on a topic with no mesh members is still cached.
+            router.cacheAndForward(
+                router.mesh.getPtr(topic),
+                exclude,
+                from,
+                seqno,
+                topic,
+                data,
+                id.bytes,
+            );
         }
 
         /// Invoke the message handler if the local node subscribes to `topic`.
@@ -1193,10 +1361,16 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Frame a single message ONCE, store it in the message cache (so a later
-        /// IWANT can be served without a second copy), and hand one reference to
-        /// every still-tracked peer in `set` (a mesh or fanout PeerSet), optionally
-        /// excluding one peer (the relay source). The shared frame carries the
-        /// message id for a later IDONTWANT purge. Fanned out on the `.data` lane.
+        /// IWANT can be served and a heartbeat IHAVE can advertise it), and — when
+        /// `set` is non-null — hand one reference to every still-tracked peer in it
+        /// (a mesh or fanout PeerSet), optionally excluding one peer (the relay
+        /// source). The shared frame carries the message id for a later IDONTWANT
+        /// purge. Fanned out on the `.data` lane.
+        ///
+        /// Caching is unconditional and independent of forwarding: a message
+        /// accepted on a topic we have no mesh for (a null `set`) is still cached,
+        /// matching go-libp2p (every accepted message enters the cache). The
+        /// fan-out target set may also be empty.
         ///
         /// Builds the frame here (ref = 1, the builder reference) rather than via
         /// `fanOut` so the single allocation can be shared with the cache: `put`
@@ -1204,9 +1378,9 @@ pub fn Router(comptime Transport: type) type {
         /// heartbeats), `fanOutFrame` retains it per target, and the trailing
         /// `release` drops the builder reference — leaving exactly the cache's and
         /// the accepting queues' references live.
-        fn forwardToPeerSet(
+        fn cacheAndForward(
             router: *Self,
-            set: *const PeerSet,
+            set: ?*const PeerSet,
             exclude: ?PeerId,
             from: []const u8,
             seqno: []const u8,
@@ -1239,10 +1413,14 @@ pub fn Router(comptime Transport: type) type {
 
             // Cache the message (retains the frame) so an IWANT can later be
             // served by retaining + pushing it; `put` dedups so the same id is
-            // never stored or retained twice.
+            // never stored or retained twice. Done for every accepted message,
+            // whether or not there are mesh peers to forward to.
             router.message_cache.put(id, topic, frame) catch {};
 
-            router.fanOutFrame(.data, frame, .{ .peer_set = .{ .set = set, .exclude = exclude } });
+            // Forward over the mesh/fanout set when there is one (it may be empty).
+            if (set) |s| {
+                router.fanOutFrame(.data, frame, .{ .peer_set = .{ .set = s, .exclude = exclude } });
+            }
         }
 
         /// Local subscribe: record the topic, announce it to every peer, then JOIN
@@ -1343,20 +1521,27 @@ pub fn Router(comptime Transport: type) type {
 
             router.deliverLocal(topic, from, data);
 
+            // A published message is ALWAYS cached (so a later IWANT can serve it
+            // and a heartbeat IHAVE can advertise it), whether or not we have any
+            // mesh/fanout peers to forward it to right now. The frame is built and
+            // cached once, then fanned out over whichever set applies.
             if (router.my_topics.contains(topic)) {
-                // Subscribed: forward over the topic's mesh (no source to exclude).
-                if (router.mesh.getPtr(topic)) |set| {
-                    router.forwardToPeerSet(set, null, from, seqno, topic, data, id.bytes);
-                }
+                // Subscribed: cache + forward over the topic's mesh (may be empty
+                // or absent — no source to exclude).
+                router.cacheAndForward(router.mesh.getPtr(topic), null, from, seqno, topic, data, id.bytes);
             } else if (router.fanoutGetOrCreate(topic)) |set| {
-                // Not subscribed: forward over the fanout set, topping it up to D
-                // first, and refresh the last-publish tick (the entry exists —
-                // fanoutGetOrCreate inserted it — so this only updates the value,
-                // never stores a new key) so the heartbeat times out the TTL from
-                // the most recent publish.
+                // Not subscribed: cache + forward over the fanout set, topping it
+                // up to D first, and refresh the last-publish tick (the entry
+                // exists — fanoutGetOrCreate inserted it — so this only updates the
+                // value, never stores a new key) so the heartbeat times out the TTL
+                // from the most recent publish.
                 router.fanoutReplenish(topic, set);
                 if (router.fanout_last_pub.getPtr(topic)) |last| last.* = router.heartbeat_tick;
-                router.forwardToPeerSet(set, null, from, seqno, topic, data, id.bytes);
+                router.cacheAndForward(set, null, from, seqno, topic, data, id.bytes);
+            } else {
+                // Not subscribed and the fanout set could not be created (OOM):
+                // still cache the message so it is gossipable/servable.
+                router.cacheAndForward(null, null, from, seqno, topic, data, id.bytes);
             }
         }
 
@@ -1839,6 +2024,18 @@ fn buildInboundPrune(allocator: std.mem.Allocator, topic: []const u8, backoff: u
     return ownedFromRpc(allocator, rpc_pb.RPC{ .control = ctrl });
 }
 
+/// Build an OwnedRpc carrying a single control IHAVE(`topic`, `ids`).
+fn buildInboundIHave(allocator: std.mem.Allocator, topic: []const u8, ids: []const ?[]const u8) !pubsub.OwnedRpc {
+    const ctrl = rpc_pb.ControlMessage{ .ihave = &[_]?rpc_pb.ControlIHave{rpc.buildIHave(topic, ids)} };
+    return ownedFromRpc(allocator, rpc_pb.RPC{ .control = ctrl });
+}
+
+/// Build an OwnedRpc carrying a single control IWANT(`ids`).
+fn buildInboundIWant(allocator: std.mem.Allocator, ids: []const ?[]const u8) !pubsub.OwnedRpc {
+    const ctrl = rpc_pb.ControlMessage{ .iwant = &[_]?rpc_pb.ControlIWant{rpc.buildIWant(ids)} };
+    return ownedFromRpc(allocator, rpc_pb.RPC{ .control = ctrl });
+}
+
 /// Encode `frame` into a heap buffer the RPCReader can borrow, wrapped as an
 /// OwnedRpc (matching what readRpc produces). The bytes are the raw protobuf
 /// payload — NOT length-prefixed — which is what RPCReader.init expects.
@@ -1931,6 +2128,48 @@ fn recordCountGrafts(written: []const u8, topic: []const u8) usize {
             var control = ctrl_reader;
             while (control.graftNext()) |graft| {
                 if (std.mem.eql(u8, graft.getTopicID(), topic)) count += 1;
+            }
+        } else |_| {}
+        rest = rest[decoded.total_len..];
+    }
+    return count;
+}
+
+/// Whether `written` contains a control IHAVE for `topic` that advertises `id`.
+/// Walks every recorded frame and every IHAVE/message-id within each control msg.
+fn recordHasIHave(written: []const u8, topic: []const u8, id: []const u8) bool {
+    var rest = written;
+    while (decodeFrame(rest)) |decoded| {
+        var reader = decoded.reader;
+        if (reader.getControl()) |ctrl_reader| {
+            var control = ctrl_reader;
+            while (control.ihaveNext()) |ihave| {
+                var ih = ihave;
+                if (!std.mem.eql(u8, ih.getTopicID(), topic)) continue;
+                while (ih.messageIDsNext()) |mid| {
+                    if (std.mem.eql(u8, mid, id)) return true;
+                }
+            }
+        } else |_| {}
+        rest = rest[decoded.total_len..];
+    }
+    return false;
+}
+
+/// Count control IWANT messages in `written` that request `id`. Walks every
+/// recorded frame and every IWANT/message-id within each control message.
+fn recordCountIWants(written: []const u8, id: []const u8) usize {
+    var count: usize = 0;
+    var rest = written;
+    while (decodeFrame(rest)) |decoded| {
+        var reader = decoded.reader;
+        if (reader.getControl()) |ctrl_reader| {
+            var control = ctrl_reader;
+            while (control.iwantNext()) |iwant| {
+                var iw = iwant;
+                while (iw.messageIDsNext()) |mid| {
+                    if (std.mem.eql(u8, mid, id)) count += 1;
+                }
             }
         } else |_| {}
         rest = rest[decoded.total_len..];
@@ -2856,4 +3095,269 @@ test "subscribe JOINs the mesh (eager GRAFTs); unsubscribe LEAVEs it (PRUNEs)" {
     try std.testing.expect(!router.my_topics.contains("t"));
     try std.testing.expect(!router.mesh.contains("t"));
     for (conns) |c| try std.testing.expect(waitPruneSent(io, c, "t"));
+}
+
+// --- gossip: cache-on-accept + IHAVE / IWANT fake tests --------------------
+
+test "cache-on-accept: an accepted message with an EMPTY mesh is still cached" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    // Subscribe to "t" but connect NO peers and graft nobody: mesh["t"] is empty
+    // (or absent). A relay source S delivers a publish on "t". Before this fix the
+    // message was cached only on the forward path, so with no mesh it would never
+    // enter the cache. It must now be cached regardless. (S is connected only so
+    // the inbound_rpc has a tracked source; it is not in the mesh.)
+    try subscribeAndWait(io, allocator, router, "t");
+    const source = testPeer(1);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    const from = "origin";
+    const seqno = "\x00\x00\x00\x09";
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, from, seqno, "t", "lonely"),
+    } });
+
+    var id = try rpc.messageId(allocator, from, seqno);
+    defer id.deinit(allocator);
+
+    // Poll until the router fiber has processed the inbound RPC and cached the id.
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (router.message_cache.get(id.bytes) != null) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(router.message_cache.get(id.bytes) != null);
+    // No mesh member existed, so nothing was forwarded to S either.
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(conn_s.record.written.items, "t", "lonely"));
+}
+
+test "IHAVE emission: heartbeat advertises cached ids to a non-mesh subscriber" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    // We subscribe to "t". Peer P subscribes to "t" but is NOT grafted into the
+    // mesh — a gossip-eligible lazy peer. A relay source S delivers a publish on
+    // "t" (caching it). The next heartbeat must send P an IHAVE listing the id.
+    try subscribeAndWait(io, allocator, router, "t");
+    const peer_p = testPeer(1);
+    const source = testPeer(2);
+    const conn_p = try connectFakePeer(io, allocator, router, peer_p);
+    defer destroyFakeConn(allocator, conn_p);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    // P announces it subscribes to "t" (so it is a gossip target) but never GRAFTs.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_p, .rpc = try buildInboundSub(allocator, "t", true) } });
+    // P also PRUNEs us for "t" so the heartbeat's mesh maintenance will NOT graft
+    // it into the mesh (a backed-off peer is not a graft candidate). It stays a
+    // gossip target, since gossip-target selection ignores backoff. This keeps P a
+    // lazy/non-mesh subscriber across the heartbeat the test then drives.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_p, .rpc = try buildInboundPrune(allocator, "t", 0) } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (peerTracksTopic(router, peer_p, "t") and router.inBackoff("t", peer_p)) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(peerTracksTopic(router, peer_p, "t"));
+    // P must not be a mesh member.
+    try std.testing.expect(!router.meshContains("t", peer_p));
+
+    const from = "origin";
+    const seqno = "\x00\x00\x00\x11";
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, from, seqno, "t", "gossiped"),
+    } });
+    var id = try rpc.messageId(allocator, from, seqno);
+    defer id.deinit(allocator);
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (router.message_cache.get(id.bytes) != null) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(router.message_cache.get(id.bytes) != null);
+
+    // One heartbeat: P receives an IHAVE(t, [id]).
+    try beatHeartbeats(io, router, 1);
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordHasIHave(conn_p.record.written.items, "t", id.bytes)) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(recordHasIHave(conn_p.record.written.items, "t", id.bytes));
+}
+
+test "inbound IHAVE: unseen id triggers an IWANT; a seen id triggers none" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    const peer_p = testPeer(1);
+    const conn_p = try connectFakePeer(io, allocator, router, peer_p);
+    defer destroyFakeConn(allocator, conn_p);
+
+    // P announces an IHAVE for an id we have NOT seen → we reply with an IWANT.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_p,
+        .rpc = try buildInboundIHave(allocator, "t", &[_]?[]const u8{"unseen-id"}),
+    } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountIWants(conn_p.record.written.items, "unseen-id") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountIWants(conn_p.record.written.items, "unseen-id"));
+
+    // Now an IHAVE for an id we HAVE seen: insert it into the seen-cache by way of
+    // an inbound publish whose (from, seqno) computes to "seen-id-marker". Build
+    // the from/seqno so messageId yields exactly that id, then IHAVE it.
+    const from = "fromX";
+    const seqno = "sq";
+    var id = try rpc.messageId(allocator, from, seqno);
+    defer id.deinit(allocator);
+    // Deliver the publish so the id is marked seen (no mesh, just dedup state).
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_p,
+        .rpc = try buildInboundPublish(allocator, from, seqno, "t", "seenmsg"),
+    } });
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (router.message_cache.get(id.bytes) != null) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    // IHAVE the now-seen id; no new IWANT for it must be sent.
+    const iwants_before = recordCountIWants(conn_p.record.written.items, id.bytes);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_p,
+        .rpc = try buildInboundIHave(allocator, "t", &[_]?[]const u8{id.bytes}),
+    } });
+    // Drive a heartbeat afterward: the single-fiber FIFO guarantees the IHAVE is
+    // fully processed by the time the heartbeat is, so any spurious IWANT shows.
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expectEqual(iwants_before, recordCountIWants(conn_p.record.written.items, id.bytes));
+}
+
+test "inbound IWANT: a cached id is served as the full publish; an unknown id is not" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0);
+    defer router.destroy();
+    try router.start();
+
+    // Subscribe to "t" and connect P (the requester). Publish locally so the
+    // message is cached and addressable by its id.
+    try subscribeAndWait(io, allocator, router, "t");
+    const peer_p = testPeer(1);
+    const conn_p = try connectFakePeer(io, allocator, router, peer_p);
+    defer destroyFakeConn(allocator, conn_p);
+
+    // Our local publish uses (local_peer, seqno 0) as its id.
+    try router.inbox.putOne(io, .{ .publish = .{
+        .topic = try allocator.dupe(u8, "t"),
+        .data = try allocator.dupe(u8, "served-data"),
+    } });
+    const from = local_test_peer.bytes[0..local_test_peer.len];
+    var id = try rpc.messageId(allocator, from, "\x00\x00\x00\x00\x00\x00\x00\x00");
+    defer id.deinit(allocator);
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (router.message_cache.get(id.bytes) != null) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(router.message_cache.get(id.bytes) != null);
+
+    // P sends an IWANT for the cached id AND an unknown id. Only the cached one is
+    // served (as the full publish on P's data lane); the unknown id is ignored.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_p,
+        .rpc = try buildInboundIWant(allocator, &[_]?[]const u8{ id.bytes, "no-such-id" }),
+    } });
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(conn_p.record.written.items, "t", "served-data") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_p.record.written.items, "t", "served-data"));
+}
+
+test "recovery: IHAVE -> IWANT -> served publish is delivered to a node that missed the mesh" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Single-router view of the recovery chain from the RECEIVER's side. The
+    // router subscribes to "t" but missed the message via the mesh. Peer P (which
+    // holds the message) gossips an IHAVE; the router replies with an IWANT; P then
+    // "serves" the message as a normal publish, which the router delivers locally
+    // through its standard inbound path (no special delivery route).
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0);
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+    const peer_p = testPeer(1);
+    const conn_p = try connectFakePeer(io, allocator, router, peer_p);
+    defer destroyFakeConn(allocator, conn_p);
+
+    const from = "publisher";
+    const seqno = "\x00\x00\x00\x2a";
+    var id = try rpc.messageId(allocator, from, seqno);
+    defer id.deinit(allocator);
+
+    // Leg 1: P gossips IHAVE(t, [id]) for an id we have not seen.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_p,
+        .rpc = try buildInboundIHave(allocator, "t", &[_]?[]const u8{id.bytes}),
+    } });
+    // Leg 2: the router must IWANT the id from P.
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountIWants(conn_p.record.written.items, id.bytes) >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountIWants(conn_p.record.written.items, id.bytes));
+
+    // Leg 3+4: P serves the requested message as a normal publish; the router's
+    // standard inbound path delivers it locally (the handler fires) and caches it.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_p,
+        .rpc = try buildInboundPublish(allocator, from, seqno, "t", "recovered"),
+    } });
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (rec.calls > 0) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), rec.calls);
+    try std.testing.expectEqualSlices(u8, "t", rec.topic.?);
+    try std.testing.expectEqualSlices(u8, "recovered", rec.data.?);
+    // And the recovered message is now cached locally too.
+    try std.testing.expect(router.message_cache.get(id.bytes) != null);
 }
