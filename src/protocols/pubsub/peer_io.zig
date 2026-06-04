@@ -1,5 +1,6 @@
 const std = @import("std");
 const channel = @import("../../quic/io/channel.zig");
+const io_time = @import("../../quic/io/time.zig");
 
 /// The lane an outbound frame travels on, in decreasing priority.
 /// subscribe is highest (subscriptions are rare and critical),
@@ -179,10 +180,6 @@ pub const OutboundQueue = struct {
                     self.data_items.items[j] = self.data_items.items[j + 1];
                 }
                 self.data_items.shrinkRetainingCapacity(self.data_items.items.len - 1);
-                // If the gap was before the head cursor, adjust it to avoid
-                // skipping an item (should not normally happen since we scan
-                // from head, but guard it for correctness).
-                if (i < self.data_head and self.data_head > 0) self.data_head -= 1;
                 frame.deinit(self.allocator);
                 removed += 1;
                 // Do NOT advance i: the item at position i is now the next one.
@@ -220,19 +217,19 @@ pub const OutboundQueue = struct {
         if (self.sub_head < self.sub_items.items.len) {
             const frame = self.sub_items.items[self.sub_head];
             self.sub_head += 1;
-            self.compactIfNeeded(&self.sub_items, &self.sub_head);
+            compactLane(&self.sub_items, &self.sub_head);
             return frame;
         }
         if (self.ctrl_head < self.ctrl_items.items.len) {
             const frame = self.ctrl_items.items[self.ctrl_head];
             self.ctrl_head += 1;
-            self.compactIfNeeded(&self.ctrl_items, &self.ctrl_head);
+            compactLane(&self.ctrl_items, &self.ctrl_head);
             return frame;
         }
         if (self.data_head < self.data_items.items.len) {
             const frame = self.data_items.items[self.data_head];
             self.data_head += 1;
-            self.compactIfNeeded(&self.data_items, &self.data_head);
+            compactLane(&self.data_items, &self.data_head);
             return frame;
         }
         return null;
@@ -247,22 +244,20 @@ pub const OutboundQueue = struct {
         head.* = 0;
     }
 
-    /// Compact a lane's backing array when the dead prefix is >= the live count.
-    /// At most one compaction per N pops (amortised O(1)).
-    fn compactIfNeeded(
-        self: *OutboundQueue,
-        items: *std.ArrayList(OutboundFrame),
-        head: *usize,
-    ) void {
-        if (head.* == 0) return;
-        const live = items.items.len - head.*;
-        if (head.* < live) return;
-        std.mem.copyForwards(OutboundFrame, items.items[0..live], items.items[head.*..]);
-        items.shrinkRetainingCapacity(live);
-        head.* = 0;
-        _ = self; // allocator not needed here; storage is retained
-    }
 };
+
+/// Compact a lane's backing array when the dead prefix is >= the live count.
+/// Shifts live items to the front and resets the head cursor. Called after a
+/// pop; at most one compaction per N pops (amortised O(1)). No allocator
+/// needed — the backing storage is retained, not reallocated.
+fn compactLane(items: *std.ArrayList(OutboundFrame), head: *usize) void {
+    if (head.* == 0) return;
+    const live = items.items.len - head.*;
+    if (head.* < live) return;
+    std.mem.copyForwards(OutboundFrame, items.items[0..live], items.items[head.*..]);
+    items.shrinkRetainingCapacity(live);
+    head.* = 0;
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -417,6 +412,50 @@ test "removeData removes matching data frames and leaves others" {
     try std.testing.expectEqual(@as(u8, 3), r3.bytes[0]);
 }
 
+test "removeData with non-zero head cursor respects live range and FIFO order" {
+    // Verifies that removeData correctly scans only the un-popped (live) slice
+    // when data_head > 0, does not touch already-consumed slots, and that the
+    // survivors arrive in FIFO order on subsequent pops. Also confirms that
+    // std.testing.allocator reports no leaks (no double-free or dead-slot read).
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var q = OutboundQueue.init(allocator, .{});
+    defer q.deinit(io);
+
+    // Push four data frames: bytes 10, 20, 30, 40.
+    try q.push(io, .data, try testFrame(allocator, 10));
+    try q.push(io, .data, try testFrame(allocator, 20));
+    try q.push(io, .data, try testFrame(allocator, 30));
+    try q.push(io, .data, try testFrame(allocator, 40));
+
+    // Pop one frame (byte 10) — data_head advances to 1.
+    var first = try q.popBlocking(io);
+    try std.testing.expectEqual(@as(u8, 10), first.bytes[0]);
+    first.deinit(allocator);
+
+    // Remove frames whose byte equals 30 (one match, index 2 in the backing
+    // array but index 1 relative to data_head). The frame at slot 0 (byte 10)
+    // was already consumed and must not be touched.
+    const removed = q.removeData(io, @as(u8, 30), struct {
+        fn pred(target: u8, frame: *const OutboundFrame) bool {
+            return frame.bytes[0] == target;
+        }
+    }.pred);
+    try std.testing.expectEqual(@as(usize, 1), removed);
+
+    // Remaining live frames in FIFO order: 20, 40.
+    var r20 = try q.popBlocking(io);
+    defer r20.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 20), r20.bytes[0]);
+
+    var r40 = try q.popBlocking(io);
+    defer r40.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 40), r40.bytes[0]);
+}
+
 test "close on empty queue returns Closed" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
@@ -474,13 +513,9 @@ test "deinit with frames in all lanes frees everything" {
 const BlockCtx = struct {
     queue: *OutboundQueue,
     popped_byte: std.atomic.Value(u8) = .init(0),
-    /// Set to true once the popper has confirmed the queue was empty and is
-    /// about to call signal.wait(), confirming the wait path ran.
-    did_wait: std.atomic.Value(bool) = .init(false),
 };
 
 fn blockedPopper(io: std.Io, ctx: *BlockCtx) void {
-    ctx.did_wait.store(true, .release);
     var frame = ctx.queue.popBlocking(io) catch return;
     defer frame.deinit(std.testing.allocator);
     ctx.popped_byte.store(frame.bytes[0], .release);
@@ -497,14 +532,15 @@ test "popBlocking wakes when push arrives from another fiber" {
 
     var ctx = BlockCtx{ .queue = &q };
 
-    // Launch the popper on a concurrent fiber (runs on its own OS thread in
-    // std.Io.Threaded). The queue is empty so it will park in signal.wait(),
-    // exercising the wake path.
+    // Launch the popper as a concurrent fiber. The queue is empty so the popper
+    // will park in signal.wait(). A subsequent push from this fiber notifies the
+    // signal, wakes the popper, and the popper receives the frame — proving the
+    // end-to-end wake path. The popped byte value (0xAB) confirms delivery.
     var fut = try std.Io.concurrent(io, blockedPopper, .{ io, &ctx });
 
-    // Sleep briefly to let the popper OS thread run and park in wait().
-    const ts = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&ts, null);
+    // Yield for 50 ms (fiber-safe: suspends this fiber, not the OS thread) to
+    // give the popper fiber time to park in signal.wait() before we push.
+    io_time.ms(50).sleep(io) catch {};
 
     // Push a frame; this notifies the signal and wakes the popper.
     const frame = try testFrame(allocator, 0xAB);
@@ -512,6 +548,6 @@ test "popBlocking wakes when push arrives from another fiber" {
 
     fut.await(io);
 
-    try std.testing.expect(ctx.did_wait.load(.acquire));
+    // The popped byte proves the popper was woken and received the pushed frame.
     try std.testing.expectEqual(@as(u8, 0xAB), ctx.popped_byte.load(.acquire));
 }
