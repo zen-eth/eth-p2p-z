@@ -250,8 +250,8 @@ pub fn Router(comptime Transport: type) type {
             queue: peer_io.OutboundQueue,
             /// Topics this peer announced it subscribes to (its SUBSCRIBE
             /// SubOpts). Keys are owned copies; freed on remove and on teardown.
-            /// Floodsub forwards a message to every peer whose set contains the
-            /// message's topic.
+            /// Used to pick graft/fanout candidates: a peer is eligible for a
+            /// topic's mesh or fanout only if its set contains that topic.
             topics: std.StringHashMapUnmanaged(void) = .empty,
             /// Heap-owned (Transport-allocated) so its address is stable while
             /// the writer fiber holds it. The sink (and its stream) MUST outlive
@@ -1013,12 +1013,12 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Handle an inbound RPC from a peer: apply its subscription changes to
-        /// the SOURCE peer's announced-topics set, then floodsub-forward each
-        /// published message to every OTHER subscribed peer (and deliver locally
-        /// if we subscribe). Control messages are parsed-but-ignored in this
-        /// floodsub layer. The OwnedRpc is freed only after all parsing AND
-        /// forward-frame construction, since its bytes back the readers and are
-        /// copied by frameRpc.
+        /// the SOURCE peer's announced-topics set, then forward each published
+        /// message over the topic's MESH (every mesh member except the source) and
+        /// deliver it locally if we subscribe. GRAFT/PRUNE drive mesh membership;
+        /// IHAVE/IWANT/IDONTWANT are parsed-but-ignored (later layers). The
+        /// OwnedRpc is freed only after all parsing AND forward-frame construction,
+        /// since its bytes back the readers and are copied by frameRpc.
         fn onInboundRpc(router: *Self, in: peer_io.InboundRpc) void {
             var owned = in;
             defer owned.rpc.deinit(router.allocator);
@@ -1030,7 +1030,7 @@ pub fn Router(comptime Transport: type) type {
                 router.applyPeerSubscription(source, sub.getTopicid(), sub.getSubscribe());
             }
 
-            // Published messages: dedup, deliver locally, floodsub-forward.
+            // Published messages: dedup, deliver locally, forward over the mesh.
             while (reader.publishNext()) |msg| {
                 router.handleIncomingMessage(
                     source,
@@ -1525,8 +1525,8 @@ const FakeRouter = Router(FakeTransport);
 
 /// Build a deterministic, distinct test PeerId. `PeerId.random()` is seeded with
 /// a fixed constant (so it returns the same id every call); `testPeer(seed)`
-/// stamps `seed` into the digest so each value is unique, which the floodsub
-/// tests need to track several peers at once.
+/// stamps `seed` into the digest so each value is unique, which the mesh
+/// forwarding tests need to track several peers at once.
 fn testPeer(seed: u8) PeerId {
     var id = PeerId.random() catch unreachable;
     id.bytes[2] = seed;
@@ -1919,7 +1919,7 @@ const RecordingHandler = struct {
     }
 };
 
-// --- floodsub pub/sub fake tests -------------------------------------------
+// --- mesh pub/sub fake tests -----------------------------------------------
 
 /// Connect a fake peer to a running router and wait until it is tracked. Returns
 /// the conn (owned by the caller; free with destroyFakeConn after teardown).
