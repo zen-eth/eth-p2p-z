@@ -117,19 +117,19 @@ pub const QuicEndpoint = opaque {
 
     pub fn dial(e: *QuicEndpoint, addr: std.Io.net.IpAddress, opts: DialOptions) DialError!*Connection {
         const ep = internal(e);
-        if (ep.socket == null) {
-            const ephemeral: std.Io.net.IpAddress = switch (addr) {
-                .ip4 => .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
-                .ip6 => .{ .ip6 = .{ .port = 0, .flow = 0, .bytes = [_]u8{0} ** 16, .interface = .{ .index = 0 } } },
-            };
-            // Auto-bind an ephemeral local socket for a dial-only endpoint. Hold
-            // bind_lock and re-check under it: concurrent first-dials must not both
-            // run router.bind (its check/bind/store is not atomic across a suspend)
-            // — the loser observes socket != null and skips. Call router.bind
-            // directly, not the locking `bind`, to avoid re-entering bind_lock.
+        {
+            // Auto-bind an ephemeral local socket for a dial-only endpoint. Read
+            // ep.socket under bind_lock (it is plain, not atomic, and bind() writes
+            // it under this same lock), so concurrent first-dials see a consistent
+            // value and only one runs router.bind — the rest find it already bound.
+            // bind_lock is uncontended once bound; dials are not a hot path.
             ep.bind_lock.lockUncancelable(ep.io);
             defer ep.bind_lock.unlock(ep.io);
             if (ep.socket == null) {
+                const ephemeral: std.Io.net.IpAddress = switch (addr) {
+                    .ip4 => .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+                    .ip6 => .{ .ip6 = .{ .port = 0, .flow = 0, .bytes = [_]u8{0} ** 16, .interface = .{ .index = 0 } } },
+                };
                 _ = router.bind(routerContext(e), ephemeral) catch |err| switch (err) {
                     error.AlreadyBound => {},
                     // Forward the causes DialError shares; map genuine bind/config
