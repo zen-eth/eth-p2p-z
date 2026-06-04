@@ -25,6 +25,7 @@ const libp2p = @import("zig-libp2p");
 const zio = @import("zio");
 const identity = libp2p.identity;
 const gossipsub = libp2p.gossipsub;
+const identify = libp2p.protocols.identify;
 const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 
 /// How often the publisher republishes its payload (mesh-formation tolerant).
@@ -153,6 +154,23 @@ pub fn main(init: std.process.Init) !void {
     defer switcher.deinit();
 
     const local_peer = try host_key.peerId(allocator);
+
+    // Register the identify protocol responder. go-libp2p (and rust-libp2p)
+    // learn which protocols a peer speaks via the `/ipfs/id/1.0.0` exchange, and
+    // their pubsub only opens a `/meshsub` stream to a peer once identify reports
+    // it supports meshsub. So the identify response must advertise both identify
+    // itself and `/meshsub/1.1.0`; without this go never peers us in gossipsub.
+    // The handler only reads its (immutable) options, so one shared instance
+    // serves every inbound identify stream. It must outlive the run, so it lives
+    // here on `main`'s stack (the service borrows it; its deinit is a no-op).
+    var id_handler = identify.IdentifyHandler.initWithOptions(allocator, .{
+        .agent_version = "eth-p2p-z-gossipsub-interop/0.1.0",
+        .protocols = &.{ identify.protocol_id, gossipsub.protocol_id },
+    });
+    try switcher.addProtocolService(
+        identify.protocol_id,
+        libp2p.protocols.streamHandlerService(identify.IdentifyHandler, identify.IdentifyHandler.run, &id_handler),
+    );
 
     var recorder = Recorder{ .io = io };
     // Construct gossipsub BEFORE any dial/accept so its peer-event callback is

@@ -111,6 +111,11 @@ const heartbeat_interval_ms: u64 = 1000;
 /// Re-export so callers construct a handler without importing router.zig.
 pub const MessageHandler = router_mod.MessageHandler;
 
+/// The gossipsub stream protocol id (`/meshsub/1.1.0`). Re-exported so callers
+/// holding only this module (e.g. an identify responder advertising which
+/// protocols this node speaks) can name it without importing pubsub.zig.
+pub const protocol_id = pubsub.protocol_id;
+
 /// Per-stream inbound handler. The Switch's dispatcher creates one of these per
 /// inbound `/meshsub/1.1.0` stream (capturing the sender's peer id) and runs it
 /// on a handler fiber the Switch owns and cancels on connection teardown. The
