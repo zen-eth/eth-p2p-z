@@ -6,15 +6,15 @@ const rpc_pb = @import("../../protobuf.zig").rpc;
 pub const MessageId = struct {
     bytes: []u8,
 
-    pub fn deinit(self: MessageId, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *MessageId, allocator: std.mem.Allocator) void {
         allocator.free(self.bytes);
+        self.* = undefined;
     }
 };
 
-// messageId computes the default libp2p gossipsub message id as the
-// concatenation of the sender's peer-id bytes and the sequence number bytes.
-// Both inputs are raw slices; callers pass msg.from orelse "" for a struct
-// field or reader.getFrom() for a MessageReader.
+/// Default libp2p message id: from ++ seqno. Takes raw slices (not a *Message) so
+/// callers can pass either an outbound Message's fields (`msg.from orelse &.{}`) or
+/// an inbound MessageReader's getters (`reader.getFrom()`) without a temporary.
 pub fn messageId(allocator: std.mem.Allocator, from: []const u8, seqno: []const u8) !MessageId {
     const buf = try allocator.alloc(u8, from.len + seqno.len);
     @memcpy(buf[0..from.len], from);
@@ -27,13 +27,13 @@ pub fn buildGraft(topic: []const u8) rpc_pb.ControlGraft {
     return .{ .topic_i_d = topic };
 }
 
-// buildPrune returns a ControlPrune for the given topic. backoff is encoded
-// only when non-null (zero is protobuf default and is omitted).
-pub fn buildPrune(topic: []const u8, px_peers: []const ?rpc_pb.PeerInfo, backoff: ?u64) rpc_pb.ControlPrune {
+// buildPrune returns a ControlPrune for the given topic. backoff=0 is the
+// protobuf default and is omitted from the wire.
+pub fn buildPrune(topic: []const u8, px_peers: []const ?rpc_pb.PeerInfo, backoff: u64) rpc_pb.ControlPrune {
     return .{
         .topic_i_d = topic,
         .peers = if (px_peers.len > 0) px_peers else null,
-        .backoff = backoff orelse 0,
+        .backoff = backoff,
     };
 }
 
@@ -68,6 +68,7 @@ pub fn buildSubscription(topic: []const u8, subscribe: bool) rpc_pb.RPC.SubOpts 
 pub const RpcOut = union(enum) {
     subscriptions: []const ?rpc_pb.RPC.SubOpts,
     publish: []const ?rpc_pb.Message,
+    forward: []const ?rpc_pb.Message, // relayed messages; same wire shape as publish, separate lane
     control: rpc_pb.ControlMessage,
 
     // toRpc assembles an rpc_pb.RPC from this variant. The returned struct
@@ -75,7 +76,7 @@ pub const RpcOut = union(enum) {
     pub fn toRpc(self: RpcOut) rpc_pb.RPC {
         return switch (self) {
             .subscriptions => |subs| .{ .subscriptions = subs },
-            .publish => |msgs| .{ .publish = msgs },
+            .publish, .forward => |msgs| .{ .publish = msgs },
             .control => |ctrl| .{ .control = ctrl },
         };
     }
@@ -85,14 +86,14 @@ test "messageId concatenates from and seqno" {
     const allocator = std.testing.allocator;
     const from = "peer1";
     const seqno = "\x00\x01\x02\x03";
-    const id = try messageId(allocator, from, seqno);
+    var id = try messageId(allocator, from, seqno);
     defer id.deinit(allocator);
     try std.testing.expectEqualSlices(u8, "peer1\x00\x01\x02\x03", id.bytes);
 }
 
 test "messageId empty inputs" {
     const allocator = std.testing.allocator;
-    const id = try messageId(allocator, "", "");
+    var id = try messageId(allocator, "", "");
     defer id.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), id.bytes.len);
 }
@@ -102,9 +103,9 @@ test "graft round-trip" {
     const topic = "test-topic";
     const graft = buildGraft(topic);
     const ctrl = rpc_pb.ControlMessage{ .graft = &[_]?rpc_pb.ControlGraft{graft} };
-    const rpc = rpc_pb.RPC{ .control = ctrl };
+    const frame = rpc_pb.RPC{ .control = ctrl };
 
-    const encoded = try rpc.encode(allocator);
+    const encoded = try frame.encode(allocator);
     defer if (encoded.len > 0) allocator.free(encoded);
 
     var reader = try rpc_pb.RPCReader.init(encoded);
@@ -119,9 +120,9 @@ test "prune round-trip" {
     const px = [_]?rpc_pb.PeerInfo{.{ .peer_i_d = "abc", .signed_peer_record = null }};
     const prune = buildPrune(topic, &px, 42);
     const ctrl = rpc_pb.ControlMessage{ .prune = &[_]?rpc_pb.ControlPrune{prune} };
-    const rpc = rpc_pb.RPC{ .control = ctrl };
+    const frame = rpc_pb.RPC{ .control = ctrl };
 
-    const encoded = try rpc.encode(allocator);
+    const encoded = try frame.encode(allocator);
     defer if (encoded.len > 0) allocator.free(encoded);
 
     var reader = try rpc_pb.RPCReader.init(encoded);
@@ -139,9 +140,9 @@ test "ihave round-trip" {
     const ids = [_]?[]const u8{ "id1", "id2" };
     const ihave = buildIHave(topic, &ids);
     const ctrl = rpc_pb.ControlMessage{ .ihave = &[_]?rpc_pb.ControlIHave{ihave} };
-    const rpc = rpc_pb.RPC{ .control = ctrl };
+    const frame = rpc_pb.RPC{ .control = ctrl };
 
-    const encoded = try rpc.encode(allocator);
+    const encoded = try frame.encode(allocator);
     defer if (encoded.len > 0) allocator.free(encoded);
 
     var reader = try rpc_pb.RPCReader.init(encoded);
@@ -160,9 +161,9 @@ test "iwant round-trip" {
     const ids = [_]?[]const u8{"want-id"};
     const iwant = buildIWant(&ids);
     const ctrl = rpc_pb.ControlMessage{ .iwant = &[_]?rpc_pb.ControlIWant{iwant} };
-    const rpc = rpc_pb.RPC{ .control = ctrl };
+    const frame = rpc_pb.RPC{ .control = ctrl };
 
-    const encoded = try rpc.encode(allocator);
+    const encoded = try frame.encode(allocator);
     defer if (encoded.len > 0) allocator.free(encoded);
 
     var reader = try rpc_pb.RPCReader.init(encoded);
@@ -178,9 +179,9 @@ test "idontwant round-trip" {
     const ids = [_]?[]const u8{"seen-id"};
     const idontwant = buildIDontWant(&ids);
     const ctrl = rpc_pb.ControlMessage{ .idontwant = &[_]?rpc_pb.ControlIDontWant{idontwant} };
-    const rpc = rpc_pb.RPC{ .control = ctrl };
+    const frame = rpc_pb.RPC{ .control = ctrl };
 
-    const encoded = try rpc.encode(allocator);
+    const encoded = try frame.encode(allocator);
     defer if (encoded.len > 0) allocator.free(encoded);
 
     var reader = try rpc_pb.RPCReader.init(encoded);
@@ -194,9 +195,9 @@ test "idontwant round-trip" {
 test "subscription round-trip" {
     const allocator = std.testing.allocator;
     const sub = buildSubscription("my-topic", true);
-    const rpc = rpc_pb.RPC{ .subscriptions = &[_]?rpc_pb.RPC.SubOpts{sub} };
+    const frame = rpc_pb.RPC{ .subscriptions = &[_]?rpc_pb.RPC.SubOpts{sub} };
 
-    const encoded = try rpc.encode(allocator);
+    const encoded = try frame.encode(allocator);
     defer if (encoded.len > 0) allocator.free(encoded);
 
     var reader = try rpc_pb.RPCReader.init(encoded);
@@ -214,9 +215,9 @@ test "message round-trip via RpcOut.publish" {
         .topic = "topic-x",
     };
     const out = RpcOut{ .publish = &[_]?rpc_pb.Message{msg} };
-    const rpc = out.toRpc();
+    const frame = out.toRpc();
 
-    const encoded = try rpc.encode(allocator);
+    const encoded = try frame.encode(allocator);
     defer if (encoded.len > 0) allocator.free(encoded);
 
     var reader = try rpc_pb.RPCReader.init(encoded);
@@ -231,12 +232,15 @@ test "RpcOut.subscriptions via toRpc" {
     const allocator = std.testing.allocator;
     const sub = buildSubscription("net", false);
     const out = RpcOut{ .subscriptions = &[_]?rpc_pb.RPC.SubOpts{sub} };
-    const rpc = out.toRpc();
+    const frame = out.toRpc();
 
-    const encoded = try rpc.encode(allocator);
+    const encoded = try frame.encode(allocator);
     defer if (encoded.len > 0) allocator.free(encoded);
 
     var reader = try rpc_pb.RPCReader.init(encoded);
+    // `subscribe=false` is the protobuf default and is omitted from the field; assert the
+    // SubOpts message itself is still present on the wire (an unsubscribe is a real message).
+    try std.testing.expectEqual(@as(usize, 1), reader.subscriptionsCount());
     const got = reader.subscriptionsNext() orelse return error.MissingSub;
     try std.testing.expect(!got.getSubscribe());
     try std.testing.expectEqualSlices(u8, "net", got.getTopicid());
@@ -247,13 +251,35 @@ test "RpcOut.control via toRpc" {
     const graft = buildGraft("ctrl-topic");
     const ctrl = rpc_pb.ControlMessage{ .graft = &[_]?rpc_pb.ControlGraft{graft} };
     const out = RpcOut{ .control = ctrl };
-    const rpc = out.toRpc();
+    const frame = out.toRpc();
 
-    const encoded = try rpc.encode(allocator);
+    const encoded = try frame.encode(allocator);
     defer if (encoded.len > 0) allocator.free(encoded);
 
     var reader = try rpc_pb.RPCReader.init(encoded);
     var ctrl_reader = try reader.getControl();
     const got = ctrl_reader.graftNext() orelse return error.MissingGraft;
     try std.testing.expectEqualSlices(u8, "ctrl-topic", got.getTopicID());
+}
+
+test "message round-trip via RpcOut.forward" {
+    const allocator = std.testing.allocator;
+    const msg = rpc_pb.Message{
+        .from = "relay-sender",
+        .seqno = "\x0a\x0b",
+        .data = "relayed",
+        .topic = "topic-y",
+    };
+    const out = RpcOut{ .forward = &[_]?rpc_pb.Message{msg} };
+    const frame = out.toRpc();
+
+    const encoded = try frame.encode(allocator);
+    defer if (encoded.len > 0) allocator.free(encoded);
+
+    var reader = try rpc_pb.RPCReader.init(encoded);
+    const got = reader.publishNext() orelse return error.MissingMessage;
+    try std.testing.expectEqualSlices(u8, "relay-sender", got.getFrom());
+    try std.testing.expectEqualSlices(u8, "\x0a\x0b", got.getSeqno());
+    try std.testing.expectEqualSlices(u8, "relayed", got.getData());
+    try std.testing.expectEqualSlices(u8, "topic-y", got.getTopic());
 }
