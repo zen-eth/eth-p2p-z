@@ -15,11 +15,12 @@ pub const MessageId = struct {
 /// Default libp2p message id: from ++ seqno. Takes raw slices (not a *Message) so
 /// callers can pass either an outbound Message's fields (`msg.from orelse &.{}`) or
 /// an inbound MessageReader's getters (`reader.getFrom()`) without a temporary.
-pub fn messageId(allocator: std.mem.Allocator, from: []const u8, seqno: []const u8) !MessageId {
+/// Empty `from` and `seqno` are valid and yield a zero-length id.
+pub fn messageId(allocator: std.mem.Allocator, from: []const u8, seqno: []const u8) std.mem.Allocator.Error!MessageId {
     const buf = try allocator.alloc(u8, from.len + seqno.len);
     @memcpy(buf[0..from.len], from);
     @memcpy(buf[from.len..], seqno);
-    return MessageId{ .bytes = buf };
+    return .{ .bytes = buf };
 }
 
 // buildGraft returns a ControlGraft for the given topic, ready to encode.

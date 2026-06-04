@@ -28,8 +28,102 @@ pub const OutboundFrame = struct {
 };
 
 pub const Options = struct {
+    /// Max un-popped frames the control lane will hold; further pushes fail.
     control_cap: usize = 4096,
+    /// Max un-popped frames the data lane will hold; further pushes fail.
     data_cap: usize = 1024,
+};
+
+/// A single-lane bounded FIFO of owned frames, backed by a std.ArrayList plus a
+/// head cursor. Pop is O(1) (head++) at the cost of dead prefix slots, which are
+/// reclaimed lazily (see `compact`) so the amortised cost stays O(1) without a
+/// circular buffer. `cap == 0` means unbounded.
+///
+/// Not synchronized on its own — OutboundQueue holds these behind its mutex.
+const LaneFifo = struct {
+    items: std.ArrayList(OutboundFrame) = .empty,
+    head: usize = 0,
+    cap: usize,
+
+    /// Number of un-popped (live) frames.
+    fn len(self: *const LaneFifo) usize {
+        return self.items.items.len - self.head;
+    }
+
+    /// Append an owned frame. Returns error.LaneFull when the lane is at
+    /// capacity, or when the backing allocation fails (OOM is treated as full:
+    /// the lane is bounded, so the caller's fallback — keep ownership and drop —
+    /// is identical either way). On error the caller still owns `frame`.
+    fn push(self: *LaneFifo, allocator: std.mem.Allocator, frame: OutboundFrame) error{LaneFull}!void {
+        if (self.cap != 0 and self.len() >= self.cap) return error.LaneFull;
+        self.items.append(allocator, frame) catch return error.LaneFull;
+    }
+
+    /// Remove and return the oldest live frame, transferring ownership to the
+    /// caller. Returns null when the lane is empty.
+    fn pop(self: *LaneFifo) ?OutboundFrame {
+        if (self.head >= self.items.items.len) return null;
+        const frame = self.items.items[self.head];
+        self.head += 1;
+        self.compact();
+        return frame;
+    }
+
+    /// Reclaim the dead prefix once it is at least as large as the live count by
+    /// shifting live frames to the front and resetting the cursor. Triggering on
+    /// `head >= live` bounds the wasted slots to the live count and amortises the
+    /// shift to O(1) per pop. The backing storage is retained, never reallocated.
+    fn compact(self: *LaneFifo) void {
+        if (self.head == 0) return;
+        const live = self.len();
+        if (self.head < live) return;
+        std.mem.copyForwards(OutboundFrame, self.items.items[0..live], self.items.items[self.head..]);
+        self.items.shrinkRetainingCapacity(live);
+        self.head = 0;
+    }
+
+    /// Remove and free every live frame for which pred(ctx, frame) is true,
+    /// preserving FIFO order of the survivors. Returns the count removed.
+    ///
+    /// Single pass with a read/write cursor over the live range: O(n), no
+    /// repeated tail shifts. `head` is left untouched so already-popped slots are
+    /// never read or freed.
+    fn removeIf(
+        self: *LaneFifo,
+        allocator: std.mem.Allocator,
+        ctx: anytype,
+        comptime pred: fn (@TypeOf(ctx), *const OutboundFrame) bool,
+    ) usize {
+        const live = self.items.items[self.head..];
+        var write: usize = 0;
+        var removed: usize = 0;
+        for (live) |*frame| {
+            if (pred(ctx, frame)) {
+                var owned = frame.*;
+                owned.deinit(allocator);
+                removed += 1;
+            } else {
+                live[write] = frame.*;
+                write += 1;
+            }
+        }
+        self.items.shrinkRetainingCapacity(self.head + write);
+        return removed;
+    }
+
+    /// Free every live frame and reset the cursor, retaining the backing storage.
+    /// Slots before `head` were already transferred to a popper and must not be
+    /// freed here.
+    fn drain(self: *LaneFifo, allocator: std.mem.Allocator) void {
+        for (self.items.items[self.head..]) |*frame| frame.deinit(allocator);
+        self.items.clearRetainingCapacity();
+        self.head = 0;
+    }
+
+    /// Release the backing storage. Call `drain` first to free any live frames.
+    fn deinit(self: *LaneFifo, allocator: std.mem.Allocator) void {
+        self.items.deinit(allocator);
+    }
 };
 
 /// Per-peer outbound queue, decoupled from the QUIC stream. A router fiber
@@ -39,25 +133,15 @@ pub const Options = struct {
 /// lock before unlocking, so a notify that races after unlock advances the epoch
 /// and the subsequent wait() returns immediately.
 ///
-/// Lane storage: std.ArrayList(OutboundFrame) with a head cursor forming a
-/// simple bounded FIFO. O(1) pop (head++) at the cost of dead prefix slots,
-/// reclaimed lazily when the dead prefix is >= the live count (amortised O(1)).
-/// This avoids per-item heap allocation without requiring a circular buffer.
+/// Lanes are drained by priority subscribe > control > data. The subscribe lane
+/// is unbounded; control and data are bounded by the matching Options cap.
 pub const OutboundQueue = struct {
     allocator: std.mem.Allocator,
     mutex: std.Io.Mutex,
     signal: channel.Signal,
-    /// subscribe lane: unbounded FIFO.
-    sub_items: std.ArrayList(OutboundFrame),
-    sub_head: usize,
-    /// control lane: bounded by control_cap.
-    ctrl_items: std.ArrayList(OutboundFrame),
-    ctrl_head: usize,
-    control_cap: usize,
-    /// data lane: bounded by data_cap.
-    data_items: std.ArrayList(OutboundFrame),
-    data_head: usize,
-    data_cap: usize,
+    sub_lane: LaneFifo,
+    ctrl_lane: LaneFifo,
+    data_lane: LaneFifo,
     closed: bool,
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) OutboundQueue {
@@ -65,14 +149,9 @@ pub const OutboundQueue = struct {
             .allocator = allocator,
             .mutex = .init,
             .signal = .{},
-            .sub_items = .empty,
-            .sub_head = 0,
-            .ctrl_items = .empty,
-            .ctrl_head = 0,
-            .control_cap = opts.control_cap,
-            .data_items = .empty,
-            .data_head = 0,
-            .data_cap = opts.data_cap,
+            .sub_lane = .{ .cap = 0 }, // unbounded
+            .ctrl_lane = .{ .cap = opts.control_cap },
+            .data_lane = .{ .cap = opts.data_cap },
             .closed = false,
         };
     }
@@ -80,13 +159,9 @@ pub const OutboundQueue = struct {
     /// Free all remaining frames and release all lane storage.
     pub fn deinit(self: *OutboundQueue, io: std.Io) void {
         self.mutex.lockUncancelable(io);
-        self.drainLane(&self.sub_items, &self.sub_head);
-        self.drainLane(&self.ctrl_items, &self.ctrl_head);
-        self.drainLane(&self.data_items, &self.data_head);
+        for (self.lanes()) |lane| lane.drain(self.allocator);
         self.mutex.unlock(io);
-        self.sub_items.deinit(self.allocator);
-        self.ctrl_items.deinit(self.allocator);
-        self.data_items.deinit(self.allocator);
+        for (self.lanes()) |lane| lane.deinit(self.allocator);
     }
 
     pub const PushError = error{ LaneFull, Closed };
@@ -100,34 +175,10 @@ pub const OutboundQueue = struct {
             self.mutex.unlock(io);
             return error.Closed;
         }
-        switch (lane) {
-            .subscribe => {
-                self.sub_items.append(self.allocator, frame) catch {
-                    self.mutex.unlock(io);
-                    return error.LaneFull; // treat OOM as full
-                };
-            },
-            .control => {
-                if (self.ctrlLen() >= self.control_cap) {
-                    self.mutex.unlock(io);
-                    return error.LaneFull;
-                }
-                self.ctrl_items.append(self.allocator, frame) catch {
-                    self.mutex.unlock(io);
-                    return error.LaneFull;
-                };
-            },
-            .data => {
-                if (self.dataLen() >= self.data_cap) {
-                    self.mutex.unlock(io);
-                    return error.LaneFull;
-                }
-                self.data_items.append(self.allocator, frame) catch {
-                    self.mutex.unlock(io);
-                    return error.LaneFull;
-                };
-            },
-        }
+        self.laneFor(lane).push(self.allocator, frame) catch |err| {
+            self.mutex.unlock(io);
+            return err;
+        };
         self.mutex.unlock(io);
         self.signal.notify(io);
     }
@@ -168,26 +219,7 @@ pub const OutboundQueue = struct {
     ) usize {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-
-        var removed: usize = 0;
-        var i = self.data_head;
-        while (i < self.data_items.items.len) {
-            if (pred(ctx, &self.data_items.items[i])) {
-                var frame = self.data_items.items[i];
-                // Shift remaining items left to fill the gap.
-                var j = i;
-                while (j + 1 < self.data_items.items.len) : (j += 1) {
-                    self.data_items.items[j] = self.data_items.items[j + 1];
-                }
-                self.data_items.shrinkRetainingCapacity(self.data_items.items.len - 1);
-                frame.deinit(self.allocator);
-                removed += 1;
-                // Do NOT advance i: the item at position i is now the next one.
-            } else {
-                i += 1;
-            }
-        }
-        return removed;
+        return self.data_lane.removeIf(self.allocator, ctx, pred);
     }
 
     /// Close the queue and wake all blocked poppers. Poppers drain remaining
@@ -201,63 +233,28 @@ pub const OutboundQueue = struct {
 
     // --- internal helpers (called under mutex) ---
 
-    /// Return the number of un-popped items in the control lane.
-    fn ctrlLen(self: *const OutboundQueue) usize {
-        return self.ctrl_items.items.len - self.ctrl_head;
+    /// The lanes in priority order; used for whole-queue operations (drain).
+    fn lanes(self: *OutboundQueue) [3]*LaneFifo {
+        return .{ &self.sub_lane, &self.ctrl_lane, &self.data_lane };
     }
 
-    /// Return the number of un-popped items in the data lane.
-    fn dataLen(self: *const OutboundQueue) usize {
-        return self.data_items.items.len - self.data_head;
+    fn laneFor(self: *OutboundQueue, lane: Lane) *LaneFifo {
+        return switch (lane) {
+            .subscribe => &self.sub_lane,
+            .control => &self.ctrl_lane,
+            .data => &self.data_lane,
+        };
     }
 
-    /// Try to pop a frame by priority (subscribe > control > data).
-    /// Caller must hold mutex. Returns null if all lanes are empty.
+    /// Pop the highest-priority available frame. Returns null if all lanes are
+    /// empty. Caller must hold the mutex.
     fn tryPopLocked(self: *OutboundQueue) ?OutboundFrame {
-        if (self.sub_head < self.sub_items.items.len) {
-            const frame = self.sub_items.items[self.sub_head];
-            self.sub_head += 1;
-            compactLane(&self.sub_items, &self.sub_head);
-            return frame;
-        }
-        if (self.ctrl_head < self.ctrl_items.items.len) {
-            const frame = self.ctrl_items.items[self.ctrl_head];
-            self.ctrl_head += 1;
-            compactLane(&self.ctrl_items, &self.ctrl_head);
-            return frame;
-        }
-        if (self.data_head < self.data_items.items.len) {
-            const frame = self.data_items.items[self.data_head];
-            self.data_head += 1;
-            compactLane(&self.data_items, &self.data_head);
-            return frame;
+        for (self.lanes()) |lane| {
+            if (lane.pop()) |frame| return frame;
         }
         return null;
     }
-
-    /// Free all frames in a lane and reset its head cursor.
-    fn drainLane(self: *OutboundQueue, items: *std.ArrayList(OutboundFrame), head: *usize) void {
-        for (items.items[head.*..]) |*frame| {
-            frame.deinit(self.allocator);
-        }
-        items.clearRetainingCapacity();
-        head.* = 0;
-    }
-
 };
-
-/// Compact a lane's backing array when the dead prefix is >= the live count.
-/// Shifts live items to the front and resets the head cursor. Called after a
-/// pop; at most one compaction per N pops (amortised O(1)). No allocator
-/// needed — the backing storage is retained, not reallocated.
-fn compactLane(items: *std.ArrayList(OutboundFrame), head: *usize) void {
-    if (head.* == 0) return;
-    const live = items.items.len - head.*;
-    if (head.* < live) return;
-    std.mem.copyForwards(OutboundFrame, items.items[0..live], items.items[head.*..]);
-    items.shrinkRetainingCapacity(live);
-    head.* = 0;
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -268,7 +265,25 @@ fn testFrame(allocator: std.mem.Allocator, byte: u8) !OutboundFrame {
     const bytes = try allocator.alloc(u8, 1);
     bytes[0] = byte;
     const ids = try allocator.alloc([]u8, 0);
-    return OutboundFrame{ .bytes = bytes, .message_ids = ids };
+    return .{ .bytes = bytes, .message_ids = ids };
+}
+
+/// Build an owned frame carrying `ids` (each copied) so deinit has real
+/// per-id allocations to free. Used to pin the message_ids ownership contract.
+fn testFrameWithIds(allocator: std.mem.Allocator, byte: u8, ids: []const []const u8) !OutboundFrame {
+    const bytes = try allocator.alloc(u8, 1);
+    errdefer allocator.free(bytes);
+    bytes[0] = byte;
+
+    const owned_ids = try allocator.alloc([]u8, ids.len);
+    errdefer allocator.free(owned_ids);
+    var filled: usize = 0;
+    errdefer for (owned_ids[0..filled]) |id| allocator.free(id);
+    for (ids) |id| {
+        owned_ids[filled] = try allocator.dupe(u8, id);
+        filled += 1;
+    }
+    return .{ .bytes = bytes, .message_ids = owned_ids };
 }
 
 test "OutboundFrame deinit frees owned slices" {
@@ -276,6 +291,14 @@ test "OutboundFrame deinit frees owned slices" {
     var frame = try testFrame(allocator, 0x42);
     frame.deinit(allocator);
     // testing.allocator detects leaks at test end.
+}
+
+test "OutboundFrame deinit frees carried message_ids" {
+    const allocator = std.testing.allocator;
+    var frame = try testFrameWithIds(allocator, 0x42, &.{ "id-a", "id-b", "id-c" });
+    try std.testing.expectEqual(@as(usize, 3), frame.message_ids.len);
+    frame.deinit(allocator);
+    // testing.allocator detects a leak if any id (or the id slice) is missed.
 }
 
 test "priority order: subscribe before control before data" {
@@ -337,7 +360,31 @@ test "FIFO within a lane" {
     try std.testing.expectEqual(@as(u8, 3), r3.bytes[0]);
 }
 
-test "control_cap and data_cap enforced" {
+test "subscribe lane is unbounded (accepts far beyond the bounded caps)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Tiny bounded caps; subscribe has cap 0 (unbounded) and must ignore them.
+    var q = OutboundQueue.init(allocator, .{ .control_cap = 1, .data_cap = 1 });
+    defer q.deinit(io);
+
+    const n = 50;
+    var pushed: usize = 0;
+    while (pushed < n) : (pushed += 1) {
+        try q.push(io, .subscribe, try testFrame(allocator, @intCast(pushed)));
+    }
+
+    var popped: usize = 0;
+    while (popped < n) : (popped += 1) {
+        var f = try q.popBlocking(io);
+        defer f.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, @intCast(popped)), f.bytes[0]);
+    }
+}
+
+test "control_cap and data_cap enforced at and one past the boundary" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -350,23 +397,30 @@ test "control_cap and data_cap enforced" {
     const c2 = try testFrame(allocator, 2);
     var c3 = try testFrame(allocator, 3); // rejected; caller must free
 
-    try q.push(io, .control, c1);
-    try q.push(io, .control, c2);
-    try std.testing.expectError(error.LaneFull, q.push(io, .control, c3));
+    try q.push(io, .control, c1); // 1/2
+    try q.push(io, .control, c2); // 2/2 — exactly at cap, still accepted
+    try std.testing.expectError(error.LaneFull, q.push(io, .control, c3)); // one over
     c3.deinit(allocator); // still owned by caller after rejection
 
     const d1 = try testFrame(allocator, 10);
     var d2 = try testFrame(allocator, 11); // rejected
 
-    try q.push(io, .data, d1);
-    try std.testing.expectError(error.LaneFull, q.push(io, .data, d2));
+    try q.push(io, .data, d1); // 1/1 — exactly at cap
+    try std.testing.expectError(error.LaneFull, q.push(io, .data, d2)); // one over
     d2.deinit(allocator);
 
-    // Drain accepted items so the queue deinit has nothing left.
+    // After popping one control frame the lane has room again (cap is on live
+    // count, not lifetime count).
     var rc1 = try q.popBlocking(io);
     rc1.deinit(allocator);
+    const c4 = try testFrame(allocator, 4);
+    try q.push(io, .control, c4);
+
+    // Drain accepted items so the queue deinit has nothing left.
     var rc2 = try q.popBlocking(io);
     rc2.deinit(allocator);
+    var rc4 = try q.popBlocking(io);
+    rc4.deinit(allocator);
     var rd1 = try q.popBlocking(io);
     rd1.deinit(allocator);
 }
@@ -410,6 +464,57 @@ test "removeData removes matching data frames and leaves others" {
     var r3 = try q.popBlocking(io);
     defer r3.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 3), r3.bytes[0]);
+}
+
+test "removeData removing all and removing none" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const always = struct {
+        fn pred(_: void, _: *const OutboundFrame) bool {
+            return true;
+        }
+    }.pred;
+    const never = struct {
+        fn pred(_: void, _: *const OutboundFrame) bool {
+            return false;
+        }
+    }.pred;
+
+    // Remove none: every frame survives in FIFO order.
+    {
+        var q = OutboundQueue.init(allocator, .{});
+        defer q.deinit(io);
+        try q.push(io, .data, try testFrame(allocator, 1));
+        try q.push(io, .data, try testFrame(allocator, 2));
+        try std.testing.expectEqual(@as(usize, 0), q.removeData(io, {}, never));
+        var a = try q.popBlocking(io);
+        defer a.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 1), a.bytes[0]);
+        var b = try q.popBlocking(io);
+        defer b.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 2), b.bytes[0]);
+    }
+
+    // Remove all: the lane empties and the next pop would block, so just check
+    // the count and let deinit confirm no leak / double-free.
+    {
+        var q = OutboundQueue.init(allocator, .{});
+        defer q.deinit(io);
+        try q.push(io, .data, try testFrame(allocator, 1));
+        try q.push(io, .data, try testFrame(allocator, 2));
+        try q.push(io, .data, try testFrame(allocator, 3));
+        try std.testing.expectEqual(@as(usize, 3), q.removeData(io, {}, always));
+    }
+
+    // removeData on an empty lane is a no-op returning 0.
+    {
+        var q = OutboundQueue.init(allocator, .{});
+        defer q.deinit(io);
+        try std.testing.expectEqual(@as(usize, 0), q.removeData(io, {}, always));
+    }
 }
 
 test "removeData with non-zero head cursor respects live range and FIFO order" {
@@ -467,6 +572,21 @@ test "close on empty queue returns Closed" {
 
     q.close(io);
     try std.testing.expectError(error.Closed, q.popBlocking(io));
+}
+
+test "push after close is rejected and caller keeps ownership" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var q = OutboundQueue.init(allocator, .{});
+    defer q.deinit(io);
+
+    q.close(io);
+    var f = try testFrame(allocator, 7);
+    try std.testing.expectError(error.Closed, q.push(io, .data, f));
+    f.deinit(allocator); // still owned by caller after rejection
 }
 
 test "close with frames queued drains before returning Closed" {
@@ -538,8 +658,8 @@ test "popBlocking wakes when push arrives from another fiber" {
     // end-to-end wake path. The popped byte value (0xAB) confirms delivery.
     var fut = try std.Io.concurrent(io, blockedPopper, .{ io, &ctx });
 
-    // Yield for 50 ms (fiber-safe: suspends this fiber, not the OS thread) to
-    // give the popper fiber time to park in signal.wait() before we push.
+    // Yield (fiber-safe: suspends this fiber, not the OS thread) to give the
+    // popper fiber time to park in signal.wait() before we push.
     io_time.ms(50).sleep(io) catch {};
 
     // Push a frame; this notifies the signal and wakes the popper.
@@ -550,4 +670,41 @@ test "popBlocking wakes when push arrives from another fiber" {
 
     // The popped byte proves the popper was woken and received the pushed frame.
     try std.testing.expectEqual(@as(u8, 0xAB), ctx.popped_byte.load(.acquire));
+}
+
+/// Shared context for the close-wakes-popper test.
+const CloseCtx = struct {
+    queue: *OutboundQueue,
+    got_closed: std.atomic.Value(bool) = .init(false),
+};
+
+fn closeWaitingPopper(io: std.Io, ctx: *CloseCtx) void {
+    if (ctx.queue.popBlocking(io)) |frame| {
+        var f = frame;
+        f.deinit(std.testing.allocator);
+    } else |err| switch (err) {
+        error.Closed => ctx.got_closed.store(true, .release),
+        error.Canceled => {},
+    }
+}
+
+test "close wakes a blocked popper which then returns Closed" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var q = OutboundQueue.init(allocator, .{});
+    defer q.deinit(io);
+
+    var ctx = CloseCtx{ .queue = &q };
+
+    // The popper parks on an empty queue; close() must notify the signal, wake
+    // it, and (with all lanes empty) make popBlocking return error.Closed.
+    var fut = try std.Io.concurrent(io, closeWaitingPopper, .{ io, &ctx });
+    io_time.ms(50).sleep(io) catch {};
+    q.close(io);
+    fut.await(io);
+
+    try std.testing.expect(ctx.got_closed.load(.acquire));
 }
