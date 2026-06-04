@@ -10,22 +10,68 @@ const PeerId = @import("peer_id").PeerId;
 /// data is lowest (published/forwarded application messages).
 pub const Lane = enum { subscribe, control, data };
 
-/// An owned, pre-framed RPC ready to write to a QUIC stream. The queue that
-/// holds this value owns it and calls deinit on pop or deinit. The caller owns
-/// it after popping and must call deinit when done.
+/// A refcounted, heap-allocated, pre-framed RPC ready to write to a QUIC stream.
+/// Forwarding a message to N peers frames the wire bytes ONCE and shares this one
+/// allocation across every target's queue (the rust `Bytes` / go shared-message
+/// model), so a 1 MiB message costs one copy, not N.
+///
+/// Ownership is the reference count: each holder (the builder, every queue that
+/// accepts a push, the writer that pops it) owns exactly one reference. A holder
+/// gives up its reference with `release`; the frame frees its own bytes/ids/self
+/// when the last reference is released. Use `create` to mint one (which sets the
+/// initial count to the number of intended holders) and `retain` to add a holder.
 ///
 /// bytes: length-prefixed wire bytes produced by pubsub.frameRpc; owned.
 /// message_ids: owned ids carried for IDONTWANT purge; empty (&.{}) for all
 ///   lanes except data frames that may later be IDONTWANT-purged.
+/// refs: live holder count; the frame frees itself on the 1→0 transition.
+/// allocator: the allocator that owns bytes/ids/self, used by the final release.
 pub const OutboundFrame = struct {
     bytes: []u8,
     message_ids: [][]u8,
+    refs: std.atomic.Value(usize),
+    allocator: std.mem.Allocator,
 
-    pub fn deinit(self: *OutboundFrame, allocator: std.mem.Allocator) void {
+    /// Mint a heap frame with `initial_refs` references (the number of intended
+    /// holders — e.g. 1 for a builder that will `retain` per target before each
+    /// push). Takes ownership of `bytes` and `message_ids`; on the final release
+    /// it frees both plus itself with `allocator`.
+    pub fn create(
+        allocator: std.mem.Allocator,
+        bytes: []u8,
+        message_ids: [][]u8,
+        initial_refs: usize,
+    ) std.mem.Allocator.Error!*OutboundFrame {
+        const self = try allocator.create(OutboundFrame);
+        self.* = .{
+            .bytes = bytes,
+            .message_ids = message_ids,
+            .refs = .init(initial_refs),
+            .allocator = allocator,
+        };
+        return self;
+    }
+
+    /// Add one holder. Cheap and unordered: a new holder only becomes reachable
+    /// to other threads through the queue mutex / signal, which carry the
+    /// happens-before edge, so the bump itself needs no ordering.
+    pub fn retain(self: *OutboundFrame) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    /// Give up one holder's reference. On the 1→0 transition this frees the
+    /// bytes, every id, the id slice, and the frame itself. Writers release from
+    /// different executor threads, so the decrement is `.release` and the freeing
+    /// thread issues an `.acquire` fence first, establishing happens-before with
+    /// every prior holder's writes before the memory is reclaimed.
+    pub fn release(self: *OutboundFrame) void {
+        if (self.refs.fetchSub(1, .release) != 1) return;
+        _ = self.refs.load(.acquire);
+        const allocator = self.allocator;
         allocator.free(self.bytes);
         for (self.message_ids) |id| allocator.free(id);
         allocator.free(self.message_ids);
-        self.* = undefined;
+        allocator.destroy(self);
     }
 };
 
@@ -36,14 +82,16 @@ pub const Options = struct {
     data_cap: usize = 1024,
 };
 
-/// A single-lane bounded FIFO of owned frames, backed by a std.ArrayList plus a
-/// head cursor. Pop is O(1) (head++) at the cost of dead prefix slots, which are
-/// reclaimed lazily (see `compact`) so the amortised cost stays O(1) without a
-/// circular buffer. `cap == 0` means unbounded.
+/// A single-lane bounded FIFO of frame references, backed by a std.ArrayList plus
+/// a head cursor. Each live slot holds one reference to a (shared) OutboundFrame;
+/// pop transfers it out, removeIf/drain release it. Pop is O(1) (head++) at the
+/// cost of dead prefix slots, which are reclaimed lazily (see `compact`) so the
+/// amortised cost stays O(1) without a circular buffer. `cap == 0` means
+/// unbounded.
 ///
 /// Not synchronized on its own — OutboundQueue holds these behind its mutex.
 const LaneFifo = struct {
-    items: std.ArrayList(OutboundFrame) = .empty,
+    items: std.ArrayList(*OutboundFrame) = .empty,
     head: usize = 0,
     cap: usize,
 
@@ -52,18 +100,18 @@ const LaneFifo = struct {
         return self.items.items.len - self.head;
     }
 
-    /// Append an owned frame. Returns error.LaneFull when the lane is at
+    /// Append a frame reference. Returns error.LaneFull when the lane is at
     /// capacity, or when the backing allocation fails (OOM is treated as full:
-    /// the lane is bounded, so the caller's fallback — keep ownership and drop —
-    /// is identical either way). On error the caller still owns `frame`.
-    fn push(self: *LaneFifo, allocator: std.mem.Allocator, frame: OutboundFrame) error{LaneFull}!void {
+    /// the lane is bounded, so the caller's fallback — keep the reference and drop
+    /// — is identical either way). On error the caller still owns the reference.
+    fn push(self: *LaneFifo, allocator: std.mem.Allocator, frame: *OutboundFrame) error{LaneFull}!void {
         if (self.cap != 0 and self.len() >= self.cap) return error.LaneFull;
         self.items.append(allocator, frame) catch return error.LaneFull;
     }
 
-    /// Remove and return the oldest live frame, transferring ownership to the
+    /// Remove and return the oldest live frame reference, transferring it to the
     /// caller. Returns null when the lane is empty.
-    fn pop(self: *LaneFifo) ?OutboundFrame {
+    fn pop(self: *LaneFifo) ?*OutboundFrame {
         if (self.head >= self.items.items.len) return null;
         const frame = self.items.items[self.head];
         self.head += 1;
@@ -79,33 +127,32 @@ const LaneFifo = struct {
         if (self.head == 0) return;
         const live = self.len();
         if (self.head < live) return;
-        std.mem.copyForwards(OutboundFrame, self.items.items[0..live], self.items.items[self.head..]);
+        std.mem.copyForwards(*OutboundFrame, self.items.items[0..live], self.items.items[self.head..]);
         self.items.shrinkRetainingCapacity(live);
         self.head = 0;
     }
 
-    /// Remove and free every live frame for which pred(ctx, frame) is true,
-    /// preserving FIFO order of the survivors. Returns the count removed.
+    /// Remove and release the reference for every live frame for which
+    /// pred(ctx, frame) is true, preserving FIFO order of the survivors. Returns
+    /// the count removed.
     ///
     /// Single pass with a read/write cursor over the live range: O(n), no
     /// repeated tail shifts. `head` is left untouched so already-popped slots are
-    /// never read or freed.
+    /// never read or released.
     fn removeIf(
         self: *LaneFifo,
-        allocator: std.mem.Allocator,
         ctx: anytype,
         comptime pred: fn (@TypeOf(ctx), *const OutboundFrame) bool,
     ) usize {
         const live = self.items.items[self.head..];
         var write: usize = 0;
         var removed: usize = 0;
-        for (live) |*frame| {
+        for (live) |frame| {
             if (pred(ctx, frame)) {
-                var owned = frame.*;
-                owned.deinit(allocator);
+                frame.release();
                 removed += 1;
             } else {
-                live[write] = frame.*;
+                live[write] = frame;
                 write += 1;
             }
         }
@@ -113,16 +160,16 @@ const LaneFifo = struct {
         return removed;
     }
 
-    /// Free every live frame and reset the cursor, retaining the backing storage.
-    /// Slots before `head` were already transferred to a popper and must not be
-    /// freed here.
-    fn drain(self: *LaneFifo, allocator: std.mem.Allocator) void {
-        for (self.items.items[self.head..]) |*frame| frame.deinit(allocator);
+    /// Release every live frame reference and reset the cursor, retaining the
+    /// backing storage. Slots before `head` were already transferred to a popper
+    /// and must not be released here.
+    fn drain(self: *LaneFifo) void {
+        for (self.items.items[self.head..]) |frame| frame.release();
         self.items.clearRetainingCapacity();
         self.head = 0;
     }
 
-    /// Release the backing storage. Call `drain` first to free any live frames.
+    /// Release the backing storage. Call `drain` first to release any live frames.
     fn deinit(self: *LaneFifo, allocator: std.mem.Allocator) void {
         self.items.deinit(allocator);
     }
@@ -158,20 +205,21 @@ pub const OutboundQueue = struct {
         };
     }
 
-    /// Free all remaining frames and release all lane storage.
+    /// Release every remaining frame reference and free all lane storage.
     pub fn deinit(self: *OutboundQueue, io: std.Io) void {
         self.mutex.lockUncancelable(io);
-        for (self.lanes()) |lane| lane.drain(self.allocator);
+        for (self.lanes()) |lane| lane.drain();
         self.mutex.unlock(io);
         for (self.lanes()) |lane| lane.deinit(self.allocator);
     }
 
     pub const PushError = error{ LaneFull, Closed };
 
-    /// Enqueue an owned frame on the given lane. On LaneFull or Closed the
-    /// caller still owns `frame` and must deinit it. On success the queue
-    /// takes ownership and wakes any blocked popper.
-    pub fn push(self: *OutboundQueue, io: std.Io, lane: Lane, frame: OutboundFrame) PushError!void {
+    /// Enqueue a frame reference on the given lane. On SUCCESS the queue takes
+    /// the reference (the caller must NOT release it). On LaneFull or Closed the
+    /// queue did NOT take the reference and the caller still owns it (must
+    /// `release` it). Success wakes any blocked popper.
+    pub fn push(self: *OutboundQueue, io: std.Io, lane: Lane, frame: *OutboundFrame) PushError!void {
         self.mutex.lockUncancelable(io);
         if (self.closed) {
             self.mutex.unlock(io);
@@ -186,10 +234,11 @@ pub const OutboundQueue = struct {
     }
 
     /// Block until a frame is available (priority: subscribe > control > data)
-    /// or the queue is closed and empty. Transfers ownership to the caller.
-    /// Returns error.Closed when the queue is closed and all lanes are drained.
-    /// Returns error.Canceled if the fiber is cancelled while waiting.
-    pub fn popBlocking(self: *OutboundQueue, io: std.Io) error{ Closed, Canceled }!OutboundFrame {
+    /// or the queue is closed and empty. Transfers the frame reference to the
+    /// caller (which must eventually `release` it). Returns error.Closed when the
+    /// queue is closed and all lanes are drained. Returns error.Canceled if the
+    /// fiber is cancelled while waiting.
+    pub fn popBlocking(self: *OutboundQueue, io: std.Io) error{ Closed, Canceled }!*OutboundFrame {
         while (true) {
             self.mutex.lockUncancelable(io);
             if (self.tryPopLocked()) |frame| {
@@ -211,8 +260,9 @@ pub const OutboundQueue = struct {
         }
     }
 
-    /// Remove and free every data-lane frame for which pred(ctx, frame) returns
-    /// true. Returns the count of removed frames. Other lanes are untouched.
+    /// Remove and release every data-lane frame for which pred(ctx, frame)
+    /// returns true. Returns the count of removed frames. Other lanes are
+    /// untouched.
     pub fn removeData(
         self: *OutboundQueue,
         io: std.Io,
@@ -221,7 +271,7 @@ pub const OutboundQueue = struct {
     ) usize {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.data_lane.removeIf(self.allocator, ctx, pred);
+        return self.data_lane.removeIf(ctx, pred);
     }
 
     /// Close the queue and wake all blocked poppers. Poppers drain remaining
@@ -248,9 +298,9 @@ pub const OutboundQueue = struct {
         };
     }
 
-    /// Pop the highest-priority available frame. Returns null if all lanes are
-    /// empty. Caller must hold the mutex.
-    fn tryPopLocked(self: *OutboundQueue) ?OutboundFrame {
+    /// Pop the highest-priority available frame reference. Returns null if all
+    /// lanes are empty. Caller must hold the mutex.
+    fn tryPopLocked(self: *OutboundQueue) ?*OutboundFrame {
         for (self.lanes()) |lane| {
             if (lane.pop()) |frame| return frame;
         }
@@ -290,35 +340,38 @@ pub fn PeerWriter(comptime Sink: type) type {
 
         queue: *OutboundQueue,
         sink: *Sink,
-        allocator: std.mem.Allocator,
         /// Open attempts before giving up on the peer (each followed by backoff).
         max_open_retries: usize = 5,
         /// Sleep between open attempts, in milliseconds.
         reopen_backoff_ms: u64 = 50,
         /// Invoked once if open retries are exhausted, so the router can tear the
         /// peer down. The writer never touches the queue lifecycle itself: on
-        /// disconnect it frees only the in-flight popped frame and returns —
-        /// frames still queued stay in the (owner-held) OutboundQueue. The owner
-        /// is responsible for draining/deinit-ing the queue after the disconnect,
-        /// otherwise those unsent frames leak. The handler must also not free the
-        /// sink/stream synchronously (see the Sink lifetime note above).
+        /// disconnect it releases only the in-flight popped frame's reference and
+        /// returns — frames still queued stay in the (owner-held) OutboundQueue.
+        /// The owner is responsible for draining/deinit-ing the queue after the
+        /// disconnect, otherwise those unsent frames leak. The handler must also
+        /// not free the sink/stream synchronously (see the Sink lifetime note
+        /// above).
         on_disconnect: ?*const fn (?*anyopaque) void = null,
         disconnect_ctx: ?*anyopaque = null,
         /// Whether the sink currently holds an open stream.
         have_stream: bool = false,
 
-        /// Fiber body. Pops frames in priority order and writes them, re-opening
-        /// the stream as needed, until the queue is closed/drained or cancelled.
+        /// Fiber body. Pops frame references in priority order and writes them,
+        /// re-opening the stream as needed, until the queue is closed/drained or
+        /// cancelled. Each popped reference is released after its write attempt
+        /// (the shared frame frees itself once the last writer releases it).
         /// Always releases the current stream on exit.
         pub fn run(self: *Self, io: std.Io) void {
             defer self.sink.close(io);
             while (true) {
-                var frame = self.queue.popBlocking(io) catch return; // Closed/Canceled
+                const frame = self.queue.popBlocking(io) catch return; // Closed/Canceled
                 if (!self.have_stream) {
                     if (!self.ensureStream(io)) {
-                        // Open retries exhausted: drop the popped frame and hand
-                        // the peer back to the router via on_disconnect.
-                        frame.deinit(self.allocator);
+                        // Open retries exhausted: drop the popped frame's
+                        // reference and hand the peer back to the router via
+                        // on_disconnect.
+                        frame.release();
                         if (self.on_disconnect) |cb| cb(self.disconnect_ctx);
                         return;
                     }
@@ -329,10 +382,10 @@ pub fn PeerWriter(comptime Sink: type) type {
                     // surviving queue drains onto a fresh stream.
                     self.sink.close(io);
                     self.have_stream = false;
-                    frame.deinit(self.allocator);
+                    frame.release();
                     continue;
                 };
-                frame.deinit(self.allocator);
+                frame.release();
             }
         }
 
@@ -411,17 +464,22 @@ pub fn PeerReader(comptime Source: type, comptime Poster: type) type {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Build a minimal owned frame for testing: 1 byte, no message_ids.
-fn testFrame(allocator: std.mem.Allocator, byte: u8) !OutboundFrame {
+/// Build a minimal shared frame for testing: 1 byte, no message_ids, one
+/// reference. The caller owns that reference (release it, push it, or hand it to
+/// a queue.deinit).
+fn testFrame(allocator: std.mem.Allocator, byte: u8) !*OutboundFrame {
     const bytes = try allocator.alloc(u8, 1);
+    errdefer allocator.free(bytes);
     bytes[0] = byte;
     const ids = try allocator.alloc([]u8, 0);
-    return .{ .bytes = bytes, .message_ids = ids };
+    errdefer allocator.free(ids);
+    return OutboundFrame.create(allocator, bytes, ids, 1);
 }
 
-/// Build an owned frame carrying `ids` (each copied) so deinit has real
-/// per-id allocations to free. Used to pin the message_ids ownership contract.
-fn testFrameWithIds(allocator: std.mem.Allocator, byte: u8, ids: []const []const u8) !OutboundFrame {
+/// Build a shared frame carrying `ids` (each copied) so the final release has
+/// real per-id allocations to free. Used to pin the message_ids ownership
+/// contract. One reference, owned by the caller.
+fn testFrameWithIds(allocator: std.mem.Allocator, byte: u8, ids: []const []const u8) !*OutboundFrame {
     const bytes = try allocator.alloc(u8, 1);
     errdefer allocator.free(bytes);
     bytes[0] = byte;
@@ -434,22 +492,38 @@ fn testFrameWithIds(allocator: std.mem.Allocator, byte: u8, ids: []const []const
         owned_ids[filled] = try allocator.dupe(u8, id);
         filled += 1;
     }
-    return .{ .bytes = bytes, .message_ids = owned_ids };
+    return OutboundFrame.create(allocator, bytes, owned_ids, 1);
 }
 
-test "OutboundFrame deinit frees owned slices" {
+test "OutboundFrame release frees owned slices" {
     const allocator = std.testing.allocator;
-    var frame = try testFrame(allocator, 0x42);
-    frame.deinit(allocator);
+    const frame = try testFrame(allocator, 0x42);
+    frame.release();
     // testing.allocator detects leaks at test end.
 }
 
-test "OutboundFrame deinit frees carried message_ids" {
+test "OutboundFrame release frees carried message_ids" {
     const allocator = std.testing.allocator;
-    var frame = try testFrameWithIds(allocator, 0x42, &.{ "id-a", "id-b", "id-c" });
+    const frame = try testFrameWithIds(allocator, 0x42, &.{ "id-a", "id-b", "id-c" });
     try std.testing.expectEqual(@as(usize, 3), frame.message_ids.len);
-    frame.deinit(allocator);
+    frame.release();
     // testing.allocator detects a leak if any id (or the id slice) is missed.
+}
+
+test "OutboundFrame retain/release: frees only on the last release" {
+    const allocator = std.testing.allocator;
+    // One holder, then add two more: three references total.
+    const frame = try testFrameWithIds(allocator, 0x01, &.{ "x", "y" });
+    frame.retain();
+    frame.retain();
+    try std.testing.expectEqual(@as(usize, 3), frame.refs.load(.monotonic));
+    // Release two; the bytes are still live (no double-free, no use-after-free).
+    frame.release();
+    frame.release();
+    try std.testing.expectEqual(@as(usize, 1), frame.refs.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 0x01), frame.bytes[0]);
+    // The final release frees everything; testing.allocator confirms no leak.
+    frame.release();
 }
 
 test "priority order: subscribe before control before data" {
@@ -469,16 +543,16 @@ test "priority order: subscribe before control before data" {
     try q.push(io, .control, ctrl);
     try q.push(io, .subscribe, sub);
 
-    var f1 = try q.popBlocking(io);
-    defer f1.deinit(allocator);
+    const f1 = try q.popBlocking(io);
+    defer f1.release();
     try std.testing.expectEqual(@as(u8, 's'), f1.bytes[0]);
 
-    var f2 = try q.popBlocking(io);
-    defer f2.deinit(allocator);
+    const f2 = try q.popBlocking(io);
+    defer f2.release();
     try std.testing.expectEqual(@as(u8, 'c'), f2.bytes[0]);
 
-    var f3 = try q.popBlocking(io);
-    defer f3.deinit(allocator);
+    const f3 = try q.popBlocking(io);
+    defer f3.release();
     try std.testing.expectEqual(@as(u8, 'd'), f3.bytes[0]);
 }
 
@@ -498,16 +572,16 @@ test "FIFO within a lane" {
     try q.push(io, .data, fb);
     try q.push(io, .data, fc);
 
-    var r1 = try q.popBlocking(io);
-    defer r1.deinit(allocator);
+    const r1 = try q.popBlocking(io);
+    defer r1.release();
     try std.testing.expectEqual(@as(u8, 1), r1.bytes[0]);
 
-    var r2 = try q.popBlocking(io);
-    defer r2.deinit(allocator);
+    const r2 = try q.popBlocking(io);
+    defer r2.release();
     try std.testing.expectEqual(@as(u8, 2), r2.bytes[0]);
 
-    var r3 = try q.popBlocking(io);
-    defer r3.deinit(allocator);
+    const r3 = try q.popBlocking(io);
+    defer r3.release();
     try std.testing.expectEqual(@as(u8, 3), r3.bytes[0]);
 }
 
@@ -529,8 +603,8 @@ test "subscribe lane is unbounded (accepts far beyond the bounded caps)" {
 
     var popped: usize = 0;
     while (popped < n) : (popped += 1) {
-        var f = try q.popBlocking(io);
-        defer f.deinit(allocator);
+        const f = try q.popBlocking(io);
+        defer f.release();
         try std.testing.expectEqual(@as(u8, @intCast(popped)), f.bytes[0]);
     }
 }
@@ -546,34 +620,34 @@ test "control_cap and data_cap enforced at and one past the boundary" {
 
     const c1 = try testFrame(allocator, 1);
     const c2 = try testFrame(allocator, 2);
-    var c3 = try testFrame(allocator, 3); // rejected; caller must free
+    const c3 = try testFrame(allocator, 3); // rejected; caller keeps its ref
 
     try q.push(io, .control, c1); // 1/2
     try q.push(io, .control, c2); // 2/2 — exactly at cap, still accepted
     try std.testing.expectError(error.LaneFull, q.push(io, .control, c3)); // one over
-    c3.deinit(allocator); // still owned by caller after rejection
+    c3.release(); // queue did not take the ref; caller releases it
 
     const d1 = try testFrame(allocator, 10);
-    var d2 = try testFrame(allocator, 11); // rejected
+    const d2 = try testFrame(allocator, 11); // rejected
 
     try q.push(io, .data, d1); // 1/1 — exactly at cap
     try std.testing.expectError(error.LaneFull, q.push(io, .data, d2)); // one over
-    d2.deinit(allocator);
+    d2.release();
 
     // After popping one control frame the lane has room again (cap is on live
     // count, not lifetime count).
-    var rc1 = try q.popBlocking(io);
-    rc1.deinit(allocator);
+    const rc1 = try q.popBlocking(io);
+    rc1.release();
     const c4 = try testFrame(allocator, 4);
     try q.push(io, .control, c4);
 
     // Drain accepted items so the queue deinit has nothing left.
-    var rc2 = try q.popBlocking(io);
-    rc2.deinit(allocator);
-    var rc4 = try q.popBlocking(io);
-    rc4.deinit(allocator);
-    var rd1 = try q.popBlocking(io);
-    rd1.deinit(allocator);
+    const rc2 = try q.popBlocking(io);
+    rc2.release();
+    const rc4 = try q.popBlocking(io);
+    rc4.release();
+    const rd1 = try q.popBlocking(io);
+    rd1.release();
 }
 
 test "removeData removes matching data frames and leaves others" {
@@ -604,16 +678,16 @@ test "removeData removes matching data frames and leaves others" {
     try std.testing.expectEqual(@as(usize, 1), removed);
 
     // control pops first (priority), then d1 and d3; d2 is gone.
-    var r_ctrl = try q.popBlocking(io);
-    defer r_ctrl.deinit(allocator);
+    const r_ctrl = try q.popBlocking(io);
+    defer r_ctrl.release();
     try std.testing.expectEqual(@as(u8, 99), r_ctrl.bytes[0]);
 
-    var r1 = try q.popBlocking(io);
-    defer r1.deinit(allocator);
+    const r1 = try q.popBlocking(io);
+    defer r1.release();
     try std.testing.expectEqual(@as(u8, 1), r1.bytes[0]);
 
-    var r3 = try q.popBlocking(io);
-    defer r3.deinit(allocator);
+    const r3 = try q.popBlocking(io);
+    defer r3.release();
     try std.testing.expectEqual(@as(u8, 3), r3.bytes[0]);
 }
 
@@ -641,11 +715,11 @@ test "removeData removing all and removing none" {
         try q.push(io, .data, try testFrame(allocator, 1));
         try q.push(io, .data, try testFrame(allocator, 2));
         try std.testing.expectEqual(@as(usize, 0), q.removeData(io, {}, never));
-        var a = try q.popBlocking(io);
-        defer a.deinit(allocator);
+        const a = try q.popBlocking(io);
+        defer a.release();
         try std.testing.expectEqual(@as(u8, 1), a.bytes[0]);
-        var b = try q.popBlocking(io);
-        defer b.deinit(allocator);
+        const b = try q.popBlocking(io);
+        defer b.release();
         try std.testing.expectEqual(@as(u8, 2), b.bytes[0]);
     }
 
@@ -688,9 +762,9 @@ test "removeData with non-zero head cursor respects live range and FIFO order" {
     try q.push(io, .data, try testFrame(allocator, 40));
 
     // Pop one frame (byte 10) — data_head advances to 1.
-    var first = try q.popBlocking(io);
+    const first = try q.popBlocking(io);
     try std.testing.expectEqual(@as(u8, 10), first.bytes[0]);
-    first.deinit(allocator);
+    first.release();
 
     // Remove frames whose byte equals 30 (one match, index 2 in the backing
     // array but index 1 relative to data_head). The frame at slot 0 (byte 10)
@@ -703,12 +777,12 @@ test "removeData with non-zero head cursor respects live range and FIFO order" {
     try std.testing.expectEqual(@as(usize, 1), removed);
 
     // Remaining live frames in FIFO order: 20, 40.
-    var r20 = try q.popBlocking(io);
-    defer r20.deinit(allocator);
+    const r20 = try q.popBlocking(io);
+    defer r20.release();
     try std.testing.expectEqual(@as(u8, 20), r20.bytes[0]);
 
-    var r40 = try q.popBlocking(io);
-    defer r40.deinit(allocator);
+    const r40 = try q.popBlocking(io);
+    defer r40.release();
     try std.testing.expectEqual(@as(u8, 40), r40.bytes[0]);
 }
 
@@ -735,9 +809,9 @@ test "push after close is rejected and caller keeps ownership" {
     defer q.deinit(io);
 
     q.close(io);
-    var f = try testFrame(allocator, 7);
+    const f = try testFrame(allocator, 7);
     try std.testing.expectError(error.Closed, q.push(io, .data, f));
-    f.deinit(allocator); // still owned by caller after rejection
+    f.release(); // queue did not take the ref; caller releases it
 }
 
 test "close with frames queued drains before returning Closed" {
@@ -756,10 +830,10 @@ test "close with frames queued drains before returning Closed" {
     q.close(io);
 
     // Pop both frames before getting error.Closed.
-    var r1 = try q.popBlocking(io);
-    defer r1.deinit(allocator);
-    var r2 = try q.popBlocking(io);
-    defer r2.deinit(allocator);
+    const r1 = try q.popBlocking(io);
+    defer r1.release();
+    const r2 = try q.popBlocking(io);
+    defer r2.release();
     try std.testing.expectError(error.Closed, q.popBlocking(io));
 }
 
@@ -787,8 +861,8 @@ const BlockCtx = struct {
 };
 
 fn blockedPopper(io: std.Io, ctx: *BlockCtx) void {
-    var frame = ctx.queue.popBlocking(io) catch return;
-    defer frame.deinit(std.testing.allocator);
+    const frame = ctx.queue.popBlocking(io) catch return;
+    defer frame.release();
     ctx.popped_byte.store(frame.bytes[0], .release);
 }
 
@@ -831,8 +905,7 @@ const CloseCtx = struct {
 
 fn closeWaitingPopper(io: std.Io, ctx: *CloseCtx) void {
     if (ctx.queue.popBlocking(io)) |frame| {
-        var f = frame;
-        f.deinit(std.testing.allocator);
+        frame.release();
     } else |err| switch (err) {
         error.Closed => ctx.got_closed.store(true, .release),
         error.Canceled => {},
@@ -917,10 +990,10 @@ const FakeSink = struct {
     }
 };
 
-/// Build an owned frame whose single byte is `byte`, matching what the writer
-/// pops and writes to the sink. (One byte per frame keeps the assertions about
-/// which bytes landed on which stream trivially readable.)
-fn writerFrame(allocator: std.mem.Allocator, byte: u8) !OutboundFrame {
+/// Build a shared frame (one reference) whose single byte is `byte`, matching
+/// what the writer pops and writes to the sink. (One byte per frame keeps the
+/// assertions about which bytes landed on which stream trivially readable.)
+fn writerFrame(allocator: std.mem.Allocator, byte: u8) !*OutboundFrame {
     return testFrame(allocator, byte);
 }
 
@@ -941,7 +1014,7 @@ test "PeerWriter happy path: all frames written to a single stream in order" {
     var sink = FakeSink{ .allocator = allocator };
     defer sink.deinit();
 
-    var writer = PeerWriter(FakeSink){ .queue = &q, .sink = &sink, .allocator = allocator };
+    var writer = PeerWriter(FakeSink){ .queue = &q, .sink = &sink };
     writer.run(io);
 
     // One stream opened, holding all three frames in order.
@@ -970,7 +1043,7 @@ test "PeerWriter re-opens on write failure, dropping only the in-flight frame" {
     var sink = FakeSink{ .allocator = allocator, .fail_on_write_n = 2 };
     defer sink.deinit();
 
-    var writer = PeerWriter(FakeSink){ .queue = &q, .sink = &sink, .allocator = allocator };
+    var writer = PeerWriter(FakeSink){ .queue = &q, .sink = &sink };
     writer.run(io);
 
     // The surviving queue drained onto a fresh stream: frame #1 on the first
@@ -1010,7 +1083,6 @@ test "PeerWriter open exhaustion calls on_disconnect once and frees the frame" {
     var writer = PeerWriter(FakeSink){
         .queue = &q,
         .sink = &sink,
-        .allocator = allocator,
         .max_open_retries = 3,
         .reopen_backoff_ms = 0,
         .on_disconnect = DisconnectFlag.cb,
@@ -1037,7 +1109,7 @@ test "PeerWriter returns immediately when the queue is already closed and empty"
     var sink = FakeSink{ .allocator = allocator };
     defer sink.deinit();
 
-    var writer = PeerWriter(FakeSink){ .queue = &q, .sink = &sink, .allocator = allocator };
+    var writer = PeerWriter(FakeSink){ .queue = &q, .sink = &sink };
     writer.run(io); // popBlocking → Closed; defer sink.close runs, no stream opened.
 
     try std.testing.expectEqual(@as(usize, 0), sink.streamCount());

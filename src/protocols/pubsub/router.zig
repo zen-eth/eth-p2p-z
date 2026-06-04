@@ -188,15 +188,16 @@ pub fn Router(comptime Transport: type) type {
             publish: struct { topic: []u8, data: []u8 },
             /// Stop the router: tear down every peer, then exit the main fiber.
             shutdown,
-            /// Test-only: enqueue an owned frame onto a tracked peer's outbound
+            /// Test-only: enqueue a frame reference onto a tracked peer's outbound
             /// queue, on the router fiber (so the peer-map lookup is race-free).
             /// Used by router unit tests to make a peer's writer actually attempt
             /// to open its stream (the writer opens lazily on its first frame).
-            /// If the peer is not tracked the frame is freed. The reply event is
-            /// set once the push (or free) is done.
+            /// The command carries one reference; if the push fails or the peer is
+            /// not tracked the reference is released. The reply event is set once
+            /// the push (or release) is done.
             enqueue_for_test: struct {
                 peer: PeerId,
-                frame: peer_io.OutboundFrame,
+                frame: *peer_io.OutboundFrame,
                 reply: *std.Io.Event,
             },
         };
@@ -352,12 +353,12 @@ pub fn Router(comptime Transport: type) type {
             return router.peer_count.load(.acquire);
         }
 
-        /// Test-only: enqueue an owned data frame onto `peer`'s outbound queue
-        /// and block until the router fiber has processed the push (or freed the
-        /// frame, if the peer is gone). Doing the lookup + push on the router
-        /// fiber keeps the peer map single-threaded. Used to make a peer's writer
-        /// attempt to open its stream, exercising the writer give-up path.
-        pub fn enqueueDataForTest(router: *Self, peer: PeerId, frame: peer_io.OutboundFrame) !void {
+        /// Test-only: enqueue a data frame reference onto `peer`'s outbound queue
+        /// and block until the router fiber has processed the push (or released
+        /// the reference, if the peer is gone). Doing the lookup + push on the
+        /// router fiber keeps the peer map single-threaded. Used to make a peer's
+        /// writer attempt to open its stream, exercising the writer give-up path.
+        pub fn enqueueDataForTest(router: *Self, peer: PeerId, frame: *peer_io.OutboundFrame) !void {
             var reply: std.Io.Event = .unset;
             try router.inbox.putOne(router.io, .{ .enqueue_for_test = .{
                 .peer = peer,
@@ -435,7 +436,6 @@ pub fn Router(comptime Transport: type) type {
             writer.* = .{
                 .queue = &state.queue,
                 .sink = sink,
-                .allocator = router.allocator,
                 .on_disconnect = onWriterDisconnect,
                 .disconnect_ctx = state,
             };
@@ -479,34 +479,46 @@ pub fn Router(comptime Transport: type) type {
 
         /// Send the local node's full current subscription set to one peer's
         /// `.subscribe` lane as a single subscription RPC. No-op when we have no
-        /// subscriptions. Best-effort: frees the frame on a push failure.
+        /// subscriptions. Best-effort: drops the frame on a push failure.
+        ///
+        /// The transient SubOpts array (one entry per local topic) is the only
+        /// genuinely multi-allocation scratch on this path, so it goes in a
+        /// per-command arena that is freed in one shot — no per-entry bookkeeping.
+        /// The shared frame itself stays gpa-owned (it outlives this call inside
+        /// the peer's queue).
         fn sendCurrentSubscriptions(router: *Self, state: *PeerState) void {
             if (router.my_topics.count() == 0) return;
 
+            var arena = std.heap.ArenaAllocator.init(router.allocator);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+
             var subs: std.ArrayListUnmanaged(?rpc_pb.RPC.SubOpts) = .empty;
-            defer subs.deinit(router.allocator);
             var it = router.my_topics.keyIterator();
             while (it.next()) |key| {
-                subs.append(router.allocator, rpc.buildSubscription(key.*, true)) catch return;
+                subs.append(scratch, rpc.buildSubscription(key.*, true)) catch return;
             }
 
             const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .subscriptions = subs.items }).toRpc()) catch return;
-            defer router.allocator.free(framed);
-            router.pushSubscribeFrame(state, framed);
+            const frame = makeSubscribeFrame(router.allocator, framed) orelse return;
+            defer frame.release(); // builder reference
+            frame.retain();
+            state.queue.push(router.io, .subscribe, frame) catch frame.release();
         }
 
-        /// Push an owned copy of `framed` onto a peer's `.subscribe` lane. Each
-        /// pushed frame owns its own byte copy (the caller keeps `framed` as a
-        /// template). On allocation or push failure the copy is freed and the peer
-        /// is left untouched.
-        fn pushSubscribeFrame(router: *Self, state: *PeerState, framed: []const u8) void {
-            const copy = router.allocator.dupe(u8, framed) catch return;
-            const ids = router.allocator.alloc([]u8, 0) catch {
-                router.allocator.free(copy);
-                return;
+        /// Build a refcounted shared subscribe frame (empty message_ids) taking
+        /// ownership of `framed`, with one builder reference. Returns null (after
+        /// freeing `framed`) on allocation failure.
+        fn makeSubscribeFrame(allocator: std.mem.Allocator, framed: []u8) ?*peer_io.OutboundFrame {
+            const ids = allocator.alloc([]u8, 0) catch {
+                allocator.free(framed);
+                return null;
             };
-            var frame = peer_io.OutboundFrame{ .bytes = copy, .message_ids = ids };
-            state.queue.push(router.io, .subscribe, frame) catch frame.deinit(router.allocator);
+            return peer_io.OutboundFrame.create(allocator, framed, ids, 1) catch {
+                allocator.free(framed);
+                allocator.free(ids);
+                return null;
+            };
         }
 
         /// Handle a peer disconnecting: look up, tear down its writer + state.
@@ -600,8 +612,13 @@ pub fn Router(comptime Transport: type) type {
 
         /// Floodsub-forward a single message to every peer whose announced topics
         /// include `topic`, optionally excluding one peer (the relay source).
-        /// Frames the message once into a template, then pushes an independent
-        /// owned copy (with a dup'd message id) onto each target's `.data` lane.
+        /// Frames the message ONCE into a single refcounted shared frame (carrying
+        /// the message id for later IDONTWANT purge), then hands one reference to
+        /// each target's `.data` lane — no per-peer copy of the (up-to-1 MiB) wire
+        /// bytes. The builder holds the initial reference and drops it at the end;
+        /// each accepted push consumes a `retain`, each rejected push releases its
+        /// retain, and the final builder release frees the frame iff no queue kept
+        /// a reference.
         fn forwardMessage(
             router: *Self,
             exclude: ?struct { peer: PeerId },
@@ -613,33 +630,38 @@ pub fn Router(comptime Transport: type) type {
         ) void {
             const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data };
             const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .publish = &.{msg} }).toRpc()) catch return;
-            defer router.allocator.free(framed);
+            // `framed`/`ids` are handed to the frame on a successful create; a
+            // failure before that frees whatever is already allocated. (This fn
+            // returns void, so explicit cleanup — not errdefer — handles the
+            // partial-allocation paths.)
+            const ids = router.allocator.alloc([]u8, 1) catch {
+                router.allocator.free(framed);
+                return;
+            };
+            ids[0] = router.allocator.dupe(u8, id) catch {
+                router.allocator.free(ids);
+                router.allocator.free(framed);
+                return;
+            };
+
+            const frame = peer_io.OutboundFrame.create(router.allocator, framed, ids, 1) catch {
+                router.allocator.free(ids[0]);
+                router.allocator.free(ids);
+                router.allocator.free(framed);
+                return;
+            };
+            // Builder reference dropped at the end; queues hold the rest. If no
+            // queue accepted a push this release frees the whole frame.
+            defer frame.release();
 
             var it = router.peers.iterator();
             while (it.next()) |entry| {
                 const state = entry.value_ptr.*;
                 if (exclude) |e| if (state.peer.eql(&e.peer)) continue;
                 if (!state.topics.contains(topic)) continue;
-                router.pushDataFrame(state, framed, id);
+                frame.retain();
+                state.queue.push(router.io, .data, frame) catch frame.release();
             }
-        }
-
-        /// Push an owned copy of a framed publish (with a dup'd message id) onto a
-        /// peer's `.data` lane. The pushed frame owns both copies; on allocation or
-        /// push failure everything allocated here is freed and the peer is skipped.
-        fn pushDataFrame(router: *Self, state: *PeerState, framed: []const u8, id: []const u8) void {
-            const copy = router.allocator.dupe(u8, framed) catch return;
-            errdefer router.allocator.free(copy);
-
-            const ids = router.allocator.alloc([]u8, 1) catch return;
-            errdefer router.allocator.free(ids);
-            ids[0] = router.allocator.dupe(u8, id) catch {
-                router.allocator.free(ids);
-                return;
-            };
-
-            var frame = peer_io.OutboundFrame{ .bytes = copy, .message_ids = ids };
-            state.queue.push(router.io, .data, frame) catch frame.deinit(router.allocator);
         }
 
         /// Local subscribe: record the topic and announce it to every peer.
@@ -665,15 +687,21 @@ pub fn Router(comptime Transport: type) type {
             router.announceSubscription(topic, false);
         }
 
-        /// Frame a single (un)subscription RPC once and push an owned copy onto
-        /// every peer's `.subscribe` lane.
+        /// Frame a single (un)subscription RPC ONCE into a refcounted shared frame
+        /// and hand one reference to every peer's `.subscribe` lane — no per-peer
+        /// copy. Builder holds the initial reference and drops it at the end; each
+        /// accepted push consumes a `retain`, each rejected push releases it.
         fn announceSubscription(router: *Self, topic: []const u8, subscribe: bool) void {
             const sub = rpc.buildSubscription(topic, subscribe);
             const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .subscriptions = &.{sub} }).toRpc()) catch return;
-            defer router.allocator.free(framed);
+            const frame = makeSubscribeFrame(router.allocator, framed) orelse return;
+            defer frame.release(); // builder reference
 
             var it = router.peers.iterator();
-            while (it.next()) |entry| router.pushSubscribeFrame(entry.value_ptr.*, framed);
+            while (it.next()) |entry| {
+                frame.retain();
+                entry.value_ptr.*.queue.push(router.io, .subscribe, frame) catch frame.release();
+            }
         }
 
         /// Local publish: build a Message from us, dedup it, deliver locally if we
@@ -699,16 +727,15 @@ pub fn Router(comptime Transport: type) type {
             router.forwardMessage(null, from, seqno, topic, data, id.bytes);
         }
 
-        /// Test-only: push an owned frame onto a tracked peer's outbound queue,
+        /// Test-only: push a frame reference onto a tracked peer's outbound queue,
         /// running on the router fiber so the peer-map lookup never races the
-        /// router's own mutations. Frees the frame if the peer is gone. Always
-        /// sets the reply event.
-        fn onEnqueueForTest(router: *Self, peer: PeerId, frame: peer_io.OutboundFrame, reply: *std.Io.Event) void {
-            var owned = frame;
+        /// router's own mutations. Releases the reference if the peer is gone or
+        /// the push fails. Always sets the reply event.
+        fn onEnqueueForTest(router: *Self, peer: PeerId, frame: *peer_io.OutboundFrame, reply: *std.Io.Event) void {
             if (router.peers.get(peerKey(&peer))) |state| {
-                state.queue.push(router.io, .data, owned) catch owned.deinit(router.allocator);
+                state.queue.push(router.io, .data, frame) catch frame.release();
             } else {
-                owned.deinit(router.allocator);
+                frame.release();
             }
             reply.set(router.io);
         }
@@ -780,11 +807,10 @@ pub fn Router(comptime Transport: type) type {
                         router.allocator.free(p.data);
                     },
                     .enqueue_for_test => |e| {
-                        // The peer map is already torn down; free the frame and
-                        // release any waiter so a test post in flight at shutdown
-                        // neither leaks nor hangs.
-                        var frame = e.frame;
-                        frame.deinit(router.allocator);
+                        // The peer map is already torn down; release the frame
+                        // reference and wake any waiter so a test post in flight at
+                        // shutdown neither leaks nor hangs.
+                        e.frame.release();
                         e.reply.set(router.io);
                     },
                     else => {},
@@ -1128,13 +1154,15 @@ test "router clean shutdown tears down registered peers" {
 
 // --- test helpers for the router-level tests -------------------------------
 
-/// Build a one-byte owned data frame for the writer-give-up test (the writer
-/// pops it, fails to open, frees it).
-fn testDataFrame(allocator: std.mem.Allocator) !peer_io.OutboundFrame {
+/// Build a one-byte shared data frame (one reference) for the writer-give-up
+/// test (the writer pops it, fails to open, releases the reference).
+fn testDataFrame(allocator: std.mem.Allocator) !*peer_io.OutboundFrame {
     const bytes = try allocator.alloc(u8, 1);
+    errdefer allocator.free(bytes);
     bytes[0] = 0x7f;
     const ids = try allocator.alloc([]u8, 0);
-    return .{ .bytes = bytes, .message_ids = ids };
+    errdefer allocator.free(ids);
+    return peer_io.OutboundFrame.create(allocator, bytes, ids, 1);
 }
 
 /// Build a real OwnedRpc carrying a single subscription, mirroring what the
