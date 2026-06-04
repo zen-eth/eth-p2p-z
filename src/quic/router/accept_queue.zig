@@ -54,7 +54,7 @@ pub const Permit = struct {
 /// caller owns a slot until `publish` (transfers it to a queued item) or
 /// `cancel` (releases it).
 pub fn tryReserve(ch: *Channel.State, available: *std.atomic.Value(usize)) ?Permit {
-    // CAS-decrement-to-floor admission idiom, shared with the E3 handler gate.
+    // CAS-decrement-to-floor admission idiom, shared with the switch handler gate.
     if (!channel.tryDecrementToFloor(available)) return null;
     return .{ .channel = ch, .available = available };
 }

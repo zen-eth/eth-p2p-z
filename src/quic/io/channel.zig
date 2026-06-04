@@ -26,17 +26,12 @@ pub const Signal = struct {
 };
 
 /// Atomically decrement `counter` by one iff it is > 0, returning whether a
-/// decrement happened. This is the lock-free counted-slot admission idiom shared
-/// by the router's accept-queue reservation (`accept_queue.tryReserve`) and the
-/// switch's E3 handler-slot admission (`Switch.dispatchInboundStream`, claiming
-/// `handler_slots_conn`/`handler_slots_total`): a CAS loop that never lets the
-/// counter underflow past zero. Both callers are strictly NON-BLOCKING — a
-/// `false` return means the caller rejects rather than parking. Centralized so
-/// the single synchronizing operation — the cmpxchg — lives in one place. The
-/// initial `.acquire` load is only the CAS's expected-value hint; the cmpxchgWeak
-/// (.acq_rel success / .acquire failure) is what establishes the happens-before
-/// edge against a releaser's `.release` store, so a stale initial read is
-/// harmless: the CAS loop retries on the fresh value.
+/// decrement happened. The lock-free counted-slot admission idiom shared by the
+/// router's accept-queue reservation (`accept_queue.tryReserve`) and the switch's
+/// aggregate handler-slot admission. Both callers are non-blocking — a `false`
+/// return means reject, not park. The cmpxchg is the single synchronizing
+/// operation; the initial `.acquire` load is only its expected-value hint, so a
+/// stale read is harmless (the loop retries on the fresh value).
 pub fn tryDecrementToFloor(counter: *std.atomic.Value(usize)) bool {
     var cur = counter.load(.acquire);
     while (cur > 0) {

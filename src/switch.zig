@@ -21,28 +21,14 @@ const channel = @import("quic/io/channel.zig");
 const io_time = @import("quic/io/time.zig");
 
 const command_queue_capacity = 32;
-/// E3 inbound stream-handler concurrency caps. Two layers, like go-libp2p
-/// (system + peer scopes) and rust-libp2p (per-connection + ConnectionLimits):
-/// a PER-CONNECTION cap (per-peer fairness) and an AGGREGATE cap (total
-/// exhaustion across all connections). Both default conservative + tunable via
-/// `Switch.Options`. The per-conn default (32) sits below the typical QUIC
-/// stream-credit (initial_max_streams_bidi = 100) so the cap is the binding
-/// limit in practice — but this is a sensible default, NOT an enforced
-/// invariant: the two knobs live in different subsystems and can be tuned
-/// independently.
-///
-/// Admission is NON-BLOCKING (go-libp2p's reserve-or-reject model, not a
-/// blocking semaphore): each slot is a plain atomic counter of AVAILABLE slots;
-/// the dispatcher claims one per gate via a lock-free CAS-decrement
-/// (`channel.tryDecrementToFloor`) and, if either gate is exhausted, gracefully
-/// CLOSES the inbound stream instead of parking. This avoids the two-gate "hold
-/// one permit while blocking on the other" hazard, the thundering-herd wake, and
-/// any teardown hang — at the cost of closing over-limit streams rather than
-/// delaying them (the close is a plain FIN/STOP_SENDING(0), not a RESET with a
-/// distinct refusal code). The cap bounds concurrent handler *fibers*;
-/// admitted-stream memory is bounded separately by the QUIC accept/overflow
-/// queues.
-const default_max_inflight_handlers_per_conn: usize = 32;
+/// Aggregate cap on concurrent inbound stream-handler fibers across all
+/// connections. The PER-CONNECTION limit is the QUIC stream credit itself
+/// (`initial_max_streams_bidi`): one inbound stream is one handler, and the peer
+/// cannot open more streams than its credit, so the transport bounds per-peer
+/// concurrency with no extra gate — set that credit to the per-peer limit you
+/// want. This aggregate cap is the cross-connection limit QUIC can't express; it
+/// is claimed non-blockingly, and a full aggregate closes the inbound stream
+/// rather than parking the dispatcher.
 const default_max_inflight_handlers_total: usize = 256;
 const default_negotiation_timeout: std.Io.Timeout = .{
     .duration = .{ .raw = .fromNanoseconds(10 * std.time.ns_per_s), .clock = .awake },
@@ -58,14 +44,11 @@ pub const Switch = struct {
     registry_frozen: bool = false,
     connections: std.ArrayList(*SwitchConnection) = .empty,
     connections_lock: std.Io.Mutex = .init,
-    /// Per-connection handler-fiber cap; each actor seeds its own slot counter.
-    max_inflight_handlers_per_conn: usize = default_max_inflight_handlers_per_conn,
-    /// Aggregate handler-fiber slots (count of AVAILABLE slots), shared by every
-    /// connection's dispatcher. Claimed non-blockingly via tryDecrementToFloor.
+    /// Available slots in the aggregate handler cap, shared by every connection's
+    /// dispatcher. Claimed non-blockingly via `channel.tryDecrementToFloor`.
     handler_slots_total: std.atomic.Value(usize) = .init(default_max_inflight_handlers_total),
 
     pub const Options = struct {
-        max_inflight_handlers_per_conn: usize = default_max_inflight_handlers_per_conn,
         max_inflight_handlers_total: usize = default_max_inflight_handlers_total,
     };
     pub const OptionsError = error{InvalidOptions};
@@ -73,7 +56,6 @@ pub const Switch = struct {
     fn validateOptions(opts: Options) OptionsError!void {
         // A zero cap would reject every inbound stream — reject the config rather
         // than silently clamp.
-        if (opts.max_inflight_handlers_per_conn == 0) return error.InvalidOptions;
         if (opts.max_inflight_handlers_total == 0) return error.InvalidOptions;
     }
 
@@ -81,10 +63,9 @@ pub const Switch = struct {
     pub const DispatchError = error{
         NoRegisteredProtocols,
         ConnectionClosed,
-        /// The per-connection or aggregate handler-slot cap is full; the inbound
-        /// stream was gracefully closed (non-blocking back-pressure). The
-        /// dispatcher loop treats this as "skip and keep accepting" (after a short
-        /// backoff), not a fatal error.
+        /// The aggregate handler cap is full; the inbound stream was gracefully
+        /// closed (non-blocking back-pressure). The dispatcher loop treats this as
+        /// "skip and keep accepting" (after a short backoff), not a fatal error.
         HandlerLimitReached,
     } || std.mem.Allocator.Error || std.Io.ConcurrentError || quic.Connection.AcceptStreamError;
     pub const AddProtocolServiceError = error{RegistryFrozen} || std.mem.Allocator.Error;
@@ -118,7 +99,7 @@ pub const Switch = struct {
         return sw;
     }
 
-    /// Like `init`, but with custom E3 handler-concurrency caps.
+    /// Like `init`, but with a custom aggregate handler cap.
     pub fn initWithOptions(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -132,7 +113,6 @@ pub const Switch = struct {
             .io = io,
             .endpoint = endpoint,
             .services = std.StringHashMap(protocols.AnyProtocolService).init(allocator),
-            .max_inflight_handlers_per_conn = opts.max_inflight_handlers_per_conn,
             .handler_slots_total = .init(opts.max_inflight_handlers_total),
         };
         return sw;
@@ -153,15 +133,11 @@ pub const Switch = struct {
         }
         sw.connections.deinit(sw.allocator);
 
-        // The aggregate slot counter (handler_slots_total) needs no teardown — it
-        // is a plain atomic with no waiters. Freeing it with the Switch below is
-        // safe ONLY because the per-connection teardown loop above JOINS every
-        // handler fiber first: each managed.deinit() -> shutdownAndDestroy
-        // cancels+awaits actorMain, whose cleanup() calls handler_group.cancel()
-        // (blocks until all handlers finish), so every handler's
-        // `defer sw.handler_slots_total.fetchAdd(...)` has already run against a
-        // still-valid counter. A future fire-and-forget teardown (cancel without
-        // join) would let an in-flight handler touch the freed counter -> UAF.
+        // The aggregate slot counter is just an atomic freed with the Switch
+        // below. That is only safe because the loop above tore down every
+        // connection first, which joins all handler fibers — so no handler can
+        // still touch the counter. Don't change this to a fire-and-forget
+        // teardown without preserving that ordering.
 
         sw.services_lock.lockUncancelable(sw.io);
         var it = sw.services.iterator();
@@ -506,11 +482,6 @@ const SwitchConnectionActor = struct {
     main_future: ?std.Io.Future(std.Io.Cancelable!void) = null,
     dispatcher_group: std.Io.Group = .init,
     handler_group: std.Io.Group = .init,
-    /// Per-connection handler admission slots (count of AVAILABLE slots, E3
-    /// fairness layer), seeded from sw.max_inflight_handlers_per_conn. Claimed
-    /// non-blockingly before spawning a handler, returned in the handler's
-    /// cleanup defer.
-    handler_slots_conn: std.atomic.Value(usize),
     dispatcher_running: bool = false,
     closing: bool = false,
     peer_id: PeerId,
@@ -535,11 +506,6 @@ const SwitchConnectionActor = struct {
             .conn = conn,
             .inbox_storage = inbox_storage,
             .inbox = std.Io.Queue(Command).init(inbox_storage),
-            // `validateOptions` rejects a zero cap on the Options path, but
-            // `max_inflight_handlers_per_conn` is a public field a caller can set
-            // to 0 directly. Clamp to >=1 here as a last-resort backstop so a 0
-            // can never seed a zero-slot gate (which would reject every stream).
-            .handler_slots_conn = .init(@max(@as(usize, 1), sw.max_inflight_handlers_per_conn)),
             .peer_id = try Switch.connectionPeerId(allocator, conn),
             .remote_addr = conn.remoteAddress(),
         };
@@ -563,20 +529,13 @@ const SwitchConnectionActor = struct {
                 actor.inbox.putOneUncancelable(actor.io, .{ .shutdown = &reply }) catch break :blk false;
                 break :blk true;
             };
-            // `.shutdown` + inbox.close() is the persistent teardown signal, but
-            // actorMain only observes it BETWEEN commands. A command handler can
-            // park actorMain on a cancel point the inbox can't reach — most
-            // notably an untimed acceptStream (E3 admission is now non-blocking
-            // tryDecrementToFloor and can never park). Cancel the main future as a
-            // backstop, exactly as the
-            // QUIC ConnectionActor does for its own main loop: every blocking
-            // point in actorMain's call tree is a cancel point and every command
-            // handler propagates Canceled straight to fiber exit (it never
-            // re-parks), so the single Canceled cleanly unwinds it — this is not
-            // the router's re-park-after-cancel hazard. cancel MUST precede the
-            // reply wait: a parked actorMain would otherwise never complete the
-            // reply, which completePending() (in actorMain's defer) does once the
-            // cancel unparks it.
+            // The `.shutdown` command only gets seen between commands; while
+            // actorMain is parked inside a command (e.g. an untimed acceptStream)
+            // it never reaches it. Cancel the main future too: every blocking
+            // point in actorMain is a cancel point that unwinds to fiber exit, so
+            // this can't re-park. Cancel before waiting on the reply, since a
+            // parked actorMain would never complete it otherwise (its defer's
+            // completePending does, once cancel unparks it).
             future.cancel(actor.io) catch {};
             if (sent) reply.event.waitUncancelable(actor.io);
             _ = future.await(actor.io) catch {};
@@ -644,28 +603,17 @@ const SwitchConnectionActor = struct {
             stream.deinit();
         };
 
-        // Non-blocking two-layer admission (E3, go-libp2p reserve-or-reject
-        // model): claim a per-connection slot THEN an aggregate slot, each via a
-        // lock-free CAS-decrement. If either gate is full we do NOT block — we
-        // return error.HandlerLimitReached, and the errdefers gracefully close the
-        // stream and roll back any slot already claimed. The dispatcher loop
-        // treats that as "skip and keep accepting" (with a short backoff — see
-        // inboundDispatcher). The back-pressure is the stream close plus the QUIC
-        // accept-queue / stream-credit tiers; note the close is a graceful
-        // FIN/STOP_SENDING(0) (the peer's negotiation fails, but it cannot tell a
-        // refusal from a completed handler — there is no distinct reset code).
-        // No parking => no two-gate hold-while-block hazard, no thundering-herd
-        // wake, and nothing to unwind at teardown.
-        if (!channel.tryDecrementToFloor(&actor.handler_slots_conn)) return error.HandlerLimitReached;
-        errdefer _ = actor.handler_slots_conn.fetchAdd(1, .release);
-
+        // Claim an aggregate handler slot (the per-connection limit is the QUIC
+        // stream credit, enforced by the transport). A full aggregate is not an
+        // error to retry on this stream: close it and return HandlerLimitReached.
+        // The close is a graceful FIN/STOP_SENDING(0) — the peer's negotiation
+        // fails but can't tell a limit from a completed handler.
         if (!channel.tryDecrementToFloor(&actor.sw.handler_slots_total)) return error.HandlerLimitReached;
         errdefer _ = actor.sw.handler_slots_total.fetchAdd(1, .release);
 
-        // Admitted: only now build the supported-protocol list the handler needs,
-        // so a REFUSED stream never touches the allocator or the services lock
-        // (this is the common path under load). The errdefers above safely roll
-        // the claimed slots back on the NoRegisteredProtocols / OOM paths.
+        // Build the supported-protocol list only after admission, so a refused
+        // stream (the common path under load) never allocates or takes the
+        // services lock. The errdefer above rolls the slot back on these paths.
         const supported = try actor.sw.supportedProtocolIds();
         errdefer actor.allocator.free(supported);
         if (supported.len == 0) return error.NoRegisteredProtocols;
@@ -673,13 +621,11 @@ const SwitchConnectionActor = struct {
         try actor.handler_group.concurrent(
             actor.io,
             runNegotiatedProtocolHandler,
-            .{ actor.sw, actor.io, stream, supported, opts.negotiation_timeout, actor.peer_id, actor.remote_addr, &actor.handler_slots_conn },
+            .{ actor.sw, actor.io, stream, supported, opts.negotiation_timeout, actor.peer_id, actor.remote_addr },
         );
-        // Spawn succeeded (the last fallible step): the handler now owns the
-        // stream + both slots + `supported` and releases them in its defers.
-        // Disarm only the stream cleanup; the slot-rollback and supported-free
-        // errdefers above never fire on this (errorless) return, so nothing is
-        // double-returned.
+        // Spawn is the last fallible step, so on success no errdefer fires: the
+        // handler now owns the stream, the slot, and `supported`, and releases
+        // them in its defers. Only the stream cleanup needs disarming.
         stream_live = false;
     }
 
@@ -798,26 +744,19 @@ fn inboundDispatcher(actor: *SwitchConnectionActor, opts: Switch.DispatchOptions
             },
             error.OutOfMemory => return,
             error.ConcurrencyUnavailable => {
-                // Handler spawn failed under fiber/thread exhaustion (the same
-                // OOM / thread-cap condition std.Io.Threaded surfaces as
-                // OutOfMemory). Continuing would tight-spin: acceptStream returns
-                // a queued stream instantly and admission is non-blocking, so each
-                // turn would re-accept, claim+roll-back both slots, and retry
-                // immediately. Exit like OutOfMemory rather than burn CPU; the
-                // connection stays up, inbound dispatch stops.
+                // Out of fibers/threads — usually the same exhaustion as
+                // OutOfMemory. Looping would tight-spin (accept and roll back
+                // instantly), so exit like OutOfMemory; the connection stays up,
+                // inbound dispatch stops.
                 std.log.warn("switch dispatcher exiting: cannot spawn handler (concurrency unavailable)", .{});
                 return;
             },
             error.HandlerLimitReached => {
-                // Back-pressure (a handler cap is full): unlike the fatal errors
-                // above we must NOT exit — keep accepting — but must NOT busy-spin
-                // either. acceptStream returns a queued stream instantly and
-                // admission is non-blocking, so an unthrottled `continue` would peg
-                // a core gracefully-closing every queued stream while a peer floods
-                // (a CPU DoS — the exact hazard the ConcurrencyUnavailable arm
-                // exits for). A short cooperative backoff bounds it; a cap frees
-                // within a handler's lifetime, so this coarse poll loses little. A
-                // cancel during the sleep is teardown -> exit.
+                // The aggregate cap is full (only reachable when the whole process
+                // is at capacity). Keep accepting, but back off so a flood of
+                // queued streams can't spin the loop accepting-and-closing them at
+                // full speed. A slot frees within a handler's lifetime, so a coarse
+                // poll is fine. Cancel = teardown.
                 io_time.ms(5).sleep(actor.io) catch return;
                 continue;
             },
@@ -837,14 +776,11 @@ fn runNegotiatedProtocolHandler(
     timeout: std.Io.Timeout,
     peer_id: PeerId,
     remote_addr: std.Io.net.IpAddress,
-    conn_slots: *std.atomic.Value(usize),
 ) std.Io.Cancelable!void {
-    // Return both admission slots LAST — registered first so they run after the
-    // stream is fully torn down, freeing a slot only once this handler is done.
-    // A plain atomic fetchAdd: non-blocking, allocation-free, and (since nobody
-    // waits on these counters) needs no wake — safe during cancel unwinding.
+    // Return the aggregate slot last (this defer runs after the stream is torn
+    // down), so the slot only frees once this handler is fully done. A plain
+    // atomic add — nobody waits on the counter, so no wake is needed.
     defer _ = sw.handler_slots_total.fetchAdd(1, .release);
-    defer _ = conn_slots.fetchAdd(1, .release);
     defer sw.allocator.free(supported);
     defer {
         const prev = io.swapCancelProtection(.blocked);
@@ -1201,7 +1137,7 @@ test "switch dispatches inbound streams to registered protocol handlers" {
     server_conn_live = false;
 }
 
-test "switch rejects inbound handlers past the per-connection cap, recycling slots (E3 non-blocking gate)" {
+test "switch rejects inbound handlers past the aggregate cap, recycling slots" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -1217,8 +1153,8 @@ test "switch rejects inbound handlers past the per-connection cap, recycling slo
     const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
     defer client_endpoint.deinit();
 
-    // Per-connection cap = 2.
-    const server = try Switch.initWithOptions(allocator, io, server_endpoint, .{ .max_inflight_handlers_per_conn = 2 });
+    // Aggregate cap = 2.
+    const server = try Switch.initWithOptions(allocator, io, server_endpoint, .{ .max_inflight_handlers_total = 2 });
     defer server.deinit();
     const client = try Switch.init(allocator, io, client_endpoint);
     defer client.deinit();
@@ -1272,8 +1208,8 @@ test "switch rejects inbound handlers past the per-connection cap, recycling slo
     defer server_conn.deinit();
     try server_conn.startInboundDispatcher(.{});
 
-    // Two streams fill the cap. openProtocolStream returns once the server has
-    // negotiated, i.e. once each handler was ADMITTED (its per-conn slot claimed).
+    // Two streams fill the aggregate cap. openProtocolStream returns once the
+    // server has negotiated, i.e. once each handler was admitted (slot claimed).
     const s1 = try client_conn.openProtocolStream("/test/gate/1.0.0", .{});
     defer {
         closeStreamForCleanup(io, s1);
@@ -1285,13 +1221,13 @@ test "switch rejects inbound handlers past the per-connection cap, recycling slo
         s2.deinit();
     }
 
-    // Wait until BOTH handlers have entered run() and parked, so both per-conn
-    // slots are definitively held.
+    // Wait until both handlers have entered run() and parked, so both slots are
+    // definitively held.
     var attempts: usize = 0;
     while (ctx.inflight.load(.acquire) < 2) {
         if (attempts >= 600) {
             std.debug.print(
-                "E3 gate never reached the cap within ~3s: inflight={d}, expected 2\n",
+                "aggregate cap never reached within ~3s: inflight={d}, expected 2\n",
                 .{ctx.inflight.load(.acquire)},
             );
             return error.SaturationTimeout;
@@ -1302,11 +1238,11 @@ test "switch rejects inbound handlers past the per-connection cap, recycling slo
     try std.testing.expectEqual(@as(usize, 2), ctx.inflight.load(.acquire));
     try std.testing.expectEqual(@as(usize, 2), ctx.peak.load(.acquire));
 
-    // Both slots are held. Two MORE inbound streams must be REJECTED (the server
-    // gracefully closes them, non-blocking) rather than queued or blocking — so
-    // the client's openProtocolStream fails. QUIC stream-credit (100) >> the cap
-    // (2), so these streams do reach the switch and get switch-rejected. With a
-    // higher cap they would be admitted and succeed, so this genuinely binds the cap.
+    // Both slots are held. Two MORE inbound streams must be rejected (the server
+    // gracefully closes them) rather than queued or blocking — so the client's
+    // openProtocolStream fails. QUIC stream-credit (100) >> the cap (2), so these
+    // streams do reach the switch and get rejected there. With a higher cap they
+    // would be admitted and succeed, so this genuinely binds the cap.
     var rejected: usize = 0;
     for (0..2) |_| {
         if (client_conn.openProtocolStream("/test/gate/1.0.0", .{})) |extra| {
