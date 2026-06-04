@@ -3,6 +3,8 @@ const PeerId = @import("peer_id").PeerId;
 const rpc_pb = @import("../../protobuf.zig").rpc;
 const Stream = @import("../../quic.zig").Stream;
 
+pub const rpc = @import("rpc.zig");
+
 pub const protocol_id = "/meshsub/1.1.0";
 pub const protocol_id_v1_0 = "/meshsub/1.0.0";
 const max_rpc_message_len = 1024 * 1024;
@@ -31,24 +33,24 @@ pub const Gossipsub = struct {
 
     pub fn run(self: *Gossipsub, io: std.Io, stream: *Stream) !void {
         while (true) {
-            var rpc = readRpc(self.allocator, io, stream) catch |err| switch (err) {
+            var msg = readRpc(self.allocator, io, stream) catch |err| switch (err) {
                 error.EndOfStream, error.StreamShutdown, error.ConnectionClosed => return,
                 else => |e| return e,
             };
-            errdefer rpc.deinit(self.allocator);
-            try self.inbox.putOne(io, rpc);
+            errdefer msg.deinit(self.allocator);
+            try self.inbox.putOne(io, msg);
         }
     }
 };
 
 pub fn writePublish(allocator: std.mem.Allocator, io: std.Io, stream: *Stream, message: rpc_pb.Message) !void {
     const publish = [_]?rpc_pb.Message{message};
-    const rpc = rpc_pb.RPC{ .publish = &publish };
-    try writeRpc(allocator, io, stream, rpc);
+    const frame = rpc_pb.RPC{ .publish = &publish };
+    try writeRpc(allocator, io, stream, frame);
 }
 
-pub fn writeRpc(allocator: std.mem.Allocator, io: std.Io, stream: *Stream, rpc: rpc_pb.RPC) !void {
-    const payload = try rpc.encode(allocator);
+pub fn writeRpc(allocator: std.mem.Allocator, io: std.Io, stream: *Stream, frame: rpc_pb.RPC) !void {
+    const payload = try frame.encode(allocator);
     defer if (payload.len > 0) allocator.free(payload);
 
     var len_buf: [max_varint_len]u8 = undefined;
