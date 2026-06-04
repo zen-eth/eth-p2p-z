@@ -7,25 +7,24 @@
 //! with no locks.
 //!
 //! This layer is lifecycle + per-peer I/O wiring only: on connect it opens a
-//! per-peer outbound `/meshsub/1.1.0` stream (lazily, via a writer fiber draining
-//! an OutboundQueue) and starts reading the peer's inbound stream; on disconnect
-//! it tears that down cleanly. There is no subscribe/publish/forwarding/mesh
-//! logic here — inbound RPCs are currently freed on arrival. Message handling is
-//! a later layer that will dispatch on the command in `inbound_rpc`.
+//! per-peer outbound stream (lazily, via a writer fiber draining an
+//! OutboundQueue) and starts reading the peer's inbound stream; on disconnect it
+//! tears that down cleanly. There is no subscribe/publish/forwarding/mesh logic
+//! here — inbound RPCs are currently freed on arrival. Message handling is a
+//! later layer that will dispatch on the command in `inbound_rpc`.
+//!
+//! The Router is generic over a comptime `Transport` so its lifecycle logic can
+//! be unit-tested against an in-memory fake (no real QUIC), exactly how
+//! go-libp2p-pubsub and rust-libp2p test their gossipsub cores. The real
+//! Switch/QUIC binding (`SwitchTransport`, the concrete stream sink/source, the
+//! inbound service) lives in gossipsub.zig; this file knows nothing about
+//! `*Switch`/`*SwitchConnection`/`*quic.Stream`.
 
 const std = @import("std");
-const protocols = @import("../../protocols.zig");
-const quic = @import("../../quic.zig");
-const swarm = @import("../../switch.zig");
 const pubsub = @import("pubsub.zig");
 const peer_io = @import("peer_io.zig");
 const io_time = @import("../../quic/io/time.zig");
 const PeerId = @import("peer_id").PeerId;
-
-const Switch = swarm.Switch;
-const SwitchConnection = swarm.SwitchConnection;
-const ProtocolId = protocols.ProtocolId;
-const Stream = quic.Stream;
 
 /// The router inbox holds at most this many un-processed commands. The single
 /// fiber drains it continuously, so this only needs to absorb bursts of
@@ -44,427 +43,413 @@ fn peerKey(peer: *const PeerId) PeerKey {
     return key;
 }
 
-/// Drains a peer's OutboundQueue onto its `/meshsub/1.1.0` stream. The sink owns
-/// the current QUIC stream and re-opens it lazily; it satisfies the PeerWriter
-/// Sink contract (open / writeFrame / close, with close idempotent).
-const StreamSink = struct {
-    conn: *SwitchConnection,
-    proto: ProtocolId,
-    /// The currently-open outbound stream, or null when none is open.
-    current: ?*Stream = null,
+/// The single-fiber gossipsub router, generic over a comptime `Transport` that
+/// supplies the per-peer outbound sink (and the opaque connection handle the
+/// `peer_connected` command carries). The router owns the peer map and inbox;
+/// the main fiber serialises every mutation.
+///
+/// The `Transport` type must provide:
+///
+///   pub const ConnHandle = ...;
+///       An opaque per-peer connection handle, carried in the `peer_connected`
+///       Command and handed back to `makeSink`. The router treats it as a value
+///       it stores and forwards; it never dereferences it. (For the real
+///       transport this is `*SwitchConnection`; for tests it is a fake handle.)
+///
+///   pub const Sink = ...;
+///       The per-peer outbound sink type. Must satisfy the PeerWriter Sink
+///       contract:
+///         fn open(self: *Sink, io: std.Io) anyerror!void
+///             (re)establish the current outbound stream. No I/O happens until
+///             the writer fiber calls this lazily on its first frame.
+///         fn writeFrame(self: *Sink, io: std.Io, bytes: []const u8) anyerror!void
+///             write framed bytes to the current stream.
+///         fn close(self: *Sink, io: std.Io) void
+///             tear down the current stream; idempotent (safe when none open).
+///
+///   pub fn makeSink(self: *Transport, allocator: std.mem.Allocator,
+///                   peer: PeerId, conn: ConnHandle) !*Sink;
+///       Allocate + initialise (NO I/O — the writer calls `open` lazily) an
+///       outbound sink for the peer. The Router OWNS the returned sink: on
+///       teardown it calls `sink.close(io)` then `allocator.destroy(sink)`.
+pub fn Router(comptime Transport: type) type {
+    return struct {
+        const Self = @This();
 
-    /// (Re)establish the outbound stream by negotiating the protocol on a new
-    /// QUIC stream. Leaves `current` set on success; on failure `current` is
-    /// untouched (it was already null — the writer only opens when it has none).
-    pub fn open(self: *StreamSink, io: std.Io) !void {
-        _ = io;
-        self.current = try self.conn.openProtocolStream(self.proto, .{});
-    }
+        const Sink = Transport.Sink;
+        const ConnHandle = Transport.ConnHandle;
+        const Writer = peer_io.PeerWriter(Sink);
 
-    /// Write one framed RPC to the current stream. Errors propagate so the
-    /// writer can tear the stream down and re-open.
-    pub fn writeFrame(self: *StreamSink, io: std.Io, bytes: []const u8) !void {
-        try self.current.?.writeAll(io, bytes, .{});
-    }
-
-    /// Tear down the current stream. Idempotent: safe when none is open. The
-    /// stream close is fire-and-forget; deinit drops the handle.
-    pub fn close(self: *StreamSink, io: std.Io) void {
-        if (self.current) |s| {
-            s.close(io) catch {};
-            s.deinit();
-            self.current = null;
-        }
-    }
-};
-
-/// Reads parsed RPCs off a peer's inbound `/meshsub/1.1.0` stream. Satisfies the
-/// PeerReader Source contract; surfaces EOF / shutdown / connection-closed as
-/// errors so the reader loop exits.
-const StreamSource = struct {
-    stream: *Stream,
-
-    pub fn read(self: *StreamSource, allocator: std.mem.Allocator, io: std.Io) !pubsub.OwnedRpc {
-        return pubsub.readRpc(allocator, io, self.stream);
-    }
-};
-
-/// Posts inbound RPCs to the router's single Command inbox by wrapping each in
-/// the `inbound_rpc` Command variant. This is the bridge the generalised
-/// PeerReader posts through, so inbound RPCs share one ordered queue with every
-/// other router event.
-const InboxPoster = struct {
-    router: *Router,
-
-    pub fn post(self: *InboxPoster, io: std.Io, rpc: peer_io.InboundRpc) anyerror!void {
-        return self.router.inbox.putOne(io, .{ .inbound_rpc = rpc });
-    }
-};
-
-/// Per-stream inbound handler. The Switch's dispatcher creates one of these per
-/// inbound `/meshsub/1.1.0` stream (capturing the sender's peer id) and runs it
-/// on a handler fiber the Switch owns and cancels on connection teardown. The
-/// handler reads RPCs and posts them to the router inbox until the stream ends.
-const InboundHandler = struct {
-    router: *Router,
-    peer: PeerId,
-
-    /// Fiber body run by the Switch. Reads + posts until the stream breaks.
-    fn run(self: *InboundHandler, io: std.Io, stream: *Stream) anyerror!void {
-        var source = StreamSource{ .stream = stream };
-        var poster = InboxPoster{ .router = self.router };
-        var reader = peer_io.PeerReader(StreamSource, InboxPoster){
-            .source = &source,
-            .poster = &poster,
-            .peer = self.peer,
-            .allocator = self.router.allocator,
+        /// A command posted to the router's single inbox. Producers post; the
+        /// router fiber processes. (subscribe/publish/heartbeat variants arrive
+        /// in later layers.) Generic in the transport's connection handle.
+        pub const Command = union(enum) {
+            /// A peer's connection is up (handshake done, peer id known). The
+            /// `conn` handle stays valid until the matching `peer_disconnected`.
+            peer_connected: struct {
+                peer: PeerId,
+                conn: ConnHandle,
+                remote_addr: std.Io.net.IpAddress,
+            },
+            /// A peer's connection is gone. Tear the peer down.
+            peer_disconnected: struct { peer: PeerId },
+            /// An RPC arrived on a peer's inbound stream. The router owns it and
+            /// must free it (no forwarding yet).
+            inbound_rpc: peer_io.InboundRpc,
+            /// Stop the router: tear down every peer, then exit the main fiber.
+            shutdown,
+            /// Test-only: enqueue an owned frame onto a tracked peer's outbound
+            /// queue, on the router fiber (so the peer-map lookup is race-free).
+            /// Used by router unit tests to make a peer's writer actually attempt
+            /// to open its stream (the writer opens lazily on its first frame).
+            /// If the peer is not tracked the frame is freed. The reply event is
+            /// set once the push (or free) is done.
+            enqueue_for_test: struct {
+                peer: PeerId,
+                frame: peer_io.OutboundFrame,
+                reply: *std.Io.Event,
+            },
         };
-        reader.run(io);
-    }
-};
 
-/// The inbound service object registered on the Switch for `/meshsub/1.1.0`.
-/// Its `openInbound` captures the negotiated peer id into a fresh, heap-owned
-/// `InboundHandler` so the read loop knows who sent the RPCs. The handler is
-/// freed by the Switch via the AnyProtocolStreamHandler deinit after `run`
-/// returns.
-const InboundService = struct {
-    router: *Router,
+        /// All state for one connected peer, owned by the router fiber. The
+        /// writer fiber drains `queue` through `sink`; the writer's lifetime is
+        /// the `writer_future`.
+        const PeerState = struct {
+            peer: PeerId,
+            queue: peer_io.OutboundQueue,
+            /// Heap-owned (Transport-allocated) so its address is stable while
+            /// the writer fiber holds it. The sink (and its stream) MUST outlive
+            /// the writer fiber — torn down only after the writer is awaited.
+            sink: *Sink,
+            writer: *Writer,
+            writer_future: std.Io.Future(void),
+            /// Back-pointer for the writer's on_disconnect callback, which
+            /// receives this PeerState as its context and needs the router to
+            /// post peer_disconnected. Set in the initializer below so it is
+            /// valid before the writer fiber spawns.
+            router_for_disconnect: *Self,
+        };
 
-    fn openInbound(
-        self: *InboundService,
+        /// Posts inbound RPCs to the router's single Command inbox by wrapping
+        /// each in the `inbound_rpc` Command variant. This is the bridge the
+        /// generalised PeerReader posts through, so inbound RPCs share one
+        /// ordered queue with every other router event. Transport-agnostic
+        /// (references only the router + Command), so it lives here.
+        pub const InboxPoster = struct {
+            router: *Self,
+
+            pub fn post(self: *InboxPoster, io: std.Io, rpc: peer_io.InboundRpc) anyerror!void {
+                return self.router.inbox.putOne(io, .{ .inbound_rpc = rpc });
+            }
+        };
+
         allocator: std.mem.Allocator,
-        ctx: protocols.InboundProtocolContext,
-    ) anyerror!protocols.AnyProtocolStreamHandler {
-        const handler = try allocator.create(InboundHandler);
-        handler.* = .{ .router = self.router, .peer = ctx.peer_id };
-        return protocols.ownedProtocolStreamHandler(InboundHandler, InboundHandler.run, handler);
-    }
-};
+        io: std.Io,
+        /// The per-peer sink factory. Held by value: the real `SwitchTransport`
+        /// is empty, so by-value avoids an extra borrowed pointer.
+        transport: Transport,
+        inbox_storage: []Command,
+        inbox: std.Io.Queue(Command),
+        /// Keyed by zero-padded peer bytes (see PeerKey). Values are heap-owned.
+        peers: std.AutoHashMap(PeerKey, *PeerState),
+        main_future: ?std.Io.Future(void) = null,
+        /// Set once when teardown begins so the main loop stops after the inbox
+        /// drains/closes. Atomic because it is read on the main fiber but set on
+        /// the caller's fiber (deinit path).
+        stopping: std.atomic.Value(bool) = .init(false),
+        /// Number of live peers, published for observers (e.g. tests).
+        peer_count: std.atomic.Value(usize) = .init(0),
 
-/// A command posted to the router's single inbox. Producers post; the router
-/// fiber processes. (subscribe/publish/heartbeat variants arrive in later
-/// layers.)
-const Command = union(enum) {
-    /// A peer's connection is up (handshake done, peer id known). The
-    /// `*SwitchConnection` stays valid until the matching `peer_disconnected`.
-    peer_connected: struct {
-        peer: PeerId,
-        conn: *SwitchConnection,
-        remote_addr: std.Io.net.IpAddress,
-    },
-    /// A peer's connection is gone. Tear the peer down.
-    peer_disconnected: struct { peer: PeerId },
-    /// An RPC arrived on a peer's inbound stream. The router owns it and must
-    /// free it (no forwarding yet).
-    inbound_rpc: peer_io.InboundRpc,
-    /// Stop the router: tear down every peer, then exit the main fiber.
-    shutdown,
-};
+        pub fn create(allocator: std.mem.Allocator, io: std.Io, transport: Transport) !*Self {
+            const inbox_storage = try allocator.alloc(Command, inbox_capacity);
+            errdefer allocator.free(inbox_storage);
 
-/// All state for one connected peer, owned by the router fiber. The writer fiber
-/// drains `queue` through `sink`; the writer's lifetime is the `writer_future`.
-const PeerState = struct {
-    peer: PeerId,
-    /// Borrowed; valid until peer_disconnected (the Switch owns it).
-    conn: *SwitchConnection,
-    queue: peer_io.OutboundQueue,
-    /// Heap-owned so its address is stable while the writer fiber holds it. The
-    /// sink (and its stream) MUST outlive the writer fiber — torn down only after
-    /// the writer is awaited.
-    sink: *StreamSink,
-    writer: *Writer,
-    writer_future: std.Io.Future(void),
-    /// Back-pointer for the writer's on_disconnect callback, which receives this
-    /// PeerState as its context and needs the router to post peer_disconnected.
-    /// Set in the initializer below so it is valid before the writer fiber spawns.
-    router_for_disconnect: *Router,
-};
-
-const Writer = peer_io.PeerWriter(StreamSink);
-
-/// The single-fiber gossipsub router. Owns the peer map and inbox; the main
-/// fiber serialises every mutation.
-pub const Router = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    /// Borrowed; must outlive the router.
-    sw: *Switch,
-    inbox_storage: []Command,
-    inbox: std.Io.Queue(Command),
-    /// Keyed by zero-padded peer bytes (see PeerKey). Values are heap-owned.
-    peers: std.AutoHashMap(PeerKey, *PeerState),
-    main_future: ?std.Io.Future(void) = null,
-    /// Set once when teardown begins so the main loop stops after the inbox
-    /// drains/closes. Atomic because it is read on the main fiber but set on the
-    /// caller's fiber (deinit path).
-    stopping: std.atomic.Value(bool) = .init(false),
-    /// Number of live peers, published for observers (e.g. the integration test).
-    peer_count: std.atomic.Value(usize) = .init(0),
-
-    pub fn create(allocator: std.mem.Allocator, io: std.Io, sw: *Switch) !*Router {
-        const inbox_storage = try allocator.alloc(Command, inbox_capacity);
-        errdefer allocator.free(inbox_storage);
-
-        const router = try allocator.create(Router);
-        router.* = .{
-            .allocator = allocator,
-            .io = io,
-            .sw = sw,
-            .inbox_storage = inbox_storage,
-            .inbox = std.Io.Queue(Command).init(inbox_storage),
-            .peers = std.AutoHashMap(PeerKey, *PeerState).init(allocator),
-        };
-        return router;
-    }
-
-    /// Spawn the main fiber. Call once after `create`.
-    pub fn start(router: *Router) std.Io.ConcurrentError!void {
-        router.main_future = try std.Io.concurrent(router.io, mainLoop, .{router});
-    }
-
-    /// Build the inbound service object that reads inbound RPCs and posts them to
-    /// the inbox. The returned AnyProtocolService borrows `router` (its instance
-    /// is a heap-owned InboundService destroyed via the service deinit).
-    pub fn inboundService(router: *Router) !protocols.AnyProtocolService {
-        const svc = try router.allocator.create(InboundService);
-        svc.* = .{ .router = router };
-        return protocols.ownedProtocolService(
-            InboundService,
-            InboundService.openInbound,
-            destroyInboundService,
-            svc,
-        );
-    }
-
-    fn destroyInboundService(svc: *InboundService) void {
-        svc.router.allocator.destroy(svc);
-    }
-
-    /// Stop the router and free all of its resources. Sets the persistent
-    /// stopping flag, closes the inbox to wake the main loop, posts a `shutdown`
-    /// as a backstop, cancels + awaits the main fiber, then frees the inbox
-    /// storage and the router. The main fiber tears down every peer on its way
-    /// out, so this is safe to call from any other fiber.
-    pub fn destroy(router: *Router) void {
-        router.stopping.store(true, .release);
-
-        // Post shutdown first (so a main loop parked in getOne wakes and runs the
-        // peer teardown on its own fiber), then close the inbox. close() alone
-        // would make getOne return Closed before processing shutdown, but the
-        // main loop also tears peers down on Closed via `teardownAllPeers`, so
-        // either path is safe. Use the uncancelable post to avoid losing it.
-        router.inbox.putOneUncancelable(router.io, .shutdown) catch {};
-
-        if (router.main_future) |*future| {
-            // The main loop exits on shutdown / closed inbox; cancel is a backstop
-            // in case it is parked in a non-inbox cancellation point. Every
-            // blocking point in the loop is a cancel point, so this cannot
-            // re-park. cancel before await so a parked loop unparks.
-            future.cancel(router.io);
-            future.await(router.io);
-            router.main_future = null;
-        } else {
-            // Never spawned: tear down directly.
-            router.teardownAllPeers();
+            const router = try allocator.create(Self);
+            router.* = .{
+                .allocator = allocator,
+                .io = io,
+                .transport = transport,
+                .inbox_storage = inbox_storage,
+                .inbox = std.Io.Queue(Command).init(inbox_storage),
+                .peers = std.AutoHashMap(PeerKey, *PeerState).init(allocator),
+            };
+            return router;
         }
 
-        router.peers.deinit();
-        router.allocator.free(router.inbox_storage);
-        router.allocator.destroy(router);
-    }
-
-    pub fn peerCount(router: *const Router) usize {
-        return router.peer_count.load(.acquire);
-    }
-
-    // ----- main fiber ------------------------------------------------------
-
-    fn mainLoop(router: *Router) void {
-        // On any exit (shutdown, closed inbox, cancellation) tear down every peer
-        // and drain the inbox so nothing leaks.
-        defer {
-            router.teardownAllPeers();
-            router.drainInbox();
+        /// Spawn the main fiber. Call once after `create`.
+        pub fn start(router: *Self) std.Io.ConcurrentError!void {
+            router.main_future = try std.Io.concurrent(router.io, mainLoop, .{router});
         }
 
-        while (true) {
-            const command = router.inbox.getOne(router.io) catch return; // Closed/Canceled
-            switch (command) {
-                .peer_connected => |c| router.onPeerConnected(c.peer, c.conn, c.remote_addr),
-                .peer_disconnected => |c| router.onPeerDisconnected(c.peer),
-                .inbound_rpc => |rpc| router.onInboundRpc(rpc),
-                .shutdown => return,
+        /// Stop the router and free all of its resources. Sets the persistent
+        /// stopping flag, closes the inbox to wake the main loop, posts a
+        /// `shutdown` as a backstop, cancels + awaits the main fiber, then frees
+        /// the inbox storage and the router. The main fiber tears down every
+        /// peer on its way out, so this is safe to call from any other fiber.
+        pub fn destroy(router: *Self) void {
+            router.stopping.store(true, .release);
+
+            // Post shutdown first (so a main loop parked in getOne wakes and runs
+            // the peer teardown on its own fiber), then close the inbox. close()
+            // alone would make getOne return Closed before processing shutdown,
+            // but the main loop also tears peers down on Closed via
+            // `teardownAllPeers`, so either path is safe. Use the uncancelable
+            // post to avoid losing it.
+            router.inbox.putOneUncancelable(router.io, .shutdown) catch {};
+
+            if (router.main_future) |*future| {
+                // The main loop exits on shutdown / closed inbox; cancel is a
+                // backstop in case it is parked in a non-inbox cancellation
+                // point. Every blocking point in the loop is a cancel point, so
+                // this cannot re-park. cancel before await so a parked loop
+                // unparks.
+                future.cancel(router.io);
+                future.await(router.io);
+                router.main_future = null;
+            } else {
+                // Never spawned: tear down directly.
+                router.teardownAllPeers();
+            }
+
+            router.peers.deinit();
+            router.allocator.free(router.inbox_storage);
+            router.allocator.destroy(router);
+        }
+
+        pub fn peerCount(router: *const Self) usize {
+            return router.peer_count.load(.acquire);
+        }
+
+        /// Test-only: enqueue an owned data frame onto `peer`'s outbound queue
+        /// and block until the router fiber has processed the push (or freed the
+        /// frame, if the peer is gone). Doing the lookup + push on the router
+        /// fiber keeps the peer map single-threaded. Used to make a peer's writer
+        /// attempt to open its stream, exercising the writer give-up path.
+        pub fn enqueueDataForTest(router: *Self, peer: PeerId, frame: peer_io.OutboundFrame) !void {
+            var reply: std.Io.Event = .unset;
+            try router.inbox.putOne(router.io, .{ .enqueue_for_test = .{
+                .peer = peer,
+                .frame = frame,
+                .reply = &reply,
+            } });
+            reply.waitUncancelable(router.io);
+        }
+
+        // ----- main fiber --------------------------------------------------
+
+        fn mainLoop(router: *Self) void {
+            // On any exit (shutdown, closed inbox, cancellation) tear down every
+            // peer and drain the inbox so nothing leaks.
+            defer {
+                router.teardownAllPeers();
+                router.drainInbox();
+            }
+
+            while (true) {
+                const command = router.inbox.getOne(router.io) catch return; // Closed/Canceled
+                switch (command) {
+                    .peer_connected => |c| router.onPeerConnected(c.peer, c.conn, c.remote_addr),
+                    .peer_disconnected => |c| router.onPeerDisconnected(c.peer),
+                    .inbound_rpc => |rpc| router.onInboundRpc(rpc),
+                    .enqueue_for_test => |e| router.onEnqueueForTest(e.peer, e.frame, e.reply),
+                    .shutdown => return,
+                }
             }
         }
-    }
 
-    /// Handle a peer connecting: dedup, then create per-peer state and spawn its
-    /// writer fiber. The writer opens the outbound stream lazily on its first
-    /// frame; on open-exhaustion it posts `peer_disconnected` so the peer is torn
-    /// down through the normal path.
-    fn onPeerConnected(router: *Router, peer: PeerId, conn: *SwitchConnection, remote_addr: std.Io.net.IpAddress) void {
-        _ = remote_addr;
-        const key = peerKey(&peer);
-        // A second connection to a peer we already track: keep the first, ignore
-        // the new one's gossipsub setup. One logical peer entry.
-        if (router.peers.contains(key)) return;
+        /// Handle a peer connecting: dedup, then create per-peer state and spawn
+        /// its writer fiber. The writer opens the outbound stream lazily on its
+        /// first frame; on open-exhaustion it posts `peer_disconnected` so the
+        /// peer is torn down through the normal path.
+        fn onPeerConnected(router: *Self, peer: PeerId, conn: ConnHandle, remote_addr: std.Io.net.IpAddress) void {
+            _ = remote_addr;
+            const key = peerKey(&peer);
+            // A second connection to a peer we already track: keep the first,
+            // ignore the new one's gossipsub setup. One logical peer entry.
+            if (router.peers.contains(key)) return;
 
-        const state = router.allocator.create(PeerState) catch return;
-        var state_live = false;
-        defer if (!state_live) router.allocator.destroy(state);
+            const state = router.allocator.create(PeerState) catch return;
+            var state_live = false;
+            defer if (!state_live) router.allocator.destroy(state);
 
-        const sink = router.allocator.create(StreamSink) catch return;
-        var sink_live = false;
-        defer if (!sink_live) router.allocator.destroy(sink);
+            // The transport allocates + initialises the sink (no I/O). The router
+            // owns it from here: it is closed + destroyed in teardownPeer.
+            const sink = router.transport.makeSink(router.allocator, peer, conn) catch return;
+            var sink_live = false;
+            defer if (!sink_live) router.allocator.destroy(sink);
 
-        const writer = router.allocator.create(Writer) catch return;
-        var writer_live = false;
-        defer if (!writer_live) router.allocator.destroy(writer);
+            const writer = router.allocator.create(Writer) catch return;
+            var writer_live = false;
+            defer if (!writer_live) router.allocator.destroy(writer);
 
-        sink.* = .{ .conn = conn, .proto = pubsub.protocol_id };
-        state.* = .{
-            .peer = peer,
-            .conn = conn,
-            .queue = peer_io.OutboundQueue.init(router.allocator, .{}),
-            .sink = sink,
-            .writer = writer,
-            .writer_future = undefined,
-            // Set up-front (not on a later line) so the back-pointer is valid
-            // before the writer fiber spawns and can fire on_disconnect.
-            .router_for_disconnect = router,
-        };
-        // Past this point `state.queue` is initialised; deinit it on any failure
-        // before the writer fiber takes ownership of draining it.
-        var queue_live = false;
-        defer if (!queue_live) state.queue.deinit(router.io);
+            state.* = .{
+                .peer = peer,
+                .queue = peer_io.OutboundQueue.init(router.allocator, .{}),
+                .sink = sink,
+                .writer = writer,
+                .writer_future = undefined,
+                // Set up-front (not on a later line) so the back-pointer is valid
+                // before the writer fiber spawns and can fire on_disconnect.
+                .router_for_disconnect = router,
+            };
+            // Past this point `state.queue` is initialised; deinit it on any
+            // failure before the writer fiber takes ownership of draining it.
+            var queue_live = false;
+            defer if (!queue_live) state.queue.deinit(router.io);
 
-        writer.* = .{
-            .queue = &state.queue,
-            .sink = sink,
-            .allocator = router.allocator,
-            .on_disconnect = onWriterDisconnect,
-            .disconnect_ctx = state,
-        };
-        // The writer reaches the router via `state.router_for_disconnect` (set in
-        // the PeerState initializer above) and tags peer_disconnected with
-        // `state.peer`, recovering both from `disconnect_ctx`.
+            writer.* = .{
+                .queue = &state.queue,
+                .sink = sink,
+                .allocator = router.allocator,
+                .on_disconnect = onWriterDisconnect,
+                .disconnect_ctx = state,
+            };
+            // The writer reaches the router via `state.router_for_disconnect`
+            // (set in the PeerState initializer above) and tags
+            // peer_disconnected with `state.peer`, recovering both from
+            // `disconnect_ctx`.
 
-        const future = std.Io.concurrent(router.io, Writer.run, .{ writer, router.io }) catch return;
+            const future = std.Io.concurrent(router.io, Writer.run, .{ writer, router.io }) catch return;
 
-        // All fallible steps done: the entry is live. Disarm the cleanups so the
-        // PeerState (and the writer fiber draining its queue) survives.
-        state.writer_future = future;
-        router.peers.put(key, state) catch {
-            // The map insert failed after the writer fiber started. Tear the
-            // writer down cleanly (close queue, cancel+await fiber) before
-            // freeing, so we don't leak the fiber or use-after-free the sink.
-            // Cancel before await so a writer parked in its reopen backoff does
-            // not stall this fiber; the backoff sleep is a cancellation point.
-            state.queue.close(router.io);
-            var f = future;
-            f.cancel(router.io);
-            f.await(router.io);
-            state.sink.close(router.io);
-            return; // defers free writer/sink/state; queue deinit fires too
-        };
-        state_live = true;
-        sink_live = true;
-        writer_live = true;
-        queue_live = true;
-        _ = router.peer_count.fetchAdd(1, .release);
-    }
+            // All fallible steps done: the entry is live. Disarm the cleanups so
+            // the PeerState (and the writer fiber draining its queue) survives.
+            state.writer_future = future;
+            router.peers.put(key, state) catch {
+                // The map insert failed after the writer fiber started. Tear the
+                // writer down cleanly (close queue, cancel+await fiber) before
+                // freeing, so we don't leak the fiber or use-after-free the sink.
+                // Cancel before await so a writer parked in its reopen backoff
+                // does not stall this fiber; the backoff sleep is a cancellation
+                // point.
+                state.queue.close(router.io);
+                var f = future;
+                f.cancel(router.io);
+                f.await(router.io);
+                state.sink.close(router.io);
+                return; // defers free writer/sink/state; queue deinit fires too
+            };
+            state_live = true;
+            sink_live = true;
+            writer_live = true;
+            queue_live = true;
+            _ = router.peer_count.fetchAdd(1, .release);
+        }
 
-    /// Handle a peer disconnecting: look up, tear down its writer + state. Absent
-    /// peer (already removed, or a dedup'd second connection) is a no-op.
-    fn onPeerDisconnected(router: *Router, peer: PeerId) void {
-        const key = peerKey(&peer);
-        const entry = router.peers.fetchRemove(key) orelse return;
-        router.teardownPeer(entry.value);
-        _ = router.peer_count.fetchSub(1, .release);
-    }
-
-    /// Handle an inbound RPC: no forwarding yet, so just free it. Freed whether
-    /// or not the peer is still tracked (proves the reader runs + posts without
-    /// leaking).
-    fn onInboundRpc(router: *Router, rpc: peer_io.InboundRpc) void {
-        var owned = rpc;
-        owned.rpc.deinit(router.allocator);
-    }
-
-    /// Tear down one peer's state. Order matters: close the queue (the writer
-    /// drains remaining frames and exits), then CANCEL+AWAIT the writer fiber
-    /// BEFORE freeing the sink (the writer's trailing `sink.close` must not race a
-    /// freed sink), then close the sink, deinit the queue, and free the heap
-    /// allocations.
-    ///
-    /// Cancel before await so a writer parked in `ensureStream`'s reopen backoff
-    /// does not stall this single router fiber for up to
-    /// max_open_retries × reopen_backoff_ms (which would serialize every peer's
-    /// teardown). The backoff `sleep` is a cancellation point, so cancel collapses
-    /// the wait; await then joins. cancel+await on the same Future is safe here:
-    /// cancel is idempotent and clears the future, so the following await returns
-    /// the cached result without double-consuming. Under cancellation the writer
-    /// unwinds cleanly — popBlocking returns Closed (queue already closed) or
-    /// Canceled, or a Cancelable surfaces from open/writeFrame/sleep — runs its
-    /// `defer sink.close`, and returns; the router's own `sink.close` below is
-    /// idempotent.
-    fn teardownPeer(router: *Router, state: *PeerState) void {
-        state.queue.close(router.io);
-        state.writer_future.cancel(router.io);
-        state.writer_future.await(router.io);
-        state.sink.close(router.io);
-        state.queue.deinit(router.io);
-        router.allocator.destroy(state.writer);
-        router.allocator.destroy(state.sink);
-        router.allocator.destroy(state);
-    }
-
-    fn teardownAllPeers(router: *Router) void {
-        var it = router.peers.iterator();
-        while (it.next()) |entry| {
-            router.teardownPeer(entry.value_ptr.*);
+        /// Handle a peer disconnecting: look up, tear down its writer + state.
+        /// Absent peer (already removed, or a dedup'd second connection) is a
+        /// no-op.
+        fn onPeerDisconnected(router: *Self, peer: PeerId) void {
+            const key = peerKey(&peer);
+            const entry = router.peers.fetchRemove(key) orelse return;
+            router.teardownPeer(entry.value);
             _ = router.peer_count.fetchSub(1, .release);
         }
-        router.peers.clearRetainingCapacity();
-    }
 
-    /// Drain and free any commands still buffered in the inbox after the loop
-    /// exits, so an inbound RPC posted concurrently with teardown is not leaked.
-    fn drainInbox(router: *Router) void {
-        router.inbox.close(router.io);
-        var buf: [16]Command = undefined;
-        while (true) {
-            const n = router.inbox.getUncancelable(router.io, &buf, 0) catch return;
-            if (n == 0) return;
-            for (buf[0..n]) |command| switch (command) {
-                .inbound_rpc => |rpc| {
-                    var owned = rpc;
-                    owned.rpc.deinit(router.allocator);
-                },
-                else => {},
-            };
+        /// Handle an inbound RPC: no forwarding yet, so just free it. Freed
+        /// whether or not the peer is still tracked (proves the reader runs +
+        /// posts without leaking).
+        fn onInboundRpc(router: *Self, rpc: peer_io.InboundRpc) void {
+            var owned = rpc;
+            owned.rpc.deinit(router.allocator);
         }
-    }
-};
 
-/// PeerWriter on_disconnect callback. The writer exhausted its open retries, so
-/// hand the peer back to the router by posting `peer_disconnected`. Runs on the
-/// writer fiber, so it must only post — never free the state/sink (the writer's
-/// trailing `sink.close` still fires after this returns).
-fn onWriterDisconnect(ctx: ?*anyopaque) void {
-    const state: *PeerState = @ptrCast(@alignCast(ctx.?));
-    const router = state.router_for_disconnect;
-    router.inbox.putOneUncancelable(router.io, .{ .peer_disconnected = .{ .peer = state.peer } }) catch {};
+        /// Test-only: push an owned frame onto a tracked peer's outbound queue,
+        /// running on the router fiber so the peer-map lookup never races the
+        /// router's own mutations. Frees the frame if the peer is gone. Always
+        /// sets the reply event.
+        fn onEnqueueForTest(router: *Self, peer: PeerId, frame: peer_io.OutboundFrame, reply: *std.Io.Event) void {
+            var owned = frame;
+            if (router.peers.get(peerKey(&peer))) |state| {
+                state.queue.push(router.io, .data, owned) catch owned.deinit(router.allocator);
+            } else {
+                owned.deinit(router.allocator);
+            }
+            reply.set(router.io);
+        }
+
+        /// Tear down one peer's state. Order matters: close the queue (the writer
+        /// drains remaining frames and exits), then CANCEL+AWAIT the writer fiber
+        /// BEFORE freeing the sink (the writer's trailing `sink.close` must not
+        /// race a freed sink), then close the sink, deinit the queue, and free
+        /// the heap allocations.
+        ///
+        /// Cancel before await so a writer parked in `ensureStream`'s reopen
+        /// backoff does not stall this single router fiber for up to
+        /// max_open_retries × reopen_backoff_ms (which would serialize every
+        /// peer's teardown). The backoff `sleep` is a cancellation point, so
+        /// cancel collapses the wait; await then joins. cancel+await on the same
+        /// Future is safe here: cancel is idempotent and clears the future, so
+        /// the following await returns the cached result without double-
+        /// consuming. Under cancellation the writer unwinds cleanly —
+        /// popBlocking returns Closed (queue already closed) or Canceled, or a
+        /// Cancelable surfaces from open/writeFrame/sleep — runs its
+        /// `defer sink.close`, and returns; the router's own `sink.close` below
+        /// is idempotent.
+        fn teardownPeer(router: *Self, state: *PeerState) void {
+            state.queue.close(router.io);
+            state.writer_future.cancel(router.io);
+            state.writer_future.await(router.io);
+            state.sink.close(router.io);
+            state.queue.deinit(router.io);
+            router.allocator.destroy(state.writer);
+            router.allocator.destroy(state.sink);
+            router.allocator.destroy(state);
+        }
+
+        fn teardownAllPeers(router: *Self) void {
+            var it = router.peers.iterator();
+            while (it.next()) |entry| {
+                router.teardownPeer(entry.value_ptr.*);
+                _ = router.peer_count.fetchSub(1, .release);
+            }
+            router.peers.clearRetainingCapacity();
+        }
+
+        /// Drain and free any commands still buffered in the inbox after the loop
+        /// exits, so an inbound RPC posted concurrently with teardown is not
+        /// leaked.
+        fn drainInbox(router: *Self) void {
+            router.inbox.close(router.io);
+            var buf: [16]Command = undefined;
+            while (true) {
+                const n = router.inbox.getUncancelable(router.io, &buf, 0) catch return;
+                if (n == 0) return;
+                for (buf[0..n]) |command| switch (command) {
+                    .inbound_rpc => |rpc| {
+                        var owned = rpc;
+                        owned.rpc.deinit(router.allocator);
+                    },
+                    .enqueue_for_test => |e| {
+                        // The peer map is already torn down; free the frame and
+                        // release any waiter so a test post in flight at shutdown
+                        // neither leaks nor hangs.
+                        var frame = e.frame;
+                        frame.deinit(router.allocator);
+                        e.reply.set(router.io);
+                    },
+                    else => {},
+                };
+            }
+        }
+
+        /// PeerWriter on_disconnect callback. The writer exhausted its open
+        /// retries, so hand the peer back to the router by posting
+        /// `peer_disconnected`. Runs on the writer fiber, so it must only post —
+        /// never free the state/sink (the writer's trailing `sink.close` still
+        /// fires after this returns).
+        fn onWriterDisconnect(ctx: ?*anyopaque) void {
+            const state: *PeerState = @ptrCast(@alignCast(ctx.?));
+            const router = state.router_for_disconnect;
+            router.inbox.putOneUncancelable(router.io, .{ .peer_disconnected = .{ .peer = state.peer } }) catch {};
+        }
+    };
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-const identity = @import("../../identity.zig");
-const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
-const gossipsub = @import("gossipsub.zig");
+const rpc_pb = @import("../../protobuf.zig").rpc;
 
 test "peerKey distinguishes peers and matches equal ids" {
     const a = try PeerId.random();
@@ -479,99 +464,303 @@ test "peerKey distinguishes peers and matches equal ids" {
     try std.testing.expect(!std.mem.eql(u8, &ka, &kb));
 }
 
-test "two gossipsub nodes wire up per-peer I/O on connect and tear down on disconnect" {
+// --- FakeTransport: an in-memory transport for router-level unit tests -----
+
+/// A fake outbound sink that records every byte written to each "stream" it
+/// opens, into transport-owned storage so the recording survives the sink being
+/// closed + destroyed during teardown. Supports a configurable open-failure mode
+/// to exercise the writer's give-up path. Satisfies the PeerWriter Sink
+/// contract.
+///
+/// The recording (`record`) is borrowed from the FakeTransport; the sink only
+/// appends to it, so a sink destroyed in teardownPeer does not lose the frames a
+/// test wants to assert on.
+const FakeSink = struct {
+    allocator: std.mem.Allocator,
+    record: *FakeRecord,
+    /// Number of leading open() calls that should fail. `maxInt` = every open
+    /// fails, driving the writer to exhaust its retries and give up.
+    fail_open_count: usize,
+
+    pub fn open(self: *FakeSink, io: std.Io) anyerror!void {
+        _ = io;
+        self.record.open_calls += 1;
+        if (self.record.open_calls <= self.fail_open_count) return error.OpenFailed;
+        self.record.streams_opened += 1;
+    }
+
+    pub fn writeFrame(self: *FakeSink, io: std.Io, bytes: []const u8) anyerror!void {
+        _ = io;
+        try self.record.written.appendSlice(self.allocator, bytes);
+    }
+
+    pub fn close(self: *FakeSink, io: std.Io) void {
+        _ = self;
+        _ = io;
+    }
+};
+
+/// Transport-owned, per-peer recording of what a peer's sink did. Outlives the
+/// sink so tests can inspect it after teardown frees the sink.
+const FakeRecord = struct {
+    allocator: std.mem.Allocator,
+    open_calls: usize = 0,
+    streams_opened: usize = 0,
+    written: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *FakeRecord) void {
+        self.written.deinit(self.allocator);
+    }
+};
+
+/// An in-memory transport for router unit tests. `ConnHandle` is a tiny fake
+/// connection that carries the per-peer recording; `Sink` is a FakeSink that
+/// records into that connection's recording. `makeSink` allocates a FakeSink
+/// and points it at the connection's transport-owned record.
+const FakeTransport = struct {
+    /// When non-zero every sink made by this transport fails its first N opens
+    /// (use `maxInt` for "always fail"), exercising the writer give-up path.
+    fail_open_count: usize = 0,
+
+    pub const ConnHandle = *FakeConn;
+    pub const Sink = FakeSink;
+
+    /// A fake per-peer connection. Owns its recording; the test owns the conn.
+    const FakeConn = struct {
+        record: FakeRecord,
+    };
+
+    pub fn makeSink(self: *FakeTransport, allocator: std.mem.Allocator, peer: PeerId, conn: ConnHandle) !*FakeSink {
+        _ = peer;
+        const sink = try allocator.create(FakeSink);
+        sink.* = .{
+            .allocator = allocator,
+            .record = &conn.record,
+            .fail_open_count = self.fail_open_count,
+        };
+        return sink;
+    }
+};
+
+/// Build a FakeConn on the heap with a fresh recording. The test owns it and
+/// frees it with `destroyFakeConn` once the router has fully torn the peer down
+/// (so the sink can no longer touch the record).
+fn makeFakeConn(allocator: std.mem.Allocator) !*FakeTransport.FakeConn {
+    const conn = try allocator.create(FakeTransport.FakeConn);
+    conn.* = .{ .record = .{ .allocator = allocator } };
+    return conn;
+}
+
+fn destroyFakeConn(allocator: std.mem.Allocator, conn: *FakeTransport.FakeConn) void {
+    conn.record.deinit();
+    allocator.destroy(conn);
+}
+
+const FakeRouter = Router(FakeTransport);
+
+/// Spin until `pred()` holds or the bounded wait elapses, yielding the fiber
+/// between checks (so the router's own fiber can make progress). Mirrors the
+/// poll loop the real 2-node test uses. Returns whether the predicate held.
+fn waitFor(io: std.Io, comptime pred: fn (*FakeRouter) bool, router: *FakeRouter) bool {
+    var waited_ms: u64 = 0;
+    while (waited_ms < 2000) : (waited_ms += 5) {
+        if (pred(router)) return true;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    return pred(router);
+}
+
+fn peerCountIsOne(router: *FakeRouter) bool {
+    return router.peerCount() == 1;
+}
+
+fn peerCountIsZero(router: *FakeRouter) bool {
+    return router.peerCount() == 0;
+}
+
+// The router ignores remote_addr; a loopback placeholder keeps the command
+// well-formed.
+const dummy_addr = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+
+test "router peer lifecycle: connect makes a sink + writer, disconnect tears down" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    var server_key = try identity.KeyPair.generate(.ED25519);
-    defer server_key.deinit();
-    var client_key = try identity.KeyPair.generate(.ED25519);
-    defer client_key.deinit();
+    const router = try FakeRouter.create(allocator, io, .{});
+    defer router.destroy();
+    try router.start();
 
-    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
-    defer server_endpoint.deinit();
-    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
-    defer client_endpoint.deinit();
+    const peer = try PeerId.random();
+    const conn = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn);
 
-    const server = try Switch.init(allocator, io, server_endpoint);
-    defer server.deinit();
-    const client = try Switch.init(allocator, io, client_endpoint);
-    defer client.deinit();
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
+    try std.testing.expect(waitFor(io, peerCountIsOne, router));
 
-    // Construct a gossipsub on each switch BEFORE dialing so each one's peer-event
-    // callback is registered when the connection comes up.
-    const server_gs = try gossipsub.Gossipsub.init(allocator, io, server);
-    var server_gs_live = true;
-    defer if (server_gs_live) server_gs.deinit();
-    const client_gs = try gossipsub.Gossipsub.init(allocator, io, client);
-    var client_gs_live = true;
-    defer if (client_gs_live) client_gs.deinit();
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try std.testing.expect(waitFor(io, peerCountIsZero, router));
+    // The sink was freed in teardown; the conn's record still lives (it is the
+    // test's, freed by destroyFakeConn). std.testing.allocator confirms the
+    // sink/writer/state allocations were all freed — no leak.
+}
 
-    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
-    defer listen_addr.deinit(allocator);
-    try server.listen(listen_addr);
-    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
-    defer client_listen_addr.deinit(allocator);
-    try client.listen(client_listen_addr);
+test "router dedups a second peer_connected for the same peer id" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
-    var addrs = try server.listenMultiaddrs(allocator);
-    defer {
-        for (addrs.items) |addr| allocator.free(addr);
-        addrs.deinit(allocator);
-    }
-    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
-    defer dial_addr.deinit(allocator);
+    const router = try FakeRouter.create(allocator, io, .{});
+    defer router.destroy();
+    try router.start();
 
-    const client_conn = try client.dial(dial_addr, .{});
-    var client_conn_live = true;
-    defer if (client_conn_live) client_conn.deinit();
+    const peer = try PeerId.random();
+    const conn_a = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_b = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn_b);
 
-    const server_conn = try server.accept();
-    var server_conn_live = true;
-    defer if (server_conn_live) server_conn.deinit();
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn_a, .remote_addr = dummy_addr } });
+    try std.testing.expect(waitFor(io, peerCountIsOne, router));
 
-    // Both routers must observe the peer and bring its per-peer I/O up. peer_count
-    // reaching 1 on BOTH sides proves: peer_connected was processed, the writer
-    // opened (or is keeping) its outbound /meshsub stream (an open-exhaustion give-up
-    // would post peer_disconnected and drop the count back to 0), and the inbound
-    // handler is running. Poll with a bounded timeout for the cross-fiber connect.
-    var waited_ms: u64 = 0;
-    while (waited_ms < 2000) : (waited_ms += 10) {
-        if (server_gs.peerCount() == 1 and client_gs.peerCount() == 1) break;
-        io_time.ms(10).sleep(io) catch {};
-    }
-    try std.testing.expectEqual(@as(usize, 1), server_gs.peerCount());
-    try std.testing.expectEqual(@as(usize, 1), client_gs.peerCount());
+    // Second connect for the same peer id: the first entry is kept, the second
+    // makes no sink (no clobber, no second count). Post it and then post a probe
+    // disconnect for a DIFFERENT peer to flush the queue, so we can assert the
+    // dedup'd connect did not raise the count.
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn_b, .remote_addr = dummy_addr } });
 
-    // Tear the client connection down: the client router sees peer_disconnected
-    // (and the server router observes its own peer drop once its connection ends).
-    client_conn.deinit();
-    client_conn_live = false;
-    server_conn.deinit();
-    server_conn_live = false;
+    // conn_b's sink was never made (dedup returned before makeSink), so its
+    // record stays at zero opens; conn_a's is the live peer.
+    try std.testing.expect(waitFor(io, peerCountIsOne, router));
+    try std.testing.expectEqual(@as(usize, 1), router.peerCount());
+    try std.testing.expectEqual(@as(usize, 0), conn_b.record.open_calls);
 
-    // After both connections are gone, both routers should drop back to 0 peers.
-    waited_ms = 0;
-    while (waited_ms < 2000) : (waited_ms += 10) {
-        if (server_gs.peerCount() == 0 and client_gs.peerCount() == 0) break;
-        io_time.ms(10).sleep(io) catch {};
-    }
-    try std.testing.expectEqual(@as(usize, 0), client_gs.peerCount());
-    try std.testing.expectEqual(@as(usize, 0), server_gs.peerCount());
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try std.testing.expect(waitFor(io, peerCountIsZero, router));
+}
 
-    // Shut the routers down before the switches/endpoints (the deinit order the
-    // gossipsub service requires). The remaining `defer`s free switches/endpoints.
+test "router tears the peer down when the writer exhausts open retries" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Every open fails → the writer's ensureStream exhausts retries → it fires
+    // on_disconnect → the router posts peer_disconnected → the peer is torn down
+    // and peerCount drops back to 0. Tiny retry/backoff so the give-up is fast.
+    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) });
+    defer router.destroy();
+    try router.start();
+
+    const peer = try PeerId.random();
+    const conn = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn);
+
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
+    try std.testing.expect(waitFor(io, peerCountIsOne, router));
+
+    // Push a frame so the writer actually tries to open (the open is lazy on the
+    // first frame). It cannot open, so it gives up and the router tears the peer
+    // down on its own.
+    try router.enqueueDataForTest(peer, try testDataFrame(allocator));
+
+    try std.testing.expect(waitFor(io, peerCountIsZero, router));
+    // The give-up freed the popped frame and the router freed the sink/state; no
+    // leak. The writer never opened a stream.
+    try std.testing.expectEqual(@as(usize, 0), conn.record.streams_opened);
+}
+
+test "router frees an inbound RPC (peer tracked and peer absent)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{});
+    defer router.destroy();
+    try router.start();
+
+    // Peer-absent case: no peer_connected was posted, so the inbound RPC arrives
+    // for an untracked peer. The router must still free it.
+    const stranger = try PeerId.random();
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = stranger, .rpc = try buildInboundRpc(allocator, "t-absent") } });
+
+    // Peer-tracked case: connect first, then deliver an inbound RPC for it.
+    const peer = try PeerId.random();
+    const conn = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn);
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
+    try std.testing.expect(waitFor(io, peerCountIsOne, router));
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundRpc(allocator, "t-present") } });
+
+    // Disconnect to flush + tear down; on test exit destroy() drains any leftover
+    // inbox commands. std.testing.allocator confirms both RPCs were freed.
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try std.testing.expect(waitFor(io, peerCountIsZero, router));
+}
+
+test "router clean shutdown tears down registered peers" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{});
+    // Tear the router down on every exit (not just the happy path): an early
+    // assertion failure must NOT leave the main + writer fibers orphaned, or
+    // threaded.deinit() would hang joining them.
+    defer router.destroy();
+    try router.start();
+
+    // Register two peers, then destroy() without disconnecting them: the main
+    // fiber's teardownAllPeers must close + free every peer. No leak.
     //
-    // Order matters and satisfies Gossipsub.deinit's precondition: both
-    // connections were already torn down above (peerCount dropped to 0 on both
-    // sides), so by the time we deinit each gossipsub no inbound `/meshsub`
-    // handler fiber is alive and no connect/disconnect can fire. Gossipsub.deinit
-    // then clears the Switch peer-event callback before freeing the router, so the
-    // Switch holds no live reference to the freed router.
-    server_gs.deinit();
-    server_gs_live = false;
-    client_gs.deinit();
-    client_gs_live = false;
+    // The two ids must be DISTINCT or onPeerConnected dedups the second (one
+    // logical peer entry per id). `PeerId.random()` is not collision-free here,
+    // so derive a second id by flipping a byte of the first — same approach the
+    // peerKey test uses to get two non-equal ids.
+    const peer_a = try PeerId.random();
+    var peer_b = peer_a;
+    peer_b.bytes[2] +%= 1;
+    const conn_a = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_b = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn_b);
+
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer_a, .conn = conn_a, .remote_addr = dummy_addr } });
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer_b, .conn = conn_b, .remote_addr = dummy_addr } });
+    try std.testing.expect(waitFor(io, struct {
+        fn pred(r: *FakeRouter) bool {
+            return r.peerCount() == 2;
+        }
+    }.pred, router));
+
+    // destroy() runs teardownAllPeers on the main fiber on its way out (via the
+    // defer above, so an assertion failure still tears the fibers down).
+}
+
+// --- test helpers for the router-level tests -------------------------------
+
+/// Build a one-byte owned data frame for the writer-give-up test (the writer
+/// pops it, fails to open, frees it).
+fn testDataFrame(allocator: std.mem.Allocator) !peer_io.OutboundFrame {
+    const bytes = try allocator.alloc(u8, 1);
+    bytes[0] = 0x7f;
+    const ids = try allocator.alloc([]u8, 0);
+    return .{ .bytes = bytes, .message_ids = ids };
+}
+
+/// Build a real OwnedRpc carrying a single subscription, mirroring what the
+/// inbound reader produces, so onInboundRpc has genuine heap bytes to free.
+fn buildInboundRpc(allocator: std.mem.Allocator, topic: []const u8) !pubsub.OwnedRpc {
+    const sub = rpc_pb.RPC{
+        .subscriptions = &[_]?rpc_pb.RPC.SubOpts{.{ .subscribe = true, .topicid = topic }},
+    };
+    const encoded = try sub.encode(allocator);
+    defer if (encoded.len > 0) allocator.free(encoded);
+    const payload = try allocator.dupe(u8, encoded);
+    errdefer allocator.free(payload);
+    return .{ .bytes = payload, .reader = try rpc_pb.RPCReader.init(payload) };
 }

@@ -35,4 +35,5 @@ test {
     _ = @import("switch.zig");
     _ = @import("protocols/pubsub/pubsub.zig");
     _ = @import("protocols/pubsub/router.zig");
+    _ = @import("protocols/pubsub/gossipsub.zig");
 }
