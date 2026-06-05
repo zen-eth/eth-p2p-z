@@ -52,6 +52,19 @@ pub const ScoreConfig = struct {
     thresholds: score_mod.PeerScoreThresholds,
 };
 
+/// Behaviour knobs handed to `Router.create` / `Gossipsub.init`. Defaults match
+/// go-libp2p so an empty `.{}` reproduces go's out-of-the-box gossipsub.
+pub const RouterConfig = struct {
+    /// Flood-publish (go-libp2p default ON): a message the local node ORIGINATES
+    /// is sent to EVERY peer subscribed to its topic (above the publish
+    /// threshold when scoring is on), not just the topic's mesh/fanout — which
+    /// maximises propagation of locally-originated messages. RELAYED (received)
+    /// messages are never flooded; they go only to the mesh. With this off, an
+    /// originated message uses the mesh (if we subscribe) or a fanout set (if we
+    /// do not), exactly as a relay would.
+    flood_publish: bool = true,
+};
+
 /// Upper bound on remembered message-ids in the seen-cache (loop/duplicate
 /// suppression). A bounded FIFO of owned id copies: once full, inserting a new id
 /// evicts the oldest. This is a deliberately minimal dedup window — a proper
@@ -378,6 +391,11 @@ pub fn Router(comptime Transport: type) type {
         signer: ?signing.Signer,
         /// Optional sink for messages delivered on topics we subscribe to.
         message_handler: ?MessageHandler,
+        /// When true (go-libp2p default), a message the local node ORIGINATES is
+        /// flooded to every topic subscriber above the publish threshold rather
+        /// than only its mesh/fanout. Relayed messages are unaffected (always
+        /// mesh-only). See `RouterConfig.flood_publish`.
+        flood_publish: bool,
         /// Optional peer-scoring engine (the gossipsub v1.1 P1-P7 accountant).
         /// Null disables scoring entirely: no events are fired and no gate is
         /// applied, so the router's behaviour is unchanged. When non-null it is
@@ -414,6 +432,7 @@ pub fn Router(comptime Transport: type) type {
             heartbeat_interval_ms: u64,
             host_key: ?*const identity.KeyPair,
             score_config: ?ScoreConfig,
+            config: RouterConfig,
         ) !*Self {
             const inbox_storage = try allocator.alloc(Command, inbox_capacity);
             errdefer allocator.free(inbox_storage);
@@ -453,6 +472,7 @@ pub fn Router(comptime Transport: type) type {
                 .local_peer = effective_peer,
                 .signer = signer,
                 .message_handler = message_handler,
+                .flood_publish = config.flood_publish,
                 .score = score_engine,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
             };
@@ -709,6 +729,15 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
+        /// Whether `peer` is eligible to receive a flood-published (originated)
+        /// message: with scoring disabled every peer qualifies; with scoring
+        /// enabled the peer must be at or above the publish threshold (go-libp2p
+        /// floods originated messages only to peers above `PublishThreshold`).
+        fn abovePublishThreshold(router: *Self, peer: PeerId) bool {
+            const sc = router.score orelse return true;
+            return sc.abovePublishThreshold(peer);
+        }
+
         // ----- graft / prune peer selection -------------------------------
 
         /// Select up to `n` peers to GRAFT into `topic`'s mesh: peers that
@@ -838,6 +867,26 @@ pub fn Router(comptime Transport: type) type {
                 if (!entry.value_ptr.*.topics.contains(topic)) continue;
                 set.put(router.allocator, peerKey(&peer), {}) catch break;
             }
+        }
+
+        /// Build a transient PeerSet of every tracked peer subscribed to `topic`
+        /// that is eligible to receive an originated (flood-published) message —
+        /// i.e. above the publish threshold when scoring is on, all of them when
+        /// scoring is off. The caller OWNS the returned set and must `deinit` it;
+        /// it is used only to TARGET the flood (the frame's references are held by
+        /// the per-peer queues, not the set), so freeing it does not touch any
+        /// frame. Returns an empty set on allocation failure (the publish still
+        /// caches; it simply reaches no peers).
+        fn floodTargets(router: *Self, topic: []const u8) PeerSet {
+            var set: PeerSet = .empty;
+            var it = router.peers.iterator();
+            while (it.next()) |entry| {
+                const peer = entry.value_ptr.*.peer;
+                if (!entry.value_ptr.*.topics.contains(topic)) continue;
+                if (!router.abovePublishThreshold(peer)) continue;
+                set.put(router.allocator, peerKey(&peer), {}) catch break;
+            }
+            return set;
         }
 
         pub fn peerCount(router: *const Self) usize {
@@ -1775,12 +1824,21 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Local publish: build a Message from us, dedup it, deliver locally if we
-        /// subscribe, then forward it. If we subscribe to the topic, forward over
-        /// its MESH; otherwise forward over a transient FANOUT set (created /
-        /// replenished to D from peers subscribed to the topic) and record the
-        /// publish tick so the heartbeat can expire the fanout after the TTL. Owns
-        /// `topic` and `data` (frees both AFTER framing/handler, since frameRpc
-        /// copies them and the handler reads them).
+        /// subscribe, then forward it.
+        ///
+        /// With flood-publish on (the go-libp2p default), the message floods to a
+        /// transient set of EVERY topic subscriber above the publish threshold —
+        /// not just the mesh/fanout — to maximise propagation of a message we
+        /// originated. With it off, we fall back to the relay topology: forward
+        /// over the topic's MESH if we subscribe, otherwise over a transient
+        /// FANOUT set (created / replenished to D from peers subscribed to the
+        /// topic) whose last-publish tick the heartbeat uses to expire it after
+        /// the TTL. Flooding does NOT touch the fanout state — it is a one-shot
+        /// target set, distinct from the relay path. (Relayed messages never
+        /// flood; only this originator path does.)
+        ///
+        /// Owns `topic` and `data` (frees both AFTER framing/handler, since
+        /// frameRpc copies them and the handler reads them).
         fn onPublish(router: *Self, topic: []u8, data: []u8) void {
             defer router.allocator.free(topic);
             defer router.allocator.free(data);
@@ -1818,6 +1876,20 @@ pub fn Router(comptime Transport: type) type {
             // and a heartbeat IHAVE can advertise it), whether or not we have any
             // mesh/fanout peers to forward it to right now. The frame is built and
             // cached once, then fanned out over whichever set applies.
+
+            // Flood-publish: an ORIGINATED message goes to every topic subscriber
+            // above the publish threshold (a transient set), bypassing the
+            // mesh/fanout topology entirely. The set targets the flood only; the
+            // frame's references live on the per-peer queues, so freeing the set
+            // afterward touches no frame. Caching still happens (in cacheAndForward)
+            // exactly once. No source to exclude — we are the origin.
+            if (router.flood_publish) {
+                var flood_set = router.floodTargets(topic);
+                defer flood_set.deinit(router.allocator);
+                router.cacheAndForward(&flood_set, null, from, seqno, topic, data, sig, key, id.bytes);
+                return;
+            }
+
             if (router.my_topics.contains(topic)) {
                 // Subscribed: cache + forward over the topic's mesh (may be empty
                 // or absent — no source to exclude).
@@ -2115,7 +2187,7 @@ test "router peer lifecycle: connect makes a sink + writer, disconnect tears dow
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2139,7 +2211,7 @@ test "router dedups a second peer_connected for the same peer id" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2177,7 +2249,7 @@ test "router tears the peer down when the writer exhausts open retries" {
     // Every open fails → the writer's ensureStream exhausts retries → it fires
     // on_disconnect → the router posts peer_disconnected → the peer is torn down
     // and peerCount drops back to 0. Tiny retry/backoff so the give-up is fast.
-    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2205,7 +2277,7 @@ test "router frees an inbound RPC (peer tracked and peer absent)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2234,7 +2306,7 @@ test "router clean shutdown tears down registered peers" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     // Tear the router down on every exit (not just the happy path): an early
     // assertion failure must NOT leave the main + writer fibers orphaned, or
     // threaded.deinit() would hang joining them.
@@ -2532,7 +2604,7 @@ test "subscribe announces the subscription to a connected peer" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2559,7 +2631,7 @@ test "inbound subscription is tracked on the source peer" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2593,7 +2665,7 @@ test "received message forwards over the mesh, not to all subscribers" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2645,7 +2717,7 @@ test "mesh forwarding dedups a repeated publish (same from+seqno) to forward onc
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2691,7 +2763,7 @@ test "publish to a subscribed topic forwards over the mesh and delivers locally"
     var rec = RecordingHandler{ .allocator = allocator };
     defer rec.deinit();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2702,11 +2774,23 @@ test "publish to a subscribed topic forwards over the mesh and delivers locally"
     const conn_a = try connectFakePeer(io, allocator, router, peer_a);
     defer destroyFakeConn(allocator, conn_a);
 
+    // A announces it subscribes to "t" (so it is both a topic subscriber and,
+    // once grafted, a mesh member). With flood-publish on (the default) an
+    // originated message reaches A as a subscriber; with it off it reaches A as a
+    // mesh member — either way A receives exactly one copy.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
+    var sub_waited: u64 = 0;
+    while (sub_waited < 2000) : (sub_waited += 5) {
+        if (peerTracksTopic(router, peer_a, "t")) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(peerTracksTopic(router, peer_a, "t"));
+
     // Graft A into the mesh so the local publish has a mesh destination.
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
     try std.testing.expect(router.meshContains("t", peer_a));
 
-    // Publish locally: A (mesh member) gets the forwarded frame and our handler fires.
+    // Publish locally: A gets the forwarded frame and our handler fires.
     try router.inbox.putOne(io, .{ .publish = .{
         .topic = try allocator.dupe(u8, "t"),
         .data = try allocator.dupe(u8, "hello"),
@@ -2725,13 +2809,196 @@ test "publish to a subscribed topic forwards over the mesh and delivers locally"
     try std.testing.expectEqualSlices(u8, local_test_peer.bytes[0..local_test_peer.len], rec.from.?);
 }
 
+test "flood-publish floods an originated message to ALL topic subscribers, not just the mesh" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Default config → flood-publish ON.
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    // We subscribe to "t". A is grafted into our mesh; B subscribes to "t" but is
+    // NOT in the mesh. A flood-published (originated) message must reach BOTH —
+    // unlike a relayed message, which reaches only the mesh member A.
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const peer_b = testPeer(2);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_b = try connectFakePeer(io, allocator, router, peer_b);
+    defer destroyFakeConn(allocator, conn_b);
+
+    // Both announce they subscribe to "t".
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_b, .rpc = try buildInboundSub(allocator, "t", true) } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t")) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t"));
+
+    // Only A is grafted into the mesh; B is a subscriber but not a mesh member.
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+    try std.testing.expect(router.meshContains("t", peer_a));
+    try std.testing.expect(!router.meshContains("t", peer_b));
+
+    // Publish (originated): with flood-publish on, BOTH A (mesh) and B (non-mesh
+    // subscriber) receive it.
+    try router.inbox.putOne(io, .{ .publish = .{
+        .topic = try allocator.dupe(u8, "t"),
+        .data = try allocator.dupe(u8, "flood"),
+    } });
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(conn_a.record.written.items, "t", "flood") >= 1 and
+            recordCountPublishes(conn_b.record.written.items, "t", "flood") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "flood"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_b.record.written.items, "t", "flood"));
+
+    // Contrast: a RELAYED message on "t" (from a third source) reaches only the
+    // mesh member A, NOT the non-mesh subscriber B — relays stay mesh-only.
+    const source = testPeer(3);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x01", "t", "relay"),
+    } });
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(conn_a.record.written.items, "t", "relay") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    // Give a wrong forward to B a chance to land before asserting it did not.
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "relay"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(conn_b.record.written.items, "t", "relay"));
+}
+
+test "flood-publish gates on the publish threshold: a below-threshold subscriber is excluded" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Scoring ON with StrictSign (so invalid inbound publishes drive a peer's
+    // score down) and a publish threshold of -1: a clean peer (score 0) is above
+    // it; one invalid message (score -1) is NOT above it (the gate is `>=`).
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+    var cfg = scoringConfig();
+    cfg.thresholds.publish_threshold = -1.0;
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, &host_key, cfg, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const peer_b = testPeer(2);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_b = try connectFakePeer(io, allocator, router, peer_b);
+    defer destroyFakeConn(allocator, conn_b);
+
+    // Both subscribe to "t".
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_b, .rpc = try buildInboundSub(allocator, "t", true) } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t")) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t"));
+
+    // Drive B below the publish threshold (2 invalid → -4 < -1); A stays at 0.
+    try driveInvalid(io, allocator, router, peer_b, "t", 2);
+    try std.testing.expect(liveScore(router, peer_b) < -1.0);
+    try std.testing.expect(liveScore(router, peer_a) >= -1.0);
+
+    // Publish (originated): the flood reaches A (above threshold) but NOT B
+    // (below the publish threshold → excluded from the flood target set).
+    try router.inbox.putOne(io, .{ .publish = .{
+        .topic = try allocator.dupe(u8, "t"),
+        .data = try allocator.dupe(u8, "gated"),
+    } });
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(conn_a.record.written.items, "t", "gated") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    // Give a wrong forward to B a chance to land before asserting it did not.
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "gated"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(conn_b.record.written.items, "t", "gated"));
+}
+
+test "flood-publish OFF: an originated message reaches mesh members only, not other subscribers" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Flood-publish OFF → originated messages use the mesh (we subscribe to "t").
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{ .flood_publish = false });
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const peer_b = testPeer(2);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_b = try connectFakePeer(io, allocator, router, peer_b);
+    defer destroyFakeConn(allocator, conn_b);
+
+    // Both subscribe to "t", but only A is grafted into the mesh.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_b, .rpc = try buildInboundSub(allocator, "t", true) } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t")) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t"));
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+    try std.testing.expect(router.meshContains("t", peer_a));
+    try std.testing.expect(!router.meshContains("t", peer_b));
+
+    // Publish (originated) with flood off: reaches mesh member A only; the
+    // subscribed-but-non-mesh peer B gets nothing (current relay-topology
+    // behaviour).
+    try router.inbox.putOne(io, .{ .publish = .{
+        .topic = try allocator.dupe(u8, "t"),
+        .data = try allocator.dupe(u8, "meshonly"),
+    } });
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(conn_a.record.written.items, "t", "meshonly") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    // Give a wrong forward to B a chance to land before asserting it did not.
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "meshonly"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(conn_b.record.written.items, "t", "meshonly"));
+}
+
 test "a forwarded message lands in the message cache and is evicted after history_length heartbeats" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2869,7 +3136,7 @@ test "GRAFT accepted: subscribed topic, peer joins the mesh, no PRUNE back" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2892,7 +3159,7 @@ test "GRAFT rejected when we do not subscribe: PRUNE sent, peer not in mesh" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2914,7 +3181,7 @@ test "GRAFT can push the mesh past D_high; the heartbeat prunes it back to D" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -2983,7 +3250,7 @@ test "heartbeat grafts up to D candidate peers when the mesh is below D_low" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3036,7 +3303,7 @@ test "heartbeat grafts only up to D, not beyond, when many candidates exist" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3090,7 +3357,7 @@ test "PRUNE removes peer from mesh and backs it off (a later GRAFT is rejected)"
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3125,7 +3392,7 @@ test "backoff expires after prune_backoff_ticks heartbeats, then GRAFT is accept
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3155,7 +3422,7 @@ test "peer disconnect cleans the peer out of mesh and backoff" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3189,7 +3456,7 @@ test "PRUNE with a max-u64 backoff does not crash and actually backs the peer of
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3231,7 +3498,7 @@ test "re-GRAFT from an existing mesh member at D_high is an idempotent accept (n
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3280,7 +3547,12 @@ test "publish to an UNSUBSCRIBED topic forms a fanout, forwards, then expires" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    // Flood-publish OFF: this test exercises the relay topology (fanout for a
+    // topic we publish to but do not subscribe). With flood-publish on, an
+    // originated message bypasses the fanout entirely (it floods straight to all
+    // subscribers), so no fanout entry would form — a separate flood test covers
+    // that path.
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{ .flood_publish = false });
     defer router.destroy();
     try router.start();
 
@@ -3341,7 +3613,7 @@ test "subscribe JOINs the mesh (eager GRAFTs); unsubscribe LEAVEs it (PRUNEs)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3403,7 +3675,7 @@ test "cache-on-accept: an accepted message with an EMPTY mesh is still cached" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3444,7 +3716,7 @@ test "IHAVE emission: heartbeat advertises cached ids to a non-mesh subscriber" 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3506,7 +3778,7 @@ test "inbound IHAVE: unseen id triggers an IWANT; a seen id triggers none" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3561,7 +3833,7 @@ test "inbound IWANT: a cached id is served as the full publish; an unknown id is
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3615,7 +3887,7 @@ test "recovery: IHAVE -> IWANT -> served publish is delivered to a node that mis
     var rec = RecordingHandler{ .allocator = allocator };
     defer rec.deinit();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{});
     defer router.destroy();
     try router.start();
 
@@ -3730,7 +4002,7 @@ fn scoringRouter(
     host_key: *const identity.KeyPair,
     message_handler: ?MessageHandler,
 ) !*FakeRouter {
-    return FakeRouter.create(allocator, io, .{}, local_test_peer, message_handler, 0, host_key, scoringConfig());
+    return FakeRouter.create(allocator, io, .{}, local_test_peer, message_handler, 0, host_key, scoringConfig(), .{});
 }
 
 /// Drive `peer`'s score down by `n` invalid-message rejects: send `n` UNSIGNED

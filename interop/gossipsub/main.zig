@@ -179,7 +179,7 @@ pub fn main(init: std.process.Init) !void {
     // StrictSign — accepts our published messages and we accept its signed ones.
     // Scoring is left disabled here (null): the interop binary exercises the
     // base mesh/gossip behaviour against go/rust-libp2p without the score gates.
-    const gs = try gossipsub.Gossipsub.init(allocator, io, switcher, local_peer, &host_key, recorder.handler(), null);
+    const gs = try gossipsub.Gossipsub.init(allocator, io, switcher, local_peer, &host_key, recorder.handler(), null, .{});
     var gs_live = true;
     defer if (gs_live) gs.deinit();
 

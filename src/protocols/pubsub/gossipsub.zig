@@ -117,6 +117,12 @@ pub const MessageHandler = router_mod.MessageHandler;
 /// events, no gates, behaviour unchanged), or `Gossipsub.default_score_config`
 /// to enable it with the documented baseline params/thresholds.
 pub const ScoreConfig = router_mod.ScoreConfig;
+
+/// Re-export the router behaviour config (flood-publish, etc.) so callers can
+/// tune it without importing router.zig. Pass `.{}` to `Gossipsub.init` for the
+/// go-libp2p defaults (flood-publish ON).
+pub const RouterConfig = router_mod.RouterConfig;
+
 const score_mod = @import("score.zig");
 pub const default_score_config: ScoreConfig = .{
     .params = score_mod.default_params,
@@ -206,6 +212,9 @@ pub const Gossipsub = struct {
     /// — no scoring events, no score-based gates — or pass a config (e.g.
     /// `Gossipsub.default_score_config`) to have the router score peers and gate
     /// its mesh/gossip/graylist decisions on those scores.
+    ///
+    /// `config` tunes router behaviour (e.g. flood-publish); pass `.{}` for the
+    /// go-libp2p defaults (flood-publish ON, matching go's out-of-the-box node).
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -214,8 +223,9 @@ pub const Gossipsub = struct {
         host_key: ?*const identity.KeyPair,
         message_handler: ?MessageHandler,
         score_config: ?ScoreConfig,
+        config: RouterConfig,
     ) !*Gossipsub {
-        const router = try Router.create(allocator, io, .{}, local_peer, message_handler, heartbeat_interval_ms, host_key, score_config);
+        const router = try Router.create(allocator, io, .{}, local_peer, message_handler, heartbeat_interval_ms, host_key, score_config, config);
         errdefer router.destroy();
 
         try router.start();
@@ -397,10 +407,10 @@ test "two gossipsub nodes wire up per-peer I/O on connect and tear down on disco
 
     // Construct a gossipsub on each switch BEFORE dialing so each one's peer-event
     // callback is registered when the connection comes up.
-    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, null, null, null);
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, null, null, null, .{});
     var server_gs_live = true;
     defer if (server_gs_live) server_gs.deinit();
-    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, null, null, null);
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, null, null, null, .{});
     var client_gs_live = true;
     defer if (client_gs_live) client_gs.deinit();
 
@@ -540,10 +550,10 @@ test "two gossipsub nodes: subscribe propagates and a publish is delivered end t
     // StrictSign on BOTH sides (pass each node's host key): the publisher signs
     // and the subscriber verifies, exercising the full sign->verify path over
     // real QUIC. The subscriber must accept the publisher's signed message.
-    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, &server_key, rec.handler(), null);
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, &server_key, rec.handler(), null, .{});
     var server_gs_live = true;
     defer if (server_gs_live) server_gs.deinit();
-    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, &client_key, null, null);
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, &client_key, null, null, .{});
     var client_gs_live = true;
     defer if (client_gs_live) client_gs.deinit();
 
