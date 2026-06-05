@@ -36,7 +36,21 @@ const rpc_pb = @import("../../protobuf.zig").rpc;
 const signing = @import("signing.zig");
 const identity = @import("../../identity.zig");
 const io_time = @import("../../quic/io/time.zig");
+const score_mod = @import("score.zig");
 const PeerId = @import("peer_id").PeerId;
+
+/// Optional peer-scoring configuration handed to `Router.create` /
+/// `Gossipsub.init`. When provided, the router builds a `PeerScore` engine,
+/// fires scoring events on every relevant transition, and gates its
+/// mesh/gossip/graylist decisions on the score. When null, scoring is entirely
+/// off: no engine, no events, no gates — the router behaves exactly as it did
+/// before scoring existed (matching go-libp2p, where scoring is app-configured
+/// and disabled by default). `score_mod.default_params` /
+/// `score_mod.default_thresholds` are a ready-made baseline a caller can pass.
+pub const ScoreConfig = struct {
+    params: score_mod.ScoreParams,
+    thresholds: score_mod.PeerScoreThresholds,
+};
 
 /// Upper bound on remembered message-ids in the seen-cache (loop/duplicate
 /// suppression). A bounded FIFO of owned id copies: once full, inserting a new id
@@ -364,6 +378,19 @@ pub fn Router(comptime Transport: type) type {
         signer: ?signing.Signer,
         /// Optional sink for messages delivered on topics we subscribe to.
         message_handler: ?MessageHandler,
+        /// Optional peer-scoring engine (the gossipsub v1.1 P1-P7 accountant).
+        /// Null disables scoring entirely: no events are fired and no gate is
+        /// applied, so the router's behaviour is unchanged. When non-null it is
+        /// heap-owned (built in `create`, freed in `destroy`) and driven only on
+        /// the single router fiber, so it needs no locking.
+        score: ?*score_mod.PeerScore,
+        /// Per-heartbeat snapshot of every tracked peer's score, recomputed once
+        /// at the top of each heartbeat (after `decay`) so the gates run on
+        /// fresh scores without recomputing `score()` in the hot mesh/gossip
+        /// loops (go-libp2p caches scores per heartbeat the same way). Empty when
+        /// scoring is disabled; cleared + rebuilt each heartbeat. Freed on
+        /// destroy. Keys mirror the engine's `PeerKey` (zero-padded peer bytes).
+        score_snapshot: std.AutoHashMapUnmanaged(score_mod.PeerKey, f64) = .empty,
         main_future: ?std.Io.Future(void) = null,
         /// Set once when teardown begins so the main loop stops after the inbox
         /// drains/closes. Atomic because it is read on the main fiber but set on
@@ -386,6 +413,7 @@ pub fn Router(comptime Transport: type) type {
             message_handler: ?MessageHandler,
             heartbeat_interval_ms: u64,
             host_key: ?*const identity.KeyPair,
+            score_config: ?ScoreConfig,
         ) !*Self {
             const inbox_storage = try allocator.alloc(Command, inbox_capacity);
             errdefer allocator.free(inbox_storage);
@@ -400,6 +428,18 @@ pub fn Router(comptime Transport: type) type {
             errdefer if (signer) |*s| s.deinit();
             const effective_peer = if (signer) |*s| s.from_peer else local_peer;
 
+            // Build the scoring engine only when a config is supplied; null leaves
+            // `score` null and every gate a no-op (current behaviour).
+            const score_engine: ?*score_mod.PeerScore = if (score_config) |cfg| blk: {
+                const ps = try allocator.create(score_mod.PeerScore);
+                ps.* = score_mod.PeerScore.init(allocator, cfg.params, cfg.thresholds);
+                break :blk ps;
+            } else null;
+            errdefer if (score_engine) |ps| {
+                ps.deinit();
+                allocator.destroy(ps);
+            };
+
             const router = try allocator.create(Self);
             router.* = .{
                 .allocator = allocator,
@@ -413,6 +453,7 @@ pub fn Router(comptime Transport: type) type {
                 .local_peer = effective_peer,
                 .signer = signer,
                 .message_handler = message_handler,
+                .score = score_engine,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
             };
             return router;
@@ -489,6 +530,11 @@ pub fn Router(comptime Transport: type) type {
             router.seen.deinit();
             router.message_cache.deinit();
             if (router.signer) |*s| s.deinit();
+            if (router.score) |ps| {
+                ps.deinit();
+                router.allocator.destroy(ps);
+            }
+            router.score_snapshot.deinit(router.allocator);
             router.allocator.free(router.inbox_storage);
             router.allocator.destroy(router);
         }
@@ -550,7 +596,9 @@ pub fn Router(comptime Transport: type) type {
 
         /// Add `peer` to `topic`'s mesh, creating the topic's PeerSet (with an
         /// owned topic-key copy) on first use. Best-effort: an allocation failure
-        /// silently leaves the peer out of the mesh.
+        /// silently leaves the peer out of the mesh. Fires a scoring GRAFT event
+        /// (when scoring is enabled) so the engine starts accruing P1 mesh time
+        /// and treats the peer as a mesh member for P3 delivery credit.
         fn meshAdd(router: *Self, topic: []const u8, peer: PeerId) void {
             const gop = router.mesh.getOrPut(router.allocator, topic) catch return;
             if (!gop.found_existing) {
@@ -562,13 +610,17 @@ pub fn Router(comptime Transport: type) type {
                 gop.value_ptr.* = .empty;
             }
             gop.value_ptr.put(router.allocator, peerKey(&peer), {}) catch {};
+            if (router.score) |sc| sc.graft(peer, topic);
         }
 
         /// Remove `peer` from `topic`'s mesh (no-op if absent). The empty PeerSet
-        /// is kept (cheap; reused on the next graft).
+        /// is kept (cheap; reused on the next graft). Fires a scoring PRUNE event
+        /// (when scoring is enabled) so the engine captures any P3b mesh-failure
+        /// penalty and stops counting the peer as a mesh member.
         fn meshRemove(router: *Self, topic: []const u8, peer: PeerId) void {
             const set = router.mesh.getPtr(topic) orelse return;
             _ = set.remove(peerKey(&peer));
+            if (router.score) |sc| sc.prune(peer, topic);
         }
 
         /// Number of peers in `topic`'s mesh (zero if the topic has no mesh yet).
@@ -624,6 +676,39 @@ pub fn Router(comptime Transport: type) type {
             while (backoff_it.next()) |set| _ = set.remove(key);
         }
 
+        // ----- scoring helpers --------------------------------------------
+
+        /// The peer's current score for gate decisions: read from the
+        /// per-heartbeat snapshot if present (the common case during mesh/gossip
+        /// maintenance, where the snapshot was just refreshed), else computed
+        /// live from the engine. Returns 0 when scoring is disabled (no engine),
+        /// so an "is this peer below zero?" gate is naturally inert. An untracked
+        /// peer also scores 0.
+        fn peerScore(router: *Self, peer: PeerId) f64 {
+            const sc = router.score orelse return 0;
+            if (router.score_snapshot.get(score_mod.peerKey(&peer))) |s| return s;
+            return sc.score(peer);
+        }
+
+        /// Advance the scoring engine one heartbeat tick (decaying counters,
+        /// accruing mesh time, purging long-gone peers) and rebuild the
+        /// per-heartbeat score snapshot so the gates run on fresh scores without
+        /// recomputing `score()` in the hot loops. No-op when scoring is
+        /// disabled. The snapshot is cleared and repopulated for exactly the
+        /// currently-tracked peers each heartbeat. Best-effort: a snapshot insert
+        /// that fails to allocate just falls back to a live `score()` in
+        /// `peerScore` for that peer.
+        fn refreshScoreSnapshot(router: *Self) void {
+            const sc = router.score orelse return;
+            sc.decay(router.heartbeat_tick);
+            router.score_snapshot.clearRetainingCapacity();
+            var it = router.peers.iterator();
+            while (it.next()) |entry| {
+                const peer = entry.value_ptr.*.peer;
+                router.score_snapshot.put(router.allocator, score_mod.peerKey(&peer), sc.score(peer)) catch {};
+            }
+        }
+
         // ----- graft / prune peer selection -------------------------------
 
         /// Select up to `n` peers to GRAFT into `topic`'s mesh: peers that
@@ -642,6 +727,10 @@ pub fn Router(comptime Transport: type) type {
                 if (!entry.value_ptr.*.topics.contains(topic)) continue;
                 if (router.meshContains(topic, peer)) continue;
                 if (router.inBackoff(topic, peer)) continue;
+                // Never graft a negative-scoring peer into the mesh (go-libp2p
+                // only grafts peers at or above zero during maintenance). Inert
+                // when scoring is disabled (peerScore is 0).
+                if (router.peerScore(peer) < 0) continue;
                 out.append(router.allocator, peer) catch break;
                 added += 1;
             }
@@ -650,12 +739,45 @@ pub fn Router(comptime Transport: type) type {
 
         /// Select up to `n` current members of `topic`'s mesh to PRUNE out (used to
         /// shrink an over-full mesh back toward D). Appends the chosen peers to
-        /// `out` and returns the count appended. Removal target is arbitrary excess
-        /// (mesh iteration order); D_out-aware / score-based retention (keeping the
-        /// best/most-outbound peers) is a future refinement.
+        /// `out` and returns the count appended.
+        ///
+        /// With scoring enabled, the victims are the LOWEST-scoring excess: the
+        /// mesh members are sorted by score (descending) and the bottom `n` are
+        /// dropped, so the heartbeat retains the highest-scoring ~D peers (a
+        /// simplified form of go-libp2p's score-aware prune; the finer D_out
+        /// outbound-quota retention is a future refinement). With scoring
+        /// disabled the victims are arbitrary excess in mesh-iteration order
+        /// (unchanged from before scoring existed).
         fn selectPruneVictims(router: *Self, topic: []const u8, n: usize, out: *std.ArrayListUnmanaged(PeerKey)) usize {
             if (n == 0) return 0;
             const set = router.mesh.getPtr(topic) orelse return 0;
+
+            if (router.score != null) {
+                // Gather (key, score) for every mesh member, sort ascending by
+                // score, and take the lowest-scoring `n` as victims (keeping the
+                // highest-scoring peers in the mesh).
+                const Scored = struct { key: PeerKey, score: f64 };
+                var scored: std.ArrayListUnmanaged(Scored) = .empty;
+                defer scored.deinit(router.allocator);
+                var it = set.keyIterator();
+                while (it.next()) |key_ptr| {
+                    const sc = if (router.score_snapshot.get(key_ptr.*)) |s| s else 0;
+                    scored.append(router.allocator, .{ .key = key_ptr.*, .score = sc }) catch break;
+                }
+                std.mem.sort(Scored, scored.items, {}, struct {
+                    fn lessThan(_: void, a: Scored, b: Scored) bool {
+                        return a.score < b.score;
+                    }
+                }.lessThan);
+                var added: usize = 0;
+                for (scored.items) |s| {
+                    if (added >= n) break;
+                    out.append(router.allocator, s.key) catch break;
+                    added += 1;
+                }
+                return added;
+            }
+
             var added: usize = 0;
             var it = set.keyIterator();
             while (it.next()) |key_ptr| {
@@ -768,7 +890,6 @@ pub fn Router(comptime Transport: type) type {
         /// first frame; on open-exhaustion it posts `peer_disconnected` so the
         /// peer is torn down through the normal path.
         fn onPeerConnected(router: *Self, peer: PeerId, conn: ConnHandle, remote_addr: std.Io.net.IpAddress) void {
-            _ = remote_addr;
             const key = peerKey(&peer);
             // A second connection to a peer we already track: keep the first,
             // ignore the new one's gossipsub setup. One logical peer entry.
@@ -838,6 +959,15 @@ pub fn Router(comptime Transport: type) type {
             writer_live = true;
             queue_live = true;
             _ = router.peer_count.fetchAdd(1, .release);
+
+            // Begin scoring the peer (a brand-new entry, or a re-activation of a
+            // recently-disconnected one retained for its score) and record its
+            // remote IP for the P6 colocation term. The IP is the peer's address
+            // with the port stripped (the engine keys colocation per address).
+            if (router.score) |sc| {
+                sc.addPeer(peer);
+                sc.addIP(peer, remote_addr);
+            }
 
             // Tell the new peer which topics we already subscribe to, so it can
             // start forwarding matching messages to us right away (mirrors how
@@ -996,6 +1126,13 @@ pub fn Router(comptime Transport: type) type {
                 }
             }
 
+            // Advance the scoring engine one tick (decays the fading counters,
+            // accrues mesh time, activates P3, purges long-gone peers) and
+            // refresh the per-heartbeat score snapshot, BEFORE mesh/gossip
+            // maintenance so every gate below runs on the freshly-decayed scores
+            // (go-libp2p caches scores per heartbeat the same way).
+            router.refreshScoreSnapshot();
+
             router.maintainMeshes();
             router.maintainFanout();
 
@@ -1068,6 +1205,14 @@ pub fn Router(comptime Transport: type) type {
                 const key = peerKey(&peer);
                 if (mesh_set) |s| if (s.contains(key)) continue;
                 if (fanout_set) |s| if (s.contains(key)) continue;
+                // Gossip gate: only advertise (IHAVE) to peers whose score clears
+                // the gossip threshold; a peer below it is denied gossip. Reads
+                // the per-heartbeat snapshot (gossip emission runs after the
+                // snapshot refresh) rather than recomputing the score. No effect
+                // when scoring is disabled (the `if` is skipped).
+                if (router.score) |sc| {
+                    if (router.peerScore(peer) < sc.thresholds.gossip_threshold) continue;
+                }
                 out.append(router.allocator, peer) catch break;
             }
         }
@@ -1087,21 +1232,52 @@ pub fn Router(comptime Transport: type) type {
             router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), empty_ids, .{ .one = peer });
         }
 
-        /// Mesh maintenance for every subscribed topic: graft new peers in when
-        /// the mesh is below D_low (up to the target D), prune excess peers out
-        /// when it is above D_high (down to D). Iterating `my_topics` while
-        /// grafting/pruning only mutates the `mesh`/`backoff` maps (never
-        /// `my_topics`), so the iterator stays valid.
+        /// Mesh maintenance for every subscribed topic: first (when scoring is
+        /// enabled) prune any current mesh peer that has gone negative, then graft
+        /// new peers in when the mesh is below D_low (up to the target D), and
+        /// prune excess peers out when it is above D_high (down to D). The
+        /// negative-peer prune runs every heartbeat, independent of the D_high
+        /// overflow, so a misbehaving peer leaves the mesh promptly. Iterating
+        /// `my_topics` while grafting/pruning only mutates the `mesh`/`backoff`
+        /// maps (never `my_topics`), so the iterator stays valid.
         fn maintainMeshes(router: *Self) void {
             var topic_it = router.my_topics.keyIterator();
             while (topic_it.next()) |key| {
                 const topic = key.*;
+                router.pruneNegativeMeshPeers(topic);
                 const size = router.meshSize(topic);
                 if (size < mesh_params.d_low) {
                     router.graftToTarget(topic, mesh_params.d - size);
                 } else if (size > mesh_params.d_high) {
                     router.pruneToTarget(topic, size - mesh_params.d);
                 }
+            }
+        }
+
+        /// Prune every current member of `topic`'s mesh whose score is negative
+        /// (each backed off + sent a PRUNE, the same as an overflow prune). No-op
+        /// when scoring is disabled. Victims are collected first (we cannot remove
+        /// from the mesh set while iterating it), then removed.
+        fn pruneNegativeMeshPeers(router: *Self, topic: []const u8) void {
+            if (router.score == null) return;
+            const set = router.mesh.getPtr(topic) orelse return;
+
+            var victims: std.ArrayListUnmanaged(PeerKey) = .empty;
+            defer victims.deinit(router.allocator);
+            var it = set.keyIterator();
+            while (it.next()) |key_ptr| {
+                const sc = if (router.score_snapshot.get(key_ptr.*)) |s| s else 0;
+                if (sc < 0) victims.append(router.allocator, key_ptr.*) catch break;
+            }
+
+            for (victims.items) |k| {
+                const state = router.peers.get(k) orelse {
+                    _ = set.remove(k);
+                    continue;
+                };
+                router.meshRemove(topic, state.peer);
+                router.setBackoff(topic, state.peer, mesh_params.prune_backoff_ticks);
+                router.sendPrune(state.peer, topic);
             }
         }
 
@@ -1173,6 +1349,17 @@ pub fn Router(comptime Transport: type) type {
             defer owned.rpc.deinit(router.allocator);
             const source = owned.peer;
             var reader = owned.rpc.reader;
+
+            // Graylist gate: a peer whose score has sunk at or below the graylist
+            // threshold is ignored entirely — drop the whole RPC without parsing
+            // its subscriptions, publishes, or control. The OwnedRpc is freed by
+            // the defer above. No-op when scoring is disabled. (Uses a live score
+            // rather than the per-heartbeat snapshot: an RPC can arrive between
+            // heartbeats, and a peer that just crossed the graylist line should be
+            // shut out immediately, matching go-libp2p's per-RPC check.)
+            if (router.score) |sc| {
+                if (sc.belowGraylist(source)) return;
+            }
 
             // Subscription changes update the source peer's announced topics.
             while (reader.subscriptionsNext()) |sub| {
@@ -1285,12 +1472,28 @@ pub fn Router(comptime Transport: type) type {
         fn handleGraft(router: *Self, source: PeerId, topic: []const u8) void {
             if (!router.peers.contains(peerKey(&source))) return;
 
-            const accept = router.meshContains(topic, source) or
-                (router.my_topics.contains(topic) and !router.inBackoff(topic, source));
+            // A negative-scoring peer is not admitted to the mesh (PRUNE back +
+            // backoff), even if it would otherwise be accepted. An existing
+            // member that has gone negative is also pushed out here. No effect
+            // when scoring is disabled (peerScore is 0, so the `< 0` test fails).
+            const negative = router.peerScore(source) < 0;
+
+            const in_backoff = router.inBackoff(topic, source);
+
+            const accept = !negative and
+                (router.meshContains(topic, source) or
+                    (router.my_topics.contains(topic) and !in_backoff));
 
             if (accept) {
                 router.meshAdd(topic, source);
             } else {
+                // A GRAFT that arrives while the peer is still backed off is a
+                // flood signal (it is grafting faster than our backoff allows):
+                // charge a behaviour penalty (P7) so a peer that repeatedly does
+                // this earns the squared penalty. No effect when scoring is off.
+                if (in_backoff) {
+                    if (router.score) |sc| sc.addPenalty(source, 1.0);
+                }
                 router.setBackoff(topic, source, mesh_params.prune_backoff_ticks);
                 router.sendPrune(source, topic);
             }
@@ -1369,14 +1572,32 @@ pub fn Router(comptime Transport: type) type {
             // unchanged on forward.
             if (router.signer != null) {
                 if (!signing.verifyMessage(router.allocator, from, seqno, topic, data, signature, key)) {
+                    // P4: the SENDING peer (the inbound stream's peer, not the
+                    // message's `from`) relayed an invalid message. Charge it the
+                    // squared invalid-delivery penalty before dropping the message.
+                    if (router.score) |sc| sc.rejectMessage(exclude, topic);
                     return;
                 }
             }
 
             var id = rpc.messageId(router.allocator, from, seqno) catch return;
             defer id.deinit(router.allocator);
-            if (router.seen.contains(id.bytes)) return;
+            if (router.seen.contains(id.bytes)) {
+                // A duplicate of an already-seen message. If the relaying peer is
+                // a current mesh member for this topic, credit it the P3
+                // mesh-delivery counter (it did relay the message to us, just not
+                // first). The engine itself no-ops for a non-mesh peer.
+                if (router.score) |sc| {
+                    if (router.meshContains(topic, exclude)) sc.duplicateMessage(exclude, topic);
+                }
+                return;
+            }
             router.seen.add(id.bytes);
+
+            // P2/P3: the relaying peer delivered a NEW, accepted message — credit
+            // its first-delivery (and, if it is a mesh member, mesh-delivery)
+            // counters. Keyed on the SENDING peer, not the message's `from`.
+            if (router.score) |sc| sc.deliverMessage(exclude, topic);
 
             router.deliverLocal(topic, from, data);
 
@@ -1533,6 +1754,10 @@ pub fn Router(comptime Transport: type) type {
             var it = set.keyIterator();
             while (it.next()) |key_ptr| {
                 if (router.peers.get(key_ptr.*)) |state| {
+                    // The mesh entry is being torn out wholesale here (not via
+                    // meshRemove), so fire the scoring PRUNE explicitly for each
+                    // departing member so the engine stops counting it in-mesh.
+                    if (router.score) |sc| sc.prune(state.peer, topic);
                     router.setBackoff(topic, state.peer, mesh_params.prune_backoff_ticks);
                     router.sendPrune(state.peer, topic);
                 }
@@ -1645,6 +1870,11 @@ pub fn Router(comptime Transport: type) type {
         /// `defer sink.close`, and returns; the router's own `sink.close` below
         /// is idempotent.
         fn teardownPeer(router: *Self, state: *PeerState) void {
+            // Mark the peer disconnected in the scoring engine: its stats (and
+            // any negative score) are retained for a while so a quick reconnect
+            // keeps them, but its IP colocation slots are released immediately.
+            // Covers both the disconnect path and shutdown's teardownAllPeers.
+            if (router.score) |sc| sc.removePeer(state.peer);
             state.queue.close(router.io);
             state.writer_future.cancel(router.io);
             state.writer_future.await(router.io);
@@ -1885,7 +2115,7 @@ test "router peer lifecycle: connect makes a sink + writer, disconnect tears dow
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -1909,7 +2139,7 @@ test "router dedups a second peer_connected for the same peer id" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -1947,7 +2177,7 @@ test "router tears the peer down when the writer exhausts open retries" {
     // Every open fails → the writer's ensureStream exhausts retries → it fires
     // on_disconnect → the router posts peer_disconnected → the peer is torn down
     // and peerCount drops back to 0. Tiny retry/backoff so the give-up is fast.
-    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -1975,7 +2205,7 @@ test "router frees an inbound RPC (peer tracked and peer absent)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2004,7 +2234,7 @@ test "router clean shutdown tears down registered peers" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     // Tear the router down on every exit (not just the happy path): an early
     // assertion failure must NOT leave the main + writer fibers orphaned, or
     // threaded.deinit() would hang joining them.
@@ -2302,7 +2532,7 @@ test "subscribe announces the subscription to a connected peer" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2329,7 +2559,7 @@ test "inbound subscription is tracked on the source peer" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2363,7 +2593,7 @@ test "received message forwards over the mesh, not to all subscribers" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2415,7 +2645,7 @@ test "mesh forwarding dedups a repeated publish (same from+seqno) to forward onc
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2461,7 +2691,7 @@ test "publish to a subscribed topic forwards over the mesh and delivers locally"
     var rec = RecordingHandler{ .allocator = allocator };
     defer rec.deinit();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2501,7 +2731,7 @@ test "a forwarded message lands in the message cache and is evicted after histor
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2639,7 +2869,7 @@ test "GRAFT accepted: subscribed topic, peer joins the mesh, no PRUNE back" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2662,7 +2892,7 @@ test "GRAFT rejected when we do not subscribe: PRUNE sent, peer not in mesh" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2684,7 +2914,7 @@ test "GRAFT can push the mesh past D_high; the heartbeat prunes it back to D" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2753,7 +2983,7 @@ test "heartbeat grafts up to D candidate peers when the mesh is below D_low" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2806,7 +3036,7 @@ test "heartbeat grafts only up to D, not beyond, when many candidates exist" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2860,7 +3090,7 @@ test "PRUNE removes peer from mesh and backs it off (a later GRAFT is rejected)"
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2895,7 +3125,7 @@ test "backoff expires after prune_backoff_ticks heartbeats, then GRAFT is accept
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2925,7 +3155,7 @@ test "peer disconnect cleans the peer out of mesh and backoff" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -2959,7 +3189,7 @@ test "PRUNE with a max-u64 backoff does not crash and actually backs the peer of
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -3001,7 +3231,7 @@ test "re-GRAFT from an existing mesh member at D_high is an idempotent accept (n
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -3050,7 +3280,7 @@ test "publish to an UNSUBSCRIBED topic forms a fanout, forwards, then expires" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -3111,7 +3341,7 @@ test "subscribe JOINs the mesh (eager GRAFTs); unsubscribe LEAVEs it (PRUNEs)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -3173,7 +3403,7 @@ test "cache-on-accept: an accepted message with an EMPTY mesh is still cached" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -3214,7 +3444,7 @@ test "IHAVE emission: heartbeat advertises cached ids to a non-mesh subscriber" 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -3276,7 +3506,7 @@ test "inbound IHAVE: unseen id triggers an IWANT; a seen id triggers none" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -3331,7 +3561,7 @@ test "inbound IWANT: a cached id is served as the full publish; an unknown id is
     defer threaded.deinit();
     const io = threaded.io();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -3385,7 +3615,7 @@ test "recovery: IHAVE -> IWANT -> served publish is delivered to a node that mis
     var rec = RecordingHandler{ .allocator = allocator };
     defer rec.deinit();
 
-    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null);
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null);
     defer router.destroy();
     try router.start();
 
@@ -3428,4 +3658,417 @@ test "recovery: IHAVE -> IWANT -> served publish is delivered to a node that mis
     try std.testing.expectEqualSlices(u8, "recovered", rec.data.?);
     // And the recovered message is now cached locally too.
     try std.testing.expect(router.message_cache.get(id.bytes) != null);
+}
+
+// --- peer-scoring gate fake tests ------------------------------------------
+//
+// These tests ENABLE scoring (pass a ScoreConfig to create) to exercise the
+// gates. Every other router test leaves scoring disabled (the trailing `null`),
+// so this block alone proves the gates fire while the rest proves disabled =
+// unchanged behaviour. Scores are driven deterministically through the wiring:
+// a peer's invalid-message penalty (P4) is raised by sending it unsigned inbound
+// publishes through a router that has StrictSign enabled — each fails
+// verification and fires `rejectMessage` against the SENDING peer, dropping its
+// score. (Clean, signed deliveries raise it via P2.) All `*_decay` are 1.0 and
+// the P1/P3/P3b/P6 weights are zero, so a peer's score is exactly
+//   -(invalid_count^2) - (behaviour_excess^2) + first_deliveries,
+// stable across heartbeats — making the gate boundaries deterministic.
+
+/// A scoring config whose only live terms are P4 (invalid messages, weight -1),
+/// P2 (first deliveries, weight +1), and P7 (behaviour penalty, weight -1), each
+/// undecayed, with the thresholds the gate tests assert against:
+///   graylist -10, gossip 0 (so a clean peer at 0 is exactly at the bar and
+///   passes, a negative peer is denied), publish/px/opportunistic out of the way.
+fn scoringConfig() ScoreConfig {
+    return .{
+        .params = .{
+            .app_specific_weight = 0,
+            .ip_colocation_factor_weight = 0,
+            .ip_colocation_factor_threshold = 0,
+            .behaviour_penalty_weight = -1.0,
+            .behaviour_penalty_threshold = 0,
+            .behaviour_penalty_decay = 1.0,
+            .decay_interval_ticks = 1,
+            .decay_to_zero = 0.0001,
+            .retain_score_ticks = 1000,
+            .topic_default = .{
+                .topic_weight = 1.0,
+                .time_in_mesh_weight = 0,
+                .time_in_mesh_quantum_ticks = 1,
+                .time_in_mesh_cap = 0,
+                .first_message_deliveries_weight = 1.0,
+                .first_message_deliveries_decay = 1.0,
+                .first_message_deliveries_cap = 100.0,
+                .mesh_message_deliveries_weight = 0,
+                .mesh_message_deliveries_decay = 1.0,
+                .mesh_message_deliveries_threshold = 0,
+                .mesh_message_deliveries_cap = 100.0,
+                .mesh_message_deliveries_activation_ticks = 100,
+                .mesh_message_deliveries_window_ticks = 0,
+                .mesh_failure_penalty_weight = 0,
+                .mesh_failure_penalty_decay = 1.0,
+                .invalid_message_deliveries_weight = -1.0,
+                .invalid_message_deliveries_decay = 1.0,
+            },
+        },
+        .thresholds = .{
+            .gossip_threshold = 0,
+            .publish_threshold = -100.0,
+            .graylist_threshold = -10.0,
+            .accept_px_threshold = 1000.0,
+            .opportunistic_graft_threshold = 1000.0,
+        },
+    };
+}
+
+/// Create a router with scoring ENABLED and StrictSign ON (so unsigned inbound
+/// publishes fail verification and fire `rejectMessage`, the lever the gate
+/// tests use to drive a peer's score down). The caller owns `host_key`.
+fn scoringRouter(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    host_key: *const identity.KeyPair,
+    message_handler: ?MessageHandler,
+) !*FakeRouter {
+    return FakeRouter.create(allocator, io, .{}, local_test_peer, message_handler, 0, host_key, scoringConfig());
+}
+
+/// Drive `peer`'s score down by `n` invalid-message rejects: send `n` UNSIGNED
+/// inbound publishes (distinct seqnos so each is a fresh message, not a dedup'd
+/// duplicate) from `peer`. With StrictSign on, each fails verification → the
+/// router fires `rejectMessage(peer, topic)` → P4 grows. After `n` rejects the
+/// peer's invalid counter is `n`, so its score contribution is `-(n^2)`. Waits
+/// until the engine reflects the target so the caller can rely on it.
+fn driveInvalid(io: std.Io, allocator: std.mem.Allocator, router: *FakeRouter, peer: PeerId, topic: []const u8, n: usize) !void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        // A distinct seqno per call keeps every publish a NEW message (the seen
+        // cache would otherwise suppress a repeat before verification).
+        var seqno: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seqno, @as(u64, 0xA000) + i, .big);
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{
+            .peer = peer,
+            .rpc = try buildInboundPublish(allocator, "publisher", &seqno, topic, "bad"),
+        } });
+    }
+    // Post a heartbeat as a fence and wait for it to advance the tick: the inbox
+    // is a single-fiber FIFO, so once the heartbeat is processed all `n` rejects
+    // are too, and the score snapshot reflects them.
+    try beatHeartbeats(io, router, 1);
+}
+
+/// The router fiber owns the scoring engine; while it is parked (no inbox
+/// command pending) reading the engine from the test fiber is race-free, the
+/// same property the mesh/cache assertions rely on. This recomputes a peer's
+/// live score off the engine.
+fn liveScore(router: *FakeRouter, peer: PeerId) f64 {
+    return router.score.?.score(peer);
+}
+
+test "scoring graylist gate: an RPC from a below-graylist peer is ignored" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    const router = try scoringRouter(allocator, io, &host_key, null);
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // Drive the peer below the graylist threshold (-10): 4 invalid messages give
+    // score -(4^2) = -16 < -10.
+    try driveInvalid(io, allocator, router, peer, "t", 4);
+    try std.testing.expect(liveScore(router, peer) <= -10.0);
+
+    // Now a SUBSCRIBE RPC from the graylisted peer must be IGNORED entirely: the
+    // peer's announced-topics set must not gain "t". Send it and fence with a
+    // heartbeat so the (dropped) RPC is fully processed before asserting.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expect(!peerTracksTopic(router, peer, "t"));
+
+    // A GRAFT from the graylisted peer is likewise dropped: no PRUNE is sent back
+    // (a graylisted peer is ignored, not even rejected). We do not subscribe to
+    // "t2", so absent the graylist a GRAFT would have drawn a PRUNE.
+    const prunes_before = recordCountPrunes(conn.record.written.items, "t2");
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundGraft(allocator, "t2") } });
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expectEqual(prunes_before, recordCountPrunes(conn.record.written.items, "t2"));
+    try std.testing.expect(!router.meshContains("t2", peer));
+}
+
+test "scoring prune gate: a negative-score mesh peer is pruned at the heartbeat" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    const router = try scoringRouter(allocator, io, &host_key, null);
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // The peer GRAFTs in (score still 0, accepted) and becomes a mesh member.
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
+    try std.testing.expect(router.meshContains("t", peer));
+
+    // Drive it negative (2 invalid → -4 < 0) but keep it above graylist (-10) so
+    // its inbound RPCs are still processed (this is the prune gate, not graylist).
+    try driveInvalid(io, allocator, router, peer, "t", 2);
+    try std.testing.expect(liveScore(router, peer) < 0 and liveScore(router, peer) > -10.0);
+
+    // One heartbeat prunes the negative peer out of the mesh + sends it a PRUNE.
+    try beatHeartbeats(io, router, 1);
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (!router.meshContains("t", peer)) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(!router.meshContains("t", peer));
+    try std.testing.expect(waitPruneSent(io, conn, "t"));
+}
+
+test "scoring graft gate: maintenance does not graft a negative-score candidate" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    const router = try scoringRouter(allocator, io, &host_key, null);
+    defer router.destroy();
+    try router.start();
+
+    // Subscribe to "t" with no peers yet so the eager join grafts nobody; the
+    // heartbeat would normally graft the subscribed candidate below.
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // The peer announces it subscribes to "t" (a graft candidate) but we drive it
+    // negative first (2 invalid → -4 < 0, still above graylist so the SUBSCRIBE is
+    // processed). Send the subscribe BEFORE the rejects so it is recorded while
+    // the peer is still at score 0.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, "t", true) } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (peerTracksTopic(router, peer, "t")) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(peerTracksTopic(router, peer, "t"));
+
+    try driveInvalid(io, allocator, router, peer, "t", 2);
+    try std.testing.expect(liveScore(router, peer) < 0 and liveScore(router, peer) > -10.0);
+
+    // The mesh is empty (< D_low); a heartbeat would graft a non-negative
+    // candidate, but this one is negative so it must NOT be grafted.
+    try std.testing.expectEqual(@as(usize, 0), router.meshSize("t"));
+    try beatHeartbeats(io, router, 1);
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expect(!router.meshContains("t", peer));
+    try std.testing.expectEqual(@as(usize, 0), router.meshSize("t"));
+    // No GRAFT was sent to it.
+    try std.testing.expectEqual(@as(usize, 0), recordCountGrafts(conn.record.written.items, "t"));
+}
+
+test "scoring graft gate: an inbound GRAFT from a negative-score peer is rejected" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    const router = try scoringRouter(allocator, io, &host_key, null);
+    defer router.destroy();
+    try router.start();
+
+    // We DO subscribe to "t", so absent the score gate a GRAFT would be accepted.
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // Drive the peer negative (2 invalid → -4) but above graylist.
+    try driveInvalid(io, allocator, router, peer, "t", 2);
+    try std.testing.expect(liveScore(router, peer) < 0 and liveScore(router, peer) > -10.0);
+
+    // Its GRAFT is rejected purely on score: PRUNE back, not added to the mesh.
+    const outcome = try graftAndWait(io, allocator, router, conn, peer, "t");
+    try std.testing.expectEqual(GraftOutcome.rejected, outcome);
+    try std.testing.expect(!router.meshContains("t", peer));
+    try std.testing.expect(waitPruneSent(io, conn, "t"));
+}
+
+test "scoring gossip gate: IHAVE goes to an above-threshold peer, not a below one" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    const router = try scoringRouter(allocator, io, &host_key, null);
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    // Two lazy (non-mesh) subscribers: GOOD stays at score 0 (>= gossip 0), BAD is
+    // driven below the gossip threshold. A relay source S caches a message so the
+    // heartbeat has an id to advertise.
+    const good = testPeer(1);
+    const bad = testPeer(2);
+    const source = testPeer(3);
+    const conn_good = try connectFakePeer(io, allocator, router, good);
+    defer destroyFakeConn(allocator, conn_good);
+    const conn_bad = try connectFakePeer(io, allocator, router, bad);
+    defer destroyFakeConn(allocator, conn_bad);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    // Both announce they subscribe to "t" (so both are gossip candidates). PRUNE
+    // each for "t" so the heartbeat's mesh maintenance does not graft them (a
+    // backed-off peer is not a graft candidate); they stay lazy subscribers.
+    for ([_]PeerId{ good, bad }) |p| {
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = p, .rpc = try buildInboundSub(allocator, "t", true) } });
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = p, .rpc = try buildInboundPrune(allocator, "t", 0) } });
+    }
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (peerTracksTopic(router, good, "t") and peerTracksTopic(router, bad, "t") and
+            router.inBackoff("t", good) and router.inBackoff("t", bad)) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(peerTracksTopic(router, good, "t") and peerTracksTopic(router, bad, "t"));
+
+    // Drive BAD below the gossip threshold (1 invalid → -1 < 0), still above
+    // graylist so its earlier subscribe stuck and it stays a tracked subscriber.
+    try driveInvalid(io, allocator, router, bad, "t", 1);
+    try std.testing.expect(liveScore(router, bad) < 0);
+
+    // A relay source delivers a publish so there is a cached id to gossip. The
+    // FakeRouter has StrictSign on, so the publish must be SIGNED to verify and
+    // be cached. It is signed by `host_key`, so the message's `from` is that
+    // key's peer id — the id is keyed under THAT from, not a synthetic origin.
+    const signer_from = host_key_from: {
+        var s = try signing.Signer.init(allocator, &host_key);
+        defer s.deinit();
+        break :host_key_from try allocator.dupe(u8, s.fromBytes());
+    };
+    defer allocator.free(signer_from);
+    const seqno = "\x00\x00\x00\x55";
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try signedInboundPublish(allocator, &host_key, seqno, "t", "gossiped"),
+    } });
+    var id = try rpc.messageId(allocator, signer_from, seqno);
+    defer id.deinit(allocator);
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (router.message_cache.get(id.bytes) != null) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(router.message_cache.get(id.bytes) != null);
+
+    // Heartbeat: GOOD gets the IHAVE, BAD does not.
+    try beatHeartbeats(io, router, 1);
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordHasIHave(conn_good.record.written.items, "t", id.bytes)) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(recordHasIHave(conn_good.record.written.items, "t", id.bytes));
+    // Give a (wrong) IHAVE to BAD a chance to land before asserting it did not.
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expect(!recordHasIHave(conn_bad.record.written.items, "t", id.bytes));
+}
+
+test "scoring events move the score: clean delivery raises it, sig-failure lowers it" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    const router = try scoringRouter(allocator, io, &host_key, null);
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // A clean, signed delivery credits P2 (first delivery, weight +1) to the
+    // SENDING peer → score rises to +1. (The message's `from`/signer is a separate
+    // publisher; the credit goes to the stream's peer regardless.)
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer,
+        .rpc = try signedInboundPublish(allocator, &host_key, "\x00\x00\x00\x01", "t", "clean"),
+    } });
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), liveScore(router, peer), 1e-9);
+
+    // A signature failure (an unsigned publish) charges P4 to the SENDING peer:
+    // invalid count 1 → P4 = -1, net score 1 (P2) - 1 (P4) = 0.
+    try driveInvalid(io, allocator, router, peer, "t", 1);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), liveScore(router, peer), 1e-9);
+
+    // A second sig-failure → invalid count 2 → P4 = -4, net 1 - 4 = -3.
+    try driveInvalid(io, allocator, router, peer, "t", 1);
+    try std.testing.expectApproxEqAbs(@as(f64, -3.0), liveScore(router, peer), 1e-9);
+}
+
+/// Build an OwnedRpc carrying a single message SIGNED by `host_key` (so it passes
+/// StrictSign verification). The message's `from`/`key` are the signer's, so the
+/// from↔key bind holds (verification requires `from` to derive from the signing
+/// key); the resulting message id is `signer_from ++ seqno`.
+fn signedInboundPublish(
+    allocator: std.mem.Allocator,
+    host_key: *const identity.KeyPair,
+    seqno: []const u8,
+    topic: []const u8,
+    data: []const u8,
+) !pubsub.OwnedRpc {
+    var signer = try signing.Signer.init(allocator, host_key);
+    defer signer.deinit();
+    const from = signer.fromBytes();
+    const sig = try signer.sign(from, seqno, topic, data);
+    defer allocator.free(sig);
+    const msg = rpc_pb.Message{
+        .from = from,
+        .seqno = seqno,
+        .topic = topic,
+        .data = data,
+        .signature = sig,
+        .key = signer.keyBytes(),
+    };
+    const frame = rpc_pb.RPC{ .publish = &[_]?rpc_pb.Message{msg} };
+    return ownedFromRpc(allocator, frame);
 }

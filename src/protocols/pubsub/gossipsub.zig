@@ -111,6 +111,18 @@ const heartbeat_interval_ms: u64 = 1000;
 /// Re-export so callers construct a handler without importing router.zig.
 pub const MessageHandler = router_mod.MessageHandler;
 
+/// Re-export the optional peer-scoring config type (and a ready-made baseline)
+/// so callers can opt into scoring without importing router.zig / score.zig.
+/// Pass `null` to `Gossipsub.init` to leave scoring disabled (the default — no
+/// events, no gates, behaviour unchanged), or `Gossipsub.default_score_config`
+/// to enable it with the documented baseline params/thresholds.
+pub const ScoreConfig = router_mod.ScoreConfig;
+const score_mod = @import("score.zig");
+pub const default_score_config: ScoreConfig = .{
+    .params = score_mod.default_params,
+    .thresholds = score_mod.default_thresholds,
+};
+
 /// The gossipsub stream protocol id (`/meshsub/1.1.0`). Re-exported so callers
 /// holding only this module (e.g. an identify responder advertising which
 /// protocols this node speaks) can name it without importing pubsub.zig.
@@ -188,6 +200,12 @@ pub const Gossipsub = struct {
     ///
     /// `message_handler` (optional) receives messages delivered on topics this
     /// node subscribes to; see router's MessageHandler for the call contract.
+    ///
+    /// `score_config` (optional) enables gossipsub peer scoring: pass null (the
+    /// default behaviour, and what the interop binary uses) to leave scoring off
+    /// — no scoring events, no score-based gates — or pass a config (e.g.
+    /// `Gossipsub.default_score_config`) to have the router score peers and gate
+    /// its mesh/gossip/graylist decisions on those scores.
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -195,8 +213,9 @@ pub const Gossipsub = struct {
         local_peer: PeerId,
         host_key: ?*const identity.KeyPair,
         message_handler: ?MessageHandler,
+        score_config: ?ScoreConfig,
     ) !*Gossipsub {
-        const router = try Router.create(allocator, io, .{}, local_peer, message_handler, heartbeat_interval_ms, host_key);
+        const router = try Router.create(allocator, io, .{}, local_peer, message_handler, heartbeat_interval_ms, host_key, score_config);
         errdefer router.destroy();
 
         try router.start();
@@ -378,10 +397,10 @@ test "two gossipsub nodes wire up per-peer I/O on connect and tear down on disco
 
     // Construct a gossipsub on each switch BEFORE dialing so each one's peer-event
     // callback is registered when the connection comes up.
-    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, null, null);
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, null, null, null);
     var server_gs_live = true;
     defer if (server_gs_live) server_gs.deinit();
-    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, null, null);
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, null, null, null);
     var client_gs_live = true;
     defer if (client_gs_live) client_gs.deinit();
 
@@ -521,10 +540,10 @@ test "two gossipsub nodes: subscribe propagates and a publish is delivered end t
     // StrictSign on BOTH sides (pass each node's host key): the publisher signs
     // and the subscriber verifies, exercising the full sign->verify path over
     // real QUIC. The subscriber must accept the publisher's signed message.
-    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, &server_key, rec.handler());
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, &server_key, rec.handler(), null);
     var server_gs_live = true;
     defer if (server_gs_live) server_gs.deinit();
-    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, &client_key, null);
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, &client_key, null, null);
     var client_gs_live = true;
     defer if (client_gs_live) client_gs.deinit();
 
