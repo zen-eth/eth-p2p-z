@@ -538,6 +538,23 @@ const DeliveryRecorder = struct {
         if (self.data) |d| self.allocator.free(d);
     }
 
+    /// Clear the captured delivery so the recorder can accept a fresh one (used
+    /// by the reconnect test to assert a SECOND publish is delivered after the
+    /// connection was dropped and re-established). Runs on the test fiber while
+    /// no router fiber is delivering (the test waits for the prior receipt and
+    /// drops the connection before resetting).
+    fn reset(self: *DeliveryRecorder) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.topic) |t| self.allocator.free(t);
+        if (self.from) |f| self.allocator.free(f);
+        if (self.data) |d| self.allocator.free(d);
+        self.topic = null;
+        self.from = null;
+        self.data = null;
+        self.received.store(false, .release);
+    }
+
     fn handler(self: *DeliveryRecorder) MessageHandler {
         return .{ .ctx = self, .on_message = onMessage };
     }
@@ -703,6 +720,149 @@ test "two gossipsub nodes: subscribe propagates and a publish is delivered end t
         io_time.ms(10).sleep(io) catch {};
     }
 
+    server_gs.deinit();
+    server_gs_live = false;
+    client_gs.deinit();
+    client_gs_live = false;
+}
+
+test "two gossipsub nodes: pub/sub survives a drop+reconnect of the connection" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    const server_peer = try server_key.peerId(allocator);
+    const client_peer = try client_key.peerId(allocator);
+
+    // Client (A) publishes; server (B) subscribes to "t" and records deliveries.
+    var rec = DeliveryRecorder{ .allocator = allocator, .io = io };
+    defer rec.deinit();
+
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, &server_key, rec.handler(), null, .{});
+    var server_gs_live = true;
+    defer if (server_gs_live) server_gs.deinit();
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, &client_key, null, null, .{});
+    var client_gs_live = true;
+    defer if (client_gs_live) client_gs.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    // B subscribes ONCE, up front. `my_topics` persists across a disconnect, so
+    // on every (re)connect the router re-announces "t" to the freshly-wired peer
+    // automatically — no re-subscribe is needed after the reconnect.
+    try server_gs.subscribe("t");
+
+    // Run the connect → propagate-subscription → publish → receive cycle twice,
+    // dropping and re-dialing the connection between the two rounds. A second
+    // delivery after the reconnect proves pub/sub resumes on the new connection.
+    var round: usize = 0;
+    while (round < 2) : (round += 1) {
+        const want = if (round == 0) "hello" else "again";
+
+        const client_conn = try client.dial(dial_addr, .{});
+        var client_conn_live = true;
+        defer if (client_conn_live) client_conn.deinit();
+        const server_conn = try server.accept();
+        var server_conn_live = true;
+        defer if (server_conn_live) server_conn.deinit();
+
+        try client_conn.startInboundDispatcher(.{});
+        try server_conn.startInboundDispatcher(.{});
+
+        // Both routers wire the peer up.
+        var waited_ms: u64 = 0;
+        while (waited_ms < 3000) : (waited_ms += 10) {
+            if (server_gs.peerCount() == 1 and client_gs.peerCount() == 1) break;
+            io_time.ms(10).sleep(io) catch {};
+        }
+        try std.testing.expectEqual(@as(usize, 1), server_gs.peerCount());
+        try std.testing.expectEqual(@as(usize, 1), client_gs.peerCount());
+
+        // A must learn B subscribes to "t" (re-announced on this connection)
+        // before A's publish, or the publish has no subscriber to flood to.
+        waited_ms = 0;
+        while (waited_ms < 3000) : (waited_ms += 10) {
+            if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state| {
+                if (state.topics.contains("t")) break;
+            }
+            io_time.ms(10).sleep(io) catch {};
+        }
+        {
+            const tracked = if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state|
+                state.topics.contains("t")
+            else
+                false;
+            try std.testing.expect(tracked);
+        }
+
+        // A publishes; B's handler must receive it. Republish on a short interval
+        // until it lands: right after a reconnect the mesh/flood topology can take
+        // a moment to settle, so a single publish may race the wire-up — repeating
+        // is how the other 2-node tests handle this timing without a fixed sleep.
+        waited_ms = 0;
+        while (waited_ms < 3000) : (waited_ms += 50) {
+            try client_gs.publish("t", want);
+            if (rec.received.load(.acquire)) break;
+            io_time.ms(50).sleep(io) catch {};
+        }
+        try std.testing.expect(rec.received.load(.acquire));
+        try std.testing.expectEqualSlices(u8, "t", rec.topic.?);
+        try std.testing.expectEqualSlices(u8, want, rec.data.?);
+        try std.testing.expectEqualSlices(u8, client_peer.bytes[0..client_peer.len], rec.from.?);
+
+        // Drop the connection: both routers must observe peer_disconnected and
+        // fall back to 0 peers. This fires the disconnect/teardown path under test
+        // (mesh/fanout drop; backoff — none here — would persist).
+        client_conn.deinit();
+        client_conn_live = false;
+        server_conn.deinit();
+        server_conn_live = false;
+        waited_ms = 0;
+        while (waited_ms < 3000) : (waited_ms += 10) {
+            if (server_gs.peerCount() == 0 and client_gs.peerCount() == 0) break;
+            io_time.ms(10).sleep(io) catch {};
+        }
+        try std.testing.expectEqual(@as(usize, 0), server_gs.peerCount());
+        try std.testing.expectEqual(@as(usize, 0), client_gs.peerCount());
+
+        // Clear the recorder so the next round's delivery is observed fresh. Both
+        // connections are down and both routers are at 0 peers, so no router fiber
+        // is delivering while we reset.
+        rec.reset();
+    }
+
+    // Shut the routers down before the switches/endpoints. Both connections are
+    // already torn down (peerCount 0 on both), satisfying Gossipsub.deinit's
+    // precondition.
     server_gs.deinit();
     server_gs_live = false;
     client_gs.deinit();

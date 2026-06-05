@@ -742,17 +742,23 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
-        /// Drop `peer` from every topic's mesh, every topic's fanout set, and
-        /// every topic's backoff set. Called when a peer disconnects so no stale
-        /// membership survives it.
-        fn dropPeerFromMeshAndBackoff(router: *Self, peer: PeerId) void {
+        /// Drop `peer` from every topic's mesh and every topic's fanout set.
+        /// Called when a peer disconnects so no stale membership survives it.
+        ///
+        /// Backoff is intentionally NOT cleared here: prune-backoff is keyed by
+        /// peer+topic and is independent of connection state. If we PRUNEd a peer
+        /// and backed it off, that backoff must persist across a disconnect —
+        /// otherwise the peer could disconnect and immediately reconnect to bypass
+        /// the backoff and re-GRAFT straight back into our mesh. A disconnected
+        /// peer's backoff entry is time-bounded and expires naturally on schedule
+        /// via the heartbeat's expiry scan (no leak), so dropping it here is both
+        /// unnecessary and exploitable.
+        fn dropPeerFromMeshAndFanout(router: *Self, peer: PeerId) void {
             const key = peerKey(&peer);
             var mesh_it = router.mesh.valueIterator();
             while (mesh_it.next()) |set| _ = set.remove(key);
             var fanout_it = router.fanout.valueIterator();
             while (fanout_it.next()) |set| _ = set.remove(key);
-            var backoff_it = router.backoff.valueIterator();
-            while (backoff_it.next()) |set| _ = set.remove(key);
         }
 
         // ----- scoring helpers --------------------------------------------
@@ -1223,7 +1229,7 @@ pub fn Router(comptime Transport: type) type {
             // never arrived), so it can't outlive the connection.
             _ = router.peer_versions.remove(key);
             const entry = router.peers.fetchRemove(key) orelse return;
-            router.dropPeerFromMeshAndBackoff(peer);
+            router.dropPeerFromMeshAndFanout(peer);
             router.teardownPeer(entry.value);
             _ = router.peer_count.fetchSub(1, .release);
         }
@@ -3748,7 +3754,7 @@ test "backoff expires after prune_backoff_ticks heartbeats, then GRAFT is accept
     try std.testing.expect(router.meshContains("t", peer));
 }
 
-test "peer disconnect cleans the peer out of mesh and backoff" {
+test "peer disconnect cleans the peer out of mesh but keeps its backoff" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -3772,17 +3778,178 @@ test "peer disconnect cleans the peer out of mesh and backoff" {
     try std.testing.expect(router.meshContains("t", peer));
     try std.testing.expect(router.inBackoff("t2", peer));
 
-    // Disconnect P: it must be removed from every mesh and every backoff set.
+    // Disconnect P: it must be removed from every mesh, but its prune-backoff
+    // must PERSIST (backoff is keyed by peer+topic, independent of the
+    // connection — otherwise a quick reconnect would bypass it).
     try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
 
-    // Sync so the disconnect (mesh/backoff cleanup) is fully applied before the
-    // reads below.
+    // Sync so the disconnect (mesh cleanup) is fully applied before the reads.
     try sync(router, io);
     try std.testing.expect(!router.meshContains("t", peer));
-    try std.testing.expect(!router.inBackoff("t2", peer));
+    try std.testing.expect(router.inBackoff("t2", peer));
     // The testing allocator's end-of-test leak check confirms destroy() freed the
     // (now peer-less) mesh/backoff topic entries with no leak.
+}
+
+test "prune-backoff persists across a disconnect+reconnect (a reconnect cannot bypass it)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // P joins the mesh, then PRUNEs us (default-floor backoff) → P is removed from
+    // the mesh and backed off for prune_backoff_ticks.
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundPrune(allocator, "t", 0) } });
+    try sync(router, io);
+    try std.testing.expect(!router.meshContains("t", peer));
+    try std.testing.expect(router.inBackoff("t", peer));
+
+    // P disconnects, then immediately reconnects (fresh conn so its record starts
+    // clean). The backoff must survive the disconnect: clearing it here is exactly
+    // the bug — it would let a pruned peer bypass the backoff by reconnecting.
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try std.testing.expect(waitFor(io, peerCountIsZero, router));
+    try sync(router, io);
+    try std.testing.expect(router.inBackoff("t", peer));
+
+    const conn2 = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn2);
+    try std.testing.expect(peerCountIsOne(router));
+
+    // The first GRAFT after reconnect must be REJECTED (still in backoff) and earn
+    // a PRUNE back — the reconnect did NOT reset the backoff.
+    try std.testing.expectEqual(GraftOutcome.rejected, try graftAndWait(io, allocator, router, conn2, peer, "t"));
+    try std.testing.expect(!router.meshContains("t", peer));
+    try std.testing.expect(waitPruneSent(io, conn2, "t"));
+
+    // Age the backoff out. The PRUNE set the expiry to prune_backoff_ticks (no
+    // heartbeat had run, so heartbeat_tick was 0); graftAndWait posts no
+    // heartbeats, so exactly prune_backoff_ticks beats reach the expiry tick and a
+    // GRAFT is then accepted.
+    try beatHeartbeats(io, router, mesh_params.prune_backoff_ticks);
+    try std.testing.expect(!router.inBackoff("t", peer));
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn2, peer, "t"));
+    try std.testing.expect(router.meshContains("t", peer));
+}
+
+test "disconnect+reconnect churn: mesh reforms and pub/sub resumes with clean state" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    // P is a mesh member; S is a separate relay source feeding publishes in. (A
+    // relayed publish forwards only over the mesh, so P — not S — receives it.)
+    const peer = testPeer(1);
+    const source = testPeer(2);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
+    try std.testing.expect(router.meshContains("t", peer));
+
+    // A relayed publish reaches mesh member P.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x01", "t", "before"),
+    } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn.record, "t", "before") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn.record, "t", "before"));
+
+    // P disconnects: it leaves the mesh, but only P (not S).
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try std.testing.expect(waitFor(io, peerCountIsOne, router)); // only S remains
+    try sync(router, io);
+    try std.testing.expect(!router.meshContains("t", peer));
+    // P was never pruned, so it is not backed off; a clean reconnect can re-graft.
+    try std.testing.expect(!router.inBackoff("t", peer));
+
+    // P reconnects (fresh conn) and re-grafts: the mesh reforms with exactly P.
+    const conn2 = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn2);
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn2, peer, "t"));
+    try std.testing.expect(router.meshContains("t", peer));
+    try std.testing.expectEqual(@as(usize, 1), router.meshSize("t"));
+
+    // Pub/sub resumes: a second relayed publish reaches the re-grafted P (on its
+    // new conn — the first publish landed on the old, now-destroyed conn's record).
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x02", "t", "after"),
+    } });
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn2.record, "t", "after") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn2.record, "t", "after"));
+    // The testing allocator's end-of-test leak check confirms the churn left no
+    // stale per-peer allocations (queues / sinks / topic sets / dont_send).
+}
+
+test "many disconnect+reconnect churn cycles leave no leak, no crash, and clean state" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+
+    // Loop connect → graft → disconnect many times for the same peer. Each cycle
+    // fully tears the peer down (queue close + writer join + frees) and rebuilds
+    // it; a leak in that path would trip the testing allocator at end of test, and
+    // a use-after-free or double-free would crash. Backoff is untouched here (P is
+    // never pruned), so every re-graft is accepted.
+    var cycle: usize = 0;
+    while (cycle < 20) : (cycle += 1) {
+        const conn = try connectFakePeer(io, allocator, router, peer);
+        try std.testing.expect(peerCountIsOne(router));
+        try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
+        try std.testing.expect(router.meshContains("t", peer));
+
+        try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+        try std.testing.expect(waitFor(io, peerCountIsZero, router));
+        try sync(router, io);
+        try std.testing.expect(!router.meshContains("t", peer));
+        // The conn is freed only after the peer is fully torn down (writer joined),
+        // so its record is no longer mutated — safe to destroy here each cycle.
+        destroyFakeConn(allocator, conn);
+    }
+
+    // Final state is clean: no peers, P not in the mesh, no backoff lingering.
+    try std.testing.expect(peerCountIsZero(router));
+    try std.testing.expect(!router.meshContains("t", peer));
+    try std.testing.expect(!router.inBackoff("t", peer));
 }
 
 test "PRUNE with a max-u64 backoff does not crash and actually backs the peer off" {
