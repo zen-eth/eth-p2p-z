@@ -293,6 +293,15 @@ pub fn Router(comptime Transport: type) type {
                 frame: *peer_io.OutboundFrame,
                 reply: *std.Io.Event,
             },
+            /// Test-only barrier: the handler does nothing but set `reply`. Because
+            /// the inbox is FIFO and the router is single-consumer, when this reply
+            /// fires every command posted before it has been fully processed and the
+            /// router fiber is back parked on the inbox (it will not touch its state
+            /// again until the next command). A test posts this after its commands
+            /// and awaits the reply, then reads router-owned state race-free — the
+            /// router fiber owns that state exclusively, so a test must never read it
+            /// concurrently with the fiber; this barrier is how a test serializes.
+            sync: struct { reply: *std.Io.Event },
         };
 
         /// All state for one connected peer, owned by the router fiber. The
@@ -952,6 +961,7 @@ pub fn Router(comptime Transport: type) type {
                     .unsubscribe => |u| router.onUnsubscribe(u.topic),
                     .publish => |p| router.onPublish(p.topic, p.data),
                     .enqueue_for_test => |e| router.onEnqueueForTest(e.peer, e.frame, e.reply),
+                    .sync => |s| s.reply.set(router.io),
                     .heartbeat => router.onHeartbeat(),
                     .shutdown => return,
                 }
@@ -2069,6 +2079,9 @@ pub fn Router(comptime Transport: type) type {
                         e.frame.release();
                         e.reply.set(router.io);
                     },
+                    // Wake a sync barrier in flight at shutdown so its awaiter
+                    // does not hang.
+                    .sync => |s| s.reply.set(router.io),
                     else => {},
                 };
             }
@@ -2130,7 +2143,12 @@ const FakeSink = struct {
     }
 
     pub fn writeFrame(self: *FakeSink, io: std.Io, bytes: []const u8) anyerror!void {
-        _ = io;
+        // The append runs on the peer's writer fiber (a std.Io.Threaded executor
+        // thread), while the test fiber reads `record.written` through the
+        // recordCount*/recordHas* helpers. Both take `record.mutex` so the append
+        // never races a read of the ArrayList's buffer/len.
+        self.record.mutex.lockUncancelable(io);
+        defer self.record.mutex.unlock(io);
         try self.record.written.appendSlice(self.allocator, bytes);
     }
 
@@ -2147,6 +2165,11 @@ const FakeRecord = struct {
     open_calls: usize = 0,
     streams_opened: usize = 0,
     written: std.ArrayList(u8) = .empty,
+    /// Guards `written` against the writer-fiber append vs. test-fiber read race.
+    /// The peer's writer fiber appends under this lock in FakeSink.writeFrame; the
+    /// recordCount*/recordHas* reader helpers below take it before walking the
+    /// buffer. std.Io.Mutex is fiber/thread-safe under std.Io.Threaded.
+    mutex: std.Io.Mutex = .init,
 
     fn deinit(self: *FakeRecord) void {
         self.written.deinit(self.allocator);
@@ -2183,8 +2206,11 @@ const FakeTransport = struct {
 };
 
 /// Build a FakeConn on the heap with a fresh recording. The test owns it and
-/// frees it with `destroyFakeConn` once the router has fully torn the peer down
-/// (so the sink can no longer touch the record).
+/// frees it with `destroyFakeConn`. By test convention the conn is freed only
+/// after the router has fully processed the peer's last operation and the peer's
+/// writer fiber is idle (the tests poll the record for the expected frames, or
+/// post no further outbound, before tearing down) — so the writer is parked, not
+/// mid-append, when the record is freed.
 fn makeFakeConn(allocator: std.mem.Allocator) !*FakeTransport.FakeConn {
     const conn = try allocator.create(FakeTransport.FakeConn);
     conn.* = .{ .record = .{ .allocator = allocator } };
@@ -2235,6 +2261,25 @@ fn waitFor(io: std.Io, comptime pred: fn (*FakeRouter) bool, router: *FakeRouter
         io_time.ms(5).sleep(io) catch {};
     }
     return pred(router);
+}
+
+/// Barrier: post a `sync` command and await its reply, so every command posted
+/// before it has been fully processed by the router fiber, which is then back
+/// parked on the inbox. After this returns, the test fiber may read router-owned
+/// state (mesh / peers / fanout / backoff / peer_versions / message_cache /
+/// score / heartbeat_tick) race-free — but only because no other command is
+/// posted and no heartbeat/inbound fiber is concurrently active during the read
+/// window (the router tests run with heartbeat_interval_ms = 0).
+///
+/// This is the one safe way for a test to read the router's HashMaps: the router
+/// is a single-fiber actor that owns that state exclusively, so a test must never
+/// read it while the router fiber might mutate it (a read racing a HashMap resize
+/// gets a torn metadata pointer and panics). `sync` serializes the test fiber
+/// behind the router fiber's FIFO inbox; read only after it returns.
+fn sync(router: *FakeRouter, io: std.Io) !void {
+    var reply: std.Io.Event = .unset;
+    try router.inbox.putOne(io, .{ .sync = .{ .reply = &reply } });
+    reply.waitUncancelable(io);
 }
 
 fn peerCountIsOne(router: *FakeRouter) bool {
@@ -2508,10 +2553,13 @@ fn decodeFrame(written: []const u8) ?DecodedFrame {
     return .{ .reader = reader, .total_len = i + len };
 }
 
-/// Whether `written` contains a frame whose first subscription matches
-/// (`topic`, `subscribe`). Walks every recorded frame.
-fn recordHasSubscription(written: []const u8, topic: []const u8, subscribe: bool) bool {
-    var rest = written;
+/// Whether the recording contains a frame whose first subscription matches
+/// (`topic`, `subscribe`). Walks every recorded frame under the record lock so
+/// the read never races the writer fiber's append.
+fn recordHasSubscription(io: std.Io, record: *FakeRecord, topic: []const u8, subscribe: bool) bool {
+    record.mutex.lockUncancelable(io);
+    defer record.mutex.unlock(io);
+    var rest = record.written.items;
     while (decodeFrame(rest)) |decoded| {
         var reader = decoded.reader;
         while (reader.subscriptionsNext()) |sub| {
@@ -2523,10 +2571,13 @@ fn recordHasSubscription(written: []const u8, topic: []const u8, subscribe: bool
 }
 
 /// Count recorded frames carrying a published Message on `topic` with the given
-/// `data`. Used to assert exactly-once forwarding (dedup).
-fn recordCountPublishes(written: []const u8, topic: []const u8, data: []const u8) usize {
+/// `data`. Used to assert exactly-once forwarding (dedup). Reads under the record
+/// lock so the walk never races the writer fiber's append.
+fn recordCountPublishes(io: std.Io, record: *FakeRecord, topic: []const u8, data: []const u8) usize {
+    record.mutex.lockUncancelable(io);
+    defer record.mutex.unlock(io);
     var count: usize = 0;
-    var rest = written;
+    var rest = record.written.items;
     while (decodeFrame(rest)) |decoded| {
         var reader = decoded.reader;
         while (reader.publishNext()) |msg| {
@@ -2538,10 +2589,13 @@ fn recordCountPublishes(written: []const u8, topic: []const u8, data: []const u8
 }
 
 /// Count recorded frames carrying a control PRUNE for `topic`. Walks every
-/// recorded frame and every prune in each frame's control message.
-fn recordCountPrunes(written: []const u8, topic: []const u8) usize {
+/// recorded frame and every prune in each frame's control message, under the
+/// record lock so the walk never races the writer fiber's append.
+fn recordCountPrunes(io: std.Io, record: *FakeRecord, topic: []const u8) usize {
+    record.mutex.lockUncancelable(io);
+    defer record.mutex.unlock(io);
     var count: usize = 0;
-    var rest = written;
+    var rest = record.written.items;
     while (decodeFrame(rest)) |decoded| {
         var reader = decoded.reader;
         if (reader.getControl()) |ctrl_reader| {
@@ -2556,10 +2610,13 @@ fn recordCountPrunes(written: []const u8, topic: []const u8) usize {
 }
 
 /// Count recorded frames carrying a control GRAFT for `topic`. Walks every
-/// recorded frame and every graft in each frame's control message.
-fn recordCountGrafts(written: []const u8, topic: []const u8) usize {
+/// recorded frame and every graft in each frame's control message, under the
+/// record lock so the walk never races the writer fiber's append.
+fn recordCountGrafts(io: std.Io, record: *FakeRecord, topic: []const u8) usize {
+    record.mutex.lockUncancelable(io);
+    defer record.mutex.unlock(io);
     var count: usize = 0;
-    var rest = written;
+    var rest = record.written.items;
     while (decodeFrame(rest)) |decoded| {
         var reader = decoded.reader;
         if (reader.getControl()) |ctrl_reader| {
@@ -2573,10 +2630,13 @@ fn recordCountGrafts(written: []const u8, topic: []const u8) usize {
     return count;
 }
 
-/// Whether `written` contains a control IHAVE for `topic` that advertises `id`.
-/// Walks every recorded frame and every IHAVE/message-id within each control msg.
-fn recordHasIHave(written: []const u8, topic: []const u8, id: []const u8) bool {
-    var rest = written;
+/// Whether the recording contains a control IHAVE for `topic` that advertises
+/// `id`. Walks every recorded frame and every IHAVE/message-id within each
+/// control msg, under the record lock so the walk never races the writer append.
+fn recordHasIHave(io: std.Io, record: *FakeRecord, topic: []const u8, id: []const u8) bool {
+    record.mutex.lockUncancelable(io);
+    defer record.mutex.unlock(io);
+    var rest = record.written.items;
     while (decodeFrame(rest)) |decoded| {
         var reader = decoded.reader;
         if (reader.getControl()) |ctrl_reader| {
@@ -2594,11 +2654,14 @@ fn recordHasIHave(written: []const u8, topic: []const u8, id: []const u8) bool {
     return false;
 }
 
-/// Count control IWANT messages in `written` that request `id`. Walks every
-/// recorded frame and every IWANT/message-id within each control message.
-fn recordCountIWants(written: []const u8, id: []const u8) usize {
+/// Count control IWANT messages in the recording that request `id`. Walks every
+/// recorded frame and every IWANT/message-id within each control message, under
+/// the record lock so the walk never races the writer fiber's append.
+fn recordCountIWants(io: std.Io, record: *FakeRecord, id: []const u8) usize {
+    record.mutex.lockUncancelable(io);
+    defer record.mutex.unlock(io);
     var count: usize = 0;
-    var rest = written;
+    var rest = record.written.items;
     while (decodeFrame(rest)) |decoded| {
         var reader = decoded.reader;
         if (reader.getControl()) |ctrl_reader| {
@@ -2655,14 +2718,10 @@ const RecordingHandler = struct {
 fn connectFakePeer(io: std.Io, allocator: std.mem.Allocator, router: *FakeRouter, peer: PeerId) !*FakeTransport.FakeConn {
     const conn = try makeFakeConn(allocator);
     errdefer destroyFakeConn(allocator, conn);
-    const before = router.peerCount();
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
-    // Spin until the count rises (peer fully wired) with a bounded wait.
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.peerCount() > before) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so the connect is fully processed (peer wired into the map) before the
+    // caller reads any router state for this peer.
+    try sync(router, io);
     return conn;
 }
 
@@ -2687,10 +2746,10 @@ test "subscribe announces the subscription to a connected peer" {
 
     var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordHasSubscription(conn.record.written.items, "t", true)) break;
+        if (recordHasSubscription(io, &conn.record, "t", true)) break;
         io_time.ms(5).sleep(io) catch {};
     }
-    try std.testing.expect(recordHasSubscription(conn.record.written.items, "t", true));
+    try std.testing.expect(recordHasSubscription(io, &conn.record, "t", true));
 }
 
 test "inbound subscription is tracked on the source peer" {
@@ -2708,22 +2767,14 @@ test "inbound subscription is tracked on the source peer" {
     defer destroyFakeConn(allocator, conn);
 
     // Peer X announces it subscribes to "t"; the router records it on X's state.
+    // Sync so the inbound is fully processed, then read the peer's topics once.
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, "t", true) } });
-
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (peerTracksTopic(router, peer, "t")) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    try sync(router, io);
     try std.testing.expect(peerTracksTopic(router, peer, "t"));
 
     // And an unsubscribe removes it.
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, "t", false) } });
-    waited = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (!peerTracksTopic(router, peer, "t")) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    try sync(router, io);
     try std.testing.expect(!peerTracksTopic(router, peer, "t"));
 }
 
@@ -2769,14 +2820,14 @@ test "received message forwards over the mesh, not to all subscribers" {
 
     var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountPublishes(conn_a.record.written.items, "t", "hello") >= 1) break;
+        if (recordCountPublishes(io, &conn_a.record, "t", "hello") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
     // Give a wrong forward to B a chance to land before asserting it did not.
     io_time.ms(50).sleep(io) catch {};
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "hello"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "hello"));
     // B is a subscriber but not in the mesh, so it gets nothing.
-    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(conn_b.record.written.items, "t", "hello"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_b.record, "t", "hello"));
 }
 
 test "mesh forwarding dedups a repeated publish (same from+seqno) to forward once" {
@@ -2814,12 +2865,12 @@ test "mesh forwarding dedups a repeated publish (same from+seqno) to forward onc
 
     var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountPublishes(conn_y.record.written.items, "t", "dup") >= 1) break;
+        if (recordCountPublishes(io, &conn_y.record, "t", "dup") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
     // Give the (suppressed) second a chance to wrongly land before asserting.
     io_time.ms(50).sleep(io) catch {};
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_y.record.written.items, "t", "dup"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_y.record, "t", "dup"));
 }
 
 test "publish to a subscribed topic forwards over the mesh and delivers locally" {
@@ -2847,29 +2898,29 @@ test "publish to a subscribed topic forwards over the mesh and delivers locally"
     // originated message reaches A as a subscriber; with it off it reaches A as a
     // mesh member — either way A receives exactly one copy.
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
-    var sub_waited: u64 = 0;
-    while (sub_waited < 2000) : (sub_waited += 5) {
-        if (peerTracksTopic(router, peer_a, "t")) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    try sync(router, io);
     try std.testing.expect(peerTracksTopic(router, peer_a, "t"));
 
     // Graft A into the mesh so the local publish has a mesh destination.
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
     try std.testing.expect(router.meshContains("t", peer_a));
 
-    // Publish locally: A gets the forwarded frame and our handler fires.
+    // Publish locally: A gets the forwarded frame and our handler fires. The local
+    // delivery (onMessage) runs synchronously on the router fiber inside onPublish,
+    // so a sync guarantees rec.* is written before the test reads it. The forwarded
+    // frame to A is flushed asynchronously by A's writer, so poll the record.
     try router.inbox.putOne(io, .{ .publish = .{
         .topic = try allocator.dupe(u8, "t"),
         .data = try allocator.dupe(u8, "hello"),
     } });
+    try sync(router, io);
 
     var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
-        if (rec.calls > 0 and recordCountPublishes(conn_a.record.written.items, "t", "hello") >= 1) break;
+        if (recordCountPublishes(io, &conn_a.record, "t", "hello") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "hello"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "hello"));
     try std.testing.expectEqual(@as(usize, 1), rec.calls);
     try std.testing.expectEqualSlices(u8, "t", rec.topic.?);
     try std.testing.expectEqualSlices(u8, "hello", rec.data.?);
@@ -2904,10 +2955,8 @@ test "flood-publish floods an originated message to ALL topic subscribers, not j
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_b, .rpc = try buildInboundSub(allocator, "t", true) } });
     var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t")) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so both inbound subscriptions are fully processed, then read once.
+    try sync(router, io);
     try std.testing.expect(peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t"));
 
     // Only A is grafted into the mesh; B is a subscriber but not a mesh member.
@@ -2923,12 +2972,12 @@ test "flood-publish floods an originated message to ALL topic subscribers, not j
     } });
     waited = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountPublishes(conn_a.record.written.items, "t", "flood") >= 1 and
-            recordCountPublishes(conn_b.record.written.items, "t", "flood") >= 1) break;
+        if (recordCountPublishes(io, &conn_a.record, "t", "flood") >= 1 and
+            recordCountPublishes(io, &conn_b.record, "t", "flood") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "flood"));
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_b.record.written.items, "t", "flood"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "flood"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_b.record, "t", "flood"));
 
     // Contrast: a RELAYED message on "t" (from a third source) reaches only the
     // mesh member A, NOT the non-mesh subscriber B — relays stay mesh-only.
@@ -2941,13 +2990,13 @@ test "flood-publish floods an originated message to ALL topic subscribers, not j
     } });
     waited = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountPublishes(conn_a.record.written.items, "t", "relay") >= 1) break;
+        if (recordCountPublishes(io, &conn_a.record, "t", "relay") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
     // Give a wrong forward to B a chance to land before asserting it did not.
     io_time.ms(50).sleep(io) catch {};
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "relay"));
-    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(conn_b.record.written.items, "t", "relay"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "relay"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_b.record, "t", "relay"));
 }
 
 test "flood-publish gates on the publish threshold: a below-threshold subscriber is excluded" {
@@ -2980,10 +3029,8 @@ test "flood-publish gates on the publish threshold: a below-threshold subscriber
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_b, .rpc = try buildInboundSub(allocator, "t", true) } });
     var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t")) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so both inbound subscriptions are fully processed, then read once.
+    try sync(router, io);
     try std.testing.expect(peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t"));
 
     // Drive B below the publish threshold (2 invalid → -4 < -1); A stays at 0.
@@ -2999,13 +3046,13 @@ test "flood-publish gates on the publish threshold: a below-threshold subscriber
     } });
     waited = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountPublishes(conn_a.record.written.items, "t", "gated") >= 1) break;
+        if (recordCountPublishes(io, &conn_a.record, "t", "gated") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
     // Give a wrong forward to B a chance to land before asserting it did not.
     io_time.ms(50).sleep(io) catch {};
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "gated"));
-    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(conn_b.record.written.items, "t", "gated"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "gated"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_b.record, "t", "gated"));
 }
 
 test "flood-publish OFF: an originated message reaches mesh members only, not other subscribers" {
@@ -3032,10 +3079,8 @@ test "flood-publish OFF: an originated message reaches mesh members only, not ot
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_b, .rpc = try buildInboundSub(allocator, "t", true) } });
     var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t")) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so both inbound subscriptions are fully processed, then read once.
+    try sync(router, io);
     try std.testing.expect(peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t"));
 
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
@@ -3051,13 +3096,13 @@ test "flood-publish OFF: an originated message reaches mesh members only, not ot
     } });
     waited = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountPublishes(conn_a.record.written.items, "t", "meshonly") >= 1) break;
+        if (recordCountPublishes(io, &conn_a.record, "t", "meshonly") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
     // Give a wrong forward to B a chance to land before asserting it did not.
     io_time.ms(50).sleep(io) catch {};
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "meshonly"));
-    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(conn_b.record.written.items, "t", "meshonly"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "meshonly"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_b.record, "t", "meshonly"));
 }
 
 test "a forwarded message lands in the message cache and is evicted after history_length heartbeats" {
@@ -3081,21 +3126,23 @@ test "a forwarded message lands in the message cache and is evicted after histor
     defer destroyFakeConn(allocator, conn_s);
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
 
-    // Source relays a publish; once mesh member A has recorded the forward the
-    // router fiber is parked, so reading its message_cache is race-free (the same
-    // pattern the mesh-state assertions use).
+    // Source relays a publish; sync so the forward (and its message-cache
+    // insertion) is fully applied on the router fiber before reading the cache.
+    // The forwarded frame reaches A's record asynchronously (A's writer flushes
+    // it), so poll the record for it; the cache state is settled by the sync.
     const from = "origin";
     const seqno = "\x00\x00\x00\x05";
     try router.inbox.putOne(io, .{ .inbound_rpc = .{
         .peer = source,
         .rpc = try buildInboundPublish(allocator, from, seqno, "t", "cached"),
     } });
+    try sync(router, io);
     var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountPublishes(conn_a.record.written.items, "t", "cached") >= 1) break;
+        if (recordCountPublishes(io, &conn_a.record, "t", "cached") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "cached"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "cached"));
 
     // The message id is from ++ seqno (the default libp2p id).
     var id = try rpc.messageId(allocator, from, seqno);
@@ -3115,27 +3162,18 @@ test "a forwarded message lands in the message cache and is evicted after histor
     // mcache's own history_length so the test tracks the source of truth.
     const history_length = @import("mcache.zig").historyLengthForTest();
     try beatHeartbeats(io, router, history_length);
-    waited = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.message_cache.get(id.bytes) == null) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // beatHeartbeats syncs, so the eviction is fully applied; read the cache once.
     try std.testing.expect(router.message_cache.get(id.bytes) == null);
 }
 
 // --- mesh: GRAFT / PRUNE / backoff / heartbeat fake tests ------------------
 
-/// Subscribe the local node to `topic` and spin (bounded) until the router has
-/// recorded it in `my_topics`. The router processes the subscribe on its fiber,
-/// so the GRAFT handler's `my_topics.contains` check is only meaningful once this
-/// has landed.
+/// Subscribe the local node to `topic`, then `sync` so the router has fully
+/// processed it (recorded it in `my_topics`) before returning. The GRAFT
+/// handler's `my_topics.contains` check is only meaningful once this has landed.
 fn subscribeAndWait(io: std.Io, allocator: std.mem.Allocator, router: *FakeRouter, topic: []const u8) !void {
     try router.inbox.putOne(io, .{ .subscribe = .{ .topic = try allocator.dupe(u8, topic) } });
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.my_topics.contains(topic)) return;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    try sync(router, io);
 }
 
 /// Spin (bounded) until P's recorded outbound bytes contain at least one PRUNE
@@ -3143,10 +3181,10 @@ fn subscribeAndWait(io: std.Io, allocator: std.mem.Allocator, router: *FakeRoute
 fn waitPruneSent(io: std.Io, conn: *FakeTransport.FakeConn, topic: []const u8) bool {
     var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountPrunes(conn.record.written.items, topic) >= 1) return true;
+        if (recordCountPrunes(io, &conn.record, topic) >= 1) return true;
         io_time.ms(5).sleep(io) catch {};
     }
-    return recordCountPrunes(conn.record.written.items, topic) >= 1;
+    return recordCountPrunes(io, &conn.record, topic) >= 1;
 }
 
 /// Spin (bounded) until P's recorded outbound bytes contain at least one GRAFT
@@ -3154,15 +3192,20 @@ fn waitPruneSent(io: std.Io, conn: *FakeTransport.FakeConn, topic: []const u8) b
 fn waitGraftSent(io: std.Io, conn: *FakeTransport.FakeConn, topic: []const u8) bool {
     var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountGrafts(conn.record.written.items, topic) >= 1) return true;
+        if (recordCountGrafts(io, &conn.record, topic) >= 1) return true;
         io_time.ms(5).sleep(io) catch {};
     }
-    return recordCountGrafts(conn.record.written.items, topic) >= 1;
+    return recordCountGrafts(io, &conn.record, topic) >= 1;
 }
 
-/// Post a GRAFT(topic) inbound from `peer` and wait until the router has applied
-/// its effect: either the mesh now contains `peer` (accepted) or a PRUNE was sent
-/// back (rejected). Returns the observed outcome.
+/// Post a GRAFT(topic) inbound from `peer`, then `sync` so the GRAFT is fully
+/// applied, and read the outcome once: mesh membership is authoritative —
+/// accepted iff the mesh now contains `peer`, otherwise rejected (the router
+/// either PRUNEd it back or it was graylisted/backed-off). The `conn` parameter
+/// is kept so callers read `conn.record` separately (e.g. waitPruneSent) when the
+/// test asserts the PRUNE actually reached the wire; the writer flush is
+/// asynchronous from the router-state effect, so the record is not consulted for
+/// the accept/reject decision.
 const GraftOutcome = enum { accepted, rejected };
 fn graftAndWait(
     io: std.Io,
@@ -3172,30 +3215,20 @@ fn graftAndWait(
     peer: PeerId,
     topic: []const u8,
 ) !GraftOutcome {
-    const prunes_before = recordCountPrunes(conn.record.written.items, topic);
+    _ = conn;
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundGraft(allocator, topic) } });
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.meshContains(topic, peer)) return .accepted;
-        if (recordCountPrunes(conn.record.written.items, topic) > prunes_before) return .rejected;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    try sync(router, io);
     return if (router.meshContains(topic, peer)) .accepted else .rejected;
 }
 
-/// Drive `n` heartbeat ticks and wait until the router's tick counter has
-/// advanced by at least `n` (each posted heartbeat advances it by one on the
-/// router fiber). Used to age out backoffs deterministically with the fiber
-/// disabled (interval 0).
+/// Drive `n` heartbeat ticks, then `sync` so all `n` ticks (and their decay /
+/// mesh maintenance) have fully run on the router fiber before returning. Used to
+/// age out backoffs deterministically with the heartbeat fiber disabled
+/// (interval 0). After this returns `heartbeat_tick` has advanced by `n`.
 fn beatHeartbeats(io: std.Io, router: *FakeRouter, n: u64) !void {
-    const target = router.heartbeat_tick + n;
     var i: u64 = 0;
     while (i < n) : (i += 1) try router.inbox.putOne(io, .heartbeat);
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.heartbeat_tick >= target) return;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    try sync(router, io);
 }
 
 test "GRAFT accepted: subscribed topic, peer joins the mesh, no PRUNE back" {
@@ -3218,7 +3251,7 @@ test "GRAFT accepted: subscribed topic, peer joins the mesh, no PRUNE back" {
     try std.testing.expectEqual(GraftOutcome.accepted, outcome);
     try std.testing.expect(router.meshContains("t", peer));
     // Accept sends nothing back: no PRUNE on the peer's recorded stream.
-    try std.testing.expectEqual(@as(usize, 0), recordCountPrunes(conn.record.written.items, "t"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountPrunes(io, &conn.record, "t"));
 }
 
 test "GRAFT rejected when we do not subscribe: PRUNE sent, peer not in mesh" {
@@ -3240,7 +3273,7 @@ test "GRAFT rejected when we do not subscribe: PRUNE sent, peer not in mesh" {
     try std.testing.expectEqual(GraftOutcome.rejected, outcome);
     try std.testing.expect(!router.meshContains("t", peer));
     try std.testing.expect(waitPruneSent(io, conn, "t"));
-    try std.testing.expectEqual(@as(usize, 1), recordCountPrunes(conn.record.written.items, "t"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPrunes(io, &conn.record, "t"));
 }
 
 test "GRAFT can push the mesh past D_high; the heartbeat prunes it back to D" {
@@ -3274,25 +3307,21 @@ test "GRAFT can push the mesh past D_high; the heartbeat prunes it back to D" {
     try std.testing.expectEqual(n, router.meshSize("t"));
 
     // One heartbeat: size (13) > D_high (12), so the mesh is pruned back to D (6).
+    // beatHeartbeats syncs, so the prune-to-D is fully applied; read the size once.
     try beatHeartbeats(io, router, 1);
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.meshSize("t") == mesh_params.d) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
     try std.testing.expectEqual(mesh_params.d, router.meshSize("t"));
 
     // Wait for the PRUNE control frames to actually land on the pruned peers'
     // streams before counting (the writer fibers drain asynchronously). Once the
     // total reaches n - D the writers are quiescent, which also keeps the FakeSink
     // records from being mutated while the test tears down. The router-state
-    // checks (meshContains / inBackoff) settle synchronously when the heartbeat
-    // is processed, so they are read directly.
+    // checks (meshContains / inBackoff) settle synchronously: beatHeartbeats
+    // synced, and no command is posted before the reads below, so they are safe.
     const want_pruned = n - mesh_params.d;
-    waited = 0;
+    var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
         var total: usize = 0;
-        for (conns[0..n]) |c| total += recordCountPrunes(c.record.written.items, "t");
+        for (conns[0..n]) |c| total += recordCountPrunes(io, &c.record, "t");
         if (total >= want_pruned) break;
         io_time.ms(5).sleep(io) catch {};
     }
@@ -3304,7 +3333,7 @@ test "GRAFT can push the mesh past D_high; the heartbeat prunes it back to D" {
     i = 0;
     while (i < n) : (i += 1) {
         if (!router.meshContains("t", peers[i])) {
-            if (recordCountPrunes(conns[i].record.written.items, "t") >= 1) pruned += 1;
+            if (recordCountPrunes(io, &conns[i].record, "t") >= 1) pruned += 1;
             if (router.inBackoff("t", peers[i])) backed_off += 1;
         }
     }
@@ -3338,24 +3367,13 @@ test "heartbeat grafts up to D candidate peers when the mesh is below D_low" {
         conns[i] = try connectFakePeer(io, allocator, router, p);
         try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = p, .rpc = try buildInboundSub(allocator, "t", true) } });
     }
-    // Wait until all three are tracked as subscribers (the GRAFT selection reads
-    // each peer's announced topics).
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (peerTracksTopic(router, peers[0], "t") and
-            peerTracksTopic(router, peers[1], "t") and
-            peerTracksTopic(router, peers[2], "t")) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so all three inbound subscriptions are fully processed (the GRAFT
+    // selection reads each peer's announced topics).
+    try sync(router, io);
 
     // Mesh starts empty; one heartbeat grafts all three (3 < D_low).
     try std.testing.expectEqual(@as(usize, 0), router.meshSize("t"));
     try beatHeartbeats(io, router, 1);
-    waited = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.meshSize("t") == n) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
     try std.testing.expectEqual(@as(usize, n), router.meshSize("t"));
     // Each grafted peer is in the mesh and got a GRAFT on its stream.
     i = 0;
@@ -3390,32 +3408,29 @@ test "heartbeat grafts only up to D, not beyond, when many candidates exist" {
         conns[i] = try connectFakePeer(io, allocator, router, p);
         try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = p, .rpc = try buildInboundSub(allocator, "t", true) } });
     }
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        var all = true;
-        for (peers) |p| {
-            if (!peerTracksTopic(router, p, "t")) all = false;
-        }
-        if (all) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so all inbound subscriptions are fully processed before subscribing
+    // locally (the eager subscribe-join reads each peer's announced topics).
+    try sync(router, io);
 
+    // The eager subscribe-join grafts up to D; subscribeAndWait syncs, so the
+    // mesh is at D right after it returns.
     try subscribeAndWait(io, allocator, router, "t");
-    // The eager subscribe-join grafts up to D; wait for the mesh to reach D.
-    waited = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.meshSize("t") == mesh_params.d) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    try std.testing.expectEqual(mesh_params.d, router.meshSize("t"));
     // A heartbeat must not push it past D (D >= D_low → no further graft).
     try beatHeartbeats(io, router, 1);
-    io_time.ms(50).sleep(io) catch {};
     try std.testing.expectEqual(mesh_params.d, router.meshSize("t"));
 
     // Exactly D GRAFTs were sent in total (one per grafted peer); the other
-    // n - D candidates got none.
+    // n - D candidates got none. The writers flush asynchronously, so poll until
+    // the total reaches D (the mesh-state assertions above already settled it).
+    var waited: u64 = 0;
     var grafts: usize = 0;
-    for (conns) |c| grafts += recordCountGrafts(c.record.written.items, "t");
+    while (waited < 2000) : (waited += 5) {
+        grafts = 0;
+        for (conns) |c| grafts += recordCountGrafts(io, &c.record, "t");
+        if (grafts >= mesh_params.d) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
     try std.testing.expectEqual(mesh_params.d, grafts);
 }
 
@@ -3439,12 +3454,8 @@ test "PRUNE removes peer from mesh and backs it off (a later GRAFT is rejected)"
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundPrune(allocator, "t", 5) } });
 
-    // Wait for the prune to take effect (peer removed from mesh).
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (!router.meshContains("t", peer)) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so the prune is fully applied (peer removed from mesh), then read once.
+    try sync(router, io);
     try std.testing.expect(!router.meshContains("t", peer));
 
     // A subsequent GRAFT from P is rejected because P is in backoff → PRUNE back.
@@ -3512,6 +3523,9 @@ test "peer disconnect cleans the peer out of mesh and backoff" {
     try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
 
+    // Sync so the disconnect (mesh/backoff cleanup) is fully applied before the
+    // reads below.
+    try sync(router, io);
     try std.testing.expect(!router.meshContains("t", peer));
     try std.testing.expect(!router.inBackoff("t2", peer));
     // The testing allocator's end-of-test leak check confirms destroy() freed the
@@ -3543,13 +3557,9 @@ test "PRUNE with a max-u64 backoff does not crash and actually backs the peer of
         .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundPrune(allocator, "t", std.math.maxInt(u64)) },
     });
 
-    // Wait for the prune to take effect (peer removed from mesh) — proves we did
-    // not crash processing it.
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (!router.meshContains("t", peer)) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so the prune is fully applied (peer removed from mesh) — proves we did
+    // not crash processing it — then read once.
+    try sync(router, io);
     try std.testing.expect(!router.meshContains("t", peer));
 
     // The backoff must be set (not wrapped to immediately-expired): a subsequent
@@ -3599,12 +3609,12 @@ test "re-GRAFT from an existing mesh member at D_high is an idempotent accept (n
     // processed the GRAFT is fully handled and any spurious PRUNE would be visible.)
     const member = peers[0];
     const member_conn = conns[0];
-    const prunes_before = recordCountPrunes(member_conn.record.written.items, "t");
+    const prunes_before = recordCountPrunes(io, &member_conn.record, "t");
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = member, .rpc = try buildInboundGraft(allocator, "t") } });
     try beatHeartbeats(io, router, 1);
     try std.testing.expect(router.meshContains("t", member));
     try std.testing.expectEqual(d_high, router.meshSize("t"));
-    try std.testing.expectEqual(prunes_before, recordCountPrunes(member_conn.record.written.items, "t"));
+    try std.testing.expectEqual(prunes_before, recordCountPrunes(io, &member_conn.record, "t"));
 }
 
 // --- fanout + subscribe-join / unsubscribe-leave fake tests ----------------
@@ -3635,10 +3645,8 @@ test "publish to an UNSUBSCRIBED topic forms a fanout, forwards, then expires" {
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_b, .rpc = try buildInboundSub(allocator, "t", true) } });
     var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t")) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so both inbound subscriptions are fully processed, then read once.
+    try sync(router, io);
     try std.testing.expect(peerTracksTopic(router, peer_a, "t") and peerTracksTopic(router, peer_b, "t"));
 
     // Publish on the unsubscribed topic: a fanout["t"] forms (up to D) from the
@@ -3650,27 +3658,25 @@ test "publish to an UNSUBSCRIBED topic forms a fanout, forwards, then expires" {
 
     waited = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountPublishes(conn_a.record.written.items, "t", "fan") >= 1 and
-            recordCountPublishes(conn_b.record.written.items, "t", "fan") >= 1) break;
+        if (recordCountPublishes(io, &conn_a.record, "t", "fan") >= 1 and
+            recordCountPublishes(io, &conn_b.record, "t", "fan") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_a.record.written.items, "t", "fan"));
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_b.record.written.items, "t", "fan"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "fan"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_b.record, "t", "fan"));
     // The fanout set exists and last-publish was stamped (we never subscribed, so
-    // there is no mesh for "t").
+    // there is no mesh for "t"). Sync so the publish's fanout-state mutation is
+    // fully applied before reading the router's fanout/mesh maps.
+    try sync(router, io);
     try std.testing.expect(router.fanout.contains("t"));
     try std.testing.expect(router.fanout_last_pub.contains("t"));
     try std.testing.expect(!router.mesh.contains("t"));
 
     // Drive more than FanoutTTL heartbeats with no further publish: the fanout
     // topic must be dropped (freed). One extra beat past the TTL guarantees the
-    // strict `> ttl` comparison fires.
+    // strict `> ttl` comparison fires. beatHeartbeats syncs, so the expiry is
+    // fully applied; read once.
     try beatHeartbeats(io, router, mesh_params.fanout_ttl_ticks + 1);
-    waited = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (!router.fanout.contains("t")) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
     try std.testing.expect(!router.fanout.contains("t"));
     try std.testing.expect(!router.fanout_last_pub.contains("t"));
 }
@@ -3698,24 +3704,13 @@ test "subscribe JOINs the mesh (eager GRAFTs); unsubscribe LEAVEs it (PRUNEs)" {
         conns[i] = try connectFakePeer(io, allocator, router, p);
         try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = p, .rpc = try buildInboundSub(allocator, "t", true) } });
     }
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        var all = true;
-        for (peers) |p| {
-            if (!peerTracksTopic(router, p, "t")) all = false;
-        }
-        if (all) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so all three inbound subscriptions are fully processed (the eager
+    // subscribe-join reads each peer's announced topics).
+    try sync(router, io);
 
     // Subscribe → eager JOIN: all three (< D) are grafted into the mesh and each
-    // gets a GRAFT.
+    // gets a GRAFT. subscribeAndWait syncs, so the eager join is fully applied.
     try subscribeAndWait(io, allocator, router, "t");
-    waited = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.meshSize("t") == n) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
     try std.testing.expectEqual(@as(usize, n), router.meshSize("t"));
     for (peers, 0..) |p, idx| {
         try std.testing.expect(router.meshContains("t", p));
@@ -3723,13 +3718,9 @@ test "subscribe JOINs the mesh (eager GRAFTs); unsubscribe LEAVEs it (PRUNEs)" {
     }
 
     // Unsubscribe → LEAVE: a PRUNE is sent to every mesh member and mesh["t"] is
-    // cleared (the topic key freed).
+    // cleared (the topic key freed). Sync so the leave is fully applied, then read.
     try router.inbox.putOne(io, .{ .unsubscribe = .{ .topic = try allocator.dupe(u8, "t") } });
-    waited = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (!router.my_topics.contains("t") and !router.mesh.contains("t")) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    try sync(router, io);
     try std.testing.expect(!router.my_topics.contains("t"));
     try std.testing.expect(!router.mesh.contains("t"));
     for (conns) |c| try std.testing.expect(waitPruneSent(io, c, "t"));
@@ -3767,15 +3758,11 @@ test "cache-on-accept: an accepted message with an EMPTY mesh is still cached" {
     var id = try rpc.messageId(allocator, from, seqno);
     defer id.deinit(allocator);
 
-    // Poll until the router fiber has processed the inbound RPC and cached the id.
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.message_cache.get(id.bytes) != null) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so the inbound RPC is fully processed (and the id cached), then read.
+    try sync(router, io);
     try std.testing.expect(router.message_cache.get(id.bytes) != null);
     // No mesh member existed, so nothing was forwarded to S either.
-    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(conn_s.record.written.items, "t", "lonely"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_s.record, "t", "lonely"));
 }
 
 test "IHAVE emission: heartbeat advertises cached ids to a non-mesh subscriber" {
@@ -3806,11 +3793,8 @@ test "IHAVE emission: heartbeat advertises cached ids to a non-mesh subscriber" 
     // gossip target, since gossip-target selection ignores backoff. This keeps P a
     // lazy/non-mesh subscriber across the heartbeat the test then drives.
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_p, .rpc = try buildInboundPrune(allocator, "t", 0) } });
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (peerTracksTopic(router, peer_p, "t") and router.inBackoff("t", peer_p)) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so P's subscribe + prune are fully processed, then read once.
+    try sync(router, io);
     try std.testing.expect(peerTracksTopic(router, peer_p, "t"));
     // P must not be a mesh member.
     try std.testing.expect(!router.meshContains("t", peer_p));
@@ -3823,21 +3807,18 @@ test "IHAVE emission: heartbeat advertises cached ids to a non-mesh subscriber" 
     } });
     var id = try rpc.messageId(allocator, from, seqno);
     defer id.deinit(allocator);
-    waited = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.message_cache.get(id.bytes) != null) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so the publish is fully processed (cached), then read the cache once.
+    try sync(router, io);
     try std.testing.expect(router.message_cache.get(id.bytes) != null);
 
     // One heartbeat: P receives an IHAVE(t, [id]).
     try beatHeartbeats(io, router, 1);
-    waited = 0;
+    var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordHasIHave(conn_p.record.written.items, "t", id.bytes)) break;
+        if (recordHasIHave(io, &conn_p.record, "t", id.bytes)) break;
         io_time.ms(5).sleep(io) catch {};
     }
-    try std.testing.expect(recordHasIHave(conn_p.record.written.items, "t", id.bytes));
+    try std.testing.expect(recordHasIHave(io, &conn_p.record, "t", id.bytes));
 }
 
 test "inbound IHAVE: unseen id triggers an IWANT; a seen id triggers none" {
@@ -3861,10 +3842,10 @@ test "inbound IHAVE: unseen id triggers an IWANT; a seen id triggers none" {
     } });
     var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountIWants(conn_p.record.written.items, "unseen-id") >= 1) break;
+        if (recordCountIWants(io, &conn_p.record, "unseen-id") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
-    try std.testing.expectEqual(@as(usize, 1), recordCountIWants(conn_p.record.written.items, "unseen-id"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountIWants(io, &conn_p.record, "unseen-id"));
 
     // Now an IHAVE for an id we HAVE seen: insert it into the seen-cache by way of
     // an inbound publish whose (from, seqno) computes to "seen-id-marker". Build
@@ -3878,13 +3859,11 @@ test "inbound IHAVE: unseen id triggers an IWANT; a seen id triggers none" {
         .peer = peer_p,
         .rpc = try buildInboundPublish(allocator, from, seqno, "t", "seenmsg"),
     } });
-    waited = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.message_cache.get(id.bytes) != null) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so the publish is fully processed (id cached/seen) before reading.
+    try sync(router, io);
+    try std.testing.expect(router.message_cache.get(id.bytes) != null);
     // IHAVE the now-seen id; no new IWANT for it must be sent.
-    const iwants_before = recordCountIWants(conn_p.record.written.items, id.bytes);
+    const iwants_before = recordCountIWants(io, &conn_p.record, id.bytes);
     try router.inbox.putOne(io, .{ .inbound_rpc = .{
         .peer = peer_p,
         .rpc = try buildInboundIHave(allocator, "t", &[_]?[]const u8{id.bytes}),
@@ -3892,7 +3871,7 @@ test "inbound IHAVE: unseen id triggers an IWANT; a seen id triggers none" {
     // Drive a heartbeat afterward: the single-fiber FIFO guarantees the IHAVE is
     // fully processed by the time the heartbeat is, so any spurious IWANT shows.
     try beatHeartbeats(io, router, 1);
-    try std.testing.expectEqual(iwants_before, recordCountIWants(conn_p.record.written.items, id.bytes));
+    try std.testing.expectEqual(iwants_before, recordCountIWants(io, &conn_p.record, id.bytes));
 }
 
 test "inbound IWANT: a cached id is served as the full publish; an unknown id is not" {
@@ -3920,12 +3899,10 @@ test "inbound IWANT: a cached id is served as the full publish; an unknown id is
     const from = local_test_peer.bytes[0..local_test_peer.len];
     var id = try rpc.messageId(allocator, from, "\x00\x00\x00\x00\x00\x00\x00\x00");
     defer id.deinit(allocator);
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.message_cache.get(id.bytes) != null) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so the local publish is fully processed (cached), then read the cache.
+    try sync(router, io);
     try std.testing.expect(router.message_cache.get(id.bytes) != null);
+    var waited: u64 = 0;
 
     // P sends an IWANT for the cached id AND an unknown id. Only the cached one is
     // served (as the full publish on P's data lane); the unknown id is ignored.
@@ -3935,10 +3912,10 @@ test "inbound IWANT: a cached id is served as the full publish; an unknown id is
     } });
     waited = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountPublishes(conn_p.record.written.items, "t", "served-data") >= 1) break;
+        if (recordCountPublishes(io, &conn_p.record, "t", "served-data") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
-    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(conn_p.record.written.items, "t", "served-data"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_p.record, "t", "served-data"));
 }
 
 test "recovery: IHAVE -> IWANT -> served publish is delivered to a node that missed the mesh" {
@@ -3977,22 +3954,20 @@ test "recovery: IHAVE -> IWANT -> served publish is delivered to a node that mis
     // Leg 2: the router must IWANT the id from P.
     var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordCountIWants(conn_p.record.written.items, id.bytes) >= 1) break;
+        if (recordCountIWants(io, &conn_p.record, id.bytes) >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
-    try std.testing.expectEqual(@as(usize, 1), recordCountIWants(conn_p.record.written.items, id.bytes));
+    try std.testing.expectEqual(@as(usize, 1), recordCountIWants(io, &conn_p.record, id.bytes));
 
     // Leg 3+4: P serves the requested message as a normal publish; the router's
     // standard inbound path delivers it locally (the handler fires) and caches it.
+    // The local delivery (onMessage) and the cache insert both run on the router
+    // fiber inside onInboundRpc, so a sync guarantees both are done before reading.
     try router.inbox.putOne(io, .{ .inbound_rpc = .{
         .peer = peer_p,
         .rpc = try buildInboundPublish(allocator, from, seqno, "t", "recovered"),
     } });
-    waited = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (rec.calls > 0) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    try sync(router, io);
     try std.testing.expectEqual(@as(usize, 1), rec.calls);
     try std.testing.expectEqualSlices(u8, "t", rec.topic.?);
     try std.testing.expectEqualSlices(u8, "recovered", rec.data.?);
@@ -4137,10 +4112,10 @@ test "scoring graylist gate: an RPC from a below-graylist peer is ignored" {
     // A GRAFT from the graylisted peer is likewise dropped: no PRUNE is sent back
     // (a graylisted peer is ignored, not even rejected). We do not subscribe to
     // "t2", so absent the graylist a GRAFT would have drawn a PRUNE.
-    const prunes_before = recordCountPrunes(conn.record.written.items, "t2");
+    const prunes_before = recordCountPrunes(io, &conn.record, "t2");
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundGraft(allocator, "t2") } });
     try beatHeartbeats(io, router, 1);
-    try std.testing.expectEqual(prunes_before, recordCountPrunes(conn.record.written.items, "t2"));
+    try std.testing.expectEqual(prunes_before, recordCountPrunes(io, &conn.record, "t2"));
     try std.testing.expect(!router.meshContains("t2", peer));
 }
 
@@ -4173,12 +4148,8 @@ test "scoring prune gate: a negative-score mesh peer is pruned at the heartbeat"
     try std.testing.expect(liveScore(router, peer) < 0 and liveScore(router, peer) > -10.0);
 
     // One heartbeat prunes the negative peer out of the mesh + sends it a PRUNE.
+    // beatHeartbeats syncs, so the prune is fully applied; read once.
     try beatHeartbeats(io, router, 1);
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (!router.meshContains("t", peer)) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
     try std.testing.expect(!router.meshContains("t", peer));
     try std.testing.expect(waitPruneSent(io, conn, "t"));
 }
@@ -4209,11 +4180,7 @@ test "scoring graft gate: maintenance does not graft a negative-score candidate"
     // processed). Send the subscribe BEFORE the rejects so it is recorded while
     // the peer is still at score 0.
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, "t", true) } });
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (peerTracksTopic(router, peer, "t")) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    try sync(router, io);
     try std.testing.expect(peerTracksTopic(router, peer, "t"));
 
     try driveInvalid(io, allocator, router, peer, "t", 2);
@@ -4227,7 +4194,7 @@ test "scoring graft gate: maintenance does not graft a negative-score candidate"
     try std.testing.expect(!router.meshContains("t", peer));
     try std.testing.expectEqual(@as(usize, 0), router.meshSize("t"));
     // No GRAFT was sent to it.
-    try std.testing.expectEqual(@as(usize, 0), recordCountGrafts(conn.record.written.items, "t"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountGrafts(io, &conn.record, "t"));
 }
 
 test "scoring graft gate: an inbound GRAFT from a negative-score peer is rejected" {
@@ -4296,12 +4263,8 @@ test "scoring gossip gate: IHAVE goes to an above-threshold peer, not a below on
         try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = p, .rpc = try buildInboundSub(allocator, "t", true) } });
         try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = p, .rpc = try buildInboundPrune(allocator, "t", 0) } });
     }
-    var waited: u64 = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (peerTracksTopic(router, good, "t") and peerTracksTopic(router, bad, "t") and
-            router.inBackoff("t", good) and router.inBackoff("t", bad)) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so both peers' subscribe + prune are fully processed, then read once.
+    try sync(router, io);
     try std.testing.expect(peerTracksTopic(router, good, "t") and peerTracksTopic(router, bad, "t"));
 
     // Drive BAD below the gossip threshold (1 invalid → -1 < 0), still above
@@ -4326,24 +4289,21 @@ test "scoring gossip gate: IHAVE goes to an above-threshold peer, not a below on
     } });
     var id = try rpc.messageId(allocator, signer_from, seqno);
     defer id.deinit(allocator);
-    waited = 0;
-    while (waited < 2000) : (waited += 5) {
-        if (router.message_cache.get(id.bytes) != null) break;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    // Sync so the signed publish is fully processed (cached) before reading.
+    try sync(router, io);
     try std.testing.expect(router.message_cache.get(id.bytes) != null);
 
     // Heartbeat: GOOD gets the IHAVE, BAD does not.
     try beatHeartbeats(io, router, 1);
-    waited = 0;
+    var waited: u64 = 0;
     while (waited < 2000) : (waited += 5) {
-        if (recordHasIHave(conn_good.record.written.items, "t", id.bytes)) break;
+        if (recordHasIHave(io, &conn_good.record, "t", id.bytes)) break;
         io_time.ms(5).sleep(io) catch {};
     }
-    try std.testing.expect(recordHasIHave(conn_good.record.written.items, "t", id.bytes));
+    try std.testing.expect(recordHasIHave(io, &conn_good.record, "t", id.bytes));
     // Give a (wrong) IHAVE to BAD a chance to land before asserting it did not.
     io_time.ms(50).sleep(io) catch {};
-    try std.testing.expect(!recordHasIHave(conn_bad.record.written.items, "t", id.bytes));
+    try std.testing.expect(!recordHasIHave(io, &conn_bad.record, "t", id.bytes));
 }
 
 test "scoring events move the score: clean delivery raises it, sig-failure lowers it" {
@@ -4421,14 +4381,12 @@ fn peerVersionOf(router: *FakeRouter, peer: PeerId) ?pubsub.Version {
     return state.protocol_version;
 }
 
-/// Spin (yielding the fiber) until the peer tracked under `peer` has recorded
-/// `want`, or the bounded wait elapses. Returns whether it landed.
+/// Sync so any previously-posted `peer_protocol` (or `peer_connected`) command
+/// is fully processed, then read the peer's recorded version once and compare to
+/// `want`. Returns whether it matched. Caller must post the version-affecting
+/// command before calling this.
 fn waitForVersion(io: std.Io, router: *FakeRouter, peer: PeerId, want: pubsub.Version) bool {
-    var waited_ms: u64 = 0;
-    while (waited_ms < 2000) : (waited_ms += 5) {
-        if (peerVersionOf(router, peer)) |v| if (v == want) return true;
-        io_time.ms(5).sleep(io) catch {};
-    }
+    sync(router, io) catch return false;
     return if (peerVersionOf(router, peer)) |v| v == want else false;
 }
 
@@ -4463,6 +4421,8 @@ test "router records each peer's negotiated /meshsub version; peerSupportsV12 on
         }
     }.pred, router));
 
+    // Sync so all three connects are fully processed before reading the peer map.
+    try sync(router, io);
     // Before any peer_protocol, every peer defaults to the 1.1 baseline.
     try std.testing.expectEqual(pubsub.Version.v1_1, peerVersionOf(router, peer_10).?);
     try std.testing.expectEqual(pubsub.Version.v1_1, peerVersionOf(router, peer_12).?);
@@ -4538,6 +4498,9 @@ test "router purges a pending version when the peer disconnects without ever con
     defer destroyFakeConn(allocator, conn);
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
     try std.testing.expect(waitFor(io, peerCountIsOne, router));
+    // Sync so the connect (which adopted/purged the pending version) is fully
+    // applied before reading the peer map.
+    try sync(router, io);
     try std.testing.expectEqual(pubsub.Version.v1_1, peerVersionOf(router, peer).?);
     try std.testing.expect(!router.peerSupportsV12(peer));
 
