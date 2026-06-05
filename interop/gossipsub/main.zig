@@ -259,24 +259,36 @@ pub fn main(init: std.process.Init) !void {
         .anonymous => .{ .signature_policy = .anonymous },
     };
     const gs = try gossipsub.Gossipsub.init(allocator, io, switcher, local_peer, host_key_opt, recorder.handler(), null, gs_config);
-    var gs_live = true;
-    defer if (gs_live) gs.deinit();
+    // Only runs on an error return from `runListener`/`runDialer` (the run never
+    // started). The success path emits its result and hard-exits below, which
+    // skips defers — see the note there for why graceful teardown is avoided.
+    defer gs.deinit();
 
+    // `runListener` / `runDialer` run until the duration elapses, then emit the
+    // result JSON and hard-exit from within (via `finishAndExit`) — see the note
+    // there. Control therefore does NOT return here on the success path; this
+    // switch only returns when the run fails to start, in which case the error
+    // propagates out of `main` and the deferred teardown above runs normally.
     switch (args.role) {
-        .listen => try runListener(allocator, io, switcher, &host_key, gs, &args),
-        .dial => try runDialer(allocator, io, switcher, gs, &args),
+        .listen => try runListener(allocator, io, switcher, &host_key, &recorder, gs, &args),
+        .dial => try runDialer(allocator, io, switcher, &recorder, gs, &args),
     }
+}
 
-    // Tear down gossipsub before the deferred Switch/endpoint deinit. By now the
-    // run duration has elapsed; closing the Switch (its deferred deinit) tears
-    // down the connection, then gossipsub deinit clears the callback + frees the
-    // router. Deiniting gossipsub here keeps the documented order.
-    gs.deinit();
-    gs_live = false;
-
+/// Emit the result JSON, flush stdout, then terminate the process immediately.
+///
+/// Called at the end of a successful run, BEFORE the run functions' deferred
+/// teardown. A listener's accept fiber is parked in a blocking `Switch.accept()`
+/// waiting for the next inbound connection, and canceling that fiber does not
+/// reliably interrupt the blocked accept (a lost-wake race at teardown), so the
+/// graceful fiber unwind can hang on exit. This is a test/interop node: it does
+/// not need graceful teardown. Hard-exiting here skips every deinit — including
+/// the accept-fiber cancel/join that would otherwise deadlock — and the OS
+/// reclaims all resources, so the process ALWAYS terminates promptly.
+fn finishAndExit(io: std.Io, recorder: *Recorder, args: *const Args) noreturn {
     const received = recorder.received.load(.acquire);
     var json_buf: [256]u8 = undefined;
-    const json = try std.fmt.bufPrint(
+    const json = std.fmt.bufPrint(
         &json_buf,
         "{{\"role\":\"{s}\",\"mode\":\"{s}\",\"received\":{s}}}\n",
         .{
@@ -284,8 +296,9 @@ pub fn main(init: std.process.Init) !void {
             if (args.mode == .publish) "pub" else "sub",
             if (received) "true" else "false",
         },
-    );
-    try printToStdout(io, json);
+    ) catch unreachable; // The fixed format + bounded fields always fit json_buf.
+    printToStdout(io, json) catch {};
+    std.process.exit(0);
 }
 
 fn runListener(
@@ -293,6 +306,7 @@ fn runListener(
     io: std.Io,
     switcher: *libp2p.Switch,
     host_key: *identity.KeyPair,
+    recorder: *Recorder,
     gs: *gossipsub.Gossipsub,
     args: *const Args,
 ) !void {
@@ -330,6 +344,11 @@ fn runListener(
     try gs.subscribe(args.topic);
 
     try runForDuration(io, gs, args);
+
+    // Hard-exit here, BEFORE the `accept_future.cancel` / `accept_state.deinit`
+    // teardown defer above runs: that defer is exactly the blocked-accept cancel
+    // that can deadlock. `finishAndExit` never returns.
+    finishAndExit(io, recorder, args);
 }
 
 const AcceptState = struct {
@@ -380,6 +399,7 @@ fn runDialer(
     allocator: std.mem.Allocator,
     io: std.Io,
     switcher: *libp2p.Switch,
+    recorder: *Recorder,
     gs: *gossipsub.Gossipsub,
     args: *const Args,
 ) !void {
@@ -425,6 +445,12 @@ fn runDialer(
     try gs.subscribe(args.topic);
 
     try runForDuration(io, gs, args);
+
+    // Emit the result and hard-exit, matching the listener path so every node
+    // terminates promptly without a fiber-graceful teardown. `finishAndExit`
+    // never returns. (A dialer has no blocking accept fiber, but hard-exiting
+    // keeps shutdown uniform and immune to any connection-deinit stall.)
+    finishAndExit(io, recorder, args);
 }
 
 /// Run until `duration_ms` elapses. In publish mode, republish every
