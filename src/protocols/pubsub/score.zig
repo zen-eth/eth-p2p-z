@@ -261,12 +261,10 @@ pub const AppScoreFn = struct {
 pub const TopicStats = struct {
     /// Whether the peer is currently in this topic's mesh (grafted, not pruned).
     in_mesh: bool = false,
-    /// Total ticks accumulated while in the mesh (P1's raw input). Accrued by
-    /// `decay` each interval the peer is `in_mesh`.
+    /// Total ticks accumulated while in the mesh (P1's raw input, and the gate for
+    /// P3 activation). Reset to zero on graft; accrued by `decay` each interval the
+    /// peer is `in_mesh`.
     mesh_time_ticks: u64 = 0,
-    /// The tick at which the peer was last grafted into this mesh. Mesh time is
-    /// measured from here; also gates P3 activation.
-    mesh_active_at_tick: u64 = 0,
     /// First-delivery credit (P2): incremented (capped) on a delivery, decayed.
     first_message_deliveries: f64 = 0,
     /// Mesh-delivery credit (P3): incremented (capped) on a delivery or in-window
@@ -474,18 +472,16 @@ pub const PeerScore = struct {
 
     // ----- mesh events ------------------------------------------------------
 
-    /// Record that `peer` was grafted into `topic`'s mesh: mark it in-mesh, stamp
-    /// the graft tick (mesh time and P3 activation are measured from here), and
-    /// reset the P3 activation + delivery window — a freshly-grafted peer starts a
-    /// new activation grace period and a clean mesh-delivery counter. No-op for an
-    /// untracked peer.
+    /// Record that `peer` was grafted into `topic`'s mesh: mark it in-mesh, restart
+    /// the mesh time so P3 activation is measured afresh, and deactivate P3 until the
+    /// activation grace period re-elapses. The decayed `mesh_message_deliveries`
+    /// counter is intentionally preserved (matching go-libp2p) — a re-grafted peer
+    /// keeps its accrued delivery credit. No-op for an untracked peer.
     pub fn graft(self: *PeerScore, peer: PeerId, topic: []const u8) void {
         const ts = self.topicStats(peerKey(&peer), topic) orelse return;
         ts.in_mesh = true;
-        ts.mesh_active_at_tick = self.tick;
         ts.mesh_time_ticks = 0;
         ts.mesh_message_deliveries_active = false;
-        ts.mesh_message_deliveries = 0;
     }
 
     /// Record that `peer` was pruned from `topic`'s mesh. If P3 was active and the
@@ -695,11 +691,13 @@ pub const PeerScore = struct {
         const p = self.params.topic_default;
         var s: f64 = 0;
 
-        // P1: time in mesh, in quantum units, capped.
+        // P1: time in mesh, in quantum units, capped. Both the accrued mesh time
+        // and the quantum are tick counts, so the division is integer (truncating)
+        // before the float cast — 5 ticks / quantum 2 yields 2, not 2.5.
         if (p.time_in_mesh_weight != 0) {
-            const quantum: f64 = @floatFromInt(@max(p.time_in_mesh_quantum_ticks, 1));
-            const mesh_time: f64 = @floatFromInt(ts.mesh_time_ticks);
-            const p1 = @min(mesh_time / quantum, p.time_in_mesh_cap);
+            const quantum = @max(p.time_in_mesh_quantum_ticks, 1); // avoid div-by-zero
+            const quanta: f64 = @floatFromInt(ts.mesh_time_ticks / quantum);
+            const p1 = @min(quanta, p.time_in_mesh_cap);
             s += p1 * p.time_in_mesh_weight;
         }
 
@@ -873,6 +871,59 @@ test "P1 time in mesh rises with accrued mesh time and is capped" {
     var i: u64 = 0;
     while (i < 100) : (i += 1) ps.decay(ps.tick + 1);
     try testing.expectApproxEqAbs(@as(f64, 1.5), ps.score(peer), 1e-9);
+}
+
+test "P1 quantum division truncates before the float cast (go parity)" {
+    const allocator = testing.allocator;
+    var params = zeroParams();
+    params.topic_default.time_in_mesh_weight = 1.0;
+    params.topic_default.time_in_mesh_quantum_ticks = 2;
+    params.topic_default.time_in_mesh_cap = 100.0; // well above the value under test.
+
+    var ps = PeerScore.init(allocator, params, zeroThresholds());
+    defer ps.deinit();
+
+    const peer = testPeer(9);
+    ps.addPeer(peer);
+    ps.graft(peer, "topic");
+
+    // Accrue exactly 5 ticks of mesh time. With quantum 2 the count is the integer
+    // 5 / 2 = 2 (NOT 2.5): truncation happens before the float cast. P1 = 2·1.0 = 2.0.
+    var t: u64 = 0;
+    while (t < 5) : (t += 1) ps.decay(ps.tick + 1);
+    try testing.expectApproxEqAbs(@as(f64, 2.0), ps.score(peer), 1e-9);
+}
+
+test "graft preserves the decayed mesh-delivery counter (go parity)" {
+    const allocator = testing.allocator;
+    var params = zeroParams();
+    // Drive P3 off the mesh-delivery counter so the score reflects its value.
+    params.topic_default.mesh_message_deliveries_weight = -1.0;
+    params.topic_default.mesh_message_deliveries_threshold = 10.0;
+    params.topic_default.mesh_message_deliveries_cap = 100.0;
+    params.topic_default.mesh_message_deliveries_activation_ticks = 1;
+    params.topic_default.mesh_message_deliveries_decay = 0.5;
+
+    var ps = PeerScore.init(allocator, params, zeroThresholds());
+    defer ps.deinit();
+
+    const peer = testPeer(10);
+    ps.addPeer(peer);
+    ps.graft(peer, "topic");
+
+    // Build up 4 mesh deliveries, then decay once (factor 0.5) → counter = 2.0.
+    var i: u32 = 0;
+    while (i < 4) : (i += 1) ps.deliverMessage(peer, "topic");
+    ps.decay(ps.tick + 1);
+    try testing.expectApproxEqAbs(@as(f64, 2.0), ps.topicStats(peerKey(&peer), "topic").?.mesh_message_deliveries, 1e-9);
+
+    // Re-graft: the decayed counter must survive (go does NOT zero it); only the
+    // mesh time restarts and P3 deactivates.
+    ps.graft(peer, "topic");
+    const ts = ps.topicStats(peerKey(&peer), "topic").?;
+    try testing.expectApproxEqAbs(@as(f64, 2.0), ts.mesh_message_deliveries, 1e-9);
+    try testing.expectEqual(@as(u64, 0), ts.mesh_time_ticks);
+    try testing.expectEqual(false, ts.mesh_message_deliveries_active);
 }
 
 test "P2 first deliveries rise (capped) then shrink by the decay factor" {
