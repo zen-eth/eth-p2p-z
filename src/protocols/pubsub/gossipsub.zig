@@ -129,10 +129,18 @@ pub const MessageHandler = router_mod.MessageHandler;
 /// to enable it with the documented baseline params/thresholds.
 pub const ScoreConfig = router_mod.ScoreConfig;
 
-/// Re-export the router behaviour config (flood-publish, etc.) so callers can
-/// tune it without importing router.zig. Pass `.{}` to `Gossipsub.init` for the
-/// go-libp2p defaults (flood-publish ON).
+/// Re-export the router behaviour config (flood-publish, signature policy, etc.)
+/// so callers can tune it without importing router.zig. Pass `.{}` to
+/// `Gossipsub.init` for the go-libp2p defaults (flood-publish ON, signature
+/// policy inferred from the host key).
 pub const RouterConfig = router_mod.RouterConfig;
+
+/// Re-export the signature-policy enum (and the message-id override types) so a
+/// caller can select `anonymous` (StrictNoSign) — or supply a custom message-id
+/// function — via `RouterConfig` without importing router.zig.
+pub const SignaturePolicy = router_mod.SignaturePolicy;
+pub const MessageIdFn = router_mod.MessageIdFn;
+pub const MessageIdConfig = router_mod.MessageIdConfig;
 
 const score_mod = @import("score.zig");
 pub const default_score_config: ScoreConfig = .{
@@ -227,13 +235,18 @@ pub const Gossipsub = struct {
     /// endpoint does not even retain the host KeyPair), so the caller — which owns
     /// the KeyPair — passes it in (e.g. `try key.peerId(allocator)`).
     ///
-    /// `host_key` selects the signature policy. Pass the node's host KeyPair (the
-    /// same one used for the endpoint identity) to enable StrictSign: outbound
-    /// messages are signed and inbound messages are verified + rejected if their
-    /// signature is invalid or absent — required for interop with go-libp2p
-    /// (whose default is StrictSign). The key is BORROWED and must outlive this
-    /// Gossipsub. Pass null for the none policy (from+seqno, no signature, no
-    /// verification). When a key is given the router derives `local_peer` from it.
+    /// `host_key` (together with `config.signature_policy`) selects the signature
+    /// policy. By default (`config.signature_policy == null`) the key infers it:
+    /// pass the node's host KeyPair (the same one used for the endpoint identity)
+    /// to enable StrictSign — outbound messages are signed and inbound messages
+    /// are verified + rejected if their signature is invalid or absent, required
+    /// for interop with go-libp2p (whose default is StrictSign) — or pass null for
+    /// the none policy (from+seqno, no signature, no verification). When a key is
+    /// given the router derives `local_peer` from it. To run anonymously
+    /// (StrictNoSign — published messages carry only topic+data, no peer-id,
+    /// content-based message-ids) pass `null` for `host_key` AND set
+    /// `config.signature_policy = .anonymous`; a key + anonymous is rejected. The
+    /// key is BORROWED and must outlive this Gossipsub.
     ///
     /// `message_handler` (optional) receives messages delivered on topics this
     /// node subscribes to; see router's MessageHandler for the call contract.

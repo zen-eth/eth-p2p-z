@@ -39,6 +39,48 @@ const io_time = @import("../../quic/io/time.zig");
 const score_mod = @import("score.zig");
 const PeerId = @import("peer_id").PeerId;
 
+/// The libp2p pubsub message-signature policy. Picks how a published message is
+/// stamped, whether an inbound message is verified, and how its message-id is
+/// derived:
+///   - `strict_sign`: every published message carries `from`+`seqno`+`signature`
+///     +`key` and every inbound published message is verified (an invalid or
+///     unsigned one is dropped). The message-id is `from`++`seqno`. Requires a
+///     host key. This is go-libp2p's default and what cross-impl interop uses.
+///   - `none`: a published message carries `from`+`seqno` but no signature, and
+///     inbound messages are not verified. The message-id is `from`++`seqno`. A
+///     local convenience (used when no host key is configured); NOT a privacy
+///     mode — the peer-id still rides on the wire as `from`.
+///   - `anonymous` (libp2p StrictNoSign): a published message carries ONLY
+///     `topic`+`data` — no `from`/`seqno`/`signature`/`key`, so the publisher's
+///     peer-id never appears on the wire. Inbound messages are not verified.
+///     Because there is no `from`/`seqno` to key on, the message-id MUST be
+///     content-derived (see `message_id_fn` / the default `sha256(topic++data)`);
+///     every node in a topic must agree on the same id function. Requires NO key.
+pub const SignaturePolicy = enum { strict_sign, none, anonymous };
+
+/// A custom message-id function. Given a message's fields (any of which may be
+/// empty — under the anonymous policy `from`/`seqno` are absent), it returns an
+/// owned `MessageId` the router frees after use. `ctx` is the opaque pointer the
+/// caller registered alongside the function (its own state, e.g. a domain tag).
+/// Provided via `RouterConfig.message_id_fn`; when set it overrides the policy's
+/// built-in id derivation for BOTH publish and receive, so all nodes in a topic
+/// must use the same function for dedup to line up.
+pub const MessageIdFn = fn (
+    ctx: ?*anyopaque,
+    topic: []const u8,
+    from: []const u8,
+    seqno: []const u8,
+    data: []const u8,
+    allocator: std.mem.Allocator,
+) anyerror!rpc.MessageId;
+
+/// A custom message-id function plus its opaque context, bundled so the router
+/// stores one optional value. See `MessageIdFn`.
+pub const MessageIdConfig = struct {
+    ctx: ?*anyopaque = null,
+    func: *const MessageIdFn,
+};
+
 /// Optional peer-scoring configuration handed to `Router.create` /
 /// `Gossipsub.init`. When provided, the router builds a `PeerScore` engine,
 /// fires scoring events on every relevant transition, and gates its
@@ -69,6 +111,19 @@ pub const RouterConfig = struct {
     /// to me", which saves bandwidth on big messages (go-libp2p
     /// `IDontWantMessageThreshold`, default 1 KiB).
     idontwant_message_threshold: usize = 1024,
+    /// The signature policy. Leave null to infer it from the host key (the
+    /// backward-compatible default): a key present means `strict_sign`, a key
+    /// absent means `none`. Set it explicitly to select a policy regardless —
+    /// notably `anonymous` (which requires NO host key). The resolved policy is
+    /// validated against the host key in `Router.create`: `strict_sign` requires a
+    /// key; `none`/`anonymous` require the key to be absent.
+    signature_policy: ?SignaturePolicy = null,
+    /// Optional override for how a message-id is computed. When set it is used for
+    /// every publish and every inbound message, replacing the policy's built-in
+    /// derivation (`from`++`seqno` for strict_sign/none, `sha256(topic++data)` for
+    /// anonymous). All nodes in a topic must use the SAME function. The default
+    /// (null) leaves the policy's built-in derivation in place.
+    message_id_fn: ?MessageIdConfig = null,
 };
 
 /// Upper bound on remembered message-ids in the seen-cache (loop/duplicate
@@ -432,15 +487,25 @@ pub fn Router(comptime Transport: type) type {
         /// Monotonic sequence number for messages WE originate; encoded big-endian
         /// into Message.seqno so (from, seqno) is a unique message id.
         seqno: u64 = 0,
-        /// Our own peer id, used as Message.from on publish.
+        /// Our own peer id, used as Message.from on publish (under strict_sign /
+        /// none; under anonymous publish omits `from` entirely).
         local_peer: PeerId,
-        /// Signature policy. When set (StrictSign), every published message is
-        /// signed and every inbound published message is verified — invalid or
-        /// unsigned inbound messages are rejected (dropped, never delivered or
-        /// forwarded). When null (none), messages carry from+seqno with no
-        /// signature and no inbound verification (the de-risk / fake-transport
-        /// behaviour). Owns its cached pubkey bytes; freed on destroy.
+        /// The resolved signature policy (see `SignaturePolicy`). Determines how
+        /// `onPublish` stamps a message, whether `handleIncomingMessage` verifies,
+        /// and — together with `message_id_fn` — how `computeMessageId` derives the
+        /// id. Set once in `create` and never mutated.
+        signature_policy: SignaturePolicy,
+        /// The signing engine, present only under `strict_sign`. When present every
+        /// published message is signed and every inbound published message is
+        /// verified — invalid or unsigned inbound messages are rejected (dropped,
+        /// never delivered or forwarded). Under `none` and `anonymous` it is null:
+        /// messages are not signed and inbound messages are not verified. Owns its
+        /// cached pubkey bytes; freed on destroy.
         signer: ?signing.Signer,
+        /// Optional message-id override (see `RouterConfig.message_id_fn`). When
+        /// set, `computeMessageId` calls it instead of the policy's built-in
+        /// derivation. Borrowed: the function pointer + ctx must outlive the router.
+        message_id_fn: ?MessageIdConfig,
         /// Optional sink for messages delivered on topics we subscribe to.
         message_handler: ?MessageHandler,
         /// When true (go-libp2p default), a message the local node ORIGINATES is
@@ -473,12 +538,18 @@ pub fn Router(comptime Transport: type) type {
         /// Number of live peers, published for observers (e.g. tests).
         peer_count: std.atomic.Value(usize) = .init(0),
 
-        /// `host_key` selects the signature policy: non-null enables StrictSign
-        /// (sign outbound, verify inbound) and the router derives + uses the
-        /// key's peer-id as `local_peer` (ignoring the passed `local_peer`, which
-        /// must match — they are the same node); null keeps the none policy and
-        /// uses `local_peer` as given. The KeyPair is borrowed and must outlive
-        /// the router.
+        /// The signature policy is resolved from `config.signature_policy` and
+        /// `host_key`: a null `signature_policy` is inferred from the key
+        /// (`strict_sign` when present, `none` when absent), keeping the historic
+        /// behaviour; an explicit policy overrides. The two must be consistent —
+        /// `strict_sign` requires a key, `none`/`anonymous` require the key to be
+        /// absent — or `create` returns `error.InvalidSignaturePolicy`.
+        ///
+        /// Under `strict_sign` the router derives + uses the key's peer-id as
+        /// `local_peer` (ignoring the passed `local_peer`, which must match — they
+        /// are the same node). Under `none`/`anonymous` `local_peer` is used as
+        /// given (and under `anonymous` it never reaches the wire). The KeyPair is
+        /// borrowed and must outlive the router.
         pub fn create(
             allocator: std.mem.Allocator,
             io: std.Io,
@@ -496,10 +567,22 @@ pub fn Router(comptime Transport: type) type {
             var seen = try SeenCache.init(allocator);
             errdefer seen.deinit();
 
-            // StrictSign when a host key is supplied: the Signer caches the
-            // marshaled pubkey + peer-id once so per-publish signing is cheap.
-            // The signer's peer-id is authoritative for `from` on publish.
-            var signer: ?signing.Signer = if (host_key) |k| try signing.Signer.init(allocator, k) else null;
+            // Resolve the policy: an explicit one is used as-is; a null one is
+            // inferred from the key (strict_sign with a key, none without) to keep
+            // the historic host_key-drives-the-policy default. Then validate the
+            // policy against the key so a caller cannot ask for an unsignable
+            // strict_sign (no key) or a key-bearing anonymous/none.
+            const policy: SignaturePolicy = config.signature_policy orelse
+                (if (host_key != null) .strict_sign else .none);
+            switch (policy) {
+                .strict_sign => if (host_key == null) return error.InvalidSignaturePolicy,
+                .none, .anonymous => if (host_key != null) return error.InvalidSignaturePolicy,
+            }
+
+            // The Signer exists only under strict_sign: it caches the marshaled
+            // pubkey + peer-id once so per-publish signing is cheap, and its
+            // peer-id is authoritative for `from` on publish.
+            var signer: ?signing.Signer = if (policy == .strict_sign) try signing.Signer.init(allocator, host_key.?) else null;
             errdefer if (signer) |*s| s.deinit();
             const effective_peer = if (signer) |*s| s.from_peer else local_peer;
 
@@ -527,7 +610,9 @@ pub fn Router(comptime Transport: type) type {
                 .seen = seen,
                 .message_cache = mcache.MessageCache.init(allocator),
                 .local_peer = effective_peer,
+                .signature_policy = policy,
                 .signer = signer,
+                .message_id_fn = config.message_id_fn,
                 .message_handler = message_handler,
                 .flood_publish = config.flood_publish,
                 .idontwant_message_threshold = config.idontwant_message_threshold,
@@ -1810,6 +1895,30 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
+        /// Compute a message's id under the active policy. The one place both the
+        /// publish and the receive paths derive an id, so the two always agree:
+        ///   - a configured `message_id_fn` wins (apps override id derivation),
+        ///   - else under `anonymous` the id is content-derived
+        ///     (`sha256(topic ++ data)`), because an anonymous message has no
+        ///     `from`/`seqno` to key on (they would be empty and collide),
+        ///   - else (strict_sign / none) the id is the default `from ++ seqno`.
+        /// The caller owns the returned MessageId and frees it.
+        fn computeMessageId(
+            router: *Self,
+            topic: []const u8,
+            from: []const u8,
+            seqno: []const u8,
+            data: []const u8,
+        ) !rpc.MessageId {
+            if (router.message_id_fn) |cfg| {
+                return cfg.func(cfg.ctx, topic, from, seqno, data, router.allocator);
+            }
+            if (router.signature_policy == .anonymous) {
+                return rpc.contentMessageId(router.allocator, topic, data);
+            }
+            return rpc.messageId(router.allocator, from, seqno);
+        }
+
         /// Process one incoming (relayed) published message: dedup on its id,
         /// deliver to the local handler if we subscribe, and forward it over the
         /// topic's MESH (every mesh member except the source — NOT all subscribers;
@@ -1841,7 +1950,10 @@ pub fn Router(comptime Transport: type) type {
                 }
             }
 
-            var id = rpc.messageId(router.allocator, from, seqno) catch return;
+            // The id is policy-derived: content-based under anonymous (where the
+            // message has no from/seqno), from++seqno otherwise. The receive and
+            // publish paths both go through computeMessageId so they always agree.
+            var id = router.computeMessageId(topic, from, seqno, data) catch return;
             defer id.deinit(router.allocator);
             if (router.seen.contains(id.bytes)) {
                 // A duplicate of an already-seen message. If the relaying peer is
@@ -2097,18 +2209,30 @@ pub fn Router(comptime Transport: type) type {
             defer router.allocator.free(topic);
             defer router.allocator.free(data);
 
-            const from = router.local_peer.bytes[0..router.local_peer.len];
+            // Anonymous (StrictNoSign) publishes carry ONLY topic+data — no
+            // `from`/`seqno`/`signature`/`key`, so the publisher's peer-id never
+            // reaches the wire (the privacy guarantee) and the seqno counter is
+            // not advanced. Under strict_sign / none the message carries our
+            // peer-id as `from` and the next seqno. Empty `from`/`seqno` encode to
+            // absent fields (the protobuf encoder omits empty bytes), so the
+            // anonymous frame is just topic+data.
+            const anonymous = router.signature_policy == .anonymous;
 
             var seqno_buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &seqno_buf, router.seqno, .big);
-            router.seqno += 1;
-            const seqno = seqno_buf[0..];
+            var from: []const u8 = &.{};
+            var seqno: []const u8 = &.{};
+            if (!anonymous) {
+                from = router.local_peer.bytes[0..router.local_peer.len];
+                std.mem.writeInt(u64, &seqno_buf, router.seqno, .big);
+                router.seqno += 1;
+                seqno = seqno_buf[0..];
+            }
 
             // Under StrictSign, sign the message and attach the signature + the
             // marshaled libp2p public key. A signing failure drops the publish (we
             // must not emit an unsigned message a StrictSign peer would reject).
-            // Under the none policy both stay null. `sig` is owned here and freed
-            // after framing (cacheAndForward copies the bytes into the frame).
+            // Under none and anonymous both stay null. `sig` is owned here and
+            // freed after framing (cacheAndForward copies the bytes into the frame).
             var sig: ?[]u8 = null;
             defer if (sig) |s| router.allocator.free(s);
             var key: ?[]const u8 = null;
@@ -2120,8 +2244,18 @@ pub fn Router(comptime Transport: type) type {
                 key = s.keyBytes();
             }
 
-            var id = rpc.messageId(router.allocator, from, seqno) catch return;
+            // Policy-derived id: content-based (sha256(topic++data)) under
+            // anonymous (from/seqno are empty), from++seqno otherwise. The receive
+            // path uses the same helper so the two always agree.
+            var id = router.computeMessageId(topic, from, seqno, data) catch return;
             defer id.deinit(router.allocator);
+            // Suppress a re-publish of a message already in the seen window. Under
+            // strict_sign / none each publish carries a fresh seqno, so its id is
+            // always new and this never triggers; under anonymous (or any
+            // content-based id) two identical (topic, data) publishes share an id,
+            // so the second is dropped here rather than forwarded twice — matching
+            // go-libp2p, which checks the seen-cache before publishing.
+            if (router.seen.contains(id.bytes)) return;
             router.seen.add(id.bytes);
 
             router.deliverLocal(topic, from, data);
@@ -4791,6 +4925,263 @@ fn signedInboundPublish(
     };
     const frame = rpc_pb.RPC{ .publish = &[_]?rpc_pb.Message{msg} };
     return ownedFromRpc(allocator, frame);
+}
+
+// --- anonymous mode (StrictNoSign) -----------------------------------------
+
+/// Build an OwnedRpc carrying a single ANONYMOUS published message: only
+/// topic+data, no from/seqno/signature/key (what an anonymous node puts on the
+/// wire). The empty identity fields encode to absent on the wire.
+fn anonymousInboundPublish(
+    allocator: std.mem.Allocator,
+    topic: []const u8,
+    data: []const u8,
+) !pubsub.OwnedRpc {
+    const msg = rpc_pb.Message{ .topic = topic, .data = data };
+    const frame = rpc_pb.RPC{ .publish = &[_]?rpc_pb.Message{msg} };
+    return ownedFromRpc(allocator, frame);
+}
+
+/// Whether ANY recorded published frame on `topic` carrying `data` has every
+/// identity field absent (from/seqno/signature/key) — the anonymous wire shape.
+/// Reads under the record lock so the walk never races the writer fiber.
+fn recordHasAnonymousPublish(io: std.Io, record: *FakeRecord, topic: []const u8, data: []const u8) bool {
+    record.mutex.lockUncancelable(io);
+    defer record.mutex.unlock(io);
+    var rest = record.written.items;
+    while (decodeFrame(rest)) |decoded| {
+        var reader = decoded.reader;
+        while (reader.publishNext()) |msg| {
+            if (std.mem.eql(u8, msg.getTopic(), topic) and std.mem.eql(u8, msg.getData(), data)) {
+                // Absent fields parse to null on the MessageReader (the encoder
+                // omits empty bytes), so an anonymous frame has all four null.
+                if (msg._from == null and msg._seqno == null and
+                    msg._signature == null and msg._key == null) return true;
+            }
+        }
+        rest = rest[decoded.total_len..];
+    }
+    return false;
+}
+
+test "anonymous publish omits identity fields and uses a content-based id" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Anonymous policy, no host key. local_test_peer is ignored on the wire.
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{ .signature_policy = .anonymous });
+    defer router.destroy();
+    try router.start();
+
+    // A peer subscribed to "t" so the flood-publish has a target to forward to.
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try sync(router, io);
+    try std.testing.expect(peerTracksTopic(router, peer, "t"));
+
+    // Publish: the forwarded frame must carry only topic+data — no identity.
+    try router.inbox.putOne(io, .{ .publish = .{
+        .topic = try allocator.dupe(u8, "t"),
+        .data = try allocator.dupe(u8, "anon"),
+    } });
+    try sync(router, io);
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn.record, "t", "anon") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(recordHasAnonymousPublish(io, &conn.record, "t", "anon"));
+
+    // The message id is the content id sha256(topic ++ data), NOT from++seqno.
+    var id = try rpc.contentMessageId(allocator, "t", "anon");
+    defer id.deinit(allocator);
+    try std.testing.expect(router.message_cache.get(id.bytes) != null);
+    // The seqno counter was never advanced (anonymous publishes do not use one).
+    try std.testing.expectEqual(@as(u64, 0), router.seqno);
+}
+
+test "anonymous: two publishes of the same (topic,data) dedup on the content id" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{ .signature_policy = .anonymous });
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try sync(router, io);
+
+    // Publish the SAME (topic, data) twice. Under from++seqno the seqno would
+    // differ each time → two distinct ids → two forwards. Under the content id
+    // both hash to the same id, so the second is a seen-duplicate and is dropped.
+    for (0..2) |_| {
+        try router.inbox.putOne(io, .{ .publish = .{
+            .topic = try allocator.dupe(u8, "t"),
+            .data = try allocator.dupe(u8, "dup"),
+        } });
+    }
+    try sync(router, io);
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn.record, "t", "dup") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    // Let any (wrongly) un-deduped second publish land before asserting.
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn.record, "t", "dup"));
+}
+
+test "anonymous: an unsigned inbound message is accepted (no verification) and forwarded over the mesh" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{ .signature_policy = .anonymous });
+    defer router.destroy();
+    try router.start();
+
+    // We subscribe to "t" (so we deliver locally). A is a mesh member; B is a
+    // non-mesh subscriber; S relays the anonymous publish. A received anonymous
+    // message (no signature) is ACCEPTED — under strict_sign it would be dropped.
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const peer_b = testPeer(2);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_b = try connectFakePeer(io, allocator, router, peer_b);
+    defer destroyFakeConn(allocator, conn_b);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    // B announces it subscribes to "t" but is never grafted (non-mesh subscriber).
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_b, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+    try std.testing.expect(router.meshContains("t", peer_a));
+
+    // S relays an anonymous (unsigned, no from/seqno) publish on "t".
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try anonymousInboundPublish(allocator, "t", "relayed"),
+    } });
+    try sync(router, io);
+
+    // It is delivered locally (we subscribe) with an EMPTY `from` (anonymous).
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (rec.calls >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), rec.calls);
+    try std.testing.expectEqualSlices(u8, "t", rec.topic.?);
+    try std.testing.expectEqualSlices(u8, "relayed", rec.data.?);
+    try std.testing.expectEqual(@as(usize, 0), rec.from.?.len);
+
+    // It is forwarded to the mesh member A (still anonymous on the wire), not to
+    // the non-mesh subscriber B.
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_a.record, "t", "relayed") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "relayed"));
+    try std.testing.expect(recordHasAnonymousPublish(io, &conn_a.record, "t", "relayed"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_b.record, "t", "relayed"));
+
+    // A duplicate anonymous message (same topic+data → same content id) is
+    // deduped: still exactly one local delivery and one forward to A.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try anonymousInboundPublish(allocator, "t", "relayed"),
+    } });
+    try sync(router, io);
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), rec.calls);
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "relayed"));
+}
+
+test "create rejects an inconsistent signature policy" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // anonymous + a host key is rejected (anonymous must carry NO key).
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+    try std.testing.expectError(error.InvalidSignaturePolicy, FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, &host_key, null, .{ .signature_policy = .anonymous }));
+
+    // strict_sign without a host key is rejected (nothing to sign with).
+    try std.testing.expectError(error.InvalidSignaturePolicy, FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{ .signature_policy = .strict_sign }));
+
+    // none + a host key is rejected (none must carry NO key).
+    try std.testing.expectError(error.InvalidSignaturePolicy, FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, &host_key, null, .{ .signature_policy = .none }));
+}
+
+/// A custom message-id function for the override test: ignores from/seqno and
+/// returns a fixed prefix ++ data, proving the override is honoured (and that the
+/// publish and receive paths agree, since both go through computeMessageId).
+fn fixedPrefixId(
+    ctx: ?*anyopaque,
+    topic: []const u8,
+    from: []const u8,
+    seqno: []const u8,
+    data: []const u8,
+    allocator: std.mem.Allocator,
+) anyerror!rpc.MessageId {
+    _ = ctx;
+    _ = topic;
+    _ = from;
+    _ = seqno;
+    const prefix = "ID-";
+    const buf = try allocator.alloc(u8, prefix.len + data.len);
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..], data);
+    return .{ .bytes = buf };
+}
+
+test "a configured message_id_fn overrides the policy's id derivation" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Anonymous policy but with a custom id function: the cached id must be the
+    // function's output, not the default content id.
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
+        .signature_policy = .anonymous,
+        .message_id_fn = .{ .func = fixedPrefixId },
+    });
+    defer router.destroy();
+    try router.start();
+
+    try router.inbox.putOne(io, .{ .publish = .{
+        .topic = try allocator.dupe(u8, "t"),
+        .data = try allocator.dupe(u8, "payload"),
+    } });
+    try sync(router, io);
+
+    // Cached under "ID-payload" (the override), and NOT under the default
+    // content id sha256("t"++"payload").
+    try std.testing.expect(router.message_cache.get("ID-payload") != null);
+    var content = try rpc.contentMessageId(allocator, "t", "payload");
+    defer content.deinit(allocator);
+    try std.testing.expect(router.message_cache.get(content.bytes) == null);
 }
 
 // --- per-peer protocol-version tracking ------------------------------------

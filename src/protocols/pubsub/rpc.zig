@@ -23,6 +23,21 @@ pub fn messageId(allocator: std.mem.Allocator, from: []const u8, seqno: []const 
     return .{ .bytes = buf };
 }
 
+/// Content-derived message id for the anonymous (StrictNoSign) policy, where a
+/// message carries no `from`/`seqno` to key on: the SHA-256 digest of
+/// `topic ++ data`. The digest is the id bytes (32 bytes). This is a sensible
+/// default, but it is NOT a libp2p wire standard — every node in a topic must
+/// agree on the SAME id function for dedup to line up, so a deployment that needs
+/// a different scheme overrides it via the router's `message_id_fn`.
+pub fn contentMessageId(allocator: std.mem.Allocator, topic: []const u8, data: []const u8) std.mem.Allocator.Error!MessageId {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(topic);
+    hasher.update(data);
+    const digest = hasher.finalResult();
+    const buf = try allocator.dupe(u8, &digest);
+    return .{ .bytes = buf };
+}
+
 // buildGraft returns a ControlGraft for the given topic, ready to encode.
 pub fn buildGraft(topic: []const u8) rpc_pb.ControlGraft {
     return .{ .topic_i_d = topic };
@@ -97,6 +112,33 @@ test "messageId empty inputs" {
     var id = try messageId(allocator, "", "");
     defer id.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), id.bytes.len);
+}
+
+test "contentMessageId is sha256(topic ++ data) and is deterministic" {
+    const allocator = std.testing.allocator;
+    const topic = "topic-a";
+    const data = "payload";
+
+    var id = try contentMessageId(allocator, topic, data);
+    defer id.deinit(allocator);
+
+    // 32-byte SHA-256 digest of the concatenation topic ++ data.
+    var expected: [32]u8 = undefined;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(topic);
+    hasher.update(data);
+    hasher.final(&expected);
+    try std.testing.expectEqualSlices(u8, &expected, id.bytes);
+
+    // The same (topic, data) yields the same id (content-based dedup relies on it).
+    var id2 = try contentMessageId(allocator, topic, data);
+    defer id2.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, id.bytes, id2.bytes);
+
+    // Different data → different id.
+    var id3 = try contentMessageId(allocator, topic, "other");
+    defer id3.deinit(allocator);
+    try std.testing.expect(!std.mem.eql(u8, id.bytes, id3.bytes));
 }
 
 test "graft round-trip" {
