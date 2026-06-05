@@ -273,11 +273,23 @@ fn acceptStreamFromState(state: *SharedState, io: std.Io, opts: AcceptStreamOpti
         }
         if (state.isClosed()) return error.ConnectionClosed;
         if (opts.timeout != .none and io_time.timeoutExpired(io, deadline)) return error.Timeout;
+        // Park on the signal EPOCH (an edge), not the readiness bits. This is a
+        // handle-side waiter that never clears the waitset bits — only the owning
+        // actor does, via `take`, each of its loops. If we parked with the
+        // level-triggered `wait` (returns whenever ANY bit is set), the actor's
+        // routinely-set, not-yet-taken bits (inbound packets, control commands)
+        // would make us return immediately and spin: re-check the still-empty
+        // accept queue, see the connection still open, return again. That spin
+        // burns the executor and can starve the actor fiber that would push a
+        // stream or mark the connection closed — turning a quiet idle accept into
+        // a livelock. Edge detection wakes us exactly when something we care about
+        // happened (a pushed stream, or shutdown), and `isClosed()` is re-checked
+        // on each wake so a connection close reliably unblocks us.
         if (opts.timeout == .none) {
-            try state.waitset.wait(io, observed);
+            try state.waitset.waitEpoch(io, observed);
             continue;
         }
-        try state.waitset.waitTimeout(io, observed, deadline);
+        try state.waitset.waitEpochTimeout(io, observed, deadline);
     }
 }
 

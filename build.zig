@@ -211,11 +211,13 @@ pub fn build(b: *std.Build) void {
     });
     addImports(zio_integ_test_module, deps);
     zio_integ_test_module.addImport("zio", zio_dep.module("zio"));
-    // Focus this target on the end-to-end loopback tests (the transitively
-    // reachable std.Io.Threaded unit tests are covered by `zig build test`).
+    // Focus this target on the end-to-end multi-executor tests: the loopback
+    // handshake/echo tests and the connection-teardown regression tests (the
+    // transitively reachable std.Io.Threaded unit tests are covered by
+    // `zig build test`).
     const zio_integ_unit_tests = b.addTest(.{
         .root_module = zio_integ_test_module,
-        .filters = filters orelse &.{"loopback"},
+        .filters = filters orelse &.{ "loopback", "teardown" },
     });
     const run_zio_integ_unit_tests = b.addRunArtifact(zio_integ_unit_tests);
     const zio_integ_test_step = b.step("zio-integ-test", "Run zio multi-executor end-to-end integration tests");

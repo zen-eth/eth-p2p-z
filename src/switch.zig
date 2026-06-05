@@ -689,14 +689,43 @@ const SwitchConnectionActor = struct {
         actor.closing = true;
         actor.inbox.close(actor.io);
         actor.dispatcher_running = false;
-        actor.dispatcher_group.cancel(actor.io);
-        actor.handler_group.cancel(actor.io);
+
+        // Close the connection BEFORE joining the dispatcher/handler fibers.
+        //
+        // The inbound dispatcher parks inside `acceptStream`, which blocks in a
+        // futex-style wait on the connection's accept waitset until a stream
+        // arrives. Joining that fiber (what `Group.cancel` does) relies on
+        // something unblocking the wait first. Relying on the cross-executor
+        // cancel itself to do that is fragile: on a multi-executor runtime the
+        // cancel's wakeup can be lost while the fiber is parked, so the wait
+        // never returns and the join blocks forever.
+        //
+        // Closing the connection first marks it closed and NOTIFIES the accept
+        // waitset (a persistent, level-triggered signal). That wakes the parked
+        // `acceptStream` via notify — not via cancel — it observes the now-closed
+        // connection and returns `ConnectionClosed`, so the dispatcher loop exits
+        // on its own. Any in-flight handler fibers likewise unblock once their
+        // streams see the closed connection. The subsequent `cancel` calls then
+        // only JOIN already-unblocking fibers (and serve as a backstop), which
+        // cannot deadlock. The connection is fully deinited LAST, after both
+        // groups have joined, so no fiber can still be touching it.
         if (actor.conn) |conn| {
             const prev = actor.io.swapCancelProtection(.blocked);
             defer _ = actor.io.swapCancelProtection(prev);
             conn.close(actor.io, 0, "switch connection shutdown") catch {};
+
+            actor.dispatcher_group.cancel(actor.io);
+            actor.handler_group.cancel(actor.io);
+
             conn.deinit();
             actor.conn = null;
+        } else {
+            // No live connection to notify through (already torn down); fall back
+            // to canceling the groups directly. With nothing parked in
+            // acceptStream against a live connection, this join cannot lose a
+            // wakeup the way the connection-backed wait can.
+            actor.dispatcher_group.cancel(actor.io);
+            actor.handler_group.cancel(actor.io);
         }
     }
 
@@ -804,9 +833,19 @@ const SwitchConnectionActor = struct {
     fn close(actor: *SwitchConnectionActor, code: u64, reason: []const u8) Switch.CloseError!void {
         const conn = actor.liveConnection() orelse return error.ConnectionClosed;
         actor.closing = true;
+
+        // Close the connection BEFORE stopping the dispatcher / joining handlers.
+        // Closing marks the connection closed and notifies its accept waitset, so
+        // a dispatcher parked in acceptStream wakes via that persistent signal,
+        // observes the closed connection, and exits on its own. The subsequent
+        // dispatcher/handler joins then only reap already-unblocking fibers rather
+        // than depending on a cross-executor cancel to wake a parked wait (whose
+        // wakeup can be lost). Capture the close result and return it after the
+        // joins so the caller still sees the real close outcome.
+        const result = conn.close(actor.io, code, reason);
         actor.stopInboundDispatch();
         actor.handler_group.cancel(actor.io);
-        return conn.close(actor.io, code, reason);
+        return result;
     }
 
     fn stats(actor: *SwitchConnectionActor) quic.ConnectionStats {

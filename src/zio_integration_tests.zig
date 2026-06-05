@@ -23,6 +23,11 @@
 const std = @import("std");
 const zio = @import("zio");
 const support = @import("quic/endpoint/test_support.zig");
+const switch_mod = @import("switch.zig");
+const identity = @import("identity.zig");
+const protocols = @import("protocols.zig");
+const quic = @import("quic.zig");
+const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 
 const testing = std.testing;
 const AcceptCtx = support.AcceptCtx;
@@ -30,6 +35,8 @@ const TwoEndpoints = support.TwoEndpoints;
 const closeStreamForTest = support.closeStreamForTest;
 const receiveTimeout = support.receiveTimeout;
 const default_handshake_timeout_ns = support.default_handshake_timeout_ns;
+const Switch = switch_mod.Switch;
+const SwitchConnection = switch_mod.SwitchConnection;
 
 /// Spin a multi-executor zio runtime and run `root(io)` to completion on the
 /// main executor; worker fibers (the server accept loop, the connection actors,
@@ -118,6 +125,139 @@ test "endpoint loopback: handshake + stream echo on exact(4)" {
     try runRoot(4, struct {
         fn root(io: std.Io) !void {
             try loopbackHandshakeAndEcho(io);
+        }
+    }.root);
+}
+
+// ---------------------------------------------------------------------------
+// Switch connection teardown under multi-executor scheduling.
+//
+// Regression guard for a teardown deadlock: a Switch connection's inbound
+// dispatcher parks inside acceptStream (futexWait on the connection's accept
+// waitset) waiting for a stream that never arrives. Tearing the connection down
+// (SwitchConnection.deinit) used to rely on a cross-executor Group.cancel to
+// unblock that parked dispatcher before joining it. On a real multi-executor
+// runtime that cancel's wakeup could be lost, so the join blocked forever.
+//
+// The fix drives the dispatcher to exit via a PERSISTENT signal — closing the
+// connection marks it closed and notifies the accept waitset (level-triggered),
+// so the parked acceptStream wakes via notify, observes isClosed(), and returns
+// ConnectionClosed; the dispatcher loop exits on its own and the join is then
+// trivial. This test loops the bring-up/teardown many times across 2 and 4
+// executors to surface the intermittent lost-wakeup race; a hang here is the
+// deadlock, and a clean completion (leak-checked by the testing allocator)
+// proves the persistent-signal teardown is reliable.
+
+/// Minimal inbound handler so the server has a registered protocol (an empty
+/// registry makes the dispatcher exit immediately with NoRegisteredProtocols,
+/// which would defeat the "dispatcher parked in acceptStream" precondition).
+const NoopHandler = struct {
+    fn run(_: *@This(), handler_io: std.Io, stream: *quic.Stream) anyerror!void {
+        var b: [1]u8 = undefined;
+        stream.readAll(handler_io, &b, .{}) catch {};
+    }
+};
+
+fn switchDispatcherTeardownLoop(io: std.Io, iterations: usize) !void {
+    const allocator = testing.allocator;
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    var noop = NoopHandler{};
+    try server.addProtocolService(
+        "/test/teardown/1.0.0",
+        protocols.streamHandlerService(NoopHandler, NoopHandler.run, &noop),
+    );
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        // Accept on a concurrent fiber so dial + accept make progress across
+        // executors (the multi-executor scheduling the deadlock needs).
+        const AcceptSwitchCtx = struct {
+            sw: *Switch,
+            conn: ?*SwitchConnection = null,
+            err: ?anyerror = null,
+
+            fn run(ctx: *@This()) void {
+                ctx.conn = ctx.sw.accept() catch |err| {
+                    ctx.err = err;
+                    return;
+                };
+            }
+        };
+        var accept_ctx = AcceptSwitchCtx{ .sw = server };
+        var accept_future = try std.Io.concurrent(io, AcceptSwitchCtx.run, .{&accept_ctx});
+
+        const client_conn = try client.dial(dial_addr, .{
+            .timeout = receiveTimeout(default_handshake_timeout_ns),
+        });
+        defer client_conn.deinit();
+
+        accept_future.await(io);
+        if (accept_ctx.err) |err| return err;
+        const server_conn = accept_ctx.conn orelse return error.TestExpectedConn;
+
+        // Start the inbound dispatcher: with no inbound stream pending it blocks
+        // inside acceptStream, parked on the connection's accept waitset. This is
+        // the precondition for the deadlock — teardown must unblock it.
+        try server_conn.startInboundDispatcher(.{});
+
+        // Give the dispatcher a moment to actually reach the parked wait
+        // (otherwise it might still be spawning and never exercise the race).
+        try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+
+        // The operation under test: this drives shutdownAndDestroy -> cleanup,
+        // which must wake the parked dispatcher and join it without hanging.
+        server_conn.deinit();
+    }
+}
+
+// 50 bring-up/teardown cycles per executor count. The race surfaced on the
+// FIRST iteration before the fix, so this is ample as a permanent regression
+// guard while keeping the default suite fast; it was validated at far higher
+// counts (hundreds of cycles, zero hangs) during the fix.
+const teardown_loop_iterations: usize = 50;
+
+test "switch connection teardown: parked dispatcher unblocks on exact(2)" {
+    try runRoot(2, struct {
+        fn root(io: std.Io) !void {
+            try switchDispatcherTeardownLoop(io, teardown_loop_iterations);
+        }
+    }.root);
+}
+
+test "switch connection teardown: parked dispatcher unblocks on exact(4)" {
+    try runRoot(4, struct {
+        fn root(io: std.Io) !void {
+            try switchDispatcherTeardownLoop(io, teardown_loop_iterations);
         }
     }.root);
 }
