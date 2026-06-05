@@ -95,6 +95,16 @@ pub const Switch = struct {
     pub const OpenProtocolStreamOptions = struct {
         negotiation_timeout: std.Io.Timeout = default_negotiation_timeout,
     };
+    /// Result of a multi-protocol open: the negotiated stream plus the protocol
+    /// id the peer accepted. `selected` aliases one element of the caller's
+    /// proposed `protocols` slice (multistream returns the matched candidate, not
+    /// a copy), so the caller must keep that slice alive as long as it reads
+    /// `selected` — passing a static/comptime list (as gossipsub does) makes this
+    /// trivially safe.
+    pub const SelectedStream = struct {
+        stream: *quic.Stream,
+        selected: protocols.ProtocolId,
+    };
     pub const OpenProtocolStreamError = error{
         ConnectionClosed,
         SelectedProtocolMismatch,
@@ -386,6 +396,31 @@ pub const SwitchConnection = struct {
         return reply.result;
     }
 
+    /// Open an outbound stream proposing `protocol_ids` in preference order and
+    /// return both the stream and the protocol the peer accepted. Unlike
+    /// `openProtocolStream` (which proposes one id and fails on any mismatch),
+    /// this negotiates the best common protocol from a list — the initiator
+    /// proposes each id in turn until the responder accepts one. Used by
+    /// gossipsub to speak the highest /meshsub version a peer supports while
+    /// falling back cleanly to older ones.
+    ///
+    /// `protocol_ids` is borrowed; `result.selected` aliases one of its elements
+    /// (see `SelectedStream`), so it must outlive the caller's use of `selected`.
+    pub fn openProtocolStreamMulti(
+        conn: *SwitchConnection,
+        protocol_ids: []const protocols.ProtocolId,
+        opts: Switch.OpenProtocolStreamOptions,
+    ) Switch.OpenProtocolStreamError!Switch.SelectedStream {
+        var reply: OpenProtocolStreamMultiReply = .{};
+        try conn.post(.{ .open_protocol_stream_multi = .{
+            .protocol_ids = protocol_ids,
+            .opts = opts,
+            .reply = &reply,
+        } });
+        reply.event.waitUncancelable(conn.io);
+        return reply.result;
+    }
+
     pub fn dispatchInboundStream(conn: *SwitchConnection, opts: Switch.DispatchOptions) Switch.DispatchError!void {
         var reply: DispatchInboundStreamReply = .{};
         try conn.post(.{ .dispatch_inbound_stream = .{
@@ -462,6 +497,11 @@ const Command = union(enum) {
         opts: Switch.OpenProtocolStreamOptions,
         reply: *OpenProtocolStreamReply,
     },
+    open_protocol_stream_multi: struct {
+        protocol_ids: []const protocols.ProtocolId,
+        opts: Switch.OpenProtocolStreamOptions,
+        reply: *OpenProtocolStreamMultiReply,
+    },
     dispatch_inbound_stream: struct {
         opts: Switch.DispatchOptions,
         reply: *DispatchInboundStreamReply,
@@ -493,6 +533,16 @@ const OpenProtocolStreamReply = struct {
     result: Switch.OpenProtocolStreamError!*quic.Stream = error.ConnectionClosed,
 
     fn complete(reply: *OpenProtocolStreamReply, io: std.Io, result: Switch.OpenProtocolStreamError!*quic.Stream) void {
+        reply.result = result;
+        reply.event.set(io);
+    }
+};
+
+const OpenProtocolStreamMultiReply = struct {
+    event: std.Io.Event = .unset,
+    result: Switch.OpenProtocolStreamError!Switch.SelectedStream = error.ConnectionClosed,
+
+    fn complete(reply: *OpenProtocolStreamMultiReply, io: std.Io, result: Switch.OpenProtocolStreamError!Switch.SelectedStream) void {
         reply.result = result;
         reply.event.set(io);
     }
@@ -642,6 +692,24 @@ const SwitchConnectionActor = struct {
         protocol_id: protocols.ProtocolId,
         opts: Switch.OpenProtocolStreamOptions,
     ) Switch.OpenProtocolStreamError!*quic.Stream {
+        // Single-protocol open: propose just `protocol_id` and treat a selection
+        // other than it as a mismatch (the responder echoing a candidate it was
+        // not offered). With a one-element list `negotiate` can only return that
+        // id, so the mismatch check is a belt-and-suspenders guard.
+        const result = try actor.openProtocolStreamMulti(&.{protocol_id}, opts);
+        if (!std.mem.eql(u8, result.selected, protocol_id)) {
+            closeStreamForCleanup(actor.io, result.stream);
+            result.stream.deinit();
+            return error.SelectedProtocolMismatch;
+        }
+        return result.stream;
+    }
+
+    fn openProtocolStreamMulti(
+        actor: *SwitchConnectionActor,
+        protocol_ids: []const protocols.ProtocolId,
+        opts: Switch.OpenProtocolStreamOptions,
+    ) Switch.OpenProtocolStreamError!Switch.SelectedStream {
         const conn = actor.liveConnection() orelse return error.ConnectionClosed;
         const stream = try conn.openStream(actor.io);
         var stream_live = true;
@@ -650,13 +718,15 @@ const SwitchConnectionActor = struct {
             stream.deinit();
         };
 
-        const selected = try protocols.multistream.negotiate(actor.io, stream, &.{protocol_id}, .{
+        // The initiator proposes each id in `protocol_ids` (preference order)
+        // until the responder accepts one; `selected` aliases that element, so it
+        // stays valid as long as the caller's slice does.
+        const selected = try protocols.multistream.negotiate(actor.io, stream, protocol_ids, .{
             .role = .initiator,
             .timeout = opts.negotiation_timeout,
         });
-        if (!std.mem.eql(u8, selected, protocol_id)) return error.SelectedProtocolMismatch;
         stream_live = false;
-        return stream;
+        return .{ .stream = stream, .selected = selected };
     }
 
     fn dispatchInboundStream(actor: *SwitchConnectionActor, opts: Switch.DispatchOptions) Switch.DispatchError!void {
@@ -748,6 +818,14 @@ fn actorMain(actor: *SwitchConnectionActor) std.Io.Cancelable!void {
                 };
                 cmd.reply.complete(actor.io, result);
             },
+            .open_protocol_stream_multi => |cmd| {
+                const result = actor.openProtocolStreamMulti(cmd.protocol_ids, cmd.opts) catch |err| {
+                    cmd.reply.complete(actor.io, err);
+                    if (err == error.Canceled) return error.Canceled;
+                    continue;
+                };
+                cmd.reply.complete(actor.io, result);
+            },
             .dispatch_inbound_stream => |cmd| {
                 actor.dispatchInboundStream(cmd.opts) catch |err| {
                     cmd.reply.complete(actor.io, err);
@@ -789,6 +867,7 @@ fn actorMain(actor: *SwitchConnectionActor) std.Io.Cancelable!void {
 fn completeCommandClosed(io: std.Io, command: Command) void {
     switch (command) {
         .open_protocol_stream => |cmd| cmd.reply.complete(io, error.ConnectionClosed),
+        .open_protocol_stream_multi => |cmd| cmd.reply.complete(io, error.ConnectionClosed),
         .dispatch_inbound_stream => |cmd| cmd.reply.complete(io, error.ConnectionClosed),
         .start_inbound_dispatch => |cmd| cmd.reply.complete(io, error.ConnectionClosed),
         .stop_inbound_dispatch => |reply| reply.complete(io),
@@ -1196,6 +1275,104 @@ test "switch dispatches inbound streams to registered protocol handlers" {
         try std.testing.expectEqual(payload.len, event.len);
         try std.testing.expectEqualStrings(payload, event.data[0..event.len]);
     }
+
+    client_conn.deinit();
+    client_conn_live = false;
+    server_conn.deinit();
+    server_conn_live = false;
+}
+
+test "openProtocolStreamMulti negotiates the best protocol the peer supports" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    // A trivial inbound handler that just reads one byte, registered under the
+    // SERVER's middle and low protocol ids but NOT the high one. The client
+    // proposes [high, middle, low]; the responder rejects "high" (not
+    // registered) and accepts "middle" (the first it supports), so the
+    // negotiated protocol must be "middle".
+    const high = "/test/multi/3.0.0";
+    const middle = "/test/multi/2.0.0";
+    const low = "/test/multi/1.0.0";
+
+    const OneByteHandler = struct {
+        fn run(_: *@This(), handler_io: std.Io, stream: *quic.Stream) anyerror!void {
+            var b: [1]u8 = undefined;
+            try stream.readAll(handler_io, &b, .{});
+        }
+    };
+    var one_byte = OneByteHandler{};
+    // Register middle and low (each a distinct service instance — registering one
+    // instance under several keys would double-free on Switch teardown).
+    try server.addProtocolService(middle, protocols.streamHandlerService(OneByteHandler, OneByteHandler.run, &one_byte));
+    try server.addProtocolService(low, protocols.streamHandlerService(OneByteHandler, OneByteHandler.run, &one_byte));
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    var client_conn_live = true;
+    errdefer if (client_conn_live) client_conn.deinit();
+    const server_conn = try server.accept();
+    var server_conn_live = true;
+    errdefer if (server_conn_live) server_conn.deinit();
+
+    const DispatchCtx = struct {
+        conn: *SwitchConnection,
+        err: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.conn.dispatchInboundStream(.{
+                .accept_timeout = .{ .duration = .{ .raw = .fromNanoseconds(std.time.ns_per_s), .clock = .awake } },
+            }) catch |err| {
+                ctx.err = err;
+            };
+        }
+    };
+
+    var dispatch_ctx = DispatchCtx{ .conn = server_conn };
+    const dispatch_thread = try std.Thread.spawn(.{}, DispatchCtx.run, .{&dispatch_ctx});
+
+    const proposed = [_]protocols.ProtocolId{ high, middle, low };
+    const result = try client_conn.openProtocolStreamMulti(&proposed, .{});
+    defer result.stream.deinit();
+    defer closeStreamForCleanup(io, result.stream);
+    // "high" is unregistered → rejected; "middle" is the first the peer accepts.
+    try std.testing.expectEqualStrings(middle, result.selected);
+    // Send the one byte the handler reads so it returns cleanly.
+    try result.stream.writeAll(io, "x", .{});
+
+    dispatch_thread.join();
+    if (dispatch_ctx.err) |err| return err;
 
     client_conn.deinit();
     client_conn_live = false;

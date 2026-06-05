@@ -36,21 +36,32 @@ const SwitchConnection = swarm.SwitchConnection;
 const ProtocolId = protocols.ProtocolId;
 const Stream = quic.Stream;
 
-/// Drains a peer's OutboundQueue onto its `/meshsub/1.1.0` stream. The sink owns
-/// the current QUIC stream and re-opens it lazily; it satisfies the PeerWriter
-/// Sink contract (open / writeFrame / close, with close idempotent).
+/// Drains a peer's OutboundQueue onto its `/meshsub` stream. The sink owns the
+/// current QUIC stream and re-opens it lazily; it satisfies the PeerWriter Sink
+/// contract (open / writeFrame / close, with close idempotent).
+///
+/// On open it proposes the full `/meshsub` version list (1.2.0, 1.1.0, 1.0.0)
+/// and uses whichever the peer accepts, recording the negotiated protocol id in
+/// `selected` so the router can learn our outbound version for the peer.
 pub const StreamSink = struct {
     conn: *SwitchConnection,
-    proto: ProtocolId,
+    /// The protocol id the peer accepted on the most recent open, or null before
+    /// the first successful open. A pointer into `pubsub.supported_protocols`
+    /// (multistream returns the matched candidate, not a copy), so it is stable.
+    selected: ?ProtocolId = null,
     /// The currently-open outbound stream, or null when none is open.
     current: ?*Stream = null,
 
-    /// (Re)establish the outbound stream by negotiating the protocol on a new
-    /// QUIC stream. Leaves `current` set on success; on failure `current` is
-    /// untouched (it was already null — the writer only opens when it has none).
+    /// (Re)establish the outbound stream by negotiating the best common /meshsub
+    /// version on a new QUIC stream. Leaves `current` and `selected` set on
+    /// success; on failure both are untouched (the writer only opens when it has
+    /// none).
     pub fn open(self: *StreamSink, io: std.Io) !void {
         _ = io;
-        self.current = try self.conn.openProtocolStream(self.proto, .{});
+        const result = try self.conn.openProtocolStreamMulti(&pubsub.supported_protocols, .{});
+        self.current = result.stream;
+        self.selected = result.selected;
+        std.log.info("gossipsub: outbound stream negotiated {s}", .{result.selected});
     }
 
     /// Write one framed RPC to the current stream. Errors propagate so the
@@ -96,7 +107,7 @@ pub const SwitchTransport = struct {
         _ = self;
         _ = peer;
         const sink = try allocator.create(StreamSink);
-        sink.* = .{ .conn = conn, .proto = pubsub.protocol_id };
+        sink.* = .{ .conn = conn };
         return sink;
     }
 };
@@ -134,6 +145,11 @@ pub const default_score_config: ScoreConfig = .{
 /// protocols this node speaks) can name it without importing pubsub.zig.
 pub const protocol_id = pubsub.protocol_id;
 
+/// Every `/meshsub` version this node speaks, newest-first (1.2.0, 1.1.0,
+/// 1.0.0). Re-exported so an identify responder can advertise the full set (a
+/// peer then negotiates the best common version) without importing pubsub.zig.
+pub const supported_protocols = pubsub.supported_protocols;
+
 /// Per-stream inbound handler. The Switch's dispatcher creates one of these per
 /// inbound `/meshsub/1.1.0` stream (capturing the sender's peer id) and runs it
 /// on a handler fiber the Switch owns and cancels on connection teardown. The
@@ -141,9 +157,19 @@ pub const protocol_id = pubsub.protocol_id;
 const InboundHandler = struct {
     router: *Router,
     peer: PeerId,
+    /// The /meshsub version the peer negotiated on THIS inbound stream (parsed
+    /// from the protocol id it selected). The peer proposes its best version and
+    /// we accept it, so this is the highest version that peer supports.
+    version: pubsub.Version,
 
     /// Fiber body run by the Switch. Reads + posts until the stream breaks.
     fn run(self: *InboundHandler, io: std.Io, stream: *Stream) anyerror!void {
+        std.log.info("gossipsub: inbound stream negotiated {s}", .{@tagName(self.version)});
+        // Tell the router which /meshsub version this peer speaks before reading,
+        // so the per-peer version is recorded as soon as the peer reaches us
+        // (even if its RPCs are slow to follow). Best-effort post.
+        self.router.postPeerProtocol(io, self.peer, self.version);
+
         var source = StreamSource{ .stream = stream };
         var poster = Router.InboxPoster{ .router = self.router };
         var reader = peer_io.PeerReader(StreamSource, Router.InboxPoster){
@@ -170,7 +196,12 @@ const InboundService = struct {
         ctx: protocols.InboundProtocolContext,
     ) anyerror!protocols.AnyProtocolStreamHandler {
         const handler = try allocator.create(InboundHandler);
-        handler.* = .{ .router = self.router, .peer = ctx.peer_id };
+        handler.* = .{
+            .router = self.router,
+            .peer = ctx.peer_id,
+            // ctx.protocol_id is the /meshsub version this stream negotiated.
+            .version = pubsub.Version.fromProtocolId(ctx.protocol_id),
+        };
         return protocols.ownedProtocolStreamHandler(InboundHandler, InboundHandler.run, handler);
     }
 };
@@ -230,13 +261,21 @@ pub const Gossipsub = struct {
 
         try router.start();
 
-        const service = try inboundService(router);
-        var service_owned = true;
-        // If addProtocolService fails it does NOT take ownership, so free the
-        // service object ourselves on that path.
-        errdefer if (service_owned) service.deinit();
-        try sw.addProtocolService(pubsub.protocol_id, service);
-        service_owned = false;
+        // Register the inbound service for EVERY /meshsub version we speak so we
+        // accept inbound streams from 1.0/1.1/1.2 peers alike. Each id gets its
+        // own heap-owned InboundService instance (all pointing at the same
+        // router) so the Switch can free each independently — registering one
+        // shared instance under several keys would double-free it on teardown.
+        // The negotiated version reaches the handler via ctx.protocol_id.
+        for (pubsub.supported_protocols) |proto| {
+            const service = try inboundService(router);
+            var service_owned = true;
+            // If addProtocolService fails it does NOT take ownership, so free the
+            // service object ourselves on that path.
+            errdefer if (service_owned) service.deinit();
+            try sw.addProtocolService(proto, service);
+            service_owned = false;
+        }
 
         sw.setPeerEventCallback(.{
             .ctx = router,
@@ -627,6 +666,27 @@ test "two gossipsub nodes: subscribe propagates and a publish is delivered end t
     try std.testing.expectEqualSlices(u8, "t", rec.topic.?);
     try std.testing.expectEqualSlices(u8, "hello", rec.data.?);
     try std.testing.expectEqualSlices(u8, client_peer.bytes[0..client_peer.len], rec.from.?);
+
+    // Both sides advertise [1.2, 1.1, 1.0] and accept the first proposed, so each
+    // peer's inbound /meshsub stream negotiates 1.2.0 → each router records the
+    // other as a 1.2 peer. A side only learns the version once the OTHER side
+    // opens its outbound stream (lazy, on its first frame): the server opened on
+    // its subscription announce and the client opened to publish above, so by now
+    // both inbound streams exist. The version post races with peer_connected, so
+    // poll for it to settle.
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        const c = if (client_gs.router.peers.get(peerKeyOf(server_peer))) |st| st.protocol_version == .v1_2 else false;
+        const s = if (server_gs.router.peers.get(peerKeyOf(client_peer))) |st| st.protocol_version == .v1_2 else false;
+        if (c and s) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+    {
+        const client_state = client_gs.router.peers.get(peerKeyOf(server_peer)) orelse return error.MissingPeer;
+        const server_state = server_gs.router.peers.get(peerKeyOf(client_peer)) orelse return error.MissingPeer;
+        try std.testing.expectEqual(pubsub.Version.v1_2, client_state.protocol_version);
+        try std.testing.expectEqual(pubsub.Version.v1_2, server_state.protocol_version);
+    }
 
     // Tear down in the gossipsub-required order: close connections first (so no
     // inbound /meshsub handler survives and no peer event can fire), then deinit

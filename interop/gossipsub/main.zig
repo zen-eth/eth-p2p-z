@@ -158,14 +158,16 @@ pub fn main(init: std.process.Init) !void {
     // Register the identify protocol responder. go-libp2p (and rust-libp2p)
     // learn which protocols a peer speaks via the `/ipfs/id/1.0.0` exchange, and
     // their pubsub only opens a `/meshsub` stream to a peer once identify reports
-    // it supports meshsub. So the identify response must advertise both identify
-    // itself and `/meshsub/1.1.0`; without this go never peers us in gossipsub.
-    // The handler only reads its (immutable) options, so one shared instance
-    // serves every inbound identify stream. It must outlive the run, so it lives
-    // here on `main`'s stack (the service borrows it; its deinit is a no-op).
+    // it supports meshsub. So the identify response must advertise identify
+    // itself plus every `/meshsub` version we speak (1.2.0, 1.1.0, 1.0.0); the
+    // peer then negotiates the best common one. Advertising 1.2.0 is what lets a
+    // 1.2-capable go/rust peer pick 1.2.0 with us. Without this go never peers us
+    // in gossipsub. The handler only reads its (immutable) options, so one shared
+    // instance serves every inbound identify stream. It must outlive the run, so
+    // it lives here on `main`'s stack (the service borrows it; deinit is a no-op).
     var id_handler = identify.IdentifyHandler.initWithOptions(allocator, .{
         .agent_version = "eth-p2p-z-gossipsub-interop/0.1.0",
-        .protocols = &.{ identify.protocol_id, gossipsub.protocol_id },
+        .protocols = &(.{identify.protocol_id} ++ gossipsub.supported_protocols),
     });
     try switcher.addProtocolService(
         identify.protocol_id,

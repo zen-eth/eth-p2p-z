@@ -8,6 +8,36 @@ pub const rpc = @import("rpc.zig");
 
 pub const protocol_id = "/meshsub/1.1.0";
 pub const protocol_id_v1_0 = "/meshsub/1.0.0";
+pub const protocol_id_v1_2 = "/meshsub/1.2.0";
+
+/// The /meshsub protocol versions this node speaks, in descending preference
+/// order. The dialer proposes these to a peer (best first) and uses whichever
+/// the peer accepts; the listener registers its inbound service for all of them.
+/// 1.2.0 adds IDONTWANT, 1.1.0 adds the gossip/scoring control messages, 1.0.0
+/// is the original floodsub-style mesh — all are wire-compatible up to the
+/// control messages each version introduces.
+pub const supported_protocols = [_][]const u8{ protocol_id_v1_2, protocol_id, protocol_id_v1_0 };
+
+/// The gossipsub protocol version in effect for one peer. Tracked per peer so
+/// version-gated features (e.g. IDONTWANT, which needs 1.2) only fire toward
+/// peers that negotiated a high enough version. `v1_1` is the baseline default
+/// for a peer whose version is not yet known.
+pub const Version = enum {
+    v1_0,
+    v1_1,
+    v1_2,
+
+    /// Map a negotiated /meshsub protocol id to its Version. An unrecognised id
+    /// (should not happen — we only ever negotiate from `supported_protocols`)
+    /// falls back to the 1.1 baseline.
+    pub fn fromProtocolId(id: []const u8) Version {
+        if (std.mem.eql(u8, id, protocol_id_v1_2)) return .v1_2;
+        if (std.mem.eql(u8, id, protocol_id)) return .v1_1;
+        if (std.mem.eql(u8, id, protocol_id_v1_0)) return .v1_0;
+        return .v1_1;
+    }
+};
+
 const max_rpc_message_len = 1024 * 1024;
 const max_varint_len = 10;
 
@@ -138,6 +168,23 @@ test {
     _ = @import("peer_io.zig");
     _ = @import("mcache.zig");
     _ = @import("score.zig");
+}
+
+test "supported_protocols lists meshsub versions newest-first" {
+    // The dialer proposes these in order and takes the first a peer accepts, so
+    // 1.2.0 must come before 1.1.0 before 1.0.0 for best-version negotiation.
+    try std.testing.expectEqual(@as(usize, 3), supported_protocols.len);
+    try std.testing.expectEqualStrings(protocol_id_v1_2, supported_protocols[0]);
+    try std.testing.expectEqualStrings(protocol_id, supported_protocols[1]);
+    try std.testing.expectEqualStrings(protocol_id_v1_0, supported_protocols[2]);
+}
+
+test "Version.fromProtocolId maps each meshsub id and defaults to v1_1" {
+    try std.testing.expectEqual(Version.v1_2, Version.fromProtocolId(protocol_id_v1_2));
+    try std.testing.expectEqual(Version.v1_1, Version.fromProtocolId(protocol_id));
+    try std.testing.expectEqual(Version.v1_0, Version.fromProtocolId(protocol_id_v1_0));
+    // An unknown id falls back to the 1.1 baseline rather than crashing.
+    try std.testing.expectEqual(Version.v1_1, Version.fromProtocolId("/meshsub/9.9.9"));
 }
 
 test "frameRpc length prefix matches payload length" {

@@ -254,6 +254,13 @@ pub fn Router(comptime Transport: type) type {
             },
             /// A peer's connection is gone. Tear the peer down.
             peer_disconnected: struct { peer: PeerId },
+            /// The /meshsub protocol version a peer negotiated, learned when it
+            /// opens an inbound stream to us (the peer proposes its best version;
+            /// we accept it, so this is the highest version that peer supports).
+            /// Recorded per peer so version-gated control (e.g. IDONTWANT, 1.2+)
+            /// only targets peers that can parse it. May arrive before or after
+            /// `peer_connected`; the handler tolerates either order.
+            peer_protocol: struct { peer: PeerId, version: pubsub.Version },
             /// An RPC arrived on a peer's inbound stream. The router owns it and
             /// must free it after parsing + forward-frame construction.
             inbound_rpc: peer_io.InboundRpc,
@@ -299,6 +306,12 @@ pub fn Router(comptime Transport: type) type {
             /// Used to pick graft/fanout candidates: a peer is eligible for a
             /// topic's mesh or fanout only if its set contains that topic.
             topics: std.StringHashMapUnmanaged(void) = .empty,
+            /// The /meshsub version in effect for this peer, learned from the
+            /// version the peer negotiated on its inbound stream. Defaults to the
+            /// 1.1 baseline until the inbound stream reports otherwise (an inbound
+            /// stream that arrives before this peer_connected seeds it via
+            /// `peer_versions`). Gates version-specific control toward the peer.
+            protocol_version: pubsub.Version = .v1_1,
             /// Heap-owned (Transport-allocated) so its address is stable while
             /// the writer fiber holds it. The sink (and its stream) MUST outlive
             /// the writer fiber — torn down only after the writer is awaited.
@@ -334,6 +347,14 @@ pub fn Router(comptime Transport: type) type {
         inbox: std.Io.Queue(Command),
         /// Keyed by zero-padded peer bytes (see PeerKey). Values are heap-owned.
         peers: std.AutoHashMap(PeerKey, *PeerState),
+        /// Negotiated /meshsub version for peers whose inbound stream reported it
+        /// BEFORE their `peer_connected` arrived (the inbound handler and the
+        /// peer-event callback fire on independent fibers, so either can win the
+        /// race). Holds the version until `peer_connected` creates the PeerState,
+        /// which then adopts it and removes the entry; entries are also dropped on
+        /// disconnect. Without a matching PeerState an entry is a transient note,
+        /// not a leak — disconnect always purges it. Keyed like `peers`.
+        peer_versions: std.AutoHashMap(PeerKey, pubsub.Version),
         /// Topics the local node subscribes to. Keys are owned copies; freed on
         /// unsubscribe and on teardown. We announce these to every peer (on our
         /// own subscribe, and to each newly-connected peer) and deliver matching
@@ -467,6 +488,7 @@ pub fn Router(comptime Transport: type) type {
                 .inbox_storage = inbox_storage,
                 .inbox = std.Io.Queue(Command).init(inbox_storage),
                 .peers = std.AutoHashMap(PeerKey, *PeerState).init(allocator),
+                .peer_versions = std.AutoHashMap(PeerKey, pubsub.Version).init(allocator),
                 .seen = seen,
                 .message_cache = mcache.MessageCache.init(allocator),
                 .local_peer = effective_peer,
@@ -543,6 +565,7 @@ pub fn Router(comptime Transport: type) type {
             }
 
             router.peers.deinit();
+            router.peer_versions.deinit();
             router.freeMyTopics();
             router.freeMesh();
             router.freeBackoff();
@@ -923,6 +946,7 @@ pub fn Router(comptime Transport: type) type {
                 switch (command) {
                     .peer_connected => |c| router.onPeerConnected(c.peer, c.conn, c.remote_addr),
                     .peer_disconnected => |c| router.onPeerDisconnected(c.peer),
+                    .peer_protocol => |c| router.onPeerProtocol(c.peer, c.version),
                     .inbound_rpc => |in| router.onInboundRpc(in),
                     .subscribe => |s| router.onSubscribe(s.topic),
                     .unsubscribe => |u| router.onUnsubscribe(u.topic),
@@ -1008,6 +1032,13 @@ pub fn Router(comptime Transport: type) type {
             writer_live = true;
             queue_live = true;
             _ = router.peer_count.fetchAdd(1, .release);
+
+            // Adopt a version the peer's inbound stream reported before this
+            // connect arrived (the two events race on independent fibers). The
+            // pending note is consumed here so it cannot outlive the PeerState.
+            if (router.peer_versions.fetchRemove(key)) |kv| {
+                state.protocol_version = kv.value;
+            }
 
             // Begin scoring the peer (a brand-new entry, or a re-activation of a
             // recently-disconnected one retained for its score) and record its
@@ -1141,10 +1172,47 @@ pub fn Router(comptime Transport: type) type {
         /// no-op.
         fn onPeerDisconnected(router: *Self, peer: PeerId) void {
             const key = peerKey(&peer);
+            // Drop any pending version note even if the peer was never fully
+            // tracked (an inbound stream reported a version but peer_connected
+            // never arrived), so it can't outlive the connection.
+            _ = router.peer_versions.remove(key);
             const entry = router.peers.fetchRemove(key) orelse return;
             router.dropPeerFromMeshAndBackoff(peer);
             router.teardownPeer(entry.value);
             _ = router.peer_count.fetchSub(1, .release);
+        }
+
+        /// Record the /meshsub version a peer negotiated on its inbound stream.
+        /// If the peer is already tracked, update its PeerState directly;
+        /// otherwise stash it in `peer_versions` so the pending `peer_connected`
+        /// adopts it (the inbound stream can be negotiated before the peer-event
+        /// callback fires). Best-effort: a failed stash just leaves the peer at
+        /// the 1.1 default until it reconnects or sends again.
+        fn onPeerProtocol(router: *Self, peer: PeerId, version: pubsub.Version) void {
+            const key = peerKey(&peer);
+            if (router.peers.get(key)) |state| {
+                state.protocol_version = version;
+                return;
+            }
+            router.peer_versions.put(key, version) catch {};
+        }
+
+        /// Whether `peer` negotiated /meshsub 1.2.0 or newer, i.e. supports the
+        /// 1.2 control messages (IDONTWANT). False for an untracked peer or one
+        /// still at the pre-1.2 baseline. The gate later layers use before
+        /// emitting 1.2-only control toward a peer.
+        fn peerSupportsV12(router: *Self, peer: PeerId) bool {
+            const state = router.peers.get(peerKey(&peer)) orelse return false;
+            return state.protocol_version == .v1_2;
+        }
+
+        /// Post the /meshsub version a peer negotiated on its inbound stream onto
+        /// the router inbox (the single ordered path into router state). Called
+        /// from the inbound stream handler — which runs on a Switch-owned fiber,
+        /// not the router fiber — so it must only post. Best-effort on a closed
+        /// inbox (the router is shutting down).
+        pub fn postPeerProtocol(router: *Self, io: std.Io, peer: PeerId, version: pubsub.Version) void {
+            router.inbox.putOne(io, .{ .peer_protocol = .{ .peer = peer, .version = version } }) catch {};
         }
 
         /// Handle one heartbeat tick: advance the tick counter, expire stale
@@ -4343,4 +4411,136 @@ fn signedInboundPublish(
     };
     const frame = rpc_pb.RPC{ .publish = &[_]?rpc_pb.Message{msg} };
     return ownedFromRpc(allocator, frame);
+}
+
+// --- per-peer protocol-version tracking ------------------------------------
+
+/// The version recorded for the peer tracked under `peer`, or null if untracked.
+fn peerVersionOf(router: *FakeRouter, peer: PeerId) ?pubsub.Version {
+    const state = router.peers.get(peerKey(&peer)) orelse return null;
+    return state.protocol_version;
+}
+
+/// Spin (yielding the fiber) until the peer tracked under `peer` has recorded
+/// `want`, or the bounded wait elapses. Returns whether it landed.
+fn waitForVersion(io: std.Io, router: *FakeRouter, peer: PeerId, want: pubsub.Version) bool {
+    var waited_ms: u64 = 0;
+    while (waited_ms < 2000) : (waited_ms += 5) {
+        if (peerVersionOf(router, peer)) |v| if (v == want) return true;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    return if (peerVersionOf(router, peer)) |v| v == want else false;
+}
+
+test "router records each peer's negotiated /meshsub version; peerSupportsV12 only for 1.2" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    // One peer per version. Each connects, then its inbound stream reports the
+    // version it negotiated (as the inbound handler would via peer_protocol).
+    const peer_10 = testPeer(0x10);
+    const peer_11 = testPeer(0x11);
+    const peer_12 = testPeer(0x12);
+    const conn_10 = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn_10);
+    const conn_11 = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn_11);
+    const conn_12 = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn_12);
+
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer_10, .conn = conn_10, .remote_addr = dummy_addr } });
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer_11, .conn = conn_11, .remote_addr = dummy_addr } });
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer_12, .conn = conn_12, .remote_addr = dummy_addr } });
+    try std.testing.expect(waitFor(io, struct {
+        fn pred(r: *FakeRouter) bool {
+            return r.peerCount() == 3;
+        }
+    }.pred, router));
+
+    // Before any peer_protocol, every peer defaults to the 1.1 baseline.
+    try std.testing.expectEqual(pubsub.Version.v1_1, peerVersionOf(router, peer_10).?);
+    try std.testing.expectEqual(pubsub.Version.v1_1, peerVersionOf(router, peer_12).?);
+    try std.testing.expect(!router.peerSupportsV12(peer_12));
+
+    router.postPeerProtocol(io, peer_10, .v1_0);
+    router.postPeerProtocol(io, peer_11, .v1_1);
+    router.postPeerProtocol(io, peer_12, .v1_2);
+
+    try std.testing.expect(waitForVersion(io, router, peer_10, .v1_0));
+    try std.testing.expect(waitForVersion(io, router, peer_11, .v1_1));
+    try std.testing.expect(waitForVersion(io, router, peer_12, .v1_2));
+
+    // peerSupportsV12 is true ONLY for the 1.2 peer.
+    try std.testing.expect(!router.peerSupportsV12(peer_10));
+    try std.testing.expect(!router.peerSupportsV12(peer_11));
+    try std.testing.expect(router.peerSupportsV12(peer_12));
+    // An untracked peer never supports 1.2.
+    try std.testing.expect(!router.peerSupportsV12(testPeer(0x99)));
+}
+
+test "router adopts a version reported before peer_connected (inbound-before-connect race)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(0x42);
+    const conn = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn);
+
+    // The inbound stream negotiates + reports 1.2 BEFORE the peer-event callback
+    // posts peer_connected (both are independent fibers; either can win). The
+    // version is stashed and adopted when peer_connected creates the PeerState.
+    router.postPeerProtocol(io, peer, .v1_2);
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
+
+    try std.testing.expect(waitForVersion(io, router, peer, .v1_2));
+    try std.testing.expect(router.peerSupportsV12(peer));
+
+    // Disconnect purges the version (the pending map too); tear down leak-clean.
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try std.testing.expect(waitFor(io, peerCountIsZero, router));
+}
+
+test "router purges a pending version when the peer disconnects without ever connecting" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(0x55);
+
+    // A version note arrives but the matching peer_connected never does; a later
+    // disconnect (e.g. the stream broke during negotiation) must drop the note so
+    // it cannot leak or be inherited by a future connection.
+    router.postPeerProtocol(io, peer, .v1_2);
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+
+    // Now connect for real: the peer must start at the baseline, not the purged
+    // 1.2 note. All three commands run in order on the one router fiber, so the
+    // connect already observes the purge; waitFor(peerCountIsOne) then confirms
+    // the connect was processed before we read the version.
+    const conn = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn);
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
+    try std.testing.expect(waitFor(io, peerCountIsOne, router));
+    try std.testing.expectEqual(pubsub.Version.v1_1, peerVersionOf(router, peer).?);
+    try std.testing.expect(!router.peerSupportsV12(peer));
+
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try std.testing.expect(waitFor(io, peerCountIsZero, router));
 }
