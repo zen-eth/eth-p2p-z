@@ -260,6 +260,15 @@ pub const OutboundQueue = struct {
         }
     }
 
+    /// Number of un-popped (live) frames on the data lane. Taken under the mutex
+    /// so it never races a concurrent push/pop. Used by router unit tests to
+    /// observe an IDONTWANT purge (frames removed) without draining the queue.
+    pub fn dataLen(self: *OutboundQueue, io: std.Io) usize {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.data_lane.len();
+    }
+
     /// Remove and release every data-lane frame for which pred(ctx, frame)
     /// returns true. Returns the count of removed frames. Other lanes are
     /// untouched.

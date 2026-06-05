@@ -63,6 +63,12 @@ pub const RouterConfig = struct {
     /// originated message uses the mesh (if we subscribe) or a fanout set (if we
     /// do not), exactly as a relay would.
     flood_publish: bool = true,
+    /// Size threshold (bytes of message data) at or above which accepting a NEW
+    /// received message broadcasts an IDONTWANT for it to our v1.2 mesh peers on
+    /// the topic — telling them "I already have this large message, don't send it
+    /// to me", which saves bandwidth on big messages (go-libp2p
+    /// `IDontWantMessageThreshold`, default 1 KiB).
+    idontwant_message_threshold: usize = 1024,
 };
 
 /// Upper bound on remembered message-ids in the seen-cache (loop/duplicate
@@ -194,6 +200,16 @@ const MeshParams = struct {
     /// single inbound IWANT. Bounds the work one peer can ask of us per request;
     /// finer rate-limiting is a future refinement.
     max_iwant_to_serve: usize = 5000,
+    /// How long (in heartbeat ticks) a per-peer IDONTWANT entry suppresses sending
+    /// that message id to the peer. After this many heartbeats the entry expires
+    /// and we may send the message again. A few heartbeats is enough to cover the
+    /// window in which the large message would otherwise be forwarded.
+    dont_send_ttl_ticks: u64 = 3,
+    /// Upper bound on per-peer IDONTWANT entries. A peer that floods IDONTWANTs
+    /// cannot make us hold an unbounded id set: once full, further new ids are
+    /// refused (the worst case is we still send a message the peer already has —
+    /// safe, just slightly wasteful). Stale entries are reclaimed each heartbeat.
+    dont_send_cap: usize = 10000,
 };
 
 const mesh_params: MeshParams = .{};
@@ -321,6 +337,12 @@ pub fn Router(comptime Transport: type) type {
             /// stream that arrives before this peer_connected seeds it via
             /// `peer_versions`). Gates version-specific control toward the peer.
             protocol_version: pubsub.Version = .v1_1,
+            /// Message ids this peer told us (via IDONTWANT) it already has, so we
+            /// must NOT send it those messages. Maps id → expiry heartbeat tick;
+            /// the entry suppresses sending until `heartbeat_tick > expiry`, at
+            /// which point the heartbeat reclaims it. Keys are owned copies (freed
+            /// on expiry and on teardown). Bounded by `dont_send_cap`.
+            dont_send: std.StringHashMapUnmanaged(u64) = .empty,
             /// Heap-owned (Transport-allocated) so its address is stable while
             /// the writer fiber holds it. The sink (and its stream) MUST outlive
             /// the writer fiber — torn down only after the writer is awaited.
@@ -426,6 +448,10 @@ pub fn Router(comptime Transport: type) type {
         /// than only its mesh/fanout. Relayed messages are unaffected (always
         /// mesh-only). See `RouterConfig.flood_publish`.
         flood_publish: bool,
+        /// Data-size threshold (bytes) at or above which accepting a NEW received
+        /// message broadcasts an IDONTWANT for it to our v1.2 mesh peers on the
+        /// topic. See `RouterConfig.idontwant_message_threshold`.
+        idontwant_message_threshold: usize,
         /// Optional peer-scoring engine (the gossipsub v1.1 P1-P7 accountant).
         /// Null disables scoring entirely: no events are fired and no gate is
         /// applied, so the router's behaviour is unchanged. When non-null it is
@@ -504,6 +530,7 @@ pub fn Router(comptime Transport: type) type {
                 .signer = signer,
                 .message_handler = message_handler,
                 .flood_publish = config.flood_publish,
+                .idontwant_message_threshold = config.idontwant_message_threshold,
                 .score = score_engine,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
             };
@@ -1141,7 +1168,16 @@ pub fn Router(comptime Transport: type) type {
 
         /// Hand one shared-frame reference to a peer's lane queue: retain before
         /// the push, release on a rejected push (the queue did not take it).
+        ///
+        /// Honours the peer's IDONTWANT (`dont_send`): if any id the frame carries
+        /// is one the peer told us it already has, the frame is SKIPPED (not
+        /// enqueued) — saving the bandwidth IDONTWANT is for. A skipped target
+        /// simply does not `retain`, so the refcount stays balanced. Only data
+        /// frames carry ids, so control/subscribe pushes are never skipped.
         fn pushTo(router: *Self, state: *PeerState, lane: peer_io.Lane, frame: *peer_io.OutboundFrame) void {
+            for (frame.message_ids) |id| {
+                if (state.dont_send.contains(id)) return;
+            }
             frame.retain();
             state.queue.push(router.io, lane, frame) catch frame.release();
         }
@@ -1226,10 +1262,10 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Handle one heartbeat tick: advance the tick counter, expire stale
-        /// backoffs, then run mesh maintenance (graft below D_low / prune above
-        /// D_high for each subscribed topic) and fanout maintenance (expire stale
-        /// fanout topics, replenish short ones). Gossip emission (IHAVE),
-        /// opportunistic graft, and score-based selection are later layers.
+        /// backoffs and per-peer IDONTWANT (`dont_send`) entries, then run mesh
+        /// maintenance (graft below D_low / prune above D_high for each subscribed
+        /// topic) and fanout maintenance (expire stale fanout topics, replenish
+        /// short ones), gossip emission (IHAVE), and the message-cache window shift.
         fn onHeartbeat(router: *Self) void {
             router.heartbeat_tick += 1;
             const tick = router.heartbeat_tick;
@@ -1246,6 +1282,29 @@ pub fn Router(comptime Transport: type) type {
                     while (entry_it.next()) |entry| {
                         if (entry.value_ptr.* <= tick) {
                             _ = set.remove(entry.key_ptr.*);
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Expire stale per-peer IDONTWANT entries (the id is now sendable
+            // again). The keys are owned, so each removed entry's id is freed. Same
+            // restart-after-removal pattern as the backoff scan: a removal can move
+            // the unscanned tail in an open-addressing map.
+            var peer_it = router.peers.valueIterator();
+            while (peer_it.next()) |state_ptr| {
+                const dont_send = &state_ptr.*.dont_send;
+                var changed = true;
+                while (changed) {
+                    changed = false;
+                    var entry_it = dont_send.iterator();
+                    while (entry_it.next()) |entry| {
+                        if (entry.value_ptr.* < tick) {
+                            const key = entry.key_ptr.*;
+                            _ = dont_send.remove(key);
+                            router.allocator.free(key);
                             changed = true;
                             break;
                         }
@@ -1468,9 +1527,9 @@ pub fn Router(comptime Transport: type) type {
         /// the SOURCE peer's announced-topics set, then forward each published
         /// message over the topic's MESH (every mesh member except the source) and
         /// deliver it locally if we subscribe. GRAFT/PRUNE drive mesh membership;
-        /// IHAVE/IWANT/IDONTWANT are parsed-but-ignored (later layers). The
-        /// OwnedRpc is freed only after all parsing AND forward-frame construction,
-        /// since its bytes back the readers and are copied by frameRpc.
+        /// IHAVE/IWANT/IDONTWANT drive gossip and bandwidth control. The OwnedRpc
+        /// is freed only after all parsing AND forward-frame construction, since
+        /// its bytes back the readers and are copied by frameRpc.
         fn onInboundRpc(router: *Self, in: peer_io.InboundRpc) void {
             var owned = in;
             defer owned.rpc.deinit(router.allocator);
@@ -1509,10 +1568,11 @@ pub fn Router(comptime Transport: type) type {
             // Mesh + gossip control. GRAFT/PRUNE move the source peer in/out of a
             // topic's mesh. IHAVE makes us reply with an IWANT for the ids we have
             // not seen; IWANT makes us serve the requested messages from the cache.
-            // IDONTWANT belongs to a later layer and stays ignored. Any control
-            // replies (a PRUNE rejecting a GRAFT, an IWANT, a served message) are
-            // built + framed inside the handlers, which copy the bytes, so freeing
-            // the OwnedRpc after this returns is safe.
+            // IDONTWANT records the ids the source already has (so we stop sending
+            // them) and purges any still-queued copies to it. Any control replies
+            // (a PRUNE rejecting a GRAFT, an IWANT, a served message) are built +
+            // framed inside the handlers, which copy the bytes, so freeing the
+            // OwnedRpc after this returns is safe.
             if (reader.getControl()) |ctrl_reader| {
                 var control = ctrl_reader;
                 while (control.graftNext()) |graft| {
@@ -1528,6 +1588,10 @@ pub fn Router(comptime Transport: type) type {
                 while (control.iwantNext()) |iwant| {
                     var iw = iwant;
                     router.handleIWant(source, &iw);
+                }
+                while (control.idontwantNext()) |idontwant| {
+                    var idw = idontwant;
+                    router.handleIDontWant(source, &idw);
                 }
             } else |_| {}
         }
@@ -1582,6 +1646,70 @@ pub fn Router(comptime Transport: type) type {
                 router.pushTo(state, .data, frame);
                 served += 1;
             }
+        }
+
+        /// Handle an inbound IDONTWANT(ids) from `source`: the peer already holds
+        /// those (typically large) messages and does not want us to send them. For
+        /// each id we (a) record it in the peer's `dont_send` set with a TTL so the
+        /// send-side skip honours it going forward, and (b) purge any not-yet-sent
+        /// copies already queued for the peer.
+        ///
+        /// The ids are gathered into a borrowed-key set (keys point into the wire
+        /// bytes, which outlive this call) so the purge predicate can test a
+        /// frame's carried id(s) against the whole IDONTWANT set in one queue scan.
+        /// The same set drives the per-id `dont_send` inserts. Honouring IDONTWANT
+        /// from any peer is harmless, so this is not version-gated. Untracked
+        /// source is ignored.
+        fn handleIDontWant(router: *Self, source: PeerId, idontwant: *rpc_pb.ControlIDontWantReader) void {
+            const state = router.peers.get(peerKey(&source)) orelse return;
+
+            // Borrowed-key set of the IDONTWANT ids: keys alias the OwnedRpc's wire
+            // bytes (valid until onInboundRpc frees them, after this returns), so no
+            // copies here. Drives both the per-id dont_send inserts (which DO own a
+            // copy of the id) and the single-pass queue purge below.
+            var ids: std.StringHashMapUnmanaged(void) = .empty;
+            defer ids.deinit(router.allocator);
+
+            const expiry = router.heartbeat_tick +| mesh_params.dont_send_ttl_ticks;
+            while (idontwant.messageIDsNext()) |id| {
+                ids.put(router.allocator, id, {}) catch continue;
+                router.recordDontSend(state, id, expiry);
+            }
+            if (ids.count() == 0) return;
+
+            // Purge every queued DATA frame whose carried id(s) the peer just said
+            // it does not want. `removeData` releases each removed frame's
+            // reference, keeping the shared-frame refcount balanced. The ctx is a
+            // const pointer to the id set (the predicate only reads it).
+            const ids_ptr: *const std.StringHashMapUnmanaged(void) = &ids;
+            _ = state.queue.removeData(router.io, ids_ptr, dontWantPred);
+        }
+
+        /// `removeData` predicate: true if ANY of the frame's carried message ids
+        /// is in the IDONTWANT id set `ids` (so the frame must be dropped from the
+        /// peer's queue). Frames carry the single id of the message they hold (or
+        /// none for control frames, which never reach the data lane).
+        fn dontWantPred(ids: *const std.StringHashMapUnmanaged(void), frame: *const peer_io.OutboundFrame) bool {
+            for (frame.message_ids) |id| {
+                if (ids.contains(id)) return true;
+            }
+            return false;
+        }
+
+        /// Record (a copy of) message id `id` in the peer's `dont_send` set with
+        /// the given expiry tick, so the send-side skip suppresses sending it to
+        /// the peer until the heartbeat reclaims the entry. A no-op if already
+        /// present (refreshing the expiry of an existing entry is not needed — the
+        /// peer re-IDONTWANTs if it still has the message). Refused (and freed) once
+        /// the set is at `dont_send_cap` so a flooding peer cannot grow it without
+        /// bound. Best-effort on OOM (the message may still be sent — safe).
+        fn recordDontSend(router: *Self, state: *PeerState, id: []const u8, expiry: u64) void {
+            if (state.dont_send.contains(id)) return;
+            if (state.dont_send.count() >= mesh_params.dont_send_cap) return;
+            const owned = router.allocator.dupe(u8, id) catch return;
+            state.dont_send.put(router.allocator, owned, expiry) catch {
+                router.allocator.free(owned);
+            };
         }
 
         /// Handle an inbound GRAFT(topic) from `source`: add the peer to the
@@ -1728,6 +1856,15 @@ pub fn Router(comptime Transport: type) type {
 
             router.deliverLocal(topic, from, data);
 
+            // For a large NEW message, tell our v1.2 mesh peers (except the sender)
+            // that we already have it via an IDONTWANT, so they skip forwarding us
+            // a redundant copy — the bandwidth saving this control message exists
+            // for. Done only on RECEIVED messages (we are not the origin) and only
+            // when the data is at or above the configured threshold.
+            if (data.len >= router.idontwant_message_threshold) {
+                router.broadcastIDontWant(topic, id.bytes, exclude);
+            }
+
             // Cache EVERY accepted message (so a later IWANT can be served and a
             // heartbeat IHAVE can advertise it) and forward it over the topic's
             // mesh, minus the sender. Caching is independent of forwarding: a
@@ -1752,6 +1889,39 @@ pub fn Router(comptime Transport: type) type {
         fn deliverLocal(router: *Self, topic: []const u8, from: []const u8, data: []const u8) void {
             if (!router.my_topics.contains(topic)) return;
             if (router.message_handler) |h| h.on_message(h.ctx, topic, from, data);
+        }
+
+        /// Broadcast an IDONTWANT(`id`) on the control lane to every member of
+        /// `topic`'s mesh that negotiated v1.2 and is NOT `exclude` (the peer the
+        /// message arrived from). Tells those peers we already hold the message so
+        /// they skip forwarding it to us. No-op if the topic has no mesh.
+        ///
+        /// v1.2 gating: a pre-1.2 peer would not understand (and would reject) the
+        /// control message, so it is wasteful to send. Honouring an inbound
+        /// IDONTWANT is unconditional (see `handleIDontWant`); only EMITTING one is
+        /// gated. Each eligible peer is targeted individually so the gate applies
+        /// per peer. The id is borrowed (valid for the call) and `frameRpc` copies
+        /// it into each frame.
+        fn broadcastIDontWant(router: *Self, topic: []const u8, id: []const u8, exclude: PeerId) void {
+            const set = router.mesh.getPtr(topic) orelse return;
+            var it = set.keyIterator();
+            while (it.next()) |key_ptr| {
+                const state = router.peers.get(key_ptr.*) orelse continue;
+                if (state.peer.eql(&exclude)) continue;
+                if (!router.peerSupportsV12(state.peer)) continue;
+                router.sendIDontWant(state.peer, id);
+            }
+        }
+
+        /// Send an IDONTWANT(`id`) to `peer` on its control lane. The id is wrapped
+        /// in a one-element optional array for the builder (which `frameRpc`
+        /// copies), and the frame carries no message ids of its own (control frames
+        /// are never IDONTWANT-purged).
+        fn sendIDontWant(router: *Self, peer: PeerId, id: []const u8) void {
+            const empty_ids = router.emptyIds() orelse return;
+            const idontwant = rpc.buildIDontWant(&[_]?[]const u8{id});
+            const ctrl = rpc_pb.ControlMessage{ .idontwant = &.{idontwant} };
+            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), empty_ids, .{ .one = peer });
         }
 
         /// Frame a single message ONCE, store it in the message cache (so a later
@@ -2031,6 +2201,7 @@ pub fn Router(comptime Transport: type) type {
             state.sink.close(router.io);
             state.queue.deinit(router.io);
             router.freePeerTopics(state);
+            router.freePeerDontSend(state);
             router.allocator.destroy(state.writer);
             router.allocator.destroy(state.sink);
             router.allocator.destroy(state);
@@ -2041,6 +2212,14 @@ pub fn Router(comptime Transport: type) type {
             var it = state.topics.keyIterator();
             while (it.next()) |key| router.allocator.free(key.*);
             state.topics.deinit(router.allocator);
+        }
+
+        /// Free every id key in a peer's IDONTWANT (`dont_send`) map and the map
+        /// itself. Called on teardown so the owned id copies do not leak.
+        fn freePeerDontSend(router: *Self, state: *PeerState) void {
+            var it = state.dont_send.keyIterator();
+            while (it.next()) |key| router.allocator.free(key.*);
+            state.dont_send.deinit(router.allocator);
         }
 
         fn teardownAllPeers(router: *Self) void {
@@ -2136,9 +2315,17 @@ const FakeSink = struct {
     fail_open_count: usize,
 
     pub fn open(self: *FakeSink, io: std.Io) anyerror!void {
-        _ = io;
         self.record.open_calls += 1;
         if (self.record.open_calls <= self.fail_open_count) return error.OpenFailed;
+        // While the test holds `block_open`, park here (short poll) so the writer
+        // does not drain the queue and a test can observe queued frames. The test
+        // CLEARS the flag before teardown, so the writer exits this loop on its
+        // own; the short sleep is also a cancellation point but the flag, not
+        // cancel, is what releases it (cancel-driven teardown of a long sleep is
+        // fragile, so this never depends on it).
+        while (self.record.block_open.load(.acquire)) {
+            io_time.ms(5).sleep(io) catch break;
+        }
         self.record.streams_opened += 1;
     }
 
@@ -2170,6 +2357,13 @@ const FakeRecord = struct {
     /// recordCount*/recordHas* reader helpers below take it before walking the
     /// buffer. std.Io.Mutex is fiber/thread-safe under std.Io.Threaded.
     mutex: std.Io.Mutex = .init,
+    /// While set, the peer's writer parks at the top of open() (short cancellable
+    /// poll), so a test can observe frames sitting un-drained in the peer's queue
+    /// (e.g. an IDONTWANT purge). The test CLEARS it before teardown so the writer
+    /// exits open() on its own — never relying on cancel to collapse a long sleep
+    /// (which the writer-teardown path treats as fragile). Written by the test
+    /// fiber, read by the writer fiber, so atomic.
+    block_open: std.atomic.Value(bool) = .init(false),
 
     fn deinit(self: *FakeRecord) void {
         self.written.deinit(self.allocator);
@@ -2466,6 +2660,35 @@ fn testDataFrame(allocator: std.mem.Allocator) !*peer_io.OutboundFrame {
     return peer_io.OutboundFrame.create(allocator, bytes, ids, 1);
 }
 
+/// Build a one-byte shared data frame (one reference) carrying a single owned
+/// copy of `id` in its `message_ids`, matching the shape `cacheAndForward`
+/// produces — so a router IDONTWANT purge has a real id to match against.
+fn testDataFrameWithId(allocator: std.mem.Allocator, id: []const u8) !*peer_io.OutboundFrame {
+    const bytes = try allocator.alloc(u8, 1);
+    errdefer allocator.free(bytes);
+    bytes[0] = 0x7f;
+    const ids = try allocator.alloc([]u8, 1);
+    errdefer allocator.free(ids);
+    ids[0] = try allocator.dupe(u8, id);
+    errdefer allocator.free(ids[0]);
+    return peer_io.OutboundFrame.create(allocator, bytes, ids, 1);
+}
+
+/// After a `sync`, the data-lane length of the peer tracked under `peer` (0 if
+/// untracked). Router-owned state; read only after `sync` and with the peer's
+/// writer parked (e.g. a block_open sink), so the read never races a drain.
+fn peerDataLen(io: std.Io, router: *FakeRouter, peer: PeerId) usize {
+    const state = router.peers.get(peerKey(&peer)) orelse return 0;
+    return state.queue.dataLen(io);
+}
+
+/// After a `sync`, whether the peer tracked under `peer` has `id` recorded in its
+/// IDONTWANT (`dont_send`) set. Router-owned state; read only after `sync`.
+fn peerDontSendHas(router: *FakeRouter, peer: PeerId, id: []const u8) bool {
+    const state = router.peers.get(peerKey(&peer)) orelse return false;
+    return state.dont_send.contains(id);
+}
+
 /// Build a real OwnedRpc carrying a single subscription, mirroring what the
 /// inbound reader produces, so onInboundRpc has genuine heap bytes to free.
 fn buildInboundRpc(allocator: std.mem.Allocator, topic: []const u8) !pubsub.OwnedRpc {
@@ -2516,6 +2739,12 @@ fn buildInboundIHave(allocator: std.mem.Allocator, topic: []const u8, ids: []con
 /// Build an OwnedRpc carrying a single control IWANT(`ids`).
 fn buildInboundIWant(allocator: std.mem.Allocator, ids: []const ?[]const u8) !pubsub.OwnedRpc {
     const ctrl = rpc_pb.ControlMessage{ .iwant = &[_]?rpc_pb.ControlIWant{rpc.buildIWant(ids)} };
+    return ownedFromRpc(allocator, rpc_pb.RPC{ .control = ctrl });
+}
+
+/// Build an OwnedRpc carrying a single control IDONTWANT(`ids`).
+fn buildInboundIDontWant(allocator: std.mem.Allocator, ids: []const ?[]const u8) !pubsub.OwnedRpc {
+    const ctrl = rpc_pb.ControlMessage{ .idontwant = &[_]?rpc_pb.ControlIDontWant{rpc.buildIDontWant(ids)} };
     return ownedFromRpc(allocator, rpc_pb.RPC{ .control = ctrl });
 }
 
@@ -2669,6 +2898,30 @@ fn recordCountIWants(io: std.Io, record: *FakeRecord, id: []const u8) usize {
             while (control.iwantNext()) |iwant| {
                 var iw = iwant;
                 while (iw.messageIDsNext()) |mid| {
+                    if (std.mem.eql(u8, mid, id)) count += 1;
+                }
+            }
+        } else |_| {}
+        rest = rest[decoded.total_len..];
+    }
+    return count;
+}
+
+/// Count control IDONTWANT messages in the recording that announce `id`. Walks
+/// every recorded frame and every IDONTWANT/message-id within each control
+/// message, under the record lock so the walk never races the writer append.
+fn recordCountIDontWants(io: std.Io, record: *FakeRecord, id: []const u8) usize {
+    record.mutex.lockUncancelable(io);
+    defer record.mutex.unlock(io);
+    var count: usize = 0;
+    var rest = record.written.items;
+    while (decodeFrame(rest)) |decoded| {
+        var reader = decoded.reader;
+        if (reader.getControl()) |ctrl_reader| {
+            var control = ctrl_reader;
+            while (control.idontwantNext()) |idontwant| {
+                var idw = idontwant;
+                while (idw.messageIDsNext()) |mid| {
                     if (std.mem.eql(u8, mid, id)) count += 1;
                 }
             }
@@ -4506,4 +4759,263 @@ test "router purges a pending version when the peer disconnects without ever con
 
     try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
+}
+
+// --- IDONTWANT (v1.2) fake tests -------------------------------------------
+
+/// Spin (bounded) until the peer tracked under `peer` has exactly `want` frames
+/// on its data lane, then return whether it held. Used with a block_open sink (so
+/// the writer never drains) to wait for the writer to pop its one priming frame
+/// and park, leaving the lane at a known length.
+fn waitForDataLen(io: std.Io, router: *FakeRouter, peer: PeerId, want: usize) bool {
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (peerDataLen(io, router, peer) == want) return true;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    return peerDataLen(io, router, peer) == want;
+}
+
+/// Clear a peer's `block_open` hold and wait until its writer has drained the
+/// queue and parked back in popBlocking (data lane empty + a short settle for the
+/// in-flight writeFrame to finish under the record lock). After this the writer no
+/// longer touches the record, so teardown can free the record and cancel the
+/// (popBlocking-parked) writer with no use-after-free and no cancel-collapsed
+/// wait. Used as a `defer` so it runs before destroyFakeConn / router.destroy.
+fn releaseAndQuiesceWriter(io: std.Io, router: *FakeRouter, conn: *FakeTransport.FakeConn, peer: PeerId) void {
+    conn.record.block_open.store(false, .release);
+    _ = waitForDataLen(io, router, peer, 0);
+    // A short settle so an in-flight writeFrame (record append) completes before
+    // the record is freed; mirrors the margins the other writer tests use.
+    io_time.ms(50).sleep(io) catch {};
+}
+
+test "inbound IDONTWANT records the ids and purges matching queued frames" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // Hold the peer's writer at the top of open() so it does not drain the queue:
+    // frames pushed after the writer pops its one priming frame stay queued, where
+    // the IDONTWANT purge is observable. The `defer` (runs FIRST, before
+    // destroyFakeConn / router.destroy, since defers are LIFO) releases the writer
+    // and waits for it to drain + park back in popBlocking, so teardown frees the
+    // record only once the writer is quiescent — no cancel-collapsed wait, no
+    // use-after-free of the record. Fires on success AND an early assertion-failure
+    // return.
+    conn.record.block_open.store(true, .release);
+    defer releaseAndQuiesceWriter(io, router, conn, peer);
+
+    // Push a priming frame (absorbs the writer's single pop), then two id-carrying
+    // data frames for X and Y. With the writer parked in open(), X and Y remain
+    // queued: data-lane length settles at 2.
+    try router.enqueueDataForTest(peer, try testDataFrame(allocator));
+    try router.enqueueDataForTest(peer, try testDataFrameWithId(allocator, "id-X"));
+    try router.enqueueDataForTest(peer, try testDataFrameWithId(allocator, "id-Y"));
+    try std.testing.expect(waitForDataLen(io, router, peer, 2));
+
+    // P sends IDONTWANT([id-X]): X is recorded in dont_send and its queued frame
+    // is purged; Y survives (its id was not in the IDONTWANT set).
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer,
+        .rpc = try buildInboundIDontWant(allocator, &[_]?[]const u8{"id-X"}),
+    } });
+    try sync(router, io);
+
+    try std.testing.expect(peerDontSendHas(router, peer, "id-X"));
+    // One frame purged (X), one survives (Y). The deferred writer release above
+    // then lets the writer drain Y and park before teardown frees the record.
+    try std.testing.expectEqual(@as(usize, 1), peerDataLen(io, router, peer));
+}
+
+test "send-side skip: a message whose id a peer IDONTWANTed is not enqueued to it" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    // We subscribe to "t" and graft two peers P and Q into the mesh. P will
+    // IDONTWANT the message id; Q will not. A relay source S then delivers the
+    // message: Q receives it (mesh forward), P does not (send-side skip).
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_p = testPeer(1);
+    const peer_q = testPeer(2);
+    const source = testPeer(3);
+    const conn_p = try connectFakePeer(io, allocator, router, peer_p);
+    defer destroyFakeConn(allocator, conn_p);
+    const conn_q = try connectFakePeer(io, allocator, router, peer_q);
+    defer destroyFakeConn(allocator, conn_q);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_p, peer_p, "t"));
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_q, peer_q, "t"));
+
+    // The relayed message's id is `from ++ seqno` = "origin" ++ seqno.
+    const from = "origin";
+    const seqno = "\x00\x00\x00\x42";
+    var id = try rpc.messageId(allocator, from, seqno);
+    defer id.deinit(allocator);
+
+    // P IDONTWANTs that id BEFORE the message arrives, so the forward to P is
+    // skipped. Sync so it is recorded before the relay.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_p,
+        .rpc = try buildInboundIDontWant(allocator, &[_]?[]const u8{id.bytes}),
+    } });
+    try sync(router, io);
+    try std.testing.expect(peerDontSendHas(router, peer_p, id.bytes));
+
+    // S relays the message on "t": Q (mesh, no IDONTWANT) gets it; P is skipped.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, from, seqno, "t", "skipme"),
+    } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_q.record, "t", "skipme") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    // Give a wrong forward to P a chance to land before asserting it did not.
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_q.record, "t", "skipme"));
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_p.record, "t", "skipme"));
+}
+
+test "emit IDONTWANT on a large received message: to v1.2 mesh peers, not v1.1 or the source" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The threshold knob is left at the default (1024); the large message below
+    // clears it, the small one does not.
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    // A is a v1.2 mesh peer (should receive IDONTWANT), C is a v1.1 mesh peer
+    // (should NOT — version-gated), S is the v1.2 relay source (should NOT — it is
+    // the sender). A and C are grafted into the mesh; S relays from outside it.
+    const peer_a = testPeer(1);
+    const peer_c = testPeer(2);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_c = try connectFakePeer(io, allocator, router, peer_c);
+    defer destroyFakeConn(allocator, conn_c);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    router.postPeerProtocol(io, peer_a, .v1_2);
+    router.postPeerProtocol(io, peer_c, .v1_1);
+    router.postPeerProtocol(io, source, .v1_2);
+    try sync(router, io);
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_c, peer_c, "t"));
+
+    // A SMALL message (< threshold) must NOT trigger any IDONTWANT.
+    const small_seqno = "\x00\x00\x00\x01";
+    var small_id = try rpc.messageId(allocator, "origin", small_seqno);
+    defer small_id.deinit(allocator);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", small_seqno, "t", "tiny"),
+    } });
+    try sync(router, io);
+
+    // A LARGE message (>= threshold) triggers IDONTWANT(id) to A only.
+    const big = try allocator.alloc(u8, 2048);
+    defer allocator.free(big);
+    @memset(big, 'Z');
+    const big_seqno = "\x00\x00\x00\x02";
+    var big_id = try rpc.messageId(allocator, "origin", big_seqno);
+    defer big_id.deinit(allocator);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", big_seqno, "t", big),
+    } });
+    try sync(router, io);
+
+    // A (v1.2 mesh peer, not the source) receives the IDONTWANT for the large id.
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountIDontWants(io, &conn_a.record, big_id.bytes) >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    // Give a wrong send to C/S a chance to land before asserting it did not.
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountIDontWants(io, &conn_a.record, big_id.bytes));
+    // C is v1.1: version-gated out. S is the source: excluded. Neither gets it.
+    try std.testing.expectEqual(@as(usize, 0), recordCountIDontWants(io, &conn_c.record, big_id.bytes));
+    try std.testing.expectEqual(@as(usize, 0), recordCountIDontWants(io, &conn_s.record, big_id.bytes));
+    // The small message produced no IDONTWANT to anyone.
+    try std.testing.expectEqual(@as(usize, 0), recordCountIDontWants(io, &conn_a.record, small_id.bytes));
+}
+
+test "IDONTWANT dont_send entry expires after its TTL, un-skipping the message" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    // Subscribe to "t", graft P (mesh) and connect S (relay source).
+    try subscribeAndWait(io, allocator, router, "t");
+    const peer_p = testPeer(1);
+    const source = testPeer(2);
+    const conn_p = try connectFakePeer(io, allocator, router, peer_p);
+    defer destroyFakeConn(allocator, conn_p);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_p, peer_p, "t"));
+
+    const from = "origin";
+    const seqno = "\x00\x00\x00\x77";
+    var id = try rpc.messageId(allocator, from, seqno);
+    defer id.deinit(allocator);
+
+    // P IDONTWANTs the id (recorded at tick 0 → expiry = dont_send_ttl_ticks).
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_p,
+        .rpc = try buildInboundIDontWant(allocator, &[_]?[]const u8{id.bytes}),
+    } });
+    try sync(router, io);
+    try std.testing.expect(peerDontSendHas(router, peer_p, id.bytes));
+
+    // Beat past the TTL: ttl+1 heartbeats reclaim the entry.
+    try beatHeartbeats(io, router, mesh_params.dont_send_ttl_ticks + 1);
+    try std.testing.expect(!peerDontSendHas(router, peer_p, id.bytes));
+
+    // A later relay of that id is no longer skipped: P now receives it.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, from, seqno, "t", "again"),
+    } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_p.record, "t", "again") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_p.record, "t", "again"));
 }
