@@ -9,9 +9,14 @@
 //
 // Signing policy defaults to StrictSign (go-libp2p's default): the publisher
 // signs every message and the subscriber rejects unsigned inbound. Set
-// sign=nosign to switch to StrictNoSign with a content-addressed message-id
-// (sha256 of the data) for the reverse-direction diagnostic, where the zig
-// node publishes unsigned.
+// sign=nosign (alias anonymous) to switch to StrictNoSign with a
+// content-addressed message-id (sha256 of topic||data) so an all-anonymous
+// mixed mesh dedups consistently with the zig node, whose anonymous policy uses
+// the same sha256(topic ++ data) id.
+//
+// Set protocols=meshsub/1.1.0 to advertise ONLY gossipsub 1.1.0 (instead of the
+// default 1.2.0+1.1.0+1.0.0 set) so a version-fallback scenario can confirm a
+// 1.2-capable peer negotiates down to 1.1.0 with this node.
 package main
 
 import (
@@ -27,6 +32,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -45,6 +51,7 @@ type args struct {
 	message    string
 	durationMs int
 	sign       string // strict (default) | nosign
+	protocols  string // empty = default (1.2/1.1/1.0); "meshsub/1.1.0" = advertise only 1.1.0
 }
 
 // dialTargets returns every peer multiaddr to dial: each comma-separated entry
@@ -98,6 +105,8 @@ func parseArgs() args {
 			fmt.Sscanf(val, "%d", &a.durationMs)
 		case "sign":
 			a.sign = val
+		case "protocols":
+			a.protocols = val
 		default:
 			fatalf("unknown argument key %q", key)
 		}
@@ -156,27 +165,49 @@ func main() {
 				continue // ignore our own republished messages
 			}
 			received = true
-			fmt.Printf("RECV topic=%s from=%s data=%s\n", a.topic, msg.ReceivedFrom, string(msg.Data))
+			// `author` is the message's signed source peer-id; under StrictNoSign
+			// it is absent (empty), which the anonymous scenario asserts. `from` is
+			// the immediate relayer (always present). Print both so a scenario can
+			// distinguish "no author" from "no propagation source".
+			author := ""
+			if id := msg.GetFrom(); len(id) > 0 {
+				author = id.String()
+			}
+			fmt.Printf("RECV topic=%s author=%s from=%s data=%s\n", a.topic, author, msg.ReceivedFrom, string(msg.Data))
 		}
 	}()
 
 	// Publisher: republish every 500ms so at least one publish lands after the
-	// mesh forms (matching the zig node's strategy).
+	// mesh forms (matching the zig node's strategy). Under anonymous the
+	// message-id is content-derived sha256(topic||data), so an identical payload
+	// would be suppressed by the seen-cache after the first publish (which fires
+	// before the mesh grafts); append a #<n> suffix so each publish is unique and
+	// propagates once the mesh is up. A subscriber asserts on the message prefix.
+	anon := a.sign == "nosign" || a.sign == "anonymous"
+	payload := func(n int) []byte {
+		if anon {
+			return []byte(fmt.Sprintf("%s#%d", a.message, n))
+		}
+		return []byte(a.message)
+	}
 	deadline := time.After(time.Duration(a.durationMs) * time.Millisecond)
 	if a.mode == "pub" {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
+		n := 0
 		// Publish once immediately, then on each tick.
-		_ = topic.Publish(ctx, []byte(a.message))
+		_ = topic.Publish(ctx, payload(n))
+		n++
 	loop:
 		for {
 			select {
 			case <-deadline:
 				break loop
 			case <-ticker.C:
-				if err := topic.Publish(ctx, []byte(a.message)); err != nil {
+				if err := topic.Publish(ctx, payload(n)); err != nil {
 					fmt.Fprintf(os.Stderr, "publish failed: %v\n", err)
 				}
+				n++
 			}
 		}
 	} else {
@@ -214,17 +245,39 @@ func newHost(a args) host.Host {
 
 func newGossipSub(ctx context.Context, h host.Host, a args) *pubsub.PubSub {
 	opts := []pubsub.Option{}
-	if a.sign == "nosign" {
-		// Reverse-direction diagnostic: accept unsigned messages and use a
-		// content-addressed message-id (the zig node publishes unsigned, with a
-		// from++seqno id we cannot reproduce without signing).
+	if a.sign == "nosign" || a.sign == "anonymous" {
+		// StrictNoSign / anonymous mesh: accept unsigned messages and key dedup on
+		// a content-addressed message-id. The id MUST match every other impl in the
+		// topic. The zig node's anonymous policy uses sha256(topic ++ data), so this
+		// hashes topic then data in the same order. (go's signed default keys on
+		// from++seqno, which an anonymous node cannot reproduce, so a content id is
+		// mandatory here.)
+		// WithMessageSignaturePolicy(StrictNoSign) disables signing + verification
+		// but, on its own, leaves signID = host.ID() so go still attaches the
+		// author (From) + seqno on publish. WithNoAuthor clears signID so the
+		// published message truly carries no author/seqno — matching the zig and
+		// rust anonymous wire format the scenario asserts.
 		opts = append(opts,
 			pubsub.WithMessageSignaturePolicy(pubsub.StrictNoSign),
+			pubsub.WithNoAuthor(),
 			pubsub.WithMessageIdFn(func(m *pubsubpb.Message) string {
-				h := sha256.Sum256(m.Data)
-				return string(h[:])
+				hsh := sha256.New()
+				hsh.Write([]byte(m.GetTopic()))
+				hsh.Write(m.Data)
+				return string(hsh.Sum(nil))
 			}),
 		)
+	}
+	if a.protocols == "meshsub/1.1.0" {
+		// Advertise ONLY gossipsub 1.1.0 (not the default 1.2/1.1/1.0 set) so a
+		// 1.2-capable peer must negotiate down to 1.1.0 to talk to us. Use the
+		// default feature test restricted to the single id so mesh/gossip features
+		// still light up for 1.1.0.
+		only11 := []protocol.ID{pubsub.GossipSubID_v11}
+		feat := func(feat pubsub.GossipSubFeature, proto protocol.ID) bool {
+			return proto == pubsub.GossipSubID_v11
+		}
+		opts = append(opts, pubsub.WithGossipSubProtocols(only11, feat))
 	}
 	gs, err := pubsub.NewGossipSub(ctx, h, opts...)
 	if err != nil {

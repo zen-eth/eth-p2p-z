@@ -737,6 +737,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "libp2p",
+ "sha2",
  "tokio",
 ]
 

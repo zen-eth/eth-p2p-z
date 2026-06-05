@@ -37,8 +37,22 @@ const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 /// How often the publisher republishes its payload (mesh-formation tolerant).
 const publish_interval_ms: u64 = 500;
 
+/// Upper bound on a printed RECV line (and any single stdout write). Sized to
+/// hold the topic, a hex author id, and a data payload well above the 1 KiB
+/// gossipsub v1.2 IDONTWANT threshold, so the large-message interop scenario's
+/// payload prints (and matches) intact rather than being truncated/dropped.
+const max_print_len: usize = 8192;
+
 const Role = enum { listen, dial };
 const Mode = enum { publish, subscribe };
+
+/// Which signing scheme this node runs. `strict` signs every outbound message
+/// and verifies inbound (the go-libp2p default, and what the base mixed-mesh
+/// runs use). `anonymous` is StrictNoSign: messages carry no author/seqno, are
+/// keyed by a content-derived id (`sha256(topic ++ data)`), and inbound is not
+/// verified — every node in the topic must agree on the SAME id scheme or dedup
+/// breaks, which is exactly what the anonymous cross-impl scenario checks.
+const Sign = enum { strict, anonymous };
 
 const Args = struct {
     role: Role,
@@ -54,6 +68,9 @@ const Args = struct {
     topic: []const u8 = "interop-test",
     message: []const u8 = "hello-gossipsub",
     duration_ms: u64 = 5000,
+    /// Signing scheme: `strict` (default, signs+verifies) or `anonymous`
+    /// (StrictNoSign, content-id dedup). See `Sign`.
+    sign: Sign = .strict,
 
     /// Iterate the dial targets: every entry of `peers` (split on commas) plus a
     /// lone `peer` if set. Blank entries are skipped so a trailing comma is fine.
@@ -128,6 +145,12 @@ const Args = struct {
                 out.message = value;
             } else if (std.mem.eql(u8, key, "duration_ms")) {
                 out.duration_ms = try std.fmt.parseInt(u64, value, 10);
+            } else if (std.mem.eql(u8, key, "sign")) {
+                if (std.mem.eql(u8, value, "strict")) {
+                    out.sign = .strict;
+                } else if (std.mem.eql(u8, value, "anonymous") or std.mem.eql(u8, value, "nosign")) {
+                    out.sign = .anonymous;
+                } else return error.InvalidSign;
             } else {
                 std.log.err("unknown argument key '{s}'", .{key});
                 return error.UnknownArgument;
@@ -163,12 +186,14 @@ const Recorder = struct {
     fn onMessage(ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
         self.received.store(true, .release);
-        // A clear, greppable line so the orchestrator can assert delivery. The
-        // sender id is raw peer-id bytes; print as hex to stay printable.
-        var line_buf: [640]u8 = undefined;
+        // A clear, greppable line so the orchestrator can assert delivery. `from`
+        // is the message AUTHOR's peer-id (raw bytes, printed as hex to stay
+        // printable). Under the anonymous policy it is empty, so `author=` prints
+        // blank — which the anonymous scenario asserts (no author on the wire).
+        var line_buf: [max_print_len]u8 = undefined;
         const line = std.fmt.bufPrint(
             &line_buf,
-            "RECV topic={s} from={x} data={s}\n",
+            "RECV topic={s} author={x} data={s}\n",
             .{ topic, from[0..@min(from.len, 64)], data },
         ) catch return;
         printToStdout(self.io, line) catch {};
@@ -216,12 +241,24 @@ pub fn main(init: std.process.Init) !void {
 
     var recorder = Recorder{ .io = io };
     // Construct gossipsub BEFORE any dial/accept so its peer-event callback is
-    // registered when the connection comes up. Pass the host key to enable
-    // StrictSign (sign outbound, verify inbound) so go-libp2p — which defaults to
-    // StrictSign — accepts our published messages and we accept its signed ones.
+    // registered when the connection comes up.
+    //
+    // In `strict` mode pass the host key to enable StrictSign (sign outbound,
+    // verify inbound) so go-libp2p — which defaults to StrictSign — accepts our
+    // published messages and we accept its signed ones. In `anonymous` mode pass
+    // NO key and the anonymous (StrictNoSign) policy: messages carry no author,
+    // inbound is not verified, and dedup keys on the content id
+    // `sha256(topic ++ data)` (the policy's built-in derivation), which the go and
+    // rust peers must match for cross-impl propagation to line up.
+    //
     // Scoring is left disabled here (null): the interop binary exercises the
     // base mesh/gossip behaviour against go/rust-libp2p without the score gates.
-    const gs = try gossipsub.Gossipsub.init(allocator, io, switcher, local_peer, &host_key, recorder.handler(), null, .{});
+    const host_key_opt: ?*const identity.KeyPair = if (args.sign == .strict) &host_key else null;
+    const gs_config: gossipsub.RouterConfig = switch (args.sign) {
+        .strict => .{},
+        .anonymous => .{ .signature_policy = .anonymous },
+    };
+    const gs = try gossipsub.Gossipsub.init(allocator, io, switcher, local_peer, host_key_opt, recorder.handler(), null, gs_config);
     var gs_live = true;
     defer if (gs_live) gs.deinit();
 
@@ -390,18 +427,36 @@ fn runDialer(
     try runForDuration(io, gs, args);
 }
 
-/// Run until `duration_ms` elapses. In publish mode, republish the payload every
+/// Run until `duration_ms` elapses. In publish mode, republish every
 /// `publish_interval_ms` so at least one publish lands after the mesh forms; in
 /// subscribe mode, just wait (deliveries arrive on the router fiber).
+///
+/// Under the anonymous policy the message-id is content-derived
+/// (`sha256(topic ++ data)`), so republishing the IDENTICAL payload yields the
+/// same id every time and the router's seen-cache suppresses every publish after
+/// the first — which fires before the mesh has grafted, so nothing propagates.
+/// (go-libp2p's StrictNoSign behaves the same: it checks the seen-cache before
+/// publishing.) To keep the republish-until-meshed strategy working under
+/// anonymous, append an incrementing suffix so each publish has a UNIQUE payload
+/// (hence a fresh content-id) and propagates once the mesh is up. The suffix is
+/// `#<n>`, so a subscriber asserts on the message PREFIX. Signed publishes carry
+/// a fresh seqno each time, so they keep the plain payload.
 fn runForDuration(io: std.Io, gs: *gossipsub.Gossipsub, args: *const Args) !void {
     if (args.mode != .publish) {
         try timeoutFromMs(args.duration_ms).sleep(io);
         return;
     }
 
+    var msg_buf: [max_print_len]u8 = undefined;
+    var seq: u64 = 0;
     var elapsed_ms: u64 = 0;
     while (elapsed_ms < args.duration_ms) : (elapsed_ms += publish_interval_ms) {
-        gs.publish(args.topic, args.message) catch |err| {
+        const payload: []const u8 = if (args.sign == .anonymous)
+            std.fmt.bufPrint(&msg_buf, "{s}#{d}", .{ args.message, seq }) catch args.message
+        else
+            args.message;
+        seq += 1;
+        gs.publish(args.topic, payload) catch |err| {
             std.log.warn("publish failed: {any}", .{err});
         };
         const step = @min(publish_interval_ms, args.duration_ms - elapsed_ms);
@@ -456,7 +511,7 @@ fn writeAddrFile(io: std.Io, path: []const u8, contents: []const u8) !void {
 /// position, which is correct for both pipes and redirected files.
 fn printToStdout(io: std.Io, bytes: []const u8) !void {
     const stdout_file: std.Io.File = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
-    var buf: [640]u8 = undefined;
+    var buf: [max_print_len]u8 = undefined;
     var writer = stdout_file.writerStreaming(io, &buf);
     try writer.interface.writeAll(bytes);
     try writer.interface.flush();

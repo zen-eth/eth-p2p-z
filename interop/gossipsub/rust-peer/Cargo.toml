@@ -11,6 +11,10 @@ publish = false
 libp2p = { version = "0.56", features = ["gossipsub", "quic", "identify", "ed25519", "tokio", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "fs"] }
 futures = "0.3"
+# Content-addressed message-id for the anonymous scenario: sha256(topic||data),
+# matching the zig and go peers. Already in the lock as a libp2p transitive dep,
+# so it resolves offline.
+sha2 = "0.10"
 
 [[bin]]
 name = "gspeer"

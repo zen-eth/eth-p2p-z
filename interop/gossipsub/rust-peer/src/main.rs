@@ -7,10 +7,16 @@
 // every 500ms (mesh-formation tolerant, matching the zig node); a subscriber
 // prints "RECV ..." on receipt and a final {"received":..} JSON line.
 //
-// Signing policy is MessageAuthenticity::Signed (rust-libp2p's StrictSign
-// equivalent and the default for go-libp2p): the publisher signs every message
-// and the subscriber rejects unsigned inbound. This matches the zig node, which
-// also signs per the libp2p pubsub scheme, so both directions verify.
+// Signing policy defaults to MessageAuthenticity::Signed (rust-libp2p's
+// StrictSign equivalent and the default for go-libp2p): the publisher signs
+// every message and the subscriber rejects unsigned inbound. This matches the
+// zig node, which also signs per the libp2p pubsub scheme, so both directions
+// verify. Set sign=anonymous (alias nosign) for MessageAuthenticity::Anonymous
+// with a content-addressed message-id sha256(topic||data), matching the zig
+// node's anonymous policy so an all-anonymous mixed mesh dedups consistently.
+//
+// Set protocols=meshsub/1.1.0 to advertise ONLY gossipsub 1.1.0 so a
+// version-fallback scenario can confirm a 1.2-capable peer negotiates down.
 //
 // Identify is included because rust-libp2p's gossipsub (like go's) only opens a
 // /meshsub stream to a peer once it learns, via the /ipfs/id/1.0.0 exchange,
@@ -23,6 +29,7 @@ use futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic, MessageAuthenticity};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{identify, identity, quic, Multiaddr, PeerId, Swarm, Transport};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::time::{interval, sleep, Instant};
 
@@ -38,6 +45,8 @@ struct Args {
     topic: String,
     message: String,
     duration_ms: u64,
+    sign: String,      // strict (default) | anonymous (alias nosign)
+    protocols: String, // empty = default (1.2/1.1/1.0); "meshsub/1.1.0" = only 1.1.0
 }
 
 impl Args {
@@ -74,6 +83,8 @@ fn parse_args() -> Args {
         topic: "interop-test".into(),
         message: "hello-from-rust".into(),
         duration_ms: 12000,
+        sign: "strict".into(),
+        protocols: String::new(),
     };
     for arg in std::env::args().skip(1) {
         let (key, val) = arg
@@ -89,6 +100,8 @@ fn parse_args() -> Args {
             "topic" => a.topic = val.into(),
             "message" => a.message = val.into(),
             "duration_ms" => a.duration_ms = val.parse().unwrap_or(12000),
+            "sign" => a.sign = val.into(),
+            "protocols" => a.protocols = val.into(),
             other => fatal(&format!("unknown argument key {other:?}")),
         }
     }
@@ -120,7 +133,7 @@ async fn main() {
     let keypair = identity::Keypair::generate_ed25519();
     let local_peer = PeerId::from(keypair.public());
 
-    let behaviour = build_behaviour(&keypair);
+    let behaviour = build_behaviour(&keypair, &a);
 
     // QUIC v1 transport, mapped to the swarm's (PeerId, StreamMuxer) output.
     let quic_transport = quic::tokio::Transport::new(quic::Config::new(&keypair))
@@ -183,18 +196,48 @@ async fn main() {
     run_event_loop(&mut swarm, &a, &topic, local_peer).await;
 }
 
-fn build_behaviour(keypair: &identity::Keypair) -> Behaviour {
-    // Signed authenticity = StrictSign: sign outbound, require + verify signed
-    // inbound. Matches go-libp2p's default and the zig node's signing so both
-    // directions verify the from/key binding.
-    let gossipsub = gossipsub::Behaviour::new(
-        MessageAuthenticity::Signed(keypair.clone()),
-        gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_secs(1))
-            .build()
-            .unwrap_or_else(|e| fatal(&format!("gossipsub config: {e}"))),
-    )
-    .unwrap_or_else(|e| fatal(&format!("gossipsub behaviour: {e}")));
+fn build_behaviour(keypair: &identity::Keypair, a: &Args) -> Behaviour {
+    let anonymous = a.sign == "anonymous" || a.sign == "nosign";
+
+    // Authenticity: Signed = StrictSign (sign outbound, require + verify signed
+    // inbound; matches go-libp2p's default and the zig node's signing). Anonymous
+    // = StrictNoSign (no author/seqno on the wire, no verification) for the
+    // anonymous mixed mesh.
+    let authenticity = if anonymous {
+        MessageAuthenticity::Anonymous
+    } else {
+        MessageAuthenticity::Signed(keypair.clone())
+    };
+
+    let mut config = gossipsub::ConfigBuilder::default();
+    config.heartbeat_interval(Duration::from_secs(1));
+    if anonymous {
+        // StrictNoSign: the default ValidationMode is Strict, which requires a
+        // signature on every inbound message and rejects unsigned ones — so the
+        // Anonymous authenticity must pair with ValidationMode::Anonymous (no
+        // author/seqno/signature expected) or the behaviour refuses to build.
+        config.validation_mode(gossipsub::ValidationMode::Anonymous);
+        // Content-addressed id sha256(topic||data), matching the zig and go peers.
+        // Under StrictNoSign there is no from/seqno to key on, so all impls in the
+        // topic MUST agree on this id or dedup/propagation breaks.
+        config.message_id_fn(|m: &gossipsub::Message| {
+            let mut hasher = Sha256::new();
+            hasher.update(m.topic.as_str().as_bytes());
+            hasher.update(&m.data);
+            gossipsub::MessageId::from(hasher.finalize().to_vec())
+        });
+    }
+    if a.protocols == "meshsub/1.1.0" {
+        // Advertise ONLY gossipsub 1.1.0 (not the default 1.1.0+1.0.0 set) so a
+        // 1.2-capable peer must negotiate down to 1.1.0 to talk to us.
+        config.protocol_id("/meshsub/1.1.0", gossipsub::Version::V1_1);
+    }
+    let config = config
+        .build()
+        .unwrap_or_else(|e| fatal(&format!("gossipsub config: {e}")));
+
+    let gossipsub = gossipsub::Behaviour::new(authenticity, config)
+        .unwrap_or_else(|e| fatal(&format!("gossipsub behaviour: {e}")));
 
     // Advertise our protocols (identify + meshsub) so the peer's gossipsub learns
     // we speak meshsub and grafts us into its mesh.
@@ -215,6 +258,13 @@ async fn run_event_loop(
     let deadline = Instant::now() + Duration::from_millis(a.duration_ms);
     let mut received = false;
     let mut ticker = interval(PUBLISH_INTERVAL);
+    // Under anonymous the message-id is content-derived sha256(topic||data), so
+    // an identical payload is suppressed by the seen-cache after the first
+    // publish (which fires before the mesh grafts); append a #<n> suffix so each
+    // publish is unique and propagates once the mesh is up. A subscriber asserts
+    // on the message prefix. Signed publishes keep the plain payload.
+    let anonymous = a.sign == "anonymous" || a.sign == "nosign";
+    let mut seq: u64 = 0;
 
     loop {
         tokio::select! {
@@ -223,10 +273,16 @@ async fn run_event_loop(
             // Publisher: republish every 500ms so at least one publish lands
             // after the mesh forms (matching the zig node's strategy).
             _ = ticker.tick(), if a.mode == "pub" => {
+                let payload = if anonymous {
+                    format!("{}#{}", a.message, seq).into_bytes()
+                } else {
+                    a.message.as_bytes().to_vec()
+                };
+                seq += 1;
                 if let Err(e) = swarm
                     .behaviour_mut()
                     .gossipsub
-                    .publish(topic.clone(), a.message.as_bytes())
+                    .publish(topic.clone(), payload)
                 {
                     // No mesh peers yet before the mesh forms is expected; only
                     // surface other publish errors.
@@ -253,14 +309,19 @@ async fn run_event_loop(
                     gossipsub::Event::Message { message, propagation_source, .. },
                 )) => {
                     received = true;
-                    let from = message
+                    // `author` is the message's signed source peer-id; under
+                    // StrictNoSign (anonymous) it is None, so `author=` prints blank
+                    // — which the anonymous scenario asserts. `from` is the immediate
+                    // relayer (propagation source, always present).
+                    let author = message
                         .source
                         .map(|p| p.to_string())
-                        .unwrap_or_else(|| propagation_source.to_string());
+                        .unwrap_or_default();
                     println!(
-                        "RECV topic={} from={} data={}",
+                        "RECV topic={} author={} from={} data={}",
                         a.topic,
-                        from,
+                        author,
+                        propagation_source,
                         String::from_utf8_lossy(&message.data)
                     );
                 }
