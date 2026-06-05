@@ -32,11 +32,35 @@ struct Args {
     role: String,    // listen | dial
     mode: String,    // pub | sub
     port: String,
-    peer: Option<String>,
+    peer: Option<String>,  // a single peer multiaddr (kept for two-node runs)
+    peers: Option<String>, // comma-separated peer multiaddrs for mesh runs
     addr_file: Option<String>,
     topic: String,
     message: String,
     duration_ms: u64,
+}
+
+impl Args {
+    // Every peer multiaddr to dial: each comma-separated entry of `peers` plus a
+    // lone `peer` if set. Blank entries are skipped (a trailing comma is fine).
+    fn dial_targets(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(peers) = &self.peers {
+            for p in peers.split(',') {
+                let t = p.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+            }
+        }
+        if let Some(p) = &self.peer {
+            let t = p.trim();
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+        }
+        out
+    }
 }
 
 fn parse_args() -> Args {
@@ -45,6 +69,7 @@ fn parse_args() -> Args {
         mode: String::new(),
         port: "4101".into(),
         peer: None,
+        peers: None,
         addr_file: None,
         topic: "interop-test".into(),
         message: "hello-from-rust".into(),
@@ -59,6 +84,7 @@ fn parse_args() -> Args {
             "mode" => a.mode = val.into(),
             "port" => a.port = val.into(),
             "peer" => a.peer = Some(val.into()),
+            "peers" => a.peers = Some(val.into()),
             "addr_file" => a.addr_file = Some(val.into()),
             "topic" => a.topic = val.into(),
             "message" => a.message = val.into(),
@@ -72,8 +98,8 @@ fn parse_args() -> Args {
     if a.mode != "pub" && a.mode != "sub" {
         fatal(&format!("mode must be pub|sub, got {:?}", a.mode));
     }
-    if a.role == "dial" && a.peer.is_none() {
-        fatal("dial role requires peer=<multiaddr>");
+    if a.role == "dial" && a.peer.is_none() && a.peers.is_none() {
+        fatal("dial role requires peer=<multiaddr> or peers=<ma1>,<ma2>,...");
     }
     a
 }
@@ -126,14 +152,30 @@ async fn main() {
                 .unwrap_or_else(|e| fatal(&format!("listen_on: {e}")));
         }
         "dial" => {
-            let peer_text = a.peer.as_ref().unwrap().trim();
-            let remote: Multiaddr = peer_text
-                .parse()
-                .unwrap_or_else(|e| fatal(&format!("parse peer multiaddr {peer_text:?}: {e}")));
-            swarm
-                .dial(remote)
-                .unwrap_or_else(|e| fatal(&format!("dial: {e}")));
-            eprintln!("dialer dialing {peer_text}");
+            // Dial every configured peer. gossipsub forms a mesh over whatever
+            // connections exist, so a node that dials several peers can graft
+            // into a mesh spanning all of them. A failed dial to one peer does
+            // not abort the others.
+            let mut dialed = 0;
+            for peer_text in a.dial_targets() {
+                let remote: Multiaddr = match peer_text.parse() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("parse peer multiaddr {peer_text:?}: {e}");
+                        continue;
+                    }
+                };
+                match swarm.dial(remote) {
+                    Ok(()) => {
+                        eprintln!("dialer dialing {peer_text}");
+                        dialed += 1;
+                    }
+                    Err(e) => eprintln!("dial {peer_text}: {e}"),
+                }
+            }
+            if dialed == 0 {
+                fatal("dial role: no peers dialed");
+            }
         }
         _ => unreachable!(),
     }

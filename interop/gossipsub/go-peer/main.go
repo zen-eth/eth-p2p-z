@@ -38,12 +38,29 @@ type args struct {
 	role       string // listen | dial
 	mode       string // pub | sub
 	port       string
-	peer       string
+	peer       string // a single peer multiaddr (kept for two-node runs)
+	peers      string // comma-separated peer multiaddrs for mesh runs
 	addrFile   string
 	topic      string
 	message    string
 	durationMs int
 	sign       string // strict (default) | nosign
+}
+
+// dialTargets returns every peer multiaddr to dial: each comma-separated entry
+// of peers plus a lone peer if set. Blank entries are skipped (a trailing comma
+// is fine).
+func (a args) dialTargets() []string {
+	var out []string
+	for _, p := range strings.Split(a.peers, ",") {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if t := strings.TrimSpace(a.peer); t != "" {
+		out = append(out, t)
+	}
+	return out
 }
 
 func parseArgs() args {
@@ -69,6 +86,8 @@ func parseArgs() args {
 			a.port = val
 		case "peer":
 			a.peer = val
+		case "peers":
+			a.peers = val
 		case "addr_file":
 			a.addrFile = val
 		case "topic":
@@ -89,8 +108,8 @@ func parseArgs() args {
 	if a.mode != "pub" && a.mode != "sub" {
 		fatalf("mode must be pub|sub, got %q", a.mode)
 	}
-	if a.role == "dial" && a.peer == "" {
-		fatalf("dial role requires peer=<multiaddr>")
+	if a.role == "dial" && a.peer == "" && a.peers == "" {
+		fatalf("dial role requires peer=<multiaddr> or peers=<ma1>,<ma2>,...")
 	}
 	return a
 }
@@ -240,21 +259,35 @@ func runListener(h host.Host, a args) {
 }
 
 func runDialer(ctx context.Context, h host.Host, a args) {
-	peerText := strings.TrimSpace(a.peer)
-	maddr, err := multiaddr.NewMultiaddr(peerText)
-	if err != nil {
-		fatalf("parse peer multiaddr %q: %v", peerText, err)
+	// Connect to every configured peer. gossipsub forms a mesh over whatever
+	// connections exist, so a node that dials several peers can graft into a
+	// mesh spanning all of them. A failed dial to one peer does not abort the
+	// others — as long as at least one succeeds the node can still mesh.
+	dialed := 0
+	for _, peerText := range a.dialTargets() {
+		maddr, err := multiaddr.NewMultiaddr(peerText)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "parse peer multiaddr %q: %v\n", peerText, err)
+			continue
+		}
+		info, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "addr info from %q: %v\n", peerText, err)
+			continue
+		}
+		dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
+		err = h.Connect(dialCtx, *info)
+		dialCancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "connect to %s: %v\n", info.ID, err)
+			continue
+		}
+		fmt.Printf("dialer connected to %s\n", info.ID)
+		dialed++
 	}
-	info, err := peer.AddrInfoFromP2pAddr(maddr)
-	if err != nil {
-		fatalf("addr info from %q: %v", peerText, err)
+	if dialed == 0 {
+		fatalf("dial role: no peers connected")
 	}
-	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer dialCancel()
-	if err := h.Connect(dialCtx, *info); err != nil {
-		fatalf("connect to %s: %v", info.ID, err)
-	}
-	fmt.Printf("dialer connected to %s\n", info.ID)
 }
 
 // seqnoBytes is unused but documents the wire shape go uses for seqno (a u64);

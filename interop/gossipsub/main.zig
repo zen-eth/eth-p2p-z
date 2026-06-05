@@ -1,11 +1,17 @@
 //! A runnable gossipsub node for interop smoke testing. It stands up a real
-//! QUIC endpoint + Switch + Gossipsub service and either listens for an inbound
-//! connection or dials a peer, then subscribes to a topic and (in `pub` mode)
-//! publishes a payload repeatedly until a duration elapses.
+//! QUIC endpoint + Switch + Gossipsub service and either listens for inbound
+//! connections or dials one or more peers, then subscribes to a topic and (in
+//! `pub` mode) publishes a payload repeatedly until a duration elapses.
 //!
-//! Coordination between the two out-of-process nodes is file-based, not Redis:
-//! the listener writes its full `/p2p/<peer-id>` multiaddr to `addr_file` once
-//! bound, and an orchestrator hands that string to the dialer's `peer` arg.
+//! Connectivity is flexible: a listener accepts EVERY inbound connection (a
+//! bootstrap node in a star is dialed by every other node), and a dialer can
+//! dial MULTIPLE peers via `peers=<ma1>,<ma2>,...` (a lone `peer=<ma>` still
+//! works). gossipsub forms a mesh over whatever connections exist, so the same
+//! binary serves both the two-node smoke runs and a multi-node mixed mesh.
+//!
+//! Coordination between the out-of-process nodes is file-based, not Redis: the
+//! listener writes its full `/p2p/<peer-id>` multiaddr to `addr_file` once
+//! bound, and an orchestrator hands that string to the dialers' `peers` arg.
 //!
 //! This mirrors the transport interop binary's endpoint/Switch setup; the new
 //! piece is the Gossipsub service plus a message handler that prints received
@@ -38,11 +44,43 @@ const Args = struct {
     role: Role,
     mode: Mode,
     port: u16 = 4101,
+    /// A single peer multiaddr to dial. Kept for backward compatibility with the
+    /// two-node runs; `peers` (comma-separated) supersedes it for mesh runs.
     peer: ?[]const u8 = null,
+    /// Comma-separated peer multiaddrs to dial. The node dials every entry and
+    /// starts an inbound dispatcher per connection, so it meshes with each peer.
+    peers: ?[]const u8 = null,
     addr_file: ?[]const u8 = null,
     topic: []const u8 = "interop-test",
     message: []const u8 = "hello-gossipsub",
     duration_ms: u64 = 5000,
+
+    /// Iterate the dial targets: every entry of `peers` (split on commas) plus a
+    /// lone `peer` if set. Blank entries are skipped so a trailing comma is fine.
+    const PeerIterator = struct {
+        peers_rest: []const u8,
+        single: ?[]const u8,
+
+        fn next(self: *PeerIterator) ?[]const u8 {
+            while (self.peers_rest.len != 0) {
+                const comma = std.mem.indexOfScalar(u8, self.peers_rest, ',');
+                const raw = if (comma) |i| self.peers_rest[0..i] else self.peers_rest;
+                self.peers_rest = if (comma) |i| self.peers_rest[i + 1 ..] else self.peers_rest[raw.len..];
+                const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+                if (trimmed.len != 0) return trimmed;
+            }
+            if (self.single) |p| {
+                self.single = null;
+                const trimmed = std.mem.trim(u8, p, " \t\r\n");
+                if (trimmed.len != 0) return trimmed;
+            }
+            return null;
+        }
+    };
+
+    fn dialTargets(self: *const Args) PeerIterator {
+        return .{ .peers_rest = self.peers orelse "", .single = self.peer };
+    }
 
     /// Parse `key=value` arguments. `arena` owns the captured strings: it is the
     /// process arena, freed automatically on exit, so no per-arg frees here.
@@ -80,6 +118,8 @@ const Args = struct {
                 out.port = try std.fmt.parseInt(u16, value, 10);
             } else if (std.mem.eql(u8, key, "peer")) {
                 out.peer = value;
+            } else if (std.mem.eql(u8, key, "peers")) {
+                out.peers = value;
             } else if (std.mem.eql(u8, key, "addr_file")) {
                 out.addr_file = value;
             } else if (std.mem.eql(u8, key, "topic")) {
@@ -102,8 +142,8 @@ const Args = struct {
             std.log.err("missing required arg mode=pub|sub", .{});
             return error.MissingMode;
         }
-        if (out.role == .dial and out.peer == null) {
-            std.log.err("dial role requires peer=<multiaddr>", .{});
+        if (out.role == .dial and out.peer == null and out.peers == null) {
+            std.log.err("dial role requires peer=<multiaddr> or peers=<ma1>,<ma2>,...", .{});
             return error.MissingPeer;
         }
         return out;
@@ -234,16 +274,18 @@ fn runListener(
         try writeAddrFile(io, path, published);
     }
 
-    // Accept the inbound connection on a fiber so the run loop bounds the wait by
+    // Accept inbound connections on a fiber so the run loop bounds the wait by
     // duration: a peer might never connect, and `accept()` blocks otherwise. The
-    // fiber stores the accepted connection so we can close it on teardown.
-    var accept_state = AcceptState{ .switcher = switcher };
+    // bootstrap of a star is dialed by every other node, so the fiber loops and
+    // accepts EACH inbound connection (not just the first), starting a dispatcher
+    // per connection and stashing it for teardown.
+    var accept_state = AcceptState{ .allocator = allocator, .switcher = switcher };
     var accept_future = try std.Io.concurrent(io, AcceptState.run, .{&accept_state});
     defer {
-        // Stop the accept fiber (no-op if it already returned), then close any
+        // Stop the accept fiber (no-op if it already returned), then close every
         // accepted connection before gossipsub/Switch teardown.
         accept_future.cancel(io);
-        if (accept_state.conn) |conn| conn.deinit();
+        accept_state.deinit();
     }
 
     // Always subscribe so the mesh can form (a sub-only node still needs the
@@ -254,26 +296,46 @@ fn runListener(
 }
 
 const AcceptState = struct {
+    allocator: std.mem.Allocator,
     switcher: *libp2p.Switch,
-    conn: ?*libp2p.SwitchConnection = null,
+    conns: std.ArrayList(*libp2p.SwitchConnection) = .empty,
 
-    /// Accept one inbound connection and start its inbound stream dispatcher.
-    /// Returns on accept failure or cancellation (the run loop bounds the wait).
+    /// Accept inbound connections in a loop, starting an inbound stream
+    /// dispatcher for each. Returns on accept failure or cancellation (the run
+    /// loop bounds the wait). A bootstrap node is dialed by every leaf, so it
+    /// must accept more than one connection for the mesh to span all peers.
     fn run(self: *AcceptState) void {
-        const conn = self.switcher.accept() catch |err| {
-            switch (err) {
-                error.Canceled => {},
-                else => std.log.warn("accept failed: {any}", .{err}),
-            }
-            return;
-        };
-        // Start inbound dispatch so the `/meshsub` inbound handler runs for this
-        // connection; without it the peers wire up but never exchange RPCs.
-        conn.startInboundDispatcher(.{}) catch |err| {
-            std.log.warn("startInboundDispatcher failed: {any}", .{err});
-        };
-        std.log.info("listener accepted inbound connection", .{});
-        self.conn = conn;
+        while (true) {
+            const conn = self.switcher.accept() catch |err| {
+                switch (err) {
+                    error.Canceled => {},
+                    else => std.log.warn("accept failed: {any}", .{err}),
+                }
+                return;
+            };
+            // Start inbound dispatch so the `/meshsub` inbound handler runs for
+            // this connection; without it the peers wire up but never exchange
+            // RPCs (and the dialer's identify exchange times out).
+            conn.startInboundDispatcher(.{}) catch |err| {
+                std.log.warn("startInboundDispatcher failed: {any}", .{err});
+                conn.deinit();
+                continue;
+            };
+            // The accept fiber and the teardown both touch `conns`, but never
+            // concurrently: teardown first cancels this fiber (joining it) and
+            // only then calls deinit, so appends here are sequenced before reads
+            // there. Drop the connection if we cannot record it for teardown.
+            self.conns.append(self.allocator, conn) catch {
+                conn.deinit();
+                continue;
+            };
+            std.log.info("listener accepted inbound connection ({d} total)", .{self.conns.items.len});
+        }
+    }
+
+    fn deinit(self: *AcceptState) void {
+        for (self.conns.items) |conn| conn.deinit();
+        self.conns.deinit(self.allocator);
     }
 };
 
@@ -284,16 +346,43 @@ fn runDialer(
     gs: *gossipsub.Gossipsub,
     args: *const Args,
 ) !void {
-    const peer_text = std.mem.trim(u8, args.peer.?, " \t\r\n");
-    std.log.info("dialing {s}", .{peer_text});
-    var remote_addr = try Multiaddr.fromString(allocator, peer_text);
-    defer remote_addr.deinit(allocator);
+    // Dial every configured peer and start an inbound dispatcher per connection.
+    // gossipsub forms a mesh over whatever connections exist, so a node that
+    // dials several peers can graft into a mesh spanning all of them. Every
+    // connection must stay alive for the whole run, so they are held in a list
+    // and closed together on teardown.
+    var conns: std.ArrayList(*libp2p.SwitchConnection) = .empty;
+    defer {
+        for (conns.items) |conn| conn.deinit();
+        conns.deinit(allocator);
+    }
 
-    const conn = try switcher.dial(remote_addr, .{ .timeout = timeoutFromMs(args.duration_ms) });
-    defer conn.deinit();
-    // Start inbound dispatch so this side's `/meshsub` inbound handler runs.
-    try conn.startInboundDispatcher(.{});
-    std.log.info("dialer connected", .{});
+    var it = args.dialTargets();
+    var dialed: usize = 0;
+    while (it.next()) |peer_text| {
+        std.log.info("dialing {s}", .{peer_text});
+        var remote_addr = Multiaddr.fromString(allocator, peer_text) catch |err| {
+            std.log.warn("invalid peer multiaddr {s}: {any}", .{ peer_text, err });
+            continue;
+        };
+        defer remote_addr.deinit(allocator);
+
+        const conn = switcher.dial(remote_addr, .{ .timeout = timeoutFromMs(args.duration_ms) }) catch |err| {
+            std.log.warn("dial {s} failed: {any}", .{ peer_text, err });
+            continue;
+        };
+        // Start inbound dispatch so this side's `/meshsub` inbound handler runs
+        // for this peer; without it the peers wire up but never exchange RPCs.
+        conn.startInboundDispatcher(.{}) catch |err| {
+            std.log.warn("startInboundDispatcher for {s} failed: {any}", .{ peer_text, err });
+            conn.deinit();
+            continue;
+        };
+        try conns.append(allocator, conn);
+        dialed += 1;
+    }
+    std.log.info("dialer connected to {d} peer(s)", .{dialed});
+    if (dialed == 0) return error.NoPeersDialed;
 
     // Always subscribe so the mesh can form on both ends.
     try gs.subscribe(args.topic);
