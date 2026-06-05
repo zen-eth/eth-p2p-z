@@ -260,32 +260,38 @@ pub fn main(init: std.process.Init) !void {
     };
     const gs = try gossipsub.Gossipsub.init(allocator, io, switcher, local_peer, host_key_opt, recorder.handler(), null, gs_config);
     // Only runs on an error return from `runListener`/`runDialer` (the run never
-    // started). The success path emits its result and hard-exits below, which
-    // skips defers — see the note there for why graceful teardown is avoided.
+    // started). The success path emits its result and hard-exits from within the
+    // run functions — see the note on `finishAndExit` for why a test/interop node
+    // hard-exits rather than unwinding the per-connection teardown.
     defer gs.deinit();
 
     // `runListener` / `runDialer` run until the duration elapses, then emit the
-    // result JSON and hard-exit from within (via `finishAndExit`) — see the note
-    // there. Control therefore does NOT return here on the success path; this
-    // switch only returns when the run fails to start, in which case the error
-    // propagates out of `main` and the deferred teardown above runs normally.
+    // result JSON and hard-exit (via `finishAndExit`). Control therefore does NOT
+    // return here on the success path; this switch only returns when the run fails
+    // to start, in which case the error propagates out of `main` and the deferred
+    // teardown above runs normally.
     switch (args.role) {
         .listen => try runListener(allocator, io, switcher, &host_key, &recorder, gs, &args),
         .dial => try runDialer(allocator, io, switcher, &recorder, gs, &args),
     }
 }
 
-/// Emit the result JSON, flush stdout, then terminate the process immediately.
+/// Emit the result JSON (the orchestrator parses this line), flush stdout, then
+/// terminate the process immediately.
 ///
-/// Called at the end of a successful run, BEFORE the run functions' deferred
-/// teardown. A listener's accept fiber is parked in a blocking `Switch.accept()`
-/// waiting for the next inbound connection, and canceling that fiber does not
-/// reliably interrupt the blocked accept (a lost-wake race at teardown), so the
-/// graceful fiber unwind can hang on exit. This is a test/interop node: it does
-/// not need graceful teardown. Hard-exiting here skips every deinit — including
-/// the accept-fiber cancel/join that would otherwise deadlock — and the OS
-/// reclaims all resources, so the process ALWAYS terminates promptly.
+/// Called at the end of a successful run. By this point the listener has already
+/// quiesced new inbound accepts gracefully (`Switch.closeListener` woke and
+/// joined its accept fiber — see `runListener`), so the process is idle. What
+/// remains is tearing down the already-established per-connection actors, each of
+/// which runs an inbound `/meshsub` dispatcher parked in an UNCANCELABLE QUIC
+/// `acceptStream`. Unwinding those from the owning fiber intermittently
+/// deadlocks the cooperative runtime (the dispatcher cannot be interrupted until
+/// the connection closes, but the teardown waits on the dispatcher first), which
+/// is an orthogonal connection-lifecycle issue. This is a test/interop node, so
+/// it hard-exits here: every deinit is skipped and the OS reclaims all resources,
+/// so the process ALWAYS terminates promptly with no teardown hang.
 fn finishAndExit(io: std.Io, recorder: *Recorder, args: *const Args) noreturn {
+    _ = io;
     const received = recorder.received.load(.acquire);
     var json_buf: [256]u8 = undefined;
     const json = std.fmt.bufPrint(
@@ -297,7 +303,19 @@ fn finishAndExit(io: std.Io, recorder: *Recorder, args: *const Args) noreturn {
             if (received) "true" else "false",
         },
     ) catch unreachable; // The fixed format + bounded fields always fit json_buf.
-    printToStdout(io, json) catch {};
+    // Write the result line with a DIRECT write(2) syscall rather than through the
+    // cooperative io runtime. The spinning inbound dispatchers (one per live
+    // connection, parked in an uncancelable QUIC acceptStream) can starve the
+    // runtime's file I/O at this point, so a runtime-mediated write could fail to
+    // be scheduled and the result line — which the orchestrator parses — could be
+    // lost or delayed. A raw write to the stdout fd is immune to that, and is the
+    // last thing this process needs before it exits.
+    var off: usize = 0;
+    while (off < json.len) {
+        const n = std.c.write(std.posix.STDOUT_FILENO, json.ptr + off, json.len - off);
+        if (n <= 0) break; // EOF/error: nothing more we can usefully do before exit.
+        off += @intCast(n);
+    }
     std.process.exit(0);
 }
 
@@ -333,8 +351,10 @@ fn runListener(
     var accept_state = AcceptState{ .allocator = allocator, .switcher = switcher };
     var accept_future = try std.Io.concurrent(io, AcceptState.run, .{&accept_state});
     defer {
-        // Stop the accept fiber (no-op if it already returned), then close every
-        // accepted connection before gossipsub/Switch teardown.
+        // Error-path teardown only. The success path hard-exits via
+        // `finishAndExit` (noreturn), so this defer does not run there; it cleans
+        // up when the run fails to start. `closeListener` makes the accept fiber
+        // return, so cancel here is a no-op if it already did.
         accept_future.cancel(io);
         accept_state.deinit();
     }
@@ -345,9 +365,19 @@ fn runListener(
 
     try runForDuration(io, gs, args);
 
-    // Hard-exit here, BEFORE the `accept_future.cancel` / `accept_state.deinit`
-    // teardown defer above runs: that defer is exactly the blocked-accept cancel
-    // that can deadlock. `finishAndExit` never returns.
+    // Graceful quiesce of inbound accepts: `Switch.closeListener` closes the
+    // accept queue, so an accept fiber parked in `accept()` wakes with
+    // `error.ListenerClosed` and returns cleanly (no cancel of a blocked accept,
+    // no lost-wake hang). We do NOT then block on joining the accept fiber: if it
+    // is mid-flight handling a just-accepted connection (spawning that
+    // connection's inbound dispatcher), joining could wait on the per-connection
+    // actor teardown, which intermittently deadlocks the cooperative runtime — the
+    // same orthogonal connection-lifecycle issue described on `finishAndExit`.
+    // Quiescing is enough; the hard-exit reclaims the rest.
+    switcher.closeListener(io);
+
+    // Emit the result and hard-exit. `finishAndExit` never returns, so the
+    // accept_state/connection teardown defers above are intentionally skipped.
     finishAndExit(io, recorder, args);
 }
 
@@ -364,7 +394,10 @@ const AcceptState = struct {
         while (true) {
             const conn = self.switcher.accept() catch |err| {
                 switch (err) {
-                    error.Canceled => {},
+                    // Both are clean stops: `ListenerClosed` is the graceful
+                    // shutdown signal from `Switch.closeListener`; `Canceled` is
+                    // a direct fiber cancel. Neither is a failure to log.
+                    error.ListenerClosed, error.Canceled => {},
                     else => std.log.warn("accept failed: {any}", .{err}),
                 }
                 return;
@@ -447,9 +480,10 @@ fn runDialer(
     try runForDuration(io, gs, args);
 
     // Emit the result and hard-exit, matching the listener path so every node
-    // terminates promptly without a fiber-graceful teardown. `finishAndExit`
-    // never returns. (A dialer has no blocking accept fiber, but hard-exiting
-    // keeps shutdown uniform and immune to any connection-deinit stall.)
+    // terminates promptly. A dialer has no blocking accept fiber, but hard-exiting
+    // keeps shutdown uniform and immune to the per-connection actor teardown stall
+    // (each dialed connection runs an inbound dispatcher in the same uncancelable
+    // QUIC `acceptStream` as the listener's). `finishAndExit` never returns.
     finishAndExit(io, recorder, args);
 }
 

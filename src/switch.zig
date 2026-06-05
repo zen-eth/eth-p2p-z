@@ -115,7 +115,7 @@ pub const Switch = struct {
     pub const ListenError = error{AddressInvalid} || quic.QuicEndpoint.ListenError;
     pub const DialOptions = struct { timeout: std.Io.Timeout = .none };
     pub const DialError = error{ AddressInvalid, PeerIdentityMismatch } || quic.QuicEndpoint.DialError || std.Io.ConcurrentError;
-    pub const AcceptError = std.Io.Cancelable || std.Io.ConcurrentError || std.mem.Allocator.Error;
+    pub const AcceptError = quic.QuicEndpoint.AcceptError || std.Io.ConcurrentError || std.mem.Allocator.Error;
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, endpoint: *quic.QuicEndpoint) InitError!*Switch {
         const sw = try allocator.create(Switch);
@@ -226,6 +226,28 @@ pub const Switch = struct {
     pub fn accept(sw: *Switch) AcceptError!*SwitchConnection {
         const conn = try sw.endpoint.accept();
         return sw.manageConnection(conn);
+    }
+
+    /// Graceful-shutdown helper: unblock a fiber parked in `accept`. After this,
+    /// a blocked `accept` returns `error.ListenerClosed` (distinct from
+    /// `error.Canceled`), so an accept loop can detect the stop and exit cleanly
+    /// instead of treating it as an unexpected failure. The underlying endpoint
+    /// is NOT torn down — existing connections keep working — so a caller can
+    /// quiesce inbound accepts before closing connections and running `deinit`.
+    /// Idempotent and safe to call before `deinit`; the later listener teardown
+    /// in `endpoint.deinit` won't double-close the accept channel. The `io`
+    /// argument is accepted for call-site symmetry with the rest of the
+    /// concurrency API; the Switch closes the accept channel via its own stored
+    /// `io`, so the passed value is not required to differ.
+    pub fn closeListener(sw: *Switch, io: std.Io) void {
+        _ = io;
+        sw.endpoint.stopAccepting();
+    }
+
+    /// Alias for `closeListener`, named for the operation it performs (stop
+    /// accepting new inbound connections).
+    pub fn stopAccepting(sw: *Switch, io: std.Io) void {
+        sw.closeListener(io);
     }
 
     /// Returns the libp2p peer id of the remote, derived from the verified
@@ -1654,4 +1676,184 @@ test "switch rejects inbound handlers past the aggregate cap, recycling slots" {
         io_time.ms(5).sleep(io) catch {};
     }
     try std.testing.expectEqual(@as(usize, 2), ctx.peak.load(.acquire));
+}
+
+test "closeListener unblocks a waiting accept for graceful shutdown" {
+    // The core graceful-shutdown proof: a fiber parked in Switch.accept() (no
+    // pending inbound) must be released cleanly by closeListener — returning the
+    // distinct error.ListenerClosed (NOT error.Canceled) — so the accept loop
+    // exits promptly, and a subsequent deinit completes with no hang or leak.
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    // An accept loop that mirrors the interop binary's: it accepts in a loop and
+    // treats ListenerClosed (and Canceled) as a clean stop. Records the terminal
+    // error and the number of accepts so the test can assert what unblocked it.
+    const AcceptLoop = struct {
+        sw: *Switch,
+        done: std.Io.Event = .unset,
+        terminal: ?anyerror = null,
+        accepts: usize = 0,
+
+        fn run(self: *@This()) void {
+            while (true) {
+                const conn = self.sw.accept() catch |err| {
+                    self.terminal = err;
+                    self.done.set(self.sw.io);
+                    return;
+                };
+                self.accepts += 1;
+                conn.deinit();
+            }
+        }
+    };
+
+    var loop = AcceptLoop{ .sw = server };
+    var loop_future = try std.Io.concurrent(io, AcceptLoop.run, .{&loop});
+
+    // Give the fiber time to actually park inside accept() with nothing pending,
+    // so we are exercising the blocked-accept wakeup (not a pre-close fast path).
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expect(!loop.done.isSet());
+
+    // Ask the listener to stop accepting. The parked accept() must wake.
+    server.closeListener(io);
+
+    // The accept fiber must exit promptly. Bounded wait so a regression (the old
+    // lost-wake hang) fails the test instead of blocking the suite forever.
+    var waited_ms: usize = 0;
+    while (!loop.done.isSet()) {
+        if (waited_ms >= 5000) return error.AcceptDidNotUnblock;
+        io_time.ms(10).sleep(io) catch {};
+        waited_ms += 10;
+    }
+    loop_future.await(io);
+
+    // It unblocked with the clean closed error, distinct from a fiber cancel, and
+    // never spuriously accepted a connection (none was dialed).
+    try std.testing.expectEqual(@as(anyerror, error.ListenerClosed), loop.terminal.?);
+    try std.testing.expectEqual(@as(usize, 0), loop.accepts);
+
+    // closeListener is idempotent: a second call (and the implicit close inside
+    // server.deinit() / endpoint.deinit() below) must not double-close or fault.
+    server.closeListener(io);
+
+    // A fresh accept after the listener is closed returns the clean error too,
+    // rather than hanging.
+    try std.testing.expectError(error.ListenerClosed, server.accept());
+}
+
+test "closeListener is idempotent across repeated calls and teardown" {
+    // Closing the accept queue is guarded by the channel's own `closed` flag, so
+    // calling closeListener many times (and again implicitly inside deinit) must
+    // not double-close, fault, or leak. This exercises the idempotency directly,
+    // without a parked accept fiber: just close repeatedly on a bound listener.
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    // Several closes in a row, each a no-op after the first.
+    server.closeListener(io);
+    server.closeListener(io);
+    server.stopAccepting(io);
+
+    // Every accept after closing reports the clean closed error, never hangs.
+    try std.testing.expectError(error.ListenerClosed, server.accept());
+    try std.testing.expectError(error.ListenerClosed, server.accept());
+
+    // The deferred server.deinit() / endpoint.deinit() below run the listener's
+    // full teardown, which closes the same accept channel once more — still safe.
+}
+
+test "closeListener drains a queued-but-unaccepted inbound connection without leak" {
+    // When an inbound connection has been accepted by the router and buffered in
+    // the accept queue but never handed to a Switch.accept() caller, closing the
+    // listener (and the following endpoint teardown) must release that buffered
+    // connection. The std.testing.allocator asserts no leak: the queued
+    // connection is dropped/closed on teardown rather than orphaned.
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    // Dial in: the server's router completes the handshake and BUFFERS the
+    // resulting connection in the accept queue. We deliberately do NOT call
+    // server.accept(), so the inbound connection stays queued and unaccepted.
+    const client_conn = try client.dial(dial_addr, .{});
+    defer client_conn.deinit();
+
+    // Give the server's router fiber time to publish the accepted connection into
+    // the accept queue, so it is genuinely buffered before we stop accepting.
+    var waited_ms: usize = 0;
+    while (server_endpoint.stats().connections_established == 0) {
+        if (waited_ms >= 5000) return error.InboundNeverQueued;
+        io_time.ms(10).sleep(io) catch {};
+        waited_ms += 10;
+    }
+    // A small extra settle so the publish into the queue has definitely landed.
+    io_time.ms(50).sleep(io) catch {};
+
+    // Stop accepting WITHOUT ever calling server.accept(): the inbound connection
+    // stays buffered in the closed accept queue. The listener teardown
+    // (server.deinit -> endpoint.deinit) must drain and release that buffered
+    // connection rather than orphan it. The std.testing.allocator's leak check at
+    // the end of the test is the assertion: a leaked queued connection fails here.
+    server.closeListener(io);
+    server.closeListener(io); // still idempotent with a buffered item present.
 }

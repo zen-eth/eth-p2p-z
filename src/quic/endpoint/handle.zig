@@ -28,6 +28,7 @@ pub const QuicEndpoint = opaque {
     pub const InitError = config.ConfigError || error{RandomFailed} || std.mem.Allocator.Error;
     pub const InitWithIdentityError = InitError || tls.ContextCreateError;
     pub const ListenError = router.ListenError;
+    pub const AcceptError = router.AcceptError;
     pub const DialError = dialer.DialError;
     pub const DialOptions = dialer.DialOptions;
 
@@ -147,8 +148,19 @@ pub const QuicEndpoint = opaque {
         return dialer.dial(dialerContext(e), addr, opts);
     }
 
-    pub fn accept(e: *QuicEndpoint) std.Io.Cancelable!*Connection {
+    pub fn accept(e: *QuicEndpoint) AcceptError!*Connection {
         return router.accept(routerContext(e));
+    }
+
+    /// Graceful-shutdown helper: unblock a fiber parked in `accept` so it can
+    /// exit, WITHOUT tearing the listener down. A blocked `accept` then returns
+    /// `error.ListenerClosed` (distinct from `error.Canceled`), letting an
+    /// accept loop stop cleanly. The endpoint stays usable for existing
+    /// connections; `deinit` still performs the full teardown afterward.
+    /// Idempotent and safe before `bind` (no-op on an unbound endpoint), and
+    /// safe to call before `deinit` (the later listener close won't double-free).
+    pub fn stopAccepting(e: *QuicEndpoint) void {
+        router.stopAccepting(routerContext(e));
     }
 
     pub fn localAddr(e: *QuicEndpoint) ?std.Io.net.IpAddress {

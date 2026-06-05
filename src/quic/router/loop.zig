@@ -154,15 +154,33 @@ pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAd
     return shared_socket.address();
 }
 
-pub fn accept(ep: Context) std.Io.Cancelable!*Connection {
+pub const AcceptError = error{ListenerClosed} || std.Io.Cancelable;
+
+pub fn accept(ep: Context) AcceptError!*Connection {
     const io = ep.io;
-    const ch = ep.accept_queue_slot.* orelse return error.Canceled;
+    // A null slot means the listener was never bound or already fully torn
+    // down; a closed-but-present channel means `stopAccepting`/`closeListener`
+    // asked accepting to stop. Both surface as `ListenerClosed` so a caller's
+    // accept loop can tell "stop accepting" apart from cancellation of its own
+    // fiber (`Canceled`).
+    const ch = ep.accept_queue_slot.* orelse return error.ListenerClosed;
     const conn = ch.receiver().recv(io) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        error.Closed => return error.Canceled,
+        error.Closed => return error.ListenerClosed,
     };
     _ = ep.accept_available.fetchAdd(1, .acq_rel);
     return conn;
+}
+
+/// Unblock a fiber parked in `accept` for graceful shutdown WITHOUT tearing the
+/// listener down. Closes the accept channel so a blocked `recv` returns (and
+/// `accept` reports `ListenerClosed`); the router fiber, socket, and CID map
+/// stay live until `closeListener` runs. Idempotent: the channel's `close` is
+/// guarded by its own `closed` flag, and `closeListener` calling `close` again
+/// is a harmless no-op — no double-free, no use-after-free. Safe on an unbound
+/// endpoint (null slot is a no-op).
+pub fn stopAccepting(ep: Context) void {
+    if (ep.accept_queue_slot.*) |state| state.close(ep.io);
 }
 
 pub fn closeListener(ep: Context) void {
