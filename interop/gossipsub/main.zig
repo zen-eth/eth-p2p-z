@@ -276,22 +276,10 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-/// Emit the result JSON (the orchestrator parses this line), flush stdout, then
-/// terminate the process immediately.
-///
-/// Called at the end of a successful run. By this point the listener has already
-/// quiesced new inbound accepts gracefully (`Switch.closeListener` woke and
-/// joined its accept fiber — see `runListener`), so the process is idle. What
-/// remains is tearing down the already-established per-connection actors, each of
-/// which runs an inbound `/meshsub` dispatcher parked in an UNCANCELABLE QUIC
-/// `acceptStream`. Unwinding those from the owning fiber intermittently
-/// deadlocks the cooperative runtime (the dispatcher cannot be interrupted until
-/// the connection closes, but the teardown waits on the dispatcher first), which
-/// is an orthogonal connection-lifecycle issue. This is a test/interop node, so
-/// it hard-exits here: every deinit is skipped and the OS reclaims all resources,
-/// so the process ALWAYS terminates promptly with no teardown hang.
-fn finishAndExit(io: std.Io, recorder: *Recorder, args: *const Args) noreturn {
-    _ = io;
+/// Emit the result JSON line that the orchestrator parses. Written with a DIRECT
+/// write(2) syscall rather than through the cooperative io runtime, so it cannot
+/// be delayed or lost if the runtime is momentarily busy at shutdown.
+fn emitResult(recorder: *Recorder, args: *const Args) void {
     const received = recorder.received.load(.acquire);
     var json_buf: [256]u8 = undefined;
     const json = std.fmt.bufPrint(
@@ -303,19 +291,24 @@ fn finishAndExit(io: std.Io, recorder: *Recorder, args: *const Args) noreturn {
             if (received) "true" else "false",
         },
     ) catch unreachable; // The fixed format + bounded fields always fit json_buf.
-    // Write the result line with a DIRECT write(2) syscall rather than through the
-    // cooperative io runtime. The spinning inbound dispatchers (one per live
-    // connection, parked in an uncancelable QUIC acceptStream) can starve the
-    // runtime's file I/O at this point, so a runtime-mediated write could fail to
-    // be scheduled and the result line — which the orchestrator parses — could be
-    // lost or delayed. A raw write to the stdout fd is immune to that, and is the
-    // last thing this process needs before it exits.
     var off: usize = 0;
     while (off < json.len) {
         const n = std.c.write(std.posix.STDOUT_FILENO, json.ptr + off, json.len - off);
-        if (n <= 0) break; // EOF/error: nothing more we can usefully do before exit.
+        if (n <= 0) break; // EOF/error: nothing more we can usefully do.
         off += @intCast(n);
     }
+}
+
+/// Emit the result, then terminate the process immediately rather than unwinding
+/// the fiber teardown. The connection-teardown deadlock that once made shutdown
+/// unreliable is fixed at the library level (Switch teardown no longer relies on
+/// a cross-executor cancel), but a short-lived test/interop node has no reason to
+/// orchestrate the multi-layer graceful teardown (gossipsub, then its
+/// connections, then the switch, then the endpoint) — emit then exit(0) keeps
+/// every node's shutdown prompt and robust.
+fn finishAndExit(io: std.Io, recorder: *Recorder, args: *const Args) noreturn {
+    _ = io;
+    emitResult(recorder, args);
     std.process.exit(0);
 }
 
