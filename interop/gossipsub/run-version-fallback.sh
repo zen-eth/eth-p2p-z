@@ -23,7 +23,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 TOPIC="interop-version-fallback"
 MESSAGE="hello-v1-1-only"
 BASE_PORT=4210
-DURATION_MS=12000
+# The peer's gossipsub grafts our node into its mesh on its heartbeat (the go and
+# rust peers heartbeat once per second), and the rust 1.1-only peer in particular
+# can take several heartbeats after connect+identify+subscribe before the 1.1
+# mesh stabilizes and a publish actually propagates. The publisher republishes
+# every 500ms for the whole run, so a generous duration guarantees many publish
+# attempts land AFTER the mesh has formed — making receipt reliable rather than
+# racing a short window. 30s gives ~60 republish cycles, ample for the slowest
+# (rust 1.1) mesh-formation path while keeping the scenario quick.
+DURATION_MS=30000
 
 build_all
 install_cleanup
