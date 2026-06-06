@@ -168,6 +168,14 @@ pub const RouterConfig = struct {
     /// negative-score prune (go suppresses PX on those paths to avoid leaking the
     /// mesh to a peer we are cutting off for cause).
     peer_exchange_enabled: bool = false,
+    /// Optional application topic-message validator (go-libp2p-pubsub
+    /// `RegisterTopicValidator` / rust-libp2p `report_message_validation_result`).
+    /// When set, a received published message — once it passes the signature check
+    /// and is found new — is handed to it; the verdict gates delivery + forwarding
+    /// and, on `reject`, charges the relaying peer the P4 penalty. Null (the
+    /// default) accepts every message: behaviour is exactly as it was before the
+    /// validator existed. See `MessageValidator` / `ValidationResult`.
+    validator: ?MessageValidator = null,
 };
 
 /// Invoked on the router fiber for each delivered message on a topic WE
@@ -178,6 +186,49 @@ pub const RouterConfig = struct {
 pub const MessageHandler = struct {
     ctx: *anyopaque,
     on_message: *const fn (ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void,
+};
+
+/// The application's verdict on a received message, mirroring go-libp2p-pubsub's
+/// `ValidationResult` (Accept/Reject/Ignore) and rust-libp2p's `MessageAcceptance`
+/// (the two implementations agree exactly on each verdict's effect):
+///   - `accept`: the message is valid — deliver it locally (if we subscribe) and
+///     forward it over the mesh (the default, accept-all behaviour).
+///   - `reject`: the message is application-invalid — do NOT deliver or forward,
+///     and PENALIZE the relaying peer with the squared invalid-message-delivery
+///     penalty (P4), exactly as a failed signature check does. Use this only for
+///     a message that is genuinely malformed/invalid, since it costs the sender
+///     score.
+///   - `ignore`: drop the message (no deliver, no forward) but do NOT penalize the
+///     relaying peer — the sender did nothing wrong; we simply choose not to
+///     propagate it (e.g. a stale-but-well-formed message).
+/// In all three cases the message has already been marked seen, so a duplicate is
+/// suppressed before the validator runs again (go marks seen right after the
+/// signature check, before invoking user validators).
+pub const ValidationResult = enum { accept, reject, ignore };
+
+/// An optional, application-supplied topic message validator, matching the
+/// validate-then-forward gate of go-libp2p-pubsub (`RegisterTopicValidator`) and
+/// rust-libp2p (`report_message_validation_result`). When set on `RouterConfig`,
+/// every received published message — AFTER it passes the signature check and is
+/// found to be new (not a seen duplicate) — is handed to `validate`, whose verdict
+/// gates delivery + forwarding (see `ValidationResult`). When null, every message
+/// is accepted (the historic accept-all behaviour, unchanged).
+///
+/// A SINGLE validator covers all topics: an application that wants per-topic logic
+/// dispatches on `topic` inside its own `validate` (mirroring how an app registers
+/// a function and switches on the topic — we do not maintain a per-topic registry).
+///
+/// Called INLINE on the single router fiber, like `MessageHandler.on_message`, so
+/// it must be cheap: it stalls every other peer's events while it runs. An app with
+/// an expensive validator should do the heavy work off-fiber and keep this function
+/// a fast lookup. (go/rust run validators asynchronously in a worker pool / via an
+/// app callback; an async validation fiber is a possible future refinement here,
+/// but the inline form matches go's `validateInline` path and keeps the held-message
+/// lifetime trivial.) The `topic`/`from`/`data` slices are valid only for the call;
+/// a validator that needs to retain them must copy.
+pub const MessageValidator = struct {
+    ctx: *anyopaque,
+    validate: *const fn (ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) ValidationResult,
 };
 
 /// One interned message-id: a single heap copy of the id bytes, shared across
@@ -858,6 +909,13 @@ pub fn Router(comptime Transport: type) type {
         message_id_fn: ?MessageIdConfig,
         /// Optional sink for messages delivered on topics we subscribe to.
         message_handler: ?MessageHandler,
+        /// Optional application topic-message validator (see `MessageValidator`).
+        /// When set, gates delivery + forwarding of each received published message
+        /// on its verdict (accept/reject/ignore) after the signature + seen checks.
+        /// Null means accept-all (the historic behaviour). Set once in `create`
+        /// from `RouterConfig.validator` and never mutated; called only on the
+        /// router fiber, so it needs no locking.
+        validator: ?MessageValidator,
         /// When true (go-libp2p default), a message the local node ORIGINATES is
         /// flooded to every topic subscriber above the publish threshold rather
         /// than only its mesh/fanout. Relayed messages are unaffected (always
@@ -965,6 +1023,7 @@ pub fn Router(comptime Transport: type) type {
                 .signer = signer,
                 .message_id_fn = config.message_id_fn,
                 .message_handler = message_handler,
+                .validator = config.validator,
                 .flood_publish = config.flood_publish,
                 .idontwant_message_threshold = config.idontwant_message_threshold,
                 .peer_exchange_enabled = config.peer_exchange_enabled,
@@ -2850,6 +2909,32 @@ pub fn Router(comptime Transport: type) type {
                 return;
             }
             router.seen.add(id.bytes, router.heartbeat_tick);
+
+            // Application topic-message validator (go-libp2p-pubsub's
+            // validate-then-forward gate / rust-libp2p's MessageAcceptance). The
+            // message is new and signature-checked; the app's verdict decides
+            // whether we propagate it. Marked seen ABOVE (before validating) so a
+            // duplicate of an ignored/rejected message is suppressed by the
+            // seen-cache and never re-validated or re-forwarded — matching go,
+            // which marks seen right after the signature check.
+            //   - reject: the message is invalid; do NOT deliver/forward, and charge
+            //     the relaying peer the squared invalid-delivery penalty (P4), the
+            //     same penalty a bad signature draws. Keyed on the SENDING peer
+            //     (`exclude`, the inbound stream's peer), not the message's `from`.
+            //   - ignore: do NOT deliver/forward, but do NOT penalize the sender.
+            //   - accept: fall through to the normal P2/deliver/IDONTWANT/forward
+            //     path below (the historic behaviour).
+            // No validator (null) means accept-all, so the behaviour is unchanged.
+            if (router.validator) |v| {
+                switch (v.validate(v.ctx, topic, from, data)) {
+                    .accept => {},
+                    .reject => {
+                        if (router.score) |sc| sc.rejectMessage(exclude, topic);
+                        return;
+                    },
+                    .ignore => return,
+                }
+            }
 
             // P2/P3: the relaying peer delivered a NEW, accepted message — credit
             // its first-delivery (and, if it is a mesh member, mesh-delivery)
@@ -8361,4 +8446,223 @@ test "intern churn through all four maps + peer teardown empties the table (no l
     try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
     try sync(router, io);
     try std.testing.expectEqual(@as(usize, 0), internCount(router));
+}
+
+// --- topic message validator (ACCEPT / REJECT / IGNORE) --------------------
+//
+// The validator gates delivery + forwarding of a NEW, signature-checked received
+// message on the app's verdict, matching go-libp2p-pubsub's validate-then-forward
+// and rust-libp2p's MessageAcceptance:
+//   accept -> deliver locally (if subscribed) + forward over the mesh + the usual
+//             P2 first-delivery credit (the historic accept-all behaviour);
+//   reject -> neither deliver nor forward, and charge the relaying peer the P4
+//             invalid-message-delivery penalty (score.rejectMessage);
+//   ignore -> neither deliver nor forward, and do NOT penalize the sender.
+// In every case the message is marked seen before the verdict, so a re-send of the
+// same id is suppressed and the validator is not invoked twice for it.
+
+/// A test validator returning a fixed verdict, counting its invocations so a test
+/// can assert it ran (or did not). Owns no heap.
+const FixedValidator = struct {
+    verdict: ValidationResult,
+    calls: usize = 0,
+
+    fn validator(self: *FixedValidator) MessageValidator {
+        return .{ .ctx = self, .validate = validate };
+    }
+
+    fn validate(ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) ValidationResult {
+        const self: *FixedValidator = @ptrCast(@alignCast(ctx));
+        _ = topic;
+        _ = from;
+        _ = data;
+        self.calls += 1;
+        return self.verdict;
+    }
+};
+
+test "validator ACCEPT: a received message is delivered locally and forwarded over the mesh" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    var val = FixedValidator{ .verdict = .accept };
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{ .validator = val.validator() });
+    try router.start();
+
+    // We subscribe to "t" (so an accepted message is delivered locally) and graft
+    // A into our mesh (so it is forwarded). S relays the publish.
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x01", "t", "hello"),
+    } });
+
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_a.record, "t", "hello") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try sync(router, io);
+    // Accepted: forwarded to mesh member A, delivered locally, and the validator
+    // ran exactly once.
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "hello"));
+    try std.testing.expectEqual(@as(usize, 1), rec.calls);
+    try std.testing.expectEqual(@as(usize, 1), val.calls);
+}
+
+test "validator REJECT: not delivered/forwarded and the sender is penalized (P4)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    var val = FixedValidator{ .verdict = .reject };
+
+    // Scoring ENABLED (to observe P4) with the `none` policy (no host key), so the
+    // inbound publish is NOT signature-checked and reaches the validator. The
+    // scoringConfig gives each reject a score contribution of -(invalid^2): one
+    // reject => -1.
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, scoringConfig(), .{ .validator = val.validator() });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+
+    // The relaying peer S starts at score 0.
+    try std.testing.expectEqual(@as(f64, 0), liveScore(router, source));
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x02", "t", "bad"),
+    } });
+    // Fence so the reject is fully processed before asserting; give a wrong forward
+    // a chance to (not) land.
+    try sync(router, io);
+    io_time.ms(50).sleep(io) catch {};
+
+    // Rejected: nothing delivered locally, nothing forwarded to A, validator ran
+    // once, and S took the P4 penalty (one invalid delivery => score -1).
+    try std.testing.expectEqual(@as(usize, 1), val.calls);
+    try std.testing.expectEqual(@as(usize, 0), rec.calls);
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_a.record, "t", "bad"));
+    try std.testing.expectEqual(@as(f64, -1), liveScore(router, source));
+}
+
+test "validator IGNORE: not delivered/forwarded, sender NOT penalized, a re-send is seen-suppressed" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    var val = FixedValidator{ .verdict = .ignore };
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, scoringConfig(), .{ .validator = val.validator() });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+    try std.testing.expectEqual(@as(f64, 0), liveScore(router, source));
+
+    // First send: the validator ignores it.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x03", "t", "stale"),
+    } });
+    try sync(router, io);
+
+    // Re-send the IDENTICAL message (same from+seqno => same id). It is suppressed
+    // by the seen-cache (the id was marked seen before the first verdict), so the
+    // validator is NOT invoked a second time.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x03", "t", "stale"),
+    } });
+    try sync(router, io);
+    io_time.ms(50).sleep(io) catch {};
+
+    // Ignored: nothing delivered/forwarded, the validator ran exactly ONCE (the
+    // re-send was seen-suppressed), and S took NO penalty (score still 0).
+    try std.testing.expectEqual(@as(usize, 1), val.calls);
+    try std.testing.expectEqual(@as(usize, 0), rec.calls);
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_a.record, "t", "stale"));
+    try std.testing.expectEqual(@as(f64, 0), liveScore(router, source));
+}
+
+test "validator null (default): accept-all — delivered + forwarded, unchanged behaviour" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+
+    // No validator (the default): every message is accepted, exactly as before the
+    // validator existed.
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{});
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x04", "t", "world"),
+    } });
+
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_a.record, "t", "world") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try sync(router, io);
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "world"));
+    try std.testing.expectEqual(@as(usize, 1), rec.calls);
 }

@@ -198,6 +198,14 @@ const heartbeat_interval_ms: u64 = 1000;
 /// Re-export so callers construct a handler without importing router.zig.
 pub const MessageHandler = router_mod.MessageHandler;
 
+/// Re-export the application topic-message validator (and its verdict enum) so a
+/// caller can gate message propagation — accept/reject/ignore, matching
+/// go-libp2p-pubsub `RegisterTopicValidator` / rust-libp2p `MessageAcceptance` —
+/// via `RouterConfig.validator` without importing router.zig. Null (the default)
+/// accepts every message.
+pub const MessageValidator = router_mod.MessageValidator;
+pub const ValidationResult = router_mod.ValidationResult;
+
 /// Re-export the optional peer-scoring config type (and a ready-made baseline)
 /// so callers can opt into scoring without importing router.zig / score.zig.
 /// Pass `null` to `Gossipsub.init` to leave scoring disabled (the default — no
@@ -279,6 +287,16 @@ const InboundHandler = struct {
 /// returns.
 const InboundService = struct {
     router: *Router,
+    /// Held DIRECTLY (a copy of the router's allocator) so `destroyInboundService`
+    /// can free this object WITHOUT dereferencing `router`. The Switch frees its
+    /// registered service objects in its own `deinit`, which runs AFTER
+    /// `Gossipsub.deinit` has already called `router.destroy()` — so by the time
+    /// `destroyInboundService` runs, `router` points at freed memory. Reaching the
+    /// allocator through `router.allocator` would be a use-after-free (latent: it
+    /// only faults once the freed Router allocation is reused/poisoned, which the
+    /// allocator's size class makes layout-dependent). Storing the allocator here
+    /// closes that hole.
+    allocator: std.mem.Allocator,
 
     fn openInbound(
         self: *InboundService,
@@ -425,7 +443,7 @@ pub const Gossipsub = struct {
     /// is a heap-owned InboundService destroyed via the service deinit).
     fn inboundService(router: *Router) !protocols.AnyProtocolService {
         const svc = try router.allocator.create(InboundService);
-        svc.* = .{ .router = router };
+        svc.* = .{ .router = router, .allocator = router.allocator };
         return protocols.ownedProtocolService(
             InboundService,
             InboundService.openInbound,
@@ -435,7 +453,11 @@ pub const Gossipsub = struct {
     }
 
     fn destroyInboundService(svc: *InboundService) void {
-        svc.router.allocator.destroy(svc);
+        // Use the directly-held allocator, NOT `svc.router.allocator`: the router
+        // is already freed by the time the Switch tears down its service objects
+        // (see `InboundService.allocator`). Dereferencing `svc.router` here would
+        // be a use-after-free.
+        svc.allocator.destroy(svc);
     }
 
     /// Shut the router down (tears down every peer, joins its fiber) and free.
