@@ -180,6 +180,22 @@ pub const RouterConfig = struct {
     /// default) accepts every message: behaviour is exactly as it was before the
     /// validator existed. See `MessageValidator` / `ValidationResult`.
     validator: ?MessageValidator = null,
+    /// How many topic-message validations may run OFF the router fiber at once
+    /// (go-libp2p-pubsub's async validator-worker model, bounded by its
+    /// `validateThrottle` semaphore). Zero (the default) runs the `validator`
+    /// INLINE on the single router fiber — the historic, backward-compatible
+    /// behaviour, fine for a cheap validator. A value > 0 enables ASYNC validation:
+    /// a received message that passes the signature + seen checks is handed to a
+    /// validation fiber (spawned in a router-owned group, up to this many in
+    /// flight) so an EXPENSIVE validator does not stall every other peer's events;
+    /// the verdict is posted back to the router as a command, which then applies the
+    /// accept/reject/ignore effects (forwarding is DEFERRED until accept). When this
+    /// many validations are already in flight a further message falls back to inline
+    /// validation rather than spawning an unbounded number of fibers — go drops the
+    /// over-throttle message; inline-fallback is the gentler choice here (the message
+    /// is still validated, just on the router fiber). No effect when `validator` is
+    /// null (no validator runs at all). See `MessageValidator`.
+    validation_concurrency: usize = 0,
     /// Optional override of the per-topic mesh DEGREE targets (`d`, `d_low`,
     /// `d_high`) the heartbeat's mesh maintenance uses to decide when to graft
     /// more peers in (mesh below `d_low`, top up to `d`) and when to prune excess
@@ -250,14 +266,16 @@ pub const ValidationResult = enum { accept, reject, ignore };
 /// dispatches on `topic` inside its own `validate` (mirroring how an app registers
 /// a function and switches on the topic — we do not maintain a per-topic registry).
 ///
-/// Called INLINE on the single router fiber, like `MessageHandler.on_message`, so
-/// it must be cheap: it stalls every other peer's events while it runs. An app with
-/// an expensive validator should do the heavy work off-fiber and keep this function
-/// a fast lookup. (go/rust run validators asynchronously in a worker pool / via an
-/// app callback; an async validation fiber is a possible future refinement here,
-/// but the inline form matches go's `validateInline` path and keeps the held-message
-/// lifetime trivial.) The `topic`/`from`/`data` slices are valid only for the call;
-/// a validator that needs to retain them must copy.
+/// By default (`RouterConfig.validation_concurrency == 0`) this is called INLINE on
+/// the single router fiber, like `MessageHandler.on_message`, so it must be cheap:
+/// it stalls every other peer's events while it runs (matching go's `validateInline`
+/// path). An app with an EXPENSIVE validator should instead set
+/// `RouterConfig.validation_concurrency > 0` to run it ASYNCHRONOUSLY on a validation
+/// fiber off the router fiber (go-libp2p's validator-worker model), so other peers'
+/// events are not blocked; the verdict is then applied back on the router fiber. The
+/// `topic`/`from`/`data` slices are valid only for the call; a validator that needs
+/// to retain them must copy (the async path hands it copies that live only for the
+/// call, exactly like the inline path).
 pub const MessageValidator = struct {
     ctx: *anyopaque,
     validate: *const fn (ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) ValidationResult,
@@ -629,6 +647,53 @@ pub fn Router(comptime Transport: type) type {
             /// router fiber owns that state exclusively, so a test must never read it
             /// concurrently with the fiber; this barrier is how a test serializes.
             sync: struct { reply: *std.Io.Event },
+            /// An ASYNC topic-message validation finished off the router fiber: its
+            /// verdict is `verdict` and `ctx` holds the owned message context the
+            /// post-verdict effects need (built before the validation fiber spawned;
+            /// freed once this command is processed, or on the inbox-drain at
+            /// teardown). Posted by a validation fiber; only enabled when
+            /// `validation_concurrency > 0`. See `ValidationContext`.
+            validation_result: struct { ctx: *ValidationContext, verdict: ValidationResult },
+        };
+
+        /// An owned, self-contained snapshot of a received message, HELD from the
+        /// moment an async validation is spawned until its verdict is applied (then
+        /// freed). It exists because the wire slices a received message borrows
+        /// (the `inbound_rpc`'s `OwnedRpc` bytes) are freed as soon as
+        /// `onInboundRpc` returns, which is BEFORE the off-fiber validation finishes
+        /// — so the validation fiber and the post-verdict accept/reject/ignore
+        /// effects must own everything they touch. Owns copies of the message
+        /// fields, the relaying peer id (the P4 reject target / forward exclusion),
+        /// and the derived message id. Freed exactly once via `deinit` — by the
+        /// router fiber when the `validation_result` command is processed, or by the
+        /// inbox drain at teardown for a result that never got processed.
+        pub const ValidationContext = struct {
+            /// The peer the message arrived from (the inbound stream's peer): the
+            /// forward-exclusion target and, on reject, the P4 penalty target.
+            exclude: PeerId,
+            from: []u8,
+            seqno: []u8,
+            topic: []u8,
+            data: []u8,
+            /// The message signature/key as carried on the wire; empty (`len == 0`)
+            /// when absent (under the none/anonymous policy), mapped back to a null
+            /// field on forward exactly as the inline path does.
+            signature: []u8,
+            key: []u8,
+            /// The policy-derived message id (owned bytes), used for the seen-cache,
+            /// the IDONTWANT-on-large broadcast, the cache, and the forward frame.
+            id: []u8,
+
+            fn deinit(self: *ValidationContext, allocator: std.mem.Allocator) void {
+                allocator.free(self.from);
+                allocator.free(self.seqno);
+                allocator.free(self.topic);
+                allocator.free(self.data);
+                allocator.free(self.signature);
+                allocator.free(self.key);
+                allocator.free(self.id);
+                allocator.destroy(self);
+            }
         };
 
         /// All state for one connected peer, owned by the router fiber. The
@@ -838,8 +903,29 @@ pub fn Router(comptime Transport: type) type {
         /// on its verdict (accept/reject/ignore) after the signature + seen checks.
         /// Null means accept-all (the historic behaviour). Set once in `create`
         /// from `RouterConfig.validator` and never mutated; called only on the
-        /// router fiber, so it needs no locking.
+        /// router fiber (inline) or on a validation fiber (async), so it must be
+        /// thread-safe when `validation_concurrency > 0`.
         validator: ?MessageValidator,
+        /// Cap on validations running OFF the router fiber at once (0 = inline; see
+        /// `RouterConfig.validation_concurrency`). Set once in `create`.
+        validation_concurrency: usize,
+        /// How many async validations are currently in flight (spawned, verdict not
+        /// yet applied). Incremented when a validation fiber is spawned, decremented
+        /// when its `validation_result` is processed (or drained at teardown).
+        /// Mutated ONLY on the router fiber (the spawn happens in
+        /// `handleIncomingMessage`, the decrement in `onValidationResult` / the
+        /// drain), so it needs no atomic. Bounds spawning against
+        /// `validation_concurrency`; over the cap a message validates inline.
+        validations_in_flight: usize = 0,
+        /// Owns every async validation fiber. Cancelled + awaited in `destroy`
+        /// BEFORE any router state the post-verdict effects touch (peers, intern
+        /// table, score, maps) is freed, so a still-running validation fiber cannot
+        /// race the teardown. A validation fiber only computes a verdict and posts a
+        /// `validation_result` command (it touches no router state directly), but it
+        /// holds the `*ValidationContext` it allocated; joining it before the inbox
+        /// drain guarantees no fiber is mid-post when the drain frees pending
+        /// contexts. Empty (no resources) when `validation_concurrency == 0`.
+        validation_group: std.Io.Group = .init,
         /// When true (go-libp2p default), a message the local node ORIGINATES is
         /// flooded to every topic subscriber above the publish threshold rather
         /// than only its mesh/fanout. Relayed messages are unaffected (always
@@ -949,6 +1035,7 @@ pub fn Router(comptime Transport: type) type {
                 .message_id_fn = config.message_id_fn,
                 .message_handler = message_handler,
                 .validator = config.validator,
+                .validation_concurrency = config.validation_concurrency,
                 .flood_publish = config.flood_publish,
                 .idontwant_message_threshold = config.idontwant_message_threshold,
                 .peer_exchange_enabled = config.peer_exchange_enabled,
@@ -1058,6 +1145,21 @@ pub fn Router(comptime Transport: type) type {
                 // Never spawned: tear down directly.
                 router.teardownAllPeers();
             }
+
+            // Cancel + join every async validation fiber AFTER the main loop has
+            // fully exited (its `defer` ran `teardownAllPeers` + `drainInbox`, so the
+            // inbox is now CLOSED) and BEFORE any router state the post-verdict
+            // effects touch (peers, intern table, score, maps) is freed below. The
+            // main loop is the only producer that spawns into this group, so once it
+            // has exited no `concurrent` can race this `cancel` (the group's
+            // not-threadsafe contract). Each still-running validation fiber is
+            // collapsed at its `validate` sleep / its result post (both cancellation
+            // points); its post then fails against the now-closed inbox, so the fiber
+            // frees its own held context — no leak, no UAF, freed exactly once.
+            // (A result the fiber posted BEFORE the inbox closed was already freed by
+            // `drainInbox`.) Idempotent and free when no validation fiber ever ran
+            // (the inline default, or an async router that was never flooded).
+            router.validation_group.cancel(router.io);
 
             router.peers.deinit();
             router.peer_versions.deinit();
@@ -1599,6 +1701,7 @@ pub fn Router(comptime Transport: type) type {
                     .publish => |p| router.onPublish(p.topic, p.data),
                     .enqueue_for_test => |e| router.onEnqueueForTest(e.peer, e.frame, e.reply),
                     .sync => |s| s.reply.set(router.io),
+                    .validation_result => |r| router.onValidationResult(r.ctx, r.verdict),
                     .heartbeat => router.onHeartbeat(),
                     .shutdown => return,
                 }
@@ -2868,6 +2971,33 @@ pub fn Router(comptime Transport: type) type {
             //   - accept: fall through to the normal P2/deliver/IDONTWANT/forward
             //     path below (the historic behaviour).
             // No validator (null) means accept-all, so the behaviour is unchanged.
+            //
+            // ASYNC validation (go-libp2p's validator-worker model): when a validator
+            // is set and `validation_concurrency > 0` and we are under the in-flight
+            // cap, run the validator OFF the router fiber so an expensive validator
+            // does not stall every other peer's events. We HOLD an owned copy of the
+            // message (the wire slices here are freed when `onInboundRpc` returns,
+            // before the validation finishes), spawn a validation fiber, and DEFER
+            // all accept/reject/ignore effects until its `validation_result` command
+            // is applied — so we return WITHOUT delivering or forwarding here. If we
+            // are at the in-flight cap (go would throttle-drop), or the held copy /
+            // spawn fails, we fall back to validating INLINE below rather than
+            // spawning unboundedly. With no validator, or `validation_concurrency == 0`,
+            // the validator (if any) runs inline exactly as before.
+            if (router.validator != null and
+                router.validation_concurrency > 0 and
+                router.validations_in_flight < router.validation_concurrency)
+            {
+                if (router.spawnValidation(exclude, from, seqno, topic, data, signature, key, id.bytes)) {
+                    // Spawned: the verdict + effects come later via the result command.
+                    return;
+                }
+                // Spawn/copy failed: fall through to inline validation (below).
+            }
+
+            // Inline validation (the default, and the async fall-back when at the cap
+            // or on a spawn failure): run the validator on the router fiber and apply
+            // the verdict immediately.
             if (router.validator) |v| {
                 switch (v.validate(v.ctx, topic, from, data)) {
                     .accept => {},
@@ -2879,6 +3009,29 @@ pub fn Router(comptime Transport: type) type {
                 }
             }
 
+            router.applyAccept(exclude, from, seqno, topic, data, signature, key, id.bytes);
+        }
+
+        /// Apply the ACCEPT effects of a NEW, signature-checked, accepted message:
+        /// the P2/P3 first-/mesh-delivery score credit, local delivery, the
+        /// IDONTWANT-on-large broadcast, and the cache + mesh forward. Shared by the
+        /// inline accept path (`handleIncomingMessage`) and the async accept path
+        /// (`onValidationResult`) so both forward through IDENTICAL logic — the one
+        /// place an accepted received message is delivered + propagated. The
+        /// signature/key are the raw wire slices (empty when absent under the
+        /// none/anonymous policy); an empty slice maps to a null Message field on
+        /// forward (the field is absent), keeping relayed copies byte-identical.
+        fn applyAccept(
+            router: *Self,
+            exclude: PeerId,
+            from: []const u8,
+            seqno: []const u8,
+            topic: []const u8,
+            data: []const u8,
+            signature: []const u8,
+            key: []const u8,
+            id: []const u8,
+        ) void {
             // P2/P3: the relaying peer delivered a NEW, accepted message — credit
             // its first-delivery (and, if it is a mesh member, mesh-delivery)
             // counters. Keyed on the SENDING peer, not the message's `from`.
@@ -2892,7 +3045,7 @@ pub fn Router(comptime Transport: type) type {
             // for. Done only on RECEIVED messages (we are not the origin) and only
             // when the data is at or above the configured threshold.
             if (data.len >= router.idontwant_message_threshold) {
-                router.broadcastIDontWant(topic, id.bytes, exclude);
+                router.broadcastIDontWant(topic, id, exclude);
             }
 
             // Cache EVERY accepted message (so a later IWANT can be served and a
@@ -2910,8 +3063,141 @@ pub fn Router(comptime Transport: type) type {
                 data,
                 if (signature.len > 0) signature else null,
                 if (key.len > 0) key else null,
-                id.bytes,
+                id,
             );
+        }
+
+        /// Build an owned `ValidationContext` from a received message and spawn a
+        /// validation fiber that runs the validator off the router fiber and posts
+        /// the verdict back as a `validation_result` command. Returns true on
+        /// success (the held context is now owned by the fiber → the result command
+        /// → freed when the command is applied or drained) and false if the owned
+        /// copy or the fiber spawn failed (NOTHING is held; the caller validates
+        /// inline instead). Called only on the router fiber, so the in-flight
+        /// counter increment is race-free; it is decremented when the result is
+        /// applied (`onValidationResult`) or drained at teardown.
+        fn spawnValidation(
+            router: *Self,
+            exclude: PeerId,
+            from: []const u8,
+            seqno: []const u8,
+            topic: []const u8,
+            data: []const u8,
+            signature: []const u8,
+            key: []const u8,
+            id: []const u8,
+        ) bool {
+            const ctx = router.allocator.create(ValidationContext) catch return false;
+            // On any partial-copy failure free what we have and report failure so the
+            // caller falls back to inline. Each field is dup'd in turn; an errdefer
+            // would not fire on the `catch` paths, so unwind explicitly.
+            const from_owned = router.allocator.dupe(u8, from) catch {
+                router.allocator.destroy(ctx);
+                return false;
+            };
+            const seqno_owned = router.allocator.dupe(u8, seqno) catch {
+                router.allocator.free(from_owned);
+                router.allocator.destroy(ctx);
+                return false;
+            };
+            const topic_owned = router.allocator.dupe(u8, topic) catch {
+                router.allocator.free(seqno_owned);
+                router.allocator.free(from_owned);
+                router.allocator.destroy(ctx);
+                return false;
+            };
+            const data_owned = router.allocator.dupe(u8, data) catch {
+                router.allocator.free(topic_owned);
+                router.allocator.free(seqno_owned);
+                router.allocator.free(from_owned);
+                router.allocator.destroy(ctx);
+                return false;
+            };
+            const sig_owned = router.allocator.dupe(u8, signature) catch {
+                router.allocator.free(data_owned);
+                router.allocator.free(topic_owned);
+                router.allocator.free(seqno_owned);
+                router.allocator.free(from_owned);
+                router.allocator.destroy(ctx);
+                return false;
+            };
+            const key_owned = router.allocator.dupe(u8, key) catch {
+                router.allocator.free(sig_owned);
+                router.allocator.free(data_owned);
+                router.allocator.free(topic_owned);
+                router.allocator.free(seqno_owned);
+                router.allocator.free(from_owned);
+                router.allocator.destroy(ctx);
+                return false;
+            };
+            const id_owned = router.allocator.dupe(u8, id) catch {
+                router.allocator.free(key_owned);
+                router.allocator.free(sig_owned);
+                router.allocator.free(data_owned);
+                router.allocator.free(topic_owned);
+                router.allocator.free(seqno_owned);
+                router.allocator.free(from_owned);
+                router.allocator.destroy(ctx);
+                return false;
+            };
+            ctx.* = .{
+                .exclude = exclude,
+                .from = from_owned,
+                .seqno = seqno_owned,
+                .topic = topic_owned,
+                .data = data_owned,
+                .signature = sig_owned,
+                .key = key_owned,
+                .id = id_owned,
+            };
+
+            // Spawn into the router-owned group (cancelled + joined in `destroy`).
+            // On spawn failure free the context and report failure (inline fallback).
+            router.validation_group.concurrent(router.io, validationFiber, .{ router, ctx }) catch {
+                ctx.deinit(router.allocator);
+                return false;
+            };
+            router.validations_in_flight += 1;
+            return true;
+        }
+
+        /// Validation-fiber body (one per async-validated message; runs OFF the
+        /// router fiber in `validation_group`). Runs the validator on the held copy,
+        /// then posts the verdict + the context back to the router inbox as a
+        /// `validation_result` command. The validator call is CPU-bound (no
+        /// cancellation point); the inbox post IS a cancellation point, so a teardown
+        /// `cancel` collapses it — on a closed/cancelled post we free the held
+        /// context HERE (this fiber is then its sole owner). On a successful post the
+        /// router (or the inbox drain) owns + frees the context: freed EXACTLY once.
+        /// The validator must be thread-safe (it can run on this fiber concurrently
+        /// with the router fiber).
+        fn validationFiber(router: *Self, ctx: *ValidationContext) void {
+            const v = router.validator.?;
+            const verdict = v.validate(v.ctx, ctx.topic, ctx.from, ctx.data);
+            router.inbox.putOne(router.io, .{ .validation_result = .{ .ctx = ctx, .verdict = verdict } }) catch {
+                // Closed (shutting down) or Canceled (teardown): no one will process
+                // the result, so this fiber frees the held context.
+                ctx.deinit(router.allocator);
+            };
+        }
+
+        /// Apply an async validation verdict on the router fiber (the deferred tail
+        /// of `handleIncomingMessage`'s accept/reject/ignore, now that the off-fiber
+        /// validator has returned). ACCEPT runs the SHARED accept effects
+        /// (`applyAccept`) — identical to the inline accept path; REJECT charges the
+        /// relaying peer the P4 penalty; IGNORE does nothing. Always decrements the
+        /// in-flight counter and frees the held context (freed exactly once — the
+        /// teardown drain frees only contexts that never reach here).
+        fn onValidationResult(router: *Self, ctx: *ValidationContext, verdict: ValidationResult) void {
+            defer {
+                router.validations_in_flight -= 1;
+                ctx.deinit(router.allocator);
+            }
+            switch (verdict) {
+                .accept => router.applyAccept(ctx.exclude, ctx.from, ctx.seqno, ctx.topic, ctx.data, ctx.signature, ctx.key, ctx.id),
+                .reject => if (router.score) |sc| sc.rejectMessage(ctx.exclude, ctx.topic),
+                .ignore => {},
+            }
         }
 
         /// Invoke the message handler if the local node subscribes to `topic`.
@@ -3390,6 +3676,17 @@ pub fn Router(comptime Transport: type) type {
                     // Wake a sync barrier in flight at shutdown so its awaiter
                     // does not hang.
                     .sync => |s| s.reply.set(router.io),
+                    // An async validation that posted its result before the inbox
+                    // closed but never got processed by the main loop: free its held
+                    // context here (the fiber that produced it handed off ownership on
+                    // the successful post, so the drain is the sole remaining owner).
+                    // Freed exactly once — a processed result is freed in
+                    // `onValidationResult`, and a fiber whose post FAILS (inbox closed
+                    // before it posted) frees its own context, so it never reaches the
+                    // inbox to be drained here. `destroy` cancels + joins the
+                    // validation group AFTER this drain, so no fiber posts a new result
+                    // into the (now-closed) inbox past this point.
+                    .validation_result => |r| r.ctx.deinit(router.allocator),
                     else => {},
                 };
             }
@@ -8663,4 +8960,433 @@ test "validator null (default): accept-all — delivered + forwarded, unchanged 
     try sync(router, io);
     try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "world"));
     try std.testing.expectEqual(@as(usize, 1), rec.calls);
+}
+
+// --- ASYNC topic message validation (off the router fiber) -----------------
+//
+// With `validation_concurrency > 0` the validator runs on a validation fiber off
+// the single router fiber (go-libp2p's validator-worker model), and the verdict is
+// posted back as a `validation_result` command the router applies: ACCEPT runs the
+// same accept effects as the inline path (deliver + forward + score), REJECT
+// charges P4, IGNORE does nothing. The effects are DEFERRED until the verdict, so a
+// test posts the message, lets the validation fiber run, and polls the observable
+// effect (a forwarded publish on the mesh peer's record, a score change) — then a
+// final `sync` makes the router-state read race-free.
+
+/// A thread-safe async-validation test validator. Its `validate` runs on a
+/// validation fiber (a worker thread under `std.Io.Threaded`), so its call counter
+/// is atomic and it may sleep (via the stored `io`) to model an EXPENSIVE/slow
+/// validator. `started` is bumped on entry (before any sleep) so a test can observe
+/// that a validation is in flight while the router fiber stays responsive.
+const AsyncValidator = struct {
+    io: std.Io,
+    verdict: ValidationResult,
+    sleep_ms: u64 = 0,
+    calls: std.atomic.Value(usize) = .init(0),
+    started: std.atomic.Value(usize) = .init(0),
+
+    fn validator(self: *AsyncValidator) MessageValidator {
+        return .{ .ctx = self, .validate = validate };
+    }
+
+    fn validate(ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) ValidationResult {
+        const self: *AsyncValidator = @ptrCast(@alignCast(ctx));
+        _ = topic;
+        _ = from;
+        _ = data;
+        _ = self.started.fetchAdd(1, .acq_rel);
+        if (self.sleep_ms > 0) io_time.ms(self.sleep_ms).sleep(self.io) catch {};
+        _ = self.calls.fetchAdd(1, .acq_rel);
+        return self.verdict;
+    }
+};
+
+/// Sync the router fiber, then read `peer`'s live score — race-free because the
+/// router fiber is parked after `sync` returns. Used to poll for an async verdict's
+/// score effect: the `validation_result` command's score mutation is visible once a
+/// `sync` posted AFTER it has been processed.
+fn syncedScore(router: *FakeRouter, io: std.Io, peer: PeerId) f64 {
+    sync(router, io) catch {};
+    return liveScore(router, peer);
+}
+
+test "async validator ACCEPT: message is delivered + forwarded once the verdict lands" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    var val = AsyncValidator{ .io = io, .verdict = .accept };
+
+    // validation_concurrency = 2 enables async validation (off the router fiber).
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{ .validator = val.validator(), .validation_concurrency = 2 });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins validation + writer fibers before records free
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x01", "t", "hello"),
+    } });
+
+    // The verdict is applied off-line: poll the forwarded copy on A's record (set by
+    // the deferred accept effects once the validation fiber's result is processed).
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_a.record, "t", "hello") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try sync(router, io);
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "hello"));
+    try std.testing.expectEqual(@as(usize, 1), rec.calls);
+    try std.testing.expectEqual(@as(usize, 1), val.calls.load(.acquire));
+}
+
+test "async validator REJECT: not delivered/forwarded and the sender takes P4" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    var val = AsyncValidator{ .io = io, .verdict = .reject };
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, scoringConfig(), .{ .validator = val.validator(), .validation_concurrency = 2 });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy();
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+    try std.testing.expectEqual(@as(f64, 0), liveScore(router, source));
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x02", "t", "bad"),
+    } });
+
+    // Poll (sync then read) until S takes the P4 penalty — the verdict's reject
+    // effect lands once the validation fiber's result command is processed.
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (syncedScore(router, io, source) == -1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try sync(router, io);
+    try std.testing.expectEqual(@as(usize, 1), val.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), rec.calls);
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_a.record, "t", "bad"));
+    try std.testing.expectEqual(@as(f64, -1), liveScore(router, source));
+}
+
+test "async validator IGNORE: not delivered/forwarded, sender NOT penalized" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    var val = AsyncValidator{ .io = io, .verdict = .ignore };
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, scoringConfig(), .{ .validator = val.validator(), .validation_concurrency = 2 });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy();
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x03", "t", "stale"),
+    } });
+
+    // Wait for the validation to run (atomic call count), then settle the result
+    // command with a sync. IGNORE leaves no observable score/forward effect, so we
+    // gate on the call count + a fence and assert the absence of effects.
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (val.calls.load(.acquire) >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try sync(router, io);
+    io_time.ms(50).sleep(io) catch {};
+    try sync(router, io);
+
+    try std.testing.expectEqual(@as(usize, 1), val.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), rec.calls);
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_a.record, "t", "stale"));
+    try std.testing.expectEqual(@as(f64, 0), liveScore(router, source));
+}
+
+test "async validator: a SLOW validation does not block other router commands" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    // A slow validator: it sleeps before returning accept, modelling an expensive
+    // off-fiber validation. The router fiber must stay responsive while it runs.
+    var val = AsyncValidator{ .io = io, .verdict = .accept, .sleep_ms = 300 };
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{ .validator = val.validator(), .validation_concurrency = 2 });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy();
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+
+    // Kick off the slow validation.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x04", "t", "slow"),
+    } });
+    // Wait until the validation has STARTED (running off the router fiber), but is
+    // still sleeping (its result is not yet posted, so nothing is forwarded yet).
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (val.started.load(.acquire) >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(val.started.load(.acquire) >= 1);
+
+    // While the validation is still in flight, the router fiber must process other
+    // commands. Subscribe to a SECOND topic and confirm the router announced it to
+    // peer A — proving the router did NOT block behind the slow validation. This
+    // sync completes well before the 300ms validator sleep, so it is processed
+    // concurrently with the in-flight validation.
+    try subscribeAndWait(io, allocator, router, "t2");
+    var ann_waited: u64 = 0;
+    while (ann_waited < 200) : (ann_waited += 5) {
+        if (recordHasSubscription(io, &conn_a.record, "t2", true)) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(recordHasSubscription(io, &conn_a.record, "t2", true));
+    // The slow validation should still NOT have delivered (it is still sleeping).
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_a.record, "t", "slow"));
+
+    // Eventually the verdict lands and the message is forwarded.
+    waited = 0;
+    while (waited < 3000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_a.record, "t", "slow") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try sync(router, io);
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "slow"));
+}
+
+test "async validator: in-flight validations are bounded by the concurrency cap (inline fallback)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    // A slow ACCEPT validator with a cap of 1: the first message validates async
+    // (and sleeps); further messages posted while it is in flight exceed the cap and
+    // fall back to INLINE validation (still accepted, on the router fiber) rather
+    // than spawning more fibers. Every message is ultimately delivered + forwarded;
+    // the cap just bounds how many run off-fiber at once.
+    var val = AsyncValidator{ .io = io, .verdict = .accept, .sleep_ms = 200 };
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{ .validator = val.validator(), .validation_concurrency = 1 });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy();
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+
+    // Post several DISTINCT messages back-to-back. The first occupies the single
+    // async slot (and sleeps); the rest, posted while it is in flight, fall back to
+    // inline validation. All are accepted and forwarded — the cap never drops one.
+    const datas = [_][]const u8{ "m0", "m1", "m2", "m3", "m4" };
+    for (datas, 0..) |d, i| {
+        var seqno: [4]u8 = undefined;
+        std.mem.writeInt(u32, &seqno, @as(u32, @intCast(0x10 + i)), .big);
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{
+            .peer = source,
+            .rpc = try buildInboundPublish(allocator, "origin", &seqno, "t", d),
+        } });
+    }
+
+    // Every one of the five distinct messages must eventually be forwarded to A.
+    var waited: u64 = 0;
+    while (waited < 3000) : (waited += 5) {
+        var all = true;
+        for (datas) |d| {
+            if (recordCountPublishes(io, &conn_a.record, "t", d) < 1) {
+                all = false;
+                break;
+            }
+        }
+        if (all) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try sync(router, io);
+    for (datas) |d| {
+        try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", d));
+    }
+}
+
+/// A validator that BLOCKS forever (until cancelled) on entry, to model an
+/// in-flight async validation that never returns a verdict — so teardown must
+/// cancel + join its fiber and free its held context. `started` lets the test wait
+/// until the validation is actually running before it drops the router.
+const BlockingValidator = struct {
+    io: std.Io,
+    started: std.atomic.Value(usize) = .init(0),
+
+    fn validator(self: *BlockingValidator) MessageValidator {
+        return .{ .ctx = self, .validate = validate };
+    }
+
+    fn validate(ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) ValidationResult {
+        const self: *BlockingValidator = @ptrCast(@alignCast(ctx));
+        _ = topic;
+        _ = from;
+        _ = data;
+        _ = self.started.fetchAdd(1, .acq_rel);
+        // Sleep in a loop until the fiber is cancelled (the sleep is a cancellation
+        // point, so teardown's group cancel collapses it). A long bound is a
+        // backstop so a test bug cannot hang forever.
+        var elapsed: u64 = 0;
+        while (elapsed < 30_000) : (elapsed += 50) {
+            io_time.ms(50).sleep(self.io) catch return .accept;
+        }
+        return .accept;
+    }
+};
+
+test "async validator teardown: a never-returning in-flight validation is cancelled + freed (no leak/UAF)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    var val = BlockingValidator{ .io = io };
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{ .validator = val.validator(), .validation_concurrency = 4 });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const source = testPeer(3);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    // Post a message whose validation will block forever (until teardown cancels
+    // it). The held context lives on the validation fiber.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x05", "t", "blocked"),
+    } });
+
+    // Wait until the validation is actually running (so it is genuinely in flight
+    // when we tear down — exercising the cancel-mid-validate path).
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (val.started.load(.acquire) >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(val.started.load(.acquire) >= 1);
+
+    // Drop the router with the validation still in flight: destroy must cancel +
+    // join the validation fiber (collapsing its sleep) and free the held context —
+    // before the peer/intern/score state is freed. std.testing.allocator + the
+    // intern-table empty-assert confirm no leak/UAF.
+    router.destroy();
+}
+
+test "async validator config (validation_concurrency=0) is the inline default — delivered + forwarded" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    // Concurrency 0 (the default) runs the validator INLINE on the router fiber —
+    // identical to the historic behaviour. A FixedValidator (no thread-safety) is
+    // fine because it is never called off the router fiber.
+    var val = FixedValidator{ .verdict = .accept };
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{ .validator = val.validator(), .validation_concurrency = 0 });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy();
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x06", "t", "inline"),
+    } });
+
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_a.record, "t", "inline") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try sync(router, io);
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "inline"));
+    try std.testing.expectEqual(@as(usize, 1), rec.calls);
+    // Inline path: the validator ran synchronously on the router fiber, exactly once.
+    try std.testing.expectEqual(@as(usize, 1), val.calls);
 }
