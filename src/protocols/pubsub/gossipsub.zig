@@ -30,6 +30,7 @@ const pubsub = @import("pubsub.zig");
 const peer_io = @import("peer_io.zig");
 const router_mod = @import("router.zig");
 const PeerId = @import("peer_id").PeerId;
+const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 
 const Switch = swarm.Switch;
 const SwitchConnection = swarm.SwitchConnection;
@@ -93,13 +94,28 @@ pub const StreamSource = struct {
 };
 
 /// The real transport binding for the gossipsub Router: it produces a per-peer
-/// `StreamSink` over a `*SwitchConnection`. The router stays generic over this
-/// (see router.zig's Transport contract); the only thing the router asks of it
-/// is `makeSink`, plus the `Sink`/`ConnHandle` types.
+/// `StreamSink` over a `*SwitchConnection`, and dials peers on the router's
+/// behalf. The router stays generic over this (see router.zig's Transport
+/// contract); it asks for `makeSink` and `dial`, plus the `Sink`/`ConnHandle`
+/// types.
 ///
-/// Empty (stateless): held by value in the router. `makeSink` allocates the sink
-/// but does no I/O — the writer fiber opens the stream lazily on its first frame.
+/// Held by value in the router but NOT stateless: it borrows the `*Switch` (to
+/// dial + to start inbound dispatch on a dialed connection) and a `*std.Io.Group`
+/// that OWNS the detached dial fibers. The group lives in the `Gossipsub` handle
+/// so its `deinit` can await/cancel every dial fiber — the router never joins
+/// them. `makeSink` allocates the sink but does no I/O (the writer fiber opens
+/// the stream lazily on its first frame).
 pub const SwitchTransport = struct {
+    /// Borrowed; must outlive the router. Used by `dial` to establish a
+    /// connection and start its inbound dispatcher.
+    sw: *Switch,
+    /// Borrowed; owned by the `Gossipsub` handle. Every detached dial fiber is
+    /// spawned into this group; `Gossipsub.deinit` cancels + awaits it, so no
+    /// dial fiber is leaked or left unjoined.
+    dial_group: *std.Io.Group,
+    /// Allocator for the dial fiber's transient work (parsing the multiaddr).
+    allocator: std.mem.Allocator,
+
     pub const ConnHandle = *SwitchConnection;
     pub const Sink = StreamSink;
 
@@ -110,7 +126,67 @@ pub const SwitchTransport = struct {
         sink.* = .{ .conn = conn };
         return sink;
     }
+
+    /// Fire-and-forget dial of the multiaddr STRING `addr`. Spawns a detached
+    /// fiber (tracked in `dial_group`) that parses the address, dials it through
+    /// the Switch, and on success starts the connection's inbound dispatcher so
+    /// inbound /meshsub streams are read — mirroring the manual dial in the 2-node
+    /// tests. Success surfaces as the Switch's peer-event callback firing
+    /// `onConnected` → the router's `onPeerConnected` (the normal connect path
+    /// that opens the outbound stream). On any failure the fiber logs and returns;
+    /// the router re-dials a still-disconnected direct peer on its next tick. The
+    /// dialed connection is owned by the Switch (registered in its connection
+    /// list, torn down by `Switch.deinit`), so the fiber does not retain it.
+    ///
+    /// If the spawn itself fails (executor exhaustion) the dial is dropped with a
+    /// log — the next direct-connect tick retries — so a transient spawn failure
+    /// never crashes the router fiber that called this.
+    pub fn dial(self: *SwitchTransport, io: std.Io, addr: []const u8) void {
+        // Copy the address: the borrowed `addr` (a router-owned direct-peer
+        // string) outlives this call, but the detached fiber runs past it, so it
+        // gets its own copy and frees it. On OOM, drop the dial (retried next tick).
+        const addr_copy = self.allocator.dupe(u8, addr) catch {
+            std.log.warn("gossipsub: dial dropped (out of memory copying address)", .{});
+            return;
+        };
+        // The dial fiber dials via `sw.io` (the Switch's own Io); it needs no
+        // separate Io, so only `sw`, the allocator, and the owned address are
+        // passed. `io` here is just the spawn context for `concurrent`.
+        self.dial_group.concurrent(io, dialFiber, .{ self.sw, self.allocator, addr_copy }) catch {
+            std.log.warn("gossipsub: dial dropped (could not spawn dial fiber)", .{});
+            self.allocator.free(addr_copy);
+        };
+    }
 };
+
+/// Detached dial-fiber body. Parses `addr` (owned, freed here), dials it through
+/// `sw`, and on success starts the connection's inbound dispatcher. All failures
+/// are logged and dropped — a direct peer is re-dialed by the router on its next
+/// direct-connect tick. The connection is owned by the Switch once dialed (it is
+/// registered there and torn down by `Switch.deinit`), so this fiber does not
+/// hold or free it.
+fn dialFiber(sw: *Switch, allocator: std.mem.Allocator, addr: []u8) void {
+    defer allocator.free(addr);
+
+    var ma = Multiaddr.fromString(allocator, addr) catch |err| {
+        std.log.warn("gossipsub: dial failed to parse {s}: {s}", .{ addr, @errorName(err) });
+        return;
+    };
+    defer ma.deinit(allocator);
+
+    const conn = sw.dial(ma, .{}) catch |err| {
+        std.log.info("gossipsub: dial to {s} failed: {s}", .{ addr, @errorName(err) });
+        return;
+    };
+    // The peer-event callback already fired `onConnected` synchronously inside
+    // `sw.dial` (before it returned), so the router is wiring the peer up. Start
+    // the inbound dispatcher so inbound /meshsub streams dispatch; a failure here
+    // leaves the connection up (the peer is still connected) but without inbound
+    // reads — logged, and the connection lives on under the Switch.
+    conn.startInboundDispatcher(.{}) catch |err| {
+        std.log.warn("gossipsub: dial to {s} connected but inbound dispatch failed: {s}", .{ addr, @errorName(err) });
+    };
+}
 
 const Router = router_mod.Router(SwitchTransport);
 
@@ -134,6 +210,12 @@ pub const ScoreConfig = router_mod.ScoreConfig;
 /// `Gossipsub.init` for the go-libp2p defaults (flood-publish ON, signature
 /// policy inferred from the host key).
 pub const RouterConfig = router_mod.RouterConfig;
+
+/// Re-export the direct-peer descriptor (peer id + multiaddr string to dial) so
+/// a caller can populate `RouterConfig.direct_peers` without importing
+/// router.zig. The router keeps each configured direct peer connected itself
+/// (dials at start, re-dials disconnected ones on a tick).
+pub const DirectPeer = router_mod.DirectPeer;
 
 /// Re-export the signature-policy enum (and the message-id override types) so a
 /// caller can select `anonymous` (StrictNoSign) — or supply a custom message-id
@@ -219,12 +301,19 @@ const InboundService = struct {
 /// peer-event callback is registered when connections come up.
 pub const Gossipsub = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     /// Borrowed; must outlive the router (the router's per-peer state borrows
     /// the Switch's connections, and the Switch holds the peer-event callback
     /// and inbound service that reference the router). Cleared via this on
     /// deinit before the router is freed.
     sw: *Switch,
     router: *Router,
+    /// Owns the detached dial fibers the `SwitchTransport.dial` spawns (direct
+    /// peer auto-connect). Heap-owned so its address is stable for the router's
+    /// by-value `SwitchTransport`, which holds a `*std.Io.Group` into it. Cancel
+    /// + awaited in `deinit` (before the router is freed) so no dial fiber leaks
+    /// or outlives the Gossipsub.
+    dial_group: *std.Io.Group,
 
     /// Construct the router, start its fiber, register the inbound service and
     /// the peer-event callback on the Switch. On any failure the router is torn
@@ -269,10 +358,31 @@ pub const Gossipsub = struct {
         score_config: ?ScoreConfig,
         config: RouterConfig,
     ) !*Gossipsub {
-        const router = try Router.create(allocator, io, .{}, local_peer, message_handler, heartbeat_interval_ms, host_key, score_config, config);
+        // The dial-fiber group must outlive the router's by-value SwitchTransport
+        // (which holds a pointer into it) and be awaited in deinit, so heap-own it
+        // up front with a stable address. This `destroy` errdefer is declared
+        // first so it runs LAST on the error path — after the cancel errdefer
+        // below joins every dial fiber, since a group with running fibers must not
+        // be freed.
+        const dial_group = try allocator.create(std.Io.Group);
+        errdefer allocator.destroy(dial_group);
+        dial_group.* = .init;
+
+        const transport = SwitchTransport{
+            .sw = sw,
+            .dial_group = dial_group,
+            .allocator = allocator,
+        };
+        const router = try Router.create(allocator, io, transport, local_peer, message_handler, heartbeat_interval_ms, host_key, score_config, config);
         errdefer router.destroy();
 
-        try router.start();
+        // Cancel + await any spawned dial fibers BEFORE the router is destroyed on
+        // the error path. Declared after `router.destroy`'s errdefer so it runs
+        // FIRST (LIFO): a dial fiber mid-`sw.dial` can fire `onConnected` into the
+        // router, so it must be joined before the router is freed. Idempotent —
+        // deinit's own cancel on the success path is a second (no-op) call, and a
+        // group with no spawned fibers cancels for free.
+        errdefer dial_group.cancel(io);
 
         // Register the inbound service for EVERY /meshsub version we speak so we
         // accept inbound streams from 1.0/1.1/1.2 peers alike. Each id gets its
@@ -290,14 +400,23 @@ pub const Gossipsub = struct {
             service_owned = false;
         }
 
+        // Register the peer-event callback BEFORE starting the router: start()
+        // dials the configured direct peers, and a dial that connects fires this
+        // callback (onConnected) synchronously. Registering first guarantees the
+        // connect is observed by the router rather than dropped.
         sw.setPeerEventCallback(.{
             .ctx = router,
             .on_connected = onConnected,
             .on_disconnected = onDisconnected,
         });
+        errdefer sw.clearPeerEventCallback();
+
+        // Start the router last: spawns its fibers and dials the direct peers (via
+        // the transport's dial_group, awaited in deinit).
+        try router.start();
 
         const self = try allocator.create(Gossipsub);
-        self.* = .{ .allocator = allocator, .sw = sw, .router = router };
+        self.* = .{ .allocator = allocator, .io = io, .sw = sw, .router = router, .dial_group = dial_group };
         return self;
     }
 
@@ -346,9 +465,20 @@ pub const Gossipsub = struct {
     /// no handler survives to touch the freed router; the dangling service-object
     /// `router` field is likewise only reached via `openInbound` on a new inbound
     /// stream, which cannot arrive once the connections are gone.
+    ///
+    /// FIRST cancel + await the dial-fiber group: a detached direct-peer dial
+    /// fiber borrows the Switch (to dial / start dispatch) and would fire
+    /// `onConnected` into the router. Joining it before clearing the callback and
+    /// freeing the router ensures no dial fiber is left running (no leak) and none
+    /// touches the router or Switch after this returns. `cancel` collapses any
+    /// in-flight dial (the dial's blocking points are cancellation points) and
+    /// joins; it is idempotent, so an init-path `errdefer` having already called
+    /// it is harmless.
     pub fn deinit(self: *Gossipsub) void {
+        self.dial_group.cancel(self.io);
         self.sw.clearPeerEventCallback();
         self.router.destroy();
+        self.allocator.destroy(self.dial_group);
         self.allocator.destroy(self);
     }
 
@@ -430,7 +560,6 @@ pub const Gossipsub = struct {
 // ---------------------------------------------------------------------------
 
 const identity = @import("../../identity.zig");
-const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 const io_time = @import("../../quic/io/time.zig");
 
 test "two gossipsub nodes wire up per-peer I/O on connect and tear down on disconnect" {

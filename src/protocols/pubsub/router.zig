@@ -94,6 +94,17 @@ pub const ScoreConfig = struct {
     thresholds: score_mod.PeerScoreThresholds,
 };
 
+/// A direct (explicit) peer: its id plus the multiaddr STRING to dial it at.
+/// The router keeps the address so it can (re)connect a disconnected direct peer
+/// itself (go-libp2p's `DirectConnectTicks` connection maintenance). Both fields
+/// are BORROWED for the `create` call only; `create` copies the id and the
+/// address into router-owned storage, so the caller may free either afterward.
+pub const DirectPeer = struct {
+    id: PeerId,
+    /// Multiaddr string to dial (e.g. `/ip4/127.0.0.1/udp/4001/quic-v1/p2p/...`).
+    addr: []const u8,
+};
+
 /// Behaviour knobs handed to `Router.create` / `Gossipsub.init`. Defaults match
 /// go-libp2p so an empty `.{}` reproduces go's out-of-the-box gossipsub.
 pub const RouterConfig = struct {
@@ -132,12 +143,17 @@ pub const RouterConfig = struct {
     /// back, signalling a non-reciprocal config), and it bypasses the score gates
     /// (graylist, the GRAFT negative-score reject, and the publish threshold). The
     /// peering should be reciprocal — both ends configure each other as direct.
-    /// The slice is BORROWED for the `create` call only: `create` copies each id
-    /// into a Router-owned set, so the caller may free the slice afterward.
-    /// Connection maintenance (auto-dialing a disconnected direct peer, go's
-    /// `DirectConnectTicks`) is NOT implemented here — the app keeps direct peers
-    /// connected; an unconnected direct peer is simply unreachable until it is.
-    direct_peers: []const PeerId = &.{},
+    /// Each entry carries the peer id AND a multiaddr string to dial it at. The
+    /// slice is BORROWED for the `create` call only: `create` copies each id and
+    /// address into Router-owned storage, so the caller may free the slice
+    /// afterward. An empty slice means no direct peers (the default).
+    ///
+    /// The router keeps each direct peer connected itself (go-libp2p's
+    /// `DirectConnectTicks`): it dials every configured direct peer once at start,
+    /// then every `MeshParams.direct_connect_ticks` heartbeats re-dials any that
+    /// are NOT currently connected. A dial is fire-and-forget — success surfaces
+    /// later as the normal connect event; a failure is logged and retried next tick.
+    direct_peers: []const DirectPeer = &.{},
 };
 
 /// Invoked on the router fiber for each delivered message on a topic WE
@@ -339,6 +355,13 @@ const MeshParams = struct {
     /// behaviour penalty. This deters peers that advertise ids they do not serve.
     /// (go GossipSubIWantFollowupTime, default 3 seconds.)
     iwant_followup_ticks: u64 = 3,
+    /// How often (in heartbeat ticks) the router re-dials any configured direct
+    /// peer that is not currently connected, keeping the explicit peering up
+    /// (go GossipSubDirectConnectTicks, default 300 ticks ≈ 5 minutes). Direct
+    /// peers are ALSO dialed once at start (go dials them after an initial delay);
+    /// the periodic re-dial covers reconnect after a drop. Only the disconnected
+    /// ones are dialed — a still-connected direct peer is left alone.
+    direct_connect_ticks: u64 = 300,
 };
 
 const mesh_params: MeshParams = .{};
@@ -379,6 +402,16 @@ const BackoffSet = std.AutoHashMapUnmanaged(PeerKey, u64);
 ///       Allocate + initialise (NO I/O — the writer calls `open` lazily) an
 ///       outbound sink for the peer. The Router OWNS the returned sink: on
 ///       teardown it calls `sink.close(io)` then `allocator.destroy(sink)`.
+///
+///   pub fn dial(self: *Transport, io: std.Io, addr: []const u8) void;
+///       Fire-and-forget: kick off a connection to the multiaddr STRING `addr`
+///       and return IMMEDIATELY. The router calls this to (re)connect a direct
+///       peer; it does NOT wait and gets no result. Success surfaces later as the
+///       normal connect event (a `peer_connected` Command → `onPeerConnected`,
+///       which sets up the per-peer streams); a failure is the transport's to log
+///       and drop (the router re-dials a still-disconnected direct peer on its
+///       next direct-connect tick). The transport owns any fiber it spawns to do
+///       the dial and must join it on its own teardown (the router never does).
 pub fn Router(comptime Transport: type) type {
     return struct {
         const Self = @This();
@@ -542,15 +575,17 @@ pub fn Router(comptime Transport: type) type {
         /// disconnect. Without a matching PeerState an entry is a transient note,
         /// not a leak — disconnect always purges it. Keyed like `peers`.
         peer_versions: std.AutoHashMap(PeerKey, pubsub.Version),
-        /// Direct (explicit) peer ids — the go-libp2p `direct` set. A peer whose
-        /// key is in here is treated as a trusted out-of-mesh forward target: it
+        /// Direct (explicit) peers — the go-libp2p `direct` set. A peer whose key
+        /// is in here is treated as a trusted out-of-mesh forward target: it
         /// receives every valid message on a topic it subscribes to, is never
         /// added to a mesh (a GRAFT from it draws a PRUNE back), and bypasses the
-        /// score gates. Populated once in `create` from `RouterConfig.direct_peers`
-        /// (each id copied into an owned key) and never mutated; freed on teardown.
-        /// Keyed like `peers` (zero-padded peer bytes), with no nested allocation,
-        /// so it is freed with a single `deinit`.
-        direct: std.AutoHashMapUnmanaged(PeerKey, void) = .empty,
+        /// score gates. The value is the owned multiaddr-string copy used to
+        /// (re)dial the peer for connection maintenance (`DirectConnectTicks`).
+        /// Populated once in `create` from `RouterConfig.direct_peers` (each id
+        /// copied into an owned key, each address into an owned value) and never
+        /// mutated; both the keys and the address values are freed on teardown.
+        /// Keyed like `peers` (zero-padded peer bytes).
+        direct: std.AutoHashMapUnmanaged(PeerKey, []const u8) = .empty,
         /// Topics the local node subscribes to. Keys are owned copies; freed on
         /// unsubscribe and on teardown. We announce these to every peer (on our
         /// own subscribe, and to each newly-connected peer) and deliver matching
@@ -731,25 +766,38 @@ pub fn Router(comptime Transport: type) type {
                 .heartbeat_interval_ms = heartbeat_interval_ms,
             };
 
-            // Copy the configured direct-peer ids into the router-owned set (the
+            // Copy the configured direct peers into the router-owned set (the
             // config slice is borrowed only for this call). Each id is stored as a
-            // zero-padded PeerKey, the same key the peer map / mesh use, so a
-            // direct lookup is a plain map probe. A failed insert (OOM) just leaves
-            // that peer non-direct — degraded but safe (it falls back to ordinary
-            // mesh treatment); the rest still load.
+            // zero-padded PeerKey (the same key the peer map / mesh use, so a
+            // direct lookup is a plain map probe) mapped to an owned copy of its
+            // dial address. A failed copy/insert (OOM) just leaves that peer
+            // non-direct — degraded but safe (it falls back to ordinary mesh
+            // treatment, and is not auto-dialed); the rest still load.
             for (config.direct_peers) |peer| {
-                router.direct.put(allocator, peerKey(&peer), {}) catch {};
+                const addr_owned = allocator.dupe(u8, peer.addr) catch continue;
+                router.direct.put(allocator, peerKey(&peer.id), addr_owned) catch {
+                    allocator.free(addr_owned);
+                };
             }
             return router;
         }
 
         /// Spawn the main fiber (and, when the heartbeat interval is non-zero, the
         /// heartbeat fiber). Call once after `create`.
+        ///
+        /// Also dials every configured direct peer once, so an explicit peering is
+        /// established at startup without waiting for the first direct-connect tick
+        /// (go-libp2p dials its direct peers once after an initial delay, then the
+        /// heartbeat re-dials disconnected ones). No peer is connected yet at this
+        /// point — and the binding registers the peer-event callback only AFTER
+        /// `start`, so no connect can race this — making the `peers` read here safe
+        /// from the caller fiber. Each dial is fire-and-forget.
         pub fn start(router: *Self) std.Io.ConcurrentError!void {
             router.main_future = try std.Io.concurrent(router.io, mainLoop, .{router});
             if (router.heartbeat_interval_ms > 0) {
                 router.heartbeat_future = try std.Io.concurrent(router.io, heartbeatLoop, .{router});
             }
+            router.dialDisconnectedDirectPeers();
         }
 
         /// Heartbeat fiber body: post a `heartbeat` command every interval until
@@ -808,6 +856,9 @@ pub fn Router(comptime Transport: type) type {
 
             router.peers.deinit();
             router.peer_versions.deinit();
+            // Free each direct peer's owned dial-address copy before the map.
+            var direct_it = router.direct.valueIterator();
+            while (direct_it.next()) |addr| router.allocator.free(addr.*);
             router.direct.deinit(router.allocator);
             router.freeMyTopics();
             router.freeMesh();
@@ -983,6 +1034,23 @@ pub fn Router(comptime Transport: type) type {
         /// the score gates. Inert (always false) when no direct peers are configured.
         fn isDirect(router: *const Self, peer: PeerId) bool {
             return router.direct.contains(peerKey(&peer));
+        }
+
+        /// Fire-and-forget (re)dial every configured direct peer that is NOT
+        /// currently connected, via `transport.dial`. Keeps the explicit peering
+        /// up (go-libp2p `directConnect`): a direct peer that drops is reconnected,
+        /// a still-connected one is left alone (no redundant dial). Runs on the
+        /// router fiber, so the `peers`/`direct` reads are race-free; each dial
+        /// returns immediately (the transport owns the connection attempt), so
+        /// this never blocks the fiber. Inert when no direct peers are configured.
+        fn dialDisconnectedDirectPeers(router: *Self) void {
+            var it = router.direct.iterator();
+            while (it.next()) |entry| {
+                // entry.key_ptr is the zero-padded PeerKey; `peers` is keyed the
+                // same way, so a plain probe tells us if the peer is connected.
+                if (router.peers.contains(entry.key_ptr.*)) continue;
+                router.transport.dial(router.io, entry.value_ptr.*);
+            }
         }
 
         // ----- scoring helpers --------------------------------------------
@@ -1510,6 +1578,17 @@ pub fn Router(comptime Transport: type) type {
         fn onHeartbeat(router: *Self) void {
             router.heartbeat_tick += 1;
             const tick = router.heartbeat_tick;
+
+            // Ensure direct peers are connected (go-libp2p `directConnect`): every
+            // `direct_connect_ticks` heartbeats, (re)dial any direct peer that is
+            // not currently connected. The tick was just incremented (matching go,
+            // which bumps `heartbeatTicks` before the check), so the first dial
+            // pass lands at tick `direct_connect_ticks`, not tick 0 — the start-time
+            // dial in `start` covers the initial connect. Cheap + inert when no
+            // direct peers are configured.
+            if (mesh_params.direct_connect_ticks > 0 and tick % mesh_params.direct_connect_ticks == 0) {
+                router.dialDisconnectedDirectPeers();
+            }
 
             // Expire seen-cache ids whose TTL has elapsed (an id added at tick T
             // expires once the tick reaches T + seen_ttl_ticks); the same id may
@@ -2924,14 +3003,57 @@ const FakeRecord = struct {
     }
 };
 
+/// Test-owned, thread-safe log of every address the router asked the transport to
+/// dial. The router runs on a worker fiber, so `dial` appends under a mutex while
+/// the test fiber reads via `count`/`contains`; both take `mutex`. The test owns
+/// the log (so the recording outlives the router) and frees it with `deinit`.
+const DialLog = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    addrs: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *DialLog, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (self.addrs.items) |a| self.allocator.free(a);
+        self.addrs.deinit(self.allocator);
+    }
+
+    /// Record one dialed address (copying it). Best-effort: on OOM the address is
+    /// simply not recorded (the test then observes one fewer dial — a failure it
+    /// can surface), never a crash.
+    fn record(self: *DialLog, io: std.Io, addr: []const u8) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const owned = self.allocator.dupe(u8, addr) catch return;
+        self.addrs.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    /// How many times `addr` was dialed.
+    fn count(self: *DialLog, io: std.Io, addr: []const u8) usize {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var n: usize = 0;
+        for (self.addrs.items) |a| {
+            if (std.mem.eql(u8, a, addr)) n += 1;
+        }
+        return n;
+    }
+};
+
 /// An in-memory transport for router unit tests. `ConnHandle` is a tiny fake
 /// connection that carries the per-peer recording; `Sink` is a FakeSink that
 /// records into that connection's recording. `makeSink` allocates a FakeSink
-/// and points it at the connection's transport-owned record.
+/// and points it at the connection's transport-owned record. `dial` records the
+/// requested address into the (optional) test-owned `DialLog` and opens NO real
+/// socket — a test drives the resulting connect itself by posting peer_connected.
 const FakeTransport = struct {
     /// When non-zero every sink made by this transport fails its first N opens
     /// (use `maxInt` for "always fail"), exercising the writer give-up path.
     fail_open_count: usize = 0,
+    /// Where `dial` records requested addresses, or null to ignore dials (the
+    /// default, so existing `.{}` call sites that never dial still compile).
+    dial_log: ?*DialLog = null,
 
     pub const ConnHandle = *FakeConn;
     pub const Sink = FakeSink;
@@ -2950,6 +3072,13 @@ const FakeTransport = struct {
             .fail_open_count = self.fail_open_count,
         };
         return sink;
+    }
+
+    /// Fire-and-forget dial: record the address (no socket). The test simulates
+    /// the resulting connect by posting peer_connected itself, exactly as the
+    /// other lifecycle tests do.
+    pub fn dial(self: *FakeTransport, io: std.Io, addr: []const u8) void {
+        if (self.dial_log) |log| log.record(io, addr);
     }
 };
 
@@ -6806,9 +6935,16 @@ test "IDONTWANT dont_send entry expires after its TTL, un-skipping the message" 
 // topic it subscribes to reaches it (alongside the mesh, deduped), it is never
 // grafted/pruned into a mesh (a GRAFT from it draws a PRUNE back), and it bypasses
 // the score gates (graylist / GRAFT-negative-reject / publish threshold). These
-// tests pass its id through `RouterConfig.direct_peers`; the connection itself is
-// established externally (the test posts peer_connected), matching the design
-// where the app keeps direct peers connected (auto-dial is not implemented here).
+// forwarding tests pass its id (and a placeholder dial address) through
+// `RouterConfig.direct_peers`; the connection itself is driven by the test (it
+// posts peer_connected). The auto-dial behaviour is covered by its own tests
+// below, which inspect the FakeTransport's DialLog.
+
+/// Placeholder dial address for the forwarding tests above, which configure a
+/// direct peer but drive its connect manually (so the FakeTransport's recorded
+/// dial is never inspected). A well-formed multiaddr string keeps the config
+/// realistic even though no socket is opened.
+const direct_test_addr = "/ip4/127.0.0.1/udp/9999/quic-v1";
 
 test "direct peer receives a relayed message though it is NOT in the mesh, and is not double-sent when also a mesh member" {
     const allocator = std.testing.allocator;
@@ -6822,7 +6958,7 @@ test "direct peer receives a relayed message though it is NOT in the mesh, and i
     const source = testPeer(3);
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
-        .direct_peers = &.{peer_d},
+        .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
     defer router.destroy();
     try router.start();
@@ -6877,7 +7013,7 @@ test "direct peer that is ALSO a mesh-eligible subscriber is forwarded to exactl
     const source = testPeer(2);
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
-        .direct_peers = &.{peer_d},
+        .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
     defer router.destroy();
     try router.start();
@@ -6923,7 +7059,7 @@ test "GRAFT from a direct peer is refused: it does NOT join the mesh and is PRUN
     const peer_d = testPeer(1);
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
-        .direct_peers = &.{peer_d},
+        .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
     defer router.destroy();
     try router.start();
@@ -6956,7 +7092,7 @@ test "heartbeat never grafts or prunes a direct peer (mesh maintenance leaves it
     const peer_r = testPeer(2);
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
-        .direct_peers = &.{peer_d},
+        .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
     defer router.destroy();
     try router.start();
@@ -6996,7 +7132,7 @@ test "flood-publish reaches a direct peer for a topic it subscribes to" {
     const peer_d = testPeer(1);
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
-        .direct_peers = &.{peer_d},
+        .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
     defer router.destroy();
     try router.start();
@@ -7038,7 +7174,7 @@ test "scoring bypass: a direct peer at a NEGATIVE score is still forwarded to an
     const source = testPeer(2);
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, &host_key, scoringConfig(), .{
-        .direct_peers = &.{peer_d},
+        .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
     defer router.destroy();
     try router.start();
@@ -7072,4 +7208,136 @@ test "scoring bypass: a direct peer at a NEGATIVE score is still forwarded to an
     }
     io_time.ms(50).sleep(io) catch {};
     try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_d.record, "t", "scored"));
+}
+
+// --- direct-peer auto-connect (go DirectConnectTicks) ----------------------
+//
+// The router keeps configured direct peers connected: it dials them once at
+// start, then every `direct_connect_ticks` heartbeats re-dials any that are not
+// currently connected (go-libp2p `directConnect`). The FakeTransport records each
+// dialed address into a test-owned DialLog so these tests can assert the cadence
+// without opening real sockets — the test still drives any resulting connect by
+// posting peer_connected, exactly as the forwarding tests above do.
+
+/// The distinct dial address for a direct peer in the auto-connect tests.
+const direct_addr_d = "/ip4/127.0.0.1/udp/4001/quic-v1";
+const direct_addr_e = "/ip4/127.0.0.1/udp/4002/quic-v1";
+
+test "direct-peer auto-connect: a configured, disconnected direct peer is dialed on start" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log = DialLog{ .allocator = allocator };
+    defer log.deinit(io);
+
+    const peer_d = testPeer(1);
+
+    // Heartbeat fiber disabled (interval 0): start's one-shot dial is the only
+    // dial we expect, so the count is exactly one.
+    const router = try FakeRouter.create(allocator, io, .{ .dial_log = &log }, local_test_peer, null, 0, null, null, .{
+        .direct_peers = &.{.{ .id = peer_d, .addr = direct_addr_d }},
+    });
+    defer router.destroy();
+    try router.start();
+    // start() dials on the caller fiber; sync settles any router-fiber work too.
+    try sync(router, io);
+
+    try std.testing.expectEqual(@as(usize, 1), log.count(io, direct_addr_d));
+}
+
+test "direct-peer auto-connect: heartbeat re-dials a disconnected direct peer but not a connected one" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log = DialLog{ .allocator = allocator };
+    defer log.deinit(io);
+
+    // D will be connected after start; E stays disconnected. Both are dialed once
+    // at start; only the still-disconnected E is re-dialed at the direct-connect
+    // tick.
+    const peer_d = testPeer(1);
+    const peer_e = testPeer(2);
+
+    const router = try FakeRouter.create(allocator, io, .{ .dial_log = &log }, local_test_peer, null, 0, null, null, .{
+        .direct_peers = &.{
+            .{ .id = peer_d, .addr = direct_addr_d },
+            .{ .id = peer_e, .addr = direct_addr_e },
+        },
+    });
+    defer router.destroy();
+    try router.start();
+    try sync(router, io);
+
+    // Both were dialed once at start (neither was connected yet).
+    try std.testing.expectEqual(@as(usize, 1), log.count(io, direct_addr_d));
+    try std.testing.expectEqual(@as(usize, 1), log.count(io, direct_addr_e));
+
+    // D connects (the dial "succeeded"); E remains disconnected.
+    const conn_d = try connectFakePeer(io, allocator, router, peer_d);
+    defer destroyFakeConn(allocator, conn_d);
+
+    // Beat exactly `direct_connect_ticks` heartbeats: the re-dial pass lands at
+    // that tick (the tick is incremented before the modulo check, matching go).
+    try beatHeartbeats(io, router, mesh_params.direct_connect_ticks);
+
+    // E (disconnected) was re-dialed; D (connected) was left alone.
+    try std.testing.expectEqual(@as(usize, 2), log.count(io, direct_addr_e));
+    try std.testing.expectEqual(@as(usize, 1), log.count(io, direct_addr_d));
+}
+
+test "direct-peer auto-connect: a dialed direct peer that then connects is treated as direct (forwarded to)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log = DialLog{ .allocator = allocator };
+    defer log.deinit(io);
+
+    // D is a direct peer; S relays a publish. The router dials D at start; the
+    // test then simulates D's connect (peer_connected) and confirms D is treated
+    // as direct — a relayed message on a topic D subscribes to is forwarded to it.
+    const peer_d = testPeer(1);
+    const source = testPeer(2);
+
+    const router = try FakeRouter.create(allocator, io, .{ .dial_log = &log }, local_test_peer, null, 0, null, null, .{
+        .direct_peers = &.{.{ .id = peer_d, .addr = direct_addr_d }},
+    });
+    defer router.destroy();
+    try router.start();
+    try sync(router, io);
+
+    // The dial was kicked off at start.
+    try std.testing.expectEqual(@as(usize, 1), log.count(io, direct_addr_d));
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    // The dial "succeeds": the connect surfaces as peer_connected, the normal path.
+    const conn_d = try connectFakePeer(io, allocator, router, peer_d);
+    defer destroyFakeConn(allocator, conn_d);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    // D announces it subscribes to "t".
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_d, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try sync(router, io);
+
+    // S relays a publish on "t": D — direct, never grafted into the mesh —
+    // receives it exactly once via the direct forward path.
+    try std.testing.expect(!router.meshContains("t", peer_d));
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x07", "t", "direct"),
+    } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_d.record, "t", "direct") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_d.record, "t", "direct"));
 }
