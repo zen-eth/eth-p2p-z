@@ -124,6 +124,20 @@ pub const RouterConfig = struct {
     /// anonymous). All nodes in a topic must use the SAME function. The default
     /// (null) leaves the policy's built-in derivation in place.
     message_id_fn: ?MessageIdConfig = null,
+    /// Direct (explicit) peers: peers with an out-of-band peering agreement
+    /// (go-libp2p `WithDirectPeers`). A connected direct peer is treated as
+    /// trusted and OUTSIDE the mesh: every valid message on a topic it subscribes
+    /// to is forwarded to it unconditionally (alongside the mesh, deduped), it is
+    /// NEVER grafted/pruned into a mesh (a GRAFT from it is refused with a PRUNE
+    /// back, signalling a non-reciprocal config), and it bypasses the score gates
+    /// (graylist, the GRAFT negative-score reject, and the publish threshold). The
+    /// peering should be reciprocal — both ends configure each other as direct.
+    /// The slice is BORROWED for the `create` call only: `create` copies each id
+    /// into a Router-owned set, so the caller may free the slice afterward.
+    /// Connection maintenance (auto-dialing a disconnected direct peer, go's
+    /// `DirectConnectTicks`) is NOT implemented here — the app keeps direct peers
+    /// connected; an unconnected direct peer is simply unreachable until it is.
+    direct_peers: []const PeerId = &.{},
 };
 
 /// Invoked on the router fiber for each delivered message on a topic WE
@@ -528,6 +542,15 @@ pub fn Router(comptime Transport: type) type {
         /// disconnect. Without a matching PeerState an entry is a transient note,
         /// not a leak — disconnect always purges it. Keyed like `peers`.
         peer_versions: std.AutoHashMap(PeerKey, pubsub.Version),
+        /// Direct (explicit) peer ids — the go-libp2p `direct` set. A peer whose
+        /// key is in here is treated as a trusted out-of-mesh forward target: it
+        /// receives every valid message on a topic it subscribes to, is never
+        /// added to a mesh (a GRAFT from it draws a PRUNE back), and bypasses the
+        /// score gates. Populated once in `create` from `RouterConfig.direct_peers`
+        /// (each id copied into an owned key) and never mutated; freed on teardown.
+        /// Keyed like `peers` (zero-padded peer bytes), with no nested allocation,
+        /// so it is freed with a single `deinit`.
+        direct: std.AutoHashMapUnmanaged(PeerKey, void) = .empty,
         /// Topics the local node subscribes to. Keys are owned copies; freed on
         /// unsubscribe and on teardown. We announce these to every peer (on our
         /// own subscribe, and to each newly-connected peer) and deliver matching
@@ -707,6 +730,16 @@ pub fn Router(comptime Transport: type) type {
                 .score = score_engine,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
             };
+
+            // Copy the configured direct-peer ids into the router-owned set (the
+            // config slice is borrowed only for this call). Each id is stored as a
+            // zero-padded PeerKey, the same key the peer map / mesh use, so a
+            // direct lookup is a plain map probe. A failed insert (OOM) just leaves
+            // that peer non-direct — degraded but safe (it falls back to ordinary
+            // mesh treatment); the rest still load.
+            for (config.direct_peers) |peer| {
+                router.direct.put(allocator, peerKey(&peer), {}) catch {};
+            }
             return router;
         }
 
@@ -775,6 +808,7 @@ pub fn Router(comptime Transport: type) type {
 
             router.peers.deinit();
             router.peer_versions.deinit();
+            router.direct.deinit(router.allocator);
             router.freeMyTopics();
             router.freeMesh();
             router.freeBackoff();
@@ -941,6 +975,16 @@ pub fn Router(comptime Transport: type) type {
             while (fanout_it.next()) |set| _ = set.remove(key);
         }
 
+        // ----- direct-peer helpers ----------------------------------------
+
+        /// Whether `peer` is a configured direct (explicit) peer. A direct peer is
+        /// treated as trusted and out-of-mesh: it receives every valid message on a
+        /// topic it subscribes to, is never grafted/pruned into a mesh, and bypasses
+        /// the score gates. Inert (always false) when no direct peers are configured.
+        fn isDirect(router: *const Self, peer: PeerId) bool {
+            return router.direct.contains(peerKey(&peer));
+        }
+
         // ----- scoring helpers --------------------------------------------
 
         /// The peer's current score for gate decisions: read from the
@@ -999,6 +1043,10 @@ pub fn Router(comptime Transport: type) type {
                 if (added >= n) break;
                 const peer = entry.value_ptr.*.peer;
                 if (!entry.value_ptr.*.topics.contains(topic)) continue;
+                // Never graft a direct (explicit) peer into a mesh — it is an
+                // out-of-mesh trusted forward target (go-libp2p filters direct
+                // peers out of every mesh-maintenance candidate selection).
+                if (router.isDirect(peer)) continue;
                 if (router.meshContains(topic, peer)) continue;
                 if (router.inBackoff(topic, peer)) continue;
                 // Never graft a negative-scoring peer into the mesh (go-libp2p
@@ -1110,6 +1158,10 @@ pub fn Router(comptime Transport: type) type {
                 if (set.count() >= mesh_params.d) break;
                 const peer = entry.value_ptr.*.peer;
                 if (!entry.value_ptr.*.topics.contains(topic)) continue;
+                // A direct (explicit) peer is never placed in a fanout set: it is
+                // an out-of-mesh trusted forward target, reached via the direct
+                // path on every publish (go filters direct peers out of fanout).
+                if (router.isDirect(peer)) continue;
                 set.put(router.allocator, peerKey(&peer), {}) catch break;
             }
         }
@@ -1128,7 +1180,10 @@ pub fn Router(comptime Transport: type) type {
             while (it.next()) |entry| {
                 const peer = entry.value_ptr.*.peer;
                 if (!entry.value_ptr.*.topics.contains(topic)) continue;
-                if (!router.abovePublishThreshold(peer)) continue;
+                // A direct peer is always flooded to (go floods to `direct ||
+                // score >= publishThreshold`), so it skips the publish-threshold
+                // gate; any other peer must be at or above the threshold.
+                if (!router.isDirect(peer) and !router.abovePublishThreshold(peer)) continue;
                 set.put(router.allocator, peerKey(&peer), {}) catch break;
             }
             return set;
@@ -1627,6 +1682,11 @@ pub fn Router(comptime Transport: type) type {
                 const key = peerKey(&peer);
                 if (mesh_set) |s| if (s.contains(key)) continue;
                 if (fanout_set) |s| if (s.contains(key)) continue;
+                // Never emit IHAVE to a direct (explicit) peer: it already
+                // receives every full message on the topic via the direct forward
+                // path, so gossiping ids to it is pointless (go excludes direct
+                // peers from gossip emission for exactly this reason).
+                if (router.isDirect(peer)) continue;
                 // Gossip gate: only advertise (IHAVE) to peers whose score clears
                 // the gossip threshold; a peer below it is denied gossip. Reads
                 // the per-heartbeat snapshot (gossip emission runs after the
@@ -1787,9 +1847,12 @@ pub fn Router(comptime Transport: type) type {
             // the defer above. No-op when scoring is disabled. (Uses a live score
             // rather than the per-heartbeat snapshot: an RPC can arrive between
             // heartbeats, and a peer that just crossed the graylist line should be
-            // shut out immediately, matching go-libp2p's per-RPC check.)
+            // shut out immediately, matching go-libp2p's per-RPC check.) A direct
+            // (explicit) peer is exempt — go-libp2p's `AcceptFrom` returns
+            // AcceptAll for a direct peer, so its RPCs are processed regardless of
+            // score (it is trusted by configuration).
             if (router.score) |sc| {
-                if (sc.belowGraylist(source)) return;
+                if (!router.isDirect(source) and sc.belowGraylist(source)) return;
             }
 
             // Subscription changes update the source peer's announced topics.
@@ -2070,6 +2133,17 @@ pub fn Router(comptime Transport: type) type {
         /// source is ignored.
         fn handleGraft(router: *Self, source: PeerId, topic: []const u8) void {
             if (!router.peers.contains(peerKey(&source))) return;
+
+            // A direct (explicit) peer is never grafted into a mesh — it is an
+            // out-of-mesh trusted forward target. A GRAFT from one signals a
+            // non-reciprocal peering config (the remote thinks we are a regular
+            // mesh peer); reply with a PRUNE so it stops, but do NOT back it off
+            // (it stays a direct forward target). Matches go-libp2p, which warns
+            // and PRUNEs the direct peer back without adding it to the mesh.
+            if (router.isDirect(source)) {
+                router.sendPrune(source, topic, mesh_params.prune_backoff_ticks);
+                return;
+            }
 
             // A negative-scoring peer is not admitted to the mesh (PRUNE back +
             // backoff), even if it would otherwise be accepted. An existing
@@ -2375,10 +2449,51 @@ pub fn Router(comptime Transport: type) type {
             // whether or not there are mesh peers to forward to.
             router.message_cache.put(id, topic, frame) catch {};
 
-            // Forward over the mesh/fanout set when there is one (it may be empty).
-            if (set) |s| {
+            // Forward over the mesh/fanout/flood set PLUS every connected direct
+            // peer subscribed to the topic. Direct peers are out-of-mesh trusted
+            // targets that go-libp2p adds to the send set alongside the mesh, so a
+            // valid message always reaches them. Build a transient UNION of the
+            // base set and those direct peers (a set, so a peer that is both a mesh
+            // member and direct is targeted exactly once), then fan out over it.
+            // When no direct peers are configured (the common case) this is a no-op
+            // and we forward over the base set directly, unchanged.
+            if (router.directSubscribers(topic, exclude)) |direct_targets| {
+                var combined = direct_targets;
+                defer combined.deinit(router.allocator);
+                if (set) |s| {
+                    var it = s.keyIterator();
+                    while (it.next()) |key_ptr| combined.put(router.allocator, key_ptr.*, {}) catch {};
+                }
+                router.fanOutFrame(.data, frame, .{ .peer_set = .{ .set = &combined, .exclude = exclude } });
+            } else if (set) |s| {
                 router.fanOutFrame(.data, frame, .{ .peer_set = .{ .set = s, .exclude = exclude } });
             }
+        }
+
+        /// Build a transient PeerSet of every connected direct peer subscribed to
+        /// `topic`, excluding `exclude` (the relay source — never echo a message
+        /// back to where it came from). Returns null when no direct peer qualifies
+        /// (no direct peers configured, none connected, or none subscribed) so the
+        /// common no-direct-peers path stays allocation-free. The caller OWNS the
+        /// returned set and must `deinit` it; it only TARGETS the fan-out (the
+        /// frame's references live on the per-peer queues), so freeing it touches no
+        /// frame. Mirrors go-libp2p, which forwards to a direct peer only for topics
+        /// it has SUBSCRIBEd to (the `tmap`/`inTopic` check in Publish).
+        fn directSubscribers(router: *Self, topic: []const u8, exclude: ?PeerId) ?PeerSet {
+            if (router.direct.count() == 0) return null;
+            var set: PeerSet = .empty;
+            var it = router.direct.keyIterator();
+            while (it.next()) |key_ptr| {
+                const state = router.peers.get(key_ptr.*) orelse continue;
+                if (exclude) |ex| if (state.peer.eql(&ex)) continue;
+                if (!state.topics.contains(topic)) continue;
+                set.put(router.allocator, key_ptr.*, {}) catch {};
+            }
+            if (set.count() == 0) {
+                set.deinit(router.allocator);
+                return null;
+            }
+            return set;
         }
 
         /// Local subscribe: record the topic, announce it to every peer, then JOIN
@@ -2405,6 +2520,10 @@ pub fn Router(comptime Transport: type) type {
                     if (router.meshSize(topic) >= mesh_params.d) break;
                     const state = router.peers.get(key_ptr.*) orelse continue;
                     const peer = state.peer;
+                    // A direct peer is never placed in the mesh, even when seeding
+                    // from a fanout set (which already excludes direct peers, so
+                    // this is a belt-and-braces guard on the mesh-add invariant).
+                    if (router.isDirect(peer)) continue;
                     if (router.meshContains(topic, peer) or router.inBackoff(topic, peer)) continue;
                     router.meshAdd(topic, peer);
                     router.sendGraft(peer, topic);
@@ -6678,4 +6797,279 @@ test "IDONTWANT dont_send entry expires after its TTL, un-skipping the message" 
         io_time.ms(5).sleep(io) catch {};
     }
     try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_p.record, "t", "again"));
+}
+
+// --- direct (explicit) peers ----------------------------------------------
+//
+// A direct peer has an out-of-band peering agreement (go-libp2p WithDirectPeers).
+// It is treated as a trusted out-of-mesh forward target: every valid message on a
+// topic it subscribes to reaches it (alongside the mesh, deduped), it is never
+// grafted/pruned into a mesh (a GRAFT from it draws a PRUNE back), and it bypasses
+// the score gates (graylist / GRAFT-negative-reject / publish threshold). These
+// tests pass its id through `RouterConfig.direct_peers`; the connection itself is
+// established externally (the test posts peer_connected), matching the design
+// where the app keeps direct peers connected (auto-dial is not implemented here).
+
+test "direct peer receives a relayed message though it is NOT in the mesh, and is not double-sent when also a mesh member" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // D is a direct peer; A is a regular mesh peer; S relays a publish.
+    const peer_d = testPeer(1);
+    const peer_a = testPeer(2);
+    const source = testPeer(3);
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
+        .direct_peers = &.{peer_d},
+    });
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const conn_d = try connectFakePeer(io, allocator, router, peer_d);
+    defer destroyFakeConn(allocator, conn_d);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    // Both D and A announce they subscribe to "t".
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_d, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
+
+    // A GRAFTs into the mesh; D is direct, so a GRAFT from it would be refused
+    // (covered by another test) — here D never grafts, it stays out of the mesh.
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+    try std.testing.expect(router.meshContains("t", peer_a));
+    try std.testing.expect(!router.meshContains("t", peer_d));
+
+    // S relays a publish on "t": both mesh member A and direct peer D receive it,
+    // each EXACTLY ONCE (D via the direct forward path, A via the mesh).
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x01", "t", "hi"),
+    } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_d.record, "t", "hi") >= 1 and
+            recordCountPublishes(io, &conn_a.record, "t", "hi") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    // Give any erroneous extra copy a chance to land before asserting exactly-once.
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_d.record, "t", "hi"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "hi"));
+}
+
+test "direct peer that is ALSO a mesh-eligible subscriber is forwarded to exactly once" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // D is direct AND subscribes to "t". The heartbeat must never graft it into
+    // the mesh (it is filtered out of candidate selection), so it only ever
+    // receives messages via the direct path — and exactly once.
+    const peer_d = testPeer(1);
+    const source = testPeer(2);
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
+        .direct_peers = &.{peer_d},
+    });
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const conn_d = try connectFakePeer(io, allocator, router, peer_d);
+    defer destroyFakeConn(allocator, conn_d);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_d, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try sync(router, io);
+
+    // Several heartbeats: the mesh is below D_low, so maintenance tries to graft —
+    // but D, the only candidate, is direct and must be skipped. The mesh stays
+    // empty of D and no GRAFT is ever sent to it.
+    try beatHeartbeats(io, router, 3);
+    try std.testing.expect(!router.meshContains("t", peer_d));
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 0), recordCountGrafts(io, &conn_d.record, "t"));
+
+    // A relayed publish still reaches D once via the direct path.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x09", "t", "z"),
+    } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_d.record, "t", "z") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_d.record, "t", "z"));
+}
+
+test "GRAFT from a direct peer is refused: it does NOT join the mesh and is PRUNEd back" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const peer_d = testPeer(1);
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
+        .direct_peers = &.{peer_d},
+    });
+    defer router.destroy();
+    try router.start();
+
+    // We subscribe to "t" so that, were D a regular peer, its GRAFT would be
+    // ACCEPTED — isolating the direct-peer refusal as the cause.
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const conn_d = try connectFakePeer(io, allocator, router, peer_d);
+    defer destroyFakeConn(allocator, conn_d);
+
+    // A GRAFT from the direct peer is refused: D never enters the mesh.
+    try std.testing.expectEqual(GraftOutcome.rejected, try graftAndWait(io, allocator, router, conn_d, peer_d, "t"));
+    try std.testing.expect(!router.meshContains("t", peer_d));
+
+    // And it draws a PRUNE back (go warns + PRUNEs a direct peer that GRAFTs).
+    try std.testing.expect(waitPruneSent(io, conn_d, "t"));
+    try std.testing.expectEqual(@as(usize, 1), recordCountPrunes(io, &conn_d.record, "t"));
+}
+
+test "heartbeat never grafts or prunes a direct peer (mesh maintenance leaves it untouched)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // D is direct and subscribed; R is a regular subscriber. With the mesh below
+    // D_low the heartbeat grafts candidates — it must graft R but never D.
+    const peer_d = testPeer(1);
+    const peer_r = testPeer(2);
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
+        .direct_peers = &.{peer_d},
+    });
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const conn_d = try connectFakePeer(io, allocator, router, peer_d);
+    defer destroyFakeConn(allocator, conn_d);
+    const conn_r = try connectFakePeer(io, allocator, router, peer_r);
+    defer destroyFakeConn(allocator, conn_r);
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_d, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_r, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try sync(router, io);
+
+    // Drive heartbeats: maintenance grafts R into the mesh (and GRAFTs it) but
+    // skips D entirely — D is never added to the mesh and never sent a GRAFT.
+    try beatHeartbeats(io, router, 3);
+    try std.testing.expect(router.meshContains("t", peer_r));
+    try std.testing.expect(!router.meshContains("t", peer_d));
+    try std.testing.expect(waitGraftSent(io, conn_r, "t"));
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 0), recordCountGrafts(io, &conn_d.record, "t"));
+    // D is out of the mesh, so it can never be a prune victim either.
+    try std.testing.expectEqual(@as(usize, 0), recordCountPrunes(io, &conn_d.record, "t"));
+}
+
+test "flood-publish reaches a direct peer for a topic it subscribes to" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // We do NOT subscribe to "t" (we only publish). Under flood-publish (the
+    // default), an originated message goes to every subscriber — including the
+    // direct peer D — even with no mesh for the topic.
+    const peer_d = testPeer(1);
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
+        .direct_peers = &.{peer_d},
+    });
+    defer router.destroy();
+    try router.start();
+
+    const conn_d = try connectFakePeer(io, allocator, router, peer_d);
+    defer destroyFakeConn(allocator, conn_d);
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_d, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try sync(router, io);
+
+    // Publish locally; D receives the originated message exactly once.
+    try router.inbox.putOne(io, .{ .publish = .{
+        .topic = try allocator.dupe(u8, "t"),
+        .data = try allocator.dupe(u8, "flood"),
+    } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_d.record, "t", "flood") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_d.record, "t", "flood"));
+}
+
+test "scoring bypass: a direct peer at a NEGATIVE score is still forwarded to and not graylisted" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    // D is a direct peer; S relays a (valid, signed) publish. Scoring is ON with
+    // StrictSign, so D's score can be driven below the graylist threshold via
+    // invalid (unsigned) deliveries — yet D must stay trusted: its RPCs are still
+    // processed (not graylisted) and it still receives forwards.
+    const peer_d = testPeer(1);
+    const source = testPeer(2);
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, &host_key, scoringConfig(), .{
+        .direct_peers = &.{peer_d},
+    });
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const conn_d = try connectFakePeer(io, allocator, router, peer_d);
+    defer destroyFakeConn(allocator, conn_d);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+
+    // Drive D well below the graylist threshold (-10): 4 invalid messages → -16.
+    try driveInvalid(io, allocator, router, peer_d, "t", 4);
+    try std.testing.expect(liveScore(router, peer_d) <= -10.0);
+
+    // A SUBSCRIBE RPC from the graylist-deep direct peer is STILL processed (a
+    // regular peer this far down would be ignored): D's announced-topics gains "t".
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_d, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expect(peerTracksTopic(router, peer_d, "t"));
+
+    // S relays a valid signed publish on "t": the direct peer D — though deeply
+    // negative — still receives it (scoring does not gate a direct forward target).
+    // The publish is signed by the host key so it passes StrictSign verification.
+    const signed = try signedInboundPublish(allocator, &host_key, "\x00\x00\x00\x05", "t", "scored");
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = source, .rpc = signed } });
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_d.record, "t", "scored") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_d.record, "t", "scored"));
 }
