@@ -3562,6 +3562,16 @@ fn makeFakeConn(allocator: std.mem.Allocator) !*FakeTransport.FakeConn {
     return conn;
 }
 
+/// Frees a FakeConn and its embedded FakeRecord. ORDERING INVARIANT: a peer's
+/// writer fiber (router-owned) appends to this record in writeFrame; those fibers
+/// are only cancelled+joined by `router.destroy()`. So for any conn whose peer is
+/// still connected at end of test, `router.destroy()` MUST run before this frees
+/// the record, or a writer mid-writeFrame touches freed memory (an `index 0xAA…`
+/// panic in appendSlice). Tests guarantee this by declaring `defer router.destroy()`
+/// AFTER the `defer destroyFakeConn(...)` calls (defers are LIFO, so destroy runs
+/// first → joins writers → then records free). Records stay inspectable until freed.
+/// (Tests that disconnect the peer first — peer_disconnected joins that writer — or
+/// quiesce the writer before teardown may free inline / in any order safely.)
 fn destroyFakeConn(allocator: std.mem.Allocator, conn: *FakeTransport.FakeConn) void {
     conn.record.deinit();
     allocator.destroy(conn);
@@ -3646,12 +3656,12 @@ test "router peer lifecycle: connect makes a sink + writer, disconnect tears dow
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = try PeerId.random();
     const conn = try makeFakeConn(allocator);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
     try std.testing.expect(waitFor(io, peerCountIsOne, router));
@@ -3670,7 +3680,6 @@ test "router dedups a second peer_connected for the same peer id" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = try PeerId.random();
@@ -3678,6 +3687,7 @@ test "router dedups a second peer_connected for the same peer id" {
     defer destroyFakeConn(allocator, conn_a);
     const conn_b = try makeFakeConn(allocator);
     defer destroyFakeConn(allocator, conn_b);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn_a, .remote_addr = dummy_addr } });
     try std.testing.expect(waitFor(io, peerCountIsOne, router));
@@ -3708,12 +3718,12 @@ test "router tears the peer down when the writer exhausts open retries" {
     // on_disconnect → the router posts peer_disconnected → the peer is torn down
     // and peerCount drops back to 0. Tiny retry/backoff so the give-up is fast.
     const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = try PeerId.random();
     const conn = try makeFakeConn(allocator);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
     try std.testing.expect(waitFor(io, peerCountIsOne, router));
@@ -3736,7 +3746,6 @@ test "router frees an inbound RPC (peer tracked and peer absent)" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // Peer-absent case: no peer_connected was posted, so the inbound RPC arrives
@@ -3748,6 +3757,7 @@ test "router frees an inbound RPC (peer tracked and peer absent)" {
     const peer = try PeerId.random();
     const conn = try makeFakeConn(allocator);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
     try std.testing.expect(waitFor(io, peerCountIsOne, router));
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundRpc(allocator, "t-present") } });
@@ -3768,7 +3778,6 @@ test "router clean shutdown tears down registered peers" {
     // Tear the router down on every exit (not just the happy path): an early
     // assertion failure must NOT leave the main + writer fibers orphaned, or
     // threaded.deinit() would hang joining them.
-    defer router.destroy();
     try router.start();
 
     // Register two peers, then destroy() without disconnecting them: the main
@@ -3785,6 +3794,7 @@ test "router clean shutdown tears down registered peers" {
     defer destroyFakeConn(allocator, conn_a);
     const conn_b = try makeFakeConn(allocator);
     defer destroyFakeConn(allocator, conn_b);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer_a, .conn = conn_a, .remote_addr = dummy_addr } });
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer_b, .conn = conn_b, .remote_addr = dummy_addr } });
@@ -4257,12 +4267,12 @@ test "subscribe announces the subscription to a connected peer" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Subscribe locally; the router announces it to every peer on the subscribe
     // lane. The writer fiber opens the fake stream and records the framed RPC.
@@ -4284,12 +4294,12 @@ test "inbound subscription is tracked on the source peer" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Peer X announces it subscribes to "t"; the router records it on X's state.
     // Sync so the inbound is fully processed, then read the peer's topics once.
@@ -4310,7 +4320,6 @@ test "received message forwards over the mesh, not to all subscribers" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // We subscribe to "t". Peer A is grafted into our mesh; peer B is subscribed
@@ -4328,6 +4337,7 @@ test "received message forwards over the mesh, not to all subscribers" {
     defer destroyFakeConn(allocator, conn_b);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // B announces it subscribes to "t" (so floodsub WOULD have forwarded to it),
     // but we never graft B, so it is not a mesh member.
@@ -4362,7 +4372,6 @@ test "mesh forwarding dedups a repeated publish (same from+seqno) to forward onc
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // Subscribe to "t" and graft Y into the mesh so a forward has a destination.
@@ -4374,6 +4383,7 @@ test "mesh forwarding dedups a repeated publish (same from+seqno) to forward onc
     defer destroyFakeConn(allocator, conn_x);
     const conn_y = try connectFakePeer(io, allocator, router, peer_y);
     defer destroyFakeConn(allocator, conn_y);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_y, peer_y, "t"));
 
@@ -4405,7 +4415,6 @@ test "seen-cache TTL: a duplicate is suppressed within the window, re-processed 
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // Subscribe to "t" and graft Y in so a forward has a destination; X relays.
@@ -4416,6 +4425,7 @@ test "seen-cache TTL: a duplicate is suppressed within the window, re-processed 
     defer destroyFakeConn(allocator, conn_x);
     const conn_y = try connectFakePeer(io, allocator, router, peer_y);
     defer destroyFakeConn(allocator, conn_y);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_y, peer_y, "t"));
 
     // Receive the message at tick 0 (from++seqno id). It forwards once and is now
@@ -4468,13 +4478,13 @@ test "seen-cache keeps more ids than the old FIFO cap within the TTL window (no 
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
     const peer_x = testPeer(1);
     const conn_x = try connectFakePeer(io, allocator, router, peer_x);
     defer destroyFakeConn(allocator, conn_x);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Receive 2000 distinct messages (> the old 1024 FIFO cap) within one TTL
     // window. Each gets a unique 4-byte seqno, so a unique from++seqno id.
@@ -4510,13 +4520,13 @@ test "seen-cache first-seen: re-adding an id does NOT extend its expiry" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
     const peer_x = testPeer(1);
     const conn_x = try connectFakePeer(io, allocator, router, peer_x);
     defer destroyFakeConn(allocator, conn_x);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Add the id at tick 0 (expiry = seen_ttl_ticks).
     try router.inbox.putOne(io, .{ .inbound_rpc = .{
@@ -4552,7 +4562,6 @@ test "publish to a subscribed topic forwards over the mesh and delivers locally"
     defer rec.deinit();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // Subscribe locally so the publish is delivered to our own handler too.
@@ -4561,6 +4570,7 @@ test "publish to a subscribed topic forwards over the mesh and delivers locally"
     const peer_a = testPeer(2);
     const conn_a = try connectFakePeer(io, allocator, router, peer_a);
     defer destroyFakeConn(allocator, conn_a);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // A announces it subscribes to "t" (so it is both a topic subscriber and,
     // once grafted, a mesh member). With flood-publish on (the default) an
@@ -4605,7 +4615,6 @@ test "flood-publish floods an originated message to ALL topic subscribers, not j
 
     // Default config → flood-publish ON.
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // We subscribe to "t". A is grafted into our mesh; B subscribes to "t" but is
@@ -4653,6 +4662,7 @@ test "flood-publish floods an originated message to ALL topic subscribers, not j
     const source = testPeer(3);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try router.inbox.putOne(io, .{ .inbound_rpc = .{
         .peer = source,
         .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x01", "t", "relay"),
@@ -4682,7 +4692,6 @@ test "flood-publish gates on the publish threshold: a below-threshold subscriber
     var cfg = scoringConfig();
     cfg.thresholds.publish_threshold = -1.0;
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, &host_key, cfg, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -4693,6 +4702,7 @@ test "flood-publish gates on the publish threshold: a below-threshold subscriber
     defer destroyFakeConn(allocator, conn_a);
     const conn_b = try connectFakePeer(io, allocator, router, peer_b);
     defer destroyFakeConn(allocator, conn_b);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Both subscribe to "t".
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
@@ -4732,7 +4742,6 @@ test "flood-publish OFF: an originated message reaches mesh members only, not ot
 
     // Flood-publish OFF → originated messages use the mesh (we subscribe to "t").
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{ .flood_publish = false });
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -4743,6 +4752,7 @@ test "flood-publish OFF: an originated message reaches mesh members only, not ot
     defer destroyFakeConn(allocator, conn_a);
     const conn_b = try connectFakePeer(io, allocator, router, peer_b);
     defer destroyFakeConn(allocator, conn_b);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Both subscribe to "t", but only A is grafted into the mesh.
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
@@ -4781,7 +4791,6 @@ test "a forwarded message lands in the message cache and is evicted after histor
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // Subscribe to "t" and graft a mesh member so a received publish is forwarded
@@ -4793,6 +4802,7 @@ test "a forwarded message lands in the message cache and is evicted after histor
     defer destroyFakeConn(allocator, conn_a);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
 
     // Source relays a publish; sync so the forward (and its message-cache
@@ -4907,7 +4917,6 @@ test "GRAFT accepted: subscribed topic, peer joins the mesh, no PRUNE back" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -4915,6 +4924,7 @@ test "GRAFT accepted: subscribed topic, peer joins the mesh, no PRUNE back" {
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     const outcome = try graftAndWait(io, allocator, router, conn, peer, "t");
     try std.testing.expectEqual(GraftOutcome.accepted, outcome);
@@ -4930,13 +4940,13 @@ test "GRAFT rejected when we do not subscribe: PRUNE sent, peer not in mesh" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // We do NOT subscribe to "t".
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     const outcome = try graftAndWait(io, allocator, router, conn, peer, "t");
     try std.testing.expectEqual(GraftOutcome.rejected, outcome);
@@ -4952,7 +4962,6 @@ test "GRAFT can push the mesh past D_high; the heartbeat prunes it back to D" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -4964,6 +4973,7 @@ test "GRAFT can push the mesh past D_high; the heartbeat prunes it back to D" {
     var peers: [mesh_params.d_high + 1]PeerId = undefined;
     var filled: usize = 0;
     defer for (conns[0..filled]) |c| destroyFakeConn(allocator, c);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const p = testPeer(@intCast(10 + i));
@@ -5017,7 +5027,6 @@ test "heartbeat grafts up to D candidate peers when the mesh is below D_low" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // Subscribe to "t" BEFORE any peer is known so the eager subscribe-join finds
@@ -5030,6 +5039,7 @@ test "heartbeat grafts up to D candidate peers when the mesh is below D_low" {
     var peers: [n]PeerId = undefined;
     var i: usize = 0;
     defer for (conns[0..]) |c| destroyFakeConn(allocator, c);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     while (i < n) : (i += 1) {
         const p = testPeer(@intCast(20 + i));
         peers[i] = p;
@@ -5059,7 +5069,6 @@ test "heartbeat grafts only up to D, not beyond, when many candidates exist" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // Connect 10 peers (all subscribed to "t") BEFORE subscribing locally, so the
@@ -5071,6 +5080,7 @@ test "heartbeat grafts only up to D, not beyond, when many candidates exist" {
     var peers: [n]PeerId = undefined;
     var i: usize = 0;
     defer for (conns[0..]) |c| destroyFakeConn(allocator, c);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     while (i < n) : (i += 1) {
         const p = testPeer(@intCast(30 + i));
         peers[i] = p;
@@ -5110,7 +5120,6 @@ test "PRUNE removes peer from mesh and backs it off (a later GRAFT is rejected)"
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -5118,6 +5127,7 @@ test "PRUNE removes peer from mesh and backs it off (a later GRAFT is rejected)"
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // P joins the mesh, then PRUNEs us (with a small backoff < default floor).
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
@@ -5141,7 +5151,6 @@ test "backoff expires after prune_backoff_ticks heartbeats, then GRAFT is accept
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -5149,6 +5158,7 @@ test "backoff expires after prune_backoff_ticks heartbeats, then GRAFT is accept
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // PRUNE from P (default-floor backoff) backs P off for prune_backoff_ticks.
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundPrune(allocator, "t", 0) } });
@@ -5171,7 +5181,6 @@ test "peer disconnect cleans the peer out of mesh but keeps its backoff" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // We subscribe to "t" (so a GRAFT(t) is accepted into the mesh) but NOT to
@@ -5182,6 +5191,7 @@ test "peer disconnect cleans the peer out of mesh but keeps its backoff" {
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
     try std.testing.expectEqual(GraftOutcome.rejected, try graftAndWait(io, allocator, router, conn, peer, "t2"));
@@ -5209,7 +5219,6 @@ test "prune-backoff persists across a disconnect+reconnect (a reconnect cannot b
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -5236,6 +5245,7 @@ test "prune-backoff persists across a disconnect+reconnect (a reconnect cannot b
 
     const conn2 = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn2);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try std.testing.expect(peerCountIsOne(router));
 
     // The first GRAFT after reconnect must be REJECTED (still in backoff) and earn
@@ -5261,7 +5271,6 @@ test "disconnect+reconnect churn: mesh reforms and pub/sub resumes with clean st
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -5301,6 +5310,7 @@ test "disconnect+reconnect churn: mesh reforms and pub/sub resumes with clean st
     // P reconnects (fresh conn) and re-grafts: the mesh reforms with exactly P.
     const conn2 = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn2);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn2, peer, "t"));
     try std.testing.expect(router.meshContains("t", peer));
     try std.testing.expectEqual(@as(usize, 1), router.meshSize("t"));
@@ -5369,7 +5379,6 @@ test "PRUNE with a max-u64 backoff does not crash and actually backs the peer of
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -5377,6 +5386,7 @@ test "PRUNE with a max-u64 backoff does not crash and actually backs the peer of
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // P joins the mesh, then PRUNEs us with an attacker-controlled max-u64 backoff.
     // Computing the expiry as heartbeat_tick + backoff would overflow: a panic in
@@ -5407,7 +5417,6 @@ test "re-GRAFT from an existing mesh member at D_high is an idempotent accept (n
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -5418,6 +5427,7 @@ test "re-GRAFT from an existing mesh member at D_high is an idempotent accept (n
     var peers: [mesh_params.d_high]PeerId = undefined;
     var filled: usize = 0;
     defer for (conns[0..filled]) |c| destroyFakeConn(allocator, c);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     var i: usize = 0;
     while (i < d_high) : (i += 1) {
         const p = testPeer(@intCast(10 + i));
@@ -5461,7 +5471,6 @@ test "publish to an UNSUBSCRIBED topic forms a fanout, forwards, then expires" {
     // subscribers), so no fanout entry would form — a separate flood test covers
     // that path.
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{ .flood_publish = false });
-    defer router.destroy();
     try router.start();
 
     // We do NOT subscribe to "t". Connect two peers that DO subscribe to "t".
@@ -5471,6 +5480,7 @@ test "publish to an UNSUBSCRIBED topic forms a fanout, forwards, then expires" {
     defer destroyFakeConn(allocator, conn_a);
     const conn_b = try connectFakePeer(io, allocator, router, peer_b);
     defer destroyFakeConn(allocator, conn_b);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_a, .rpc = try buildInboundSub(allocator, "t", true) } });
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_b, .rpc = try buildInboundSub(allocator, "t", true) } });
@@ -5518,7 +5528,6 @@ test "subscribe JOINs the mesh (eager GRAFTs); unsubscribe LEAVEs it (PRUNEs)" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // Connect three candidate peers, each subscribed to "t", BEFORE we subscribe,
@@ -5528,6 +5537,7 @@ test "subscribe JOINs the mesh (eager GRAFTs); unsubscribe LEAVEs it (PRUNEs)" {
     var peers: [n]PeerId = undefined;
     var i: usize = 0;
     defer for (conns[0..]) |c| destroyFakeConn(allocator, c);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     while (i < n) : (i += 1) {
         const p = testPeer(@intCast(40 + i));
         peers[i] = p;
@@ -5563,7 +5573,6 @@ test "unsubscribe LEAVE uses the shorter unsubscribe backoff (wire + local), not
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -5572,6 +5581,7 @@ test "unsubscribe LEAVE uses the shorter unsubscribe backoff (wire + local), not
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
     try std.testing.expect(router.meshContains("t", peer));
 
@@ -5613,7 +5623,6 @@ test "handlePrune honors a shorter advertised backoff (not floored to prune_back
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -5621,6 +5630,7 @@ test "handlePrune honors a shorter advertised backoff (not floored to prune_back
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // P joins the mesh, then PRUNEs us advertising the SHORT unsubscribe backoff
     // (10) — as a peer that is leaving the topic does. We must honor 10, NOT floor
@@ -5652,7 +5662,6 @@ test "over-degree heartbeat prune still carries prune_backoff_ticks (not the uns
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -5665,6 +5674,7 @@ test "over-degree heartbeat prune still carries prune_backoff_ticks (not the uns
     var peers = try allocator.alloc(PeerId, n);
     defer allocator.free(peers);
     defer for (conns) |c| destroyFakeConn(allocator, c);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     for (0..n) |idx| {
         const p = testPeer(@intCast(70 + idx));
         peers[idx] = p;
@@ -5710,7 +5720,6 @@ test "cache-on-accept: an accepted message with an EMPTY mesh is still cached" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // Subscribe to "t" but connect NO peers and graft nobody: mesh["t"] is empty
@@ -5722,6 +5731,7 @@ test "cache-on-accept: an accepted message with an EMPTY mesh is still cached" {
     const source = testPeer(1);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     const from = "origin";
     const seqno = "\x00\x00\x00\x09";
@@ -5747,7 +5757,6 @@ test "IHAVE emission: heartbeat advertises cached ids to a non-mesh subscriber" 
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // We subscribe to "t". Peer P subscribes to "t" but is NOT grafted into the
@@ -5760,6 +5769,7 @@ test "IHAVE emission: heartbeat advertises cached ids to a non-mesh subscriber" 
     defer destroyFakeConn(allocator, conn_p);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // P announces it subscribes to "t" (so it is a gossip target) but never GRAFTs.
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_p, .rpc = try buildInboundSub(allocator, "t", true) } });
@@ -5803,12 +5813,12 @@ test "inbound IHAVE: unseen id triggers an IWANT; a seen id triggers none" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer_p = testPeer(1);
     const conn_p = try connectFakePeer(io, allocator, router, peer_p);
     defer destroyFakeConn(allocator, conn_p);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // P announces an IHAVE for an id we have NOT seen → we reply with an IWANT.
     try router.inbox.putOne(io, .{ .inbound_rpc = .{
@@ -5856,7 +5866,6 @@ test "inbound IWANT: a cached id is served as the full publish; an unknown id is
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // Subscribe to "t" and connect P (the requester). Publish locally so the
@@ -5865,6 +5874,7 @@ test "inbound IWANT: a cached id is served as the full publish; an unknown id is
     const peer_p = testPeer(1);
     const conn_p = try connectFakePeer(io, allocator, router, peer_p);
     defer destroyFakeConn(allocator, conn_p);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Our local publish uses (local_peer, seqno 0) as its id.
     try router.inbox.putOne(io, .{ .publish = .{
@@ -5908,13 +5918,13 @@ test "recovery: IHAVE -> IWANT -> served publish is delivered to a node that mis
     defer rec.deinit();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
     const peer_p = testPeer(1);
     const conn_p = try connectFakePeer(io, allocator, router, peer_p);
     defer destroyFakeConn(allocator, conn_p);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     const from = "publisher";
     const seqno = "\x00\x00\x00\x2a";
@@ -5994,7 +6004,6 @@ test "gossip factor: emits IHAVE to max(0.25*eligible, d_lazy) lazy subscribers"
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -6010,6 +6019,7 @@ test "gossip factor: emits IHAVE to max(0.25*eligible, d_lazy) lazy subscribers"
     const source = testPeer(200);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     const from = "origin";
     const seqno = "\x00\x00\x00\x42";
     try router.inbox.putOne(io, .{ .inbound_rpc = .{
@@ -6035,7 +6045,6 @@ test "gossip factor floor: few eligible peers still gossips to d_lazy" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -6050,6 +6059,7 @@ test "gossip factor floor: few eligible peers still gossips to d_lazy" {
     const source = testPeer(200);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     const from = "origin";
     const seqno = "\x00\x00\x00\x43";
     try router.inbox.putOne(io, .{ .inbound_rpc = .{
@@ -6074,13 +6084,13 @@ test "gossip retransmission: same id served at most gossip_retransmission times 
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
     const peer_p = testPeer(1);
     const conn_p = try connectFakePeer(io, allocator, router, peer_p);
     defer destroyFakeConn(allocator, conn_p);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Cache a message (local publish) so its id is serveable by IWANT.
     try router.inbox.putOne(io, .{ .publish = .{
@@ -6126,12 +6136,12 @@ test "max IHAVE messages: only the first max_ihave_messages IHAVEs per heartbeat
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer_p = testPeer(1);
     const conn_p = try connectFakePeer(io, allocator, router, peer_p);
     defer destroyFakeConn(allocator, conn_p);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // P sends 12 separate IHAVE messages, each advertising a distinct unseen id.
     // Only the first max_ihave_messages (10) are processed → exactly 10 ids draw an
@@ -6293,12 +6303,12 @@ test "scoring graylist gate: an RPC from a below-graylist peer is ignored" {
     defer host_key.deinit();
 
     const router = try scoringRouter(allocator, io, &host_key, null);
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Drive the peer below the graylist threshold (-10): 4 invalid messages give
     // score -(4^2) = -16 < -10.
@@ -6332,7 +6342,6 @@ test "scoring prune gate: a negative-score mesh peer is pruned at the heartbeat"
     defer host_key.deinit();
 
     const router = try scoringRouter(allocator, io, &host_key, null);
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -6340,6 +6349,7 @@ test "scoring prune gate: a negative-score mesh peer is pruned at the heartbeat"
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // The peer GRAFTs in (score still 0, accepted) and becomes a mesh member.
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
@@ -6367,7 +6377,6 @@ test "scoring graft gate: maintenance does not graft a negative-score candidate"
     defer host_key.deinit();
 
     const router = try scoringRouter(allocator, io, &host_key, null);
-    defer router.destroy();
     try router.start();
 
     // Subscribe to "t" with no peers yet so the eager join grafts nobody; the
@@ -6377,6 +6386,7 @@ test "scoring graft gate: maintenance does not graft a negative-score candidate"
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // The peer announces it subscribes to "t" (a graft candidate) but we drive it
     // negative first (2 invalid → -4 < 0, still above graylist so the SUBSCRIBE is
@@ -6410,7 +6420,6 @@ test "scoring graft gate: an inbound GRAFT from a negative-score peer is rejecte
     defer host_key.deinit();
 
     const router = try scoringRouter(allocator, io, &host_key, null);
-    defer router.destroy();
     try router.start();
 
     // We DO subscribe to "t", so absent the score gate a GRAFT would be accepted.
@@ -6419,6 +6428,7 @@ test "scoring graft gate: an inbound GRAFT from a negative-score peer is rejecte
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Drive the peer negative (2 invalid → -4) but above graylist.
     try driveInvalid(io, allocator, router, peer, "t", 2);
@@ -6441,7 +6451,6 @@ test "scoring gossip gate: IHAVE goes to an above-threshold peer, not a below on
     defer host_key.deinit();
 
     const router = try scoringRouter(allocator, io, &host_key, null);
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -6458,6 +6467,7 @@ test "scoring gossip gate: IHAVE goes to an above-threshold peer, not a below on
     defer destroyFakeConn(allocator, conn_bad);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Both announce they subscribe to "t" (so both are gossip candidates). PRUNE
     // each for "t" so the heartbeat's mesh maintenance does not graft them (a
@@ -6519,7 +6529,6 @@ test "scoring events move the score: clean delivery raises it, sig-failure lower
     defer host_key.deinit();
 
     const router = try scoringRouter(allocator, io, &host_key, null);
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -6527,6 +6536,7 @@ test "scoring events move the score: clean delivery raises it, sig-failure lower
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // A clean, signed delivery credits P2 (first delivery, weight +1) to the
     // SENDING peer → score rises to +1. (The message's `from`/signer is a separate
@@ -6600,12 +6610,12 @@ test "broken IWANT promise: a peer that IHAVEs an id it never serves is penalize
     defer host_key.deinit();
 
     const router = try scoringRouter(allocator, io, &host_key, null);
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // P advertises an unseen id (IHAVE) → we IWANT it, recording a promise that P
     // must serve the message by `iwant_followup_ticks`. P never delivers it.
@@ -6645,7 +6655,6 @@ test "fulfilled IWANT promise: delivering the promised message before the deadli
     defer host_key.deinit();
 
     const router = try scoringRouter(allocator, io, &host_key, null);
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -6653,6 +6662,7 @@ test "fulfilled IWANT promise: delivering the promised message before the deadli
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // The id P will advertise is exactly the id the signed message below produces
     // (`from ++ seqno`), so the delivery fulfills the promise for that id.
@@ -6690,13 +6700,13 @@ test "IWANT promise tracking is skipped when scoring is disabled (no penalty, no
     // No score config → scoring disabled; promise bookkeeping must be skipped
     // entirely (and the leak-checking allocator proves no id key is allocated).
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
     try std.testing.expect(router.score == null);
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // IHAVE → IWANT still works without scoring: the id is requested.
     const id = "unserved-no-scoring";
@@ -6766,13 +6776,13 @@ test "anonymous publish omits identity fields and uses a content-based id" {
 
     // Anonymous policy, no host key. local_test_peer is ignored on the wire.
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{ .signature_policy = .anonymous });
-    defer router.destroy();
     try router.start();
 
     // A peer subscribed to "t" so the flood-publish has a target to forward to.
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, "t", true) } });
     try sync(router, io);
     try std.testing.expect(peerTracksTopic(router, peer, "t"));
@@ -6805,12 +6815,12 @@ test "anonymous: two publishes of the same (topic,data) dedup on the content id"
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{ .signature_policy = .anonymous });
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, "t", true) } });
     try sync(router, io);
 
@@ -6844,7 +6854,6 @@ test "anonymous: an unsigned inbound message is accepted (no verification) and f
     defer rec.deinit();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{ .signature_policy = .anonymous });
-    defer router.destroy();
     try router.start();
 
     // We subscribe to "t" (so we deliver locally). A is a mesh member; B is a
@@ -6861,6 +6870,7 @@ test "anonymous: an unsigned inbound message is accepted (no verification) and f
     defer destroyFakeConn(allocator, conn_b);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // B announces it subscribes to "t" but is never grafted (non-mesh subscriber).
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_b, .rpc = try buildInboundSub(allocator, "t", true) } });
@@ -7002,7 +7012,6 @@ test "router records each peer's negotiated /meshsub version; peerSupportsV12 on
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // One peer per version. Each connects, then its inbound stream reports the
@@ -7016,6 +7025,7 @@ test "router records each peer's negotiated /meshsub version; peerSupportsV12 on
     defer destroyFakeConn(allocator, conn_11);
     const conn_12 = try makeFakeConn(allocator);
     defer destroyFakeConn(allocator, conn_12);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer_10, .conn = conn_10, .remote_addr = dummy_addr } });
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer_11, .conn = conn_11, .remote_addr = dummy_addr } });
@@ -7056,12 +7066,12 @@ test "router adopts a version reported before peer_connected (inbound-before-con
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(0x42);
     const conn = try makeFakeConn(allocator);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // The inbound stream negotiates + reports 1.2 BEFORE the peer-event callback
     // posts peer_connected (both are independent fibers; either can win). The
@@ -7084,7 +7094,6 @@ test "router purges a pending version when the peer disconnects without ever con
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(0x55);
@@ -7101,6 +7110,7 @@ test "router purges a pending version when the peer disconnects without ever con
     // the connect was processed before we read the version.
     const conn = try makeFakeConn(allocator);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
     try std.testing.expect(waitFor(io, peerCountIsOne, router));
     // Sync so the connect (which adopted/purged the pending version) is fully
@@ -7149,12 +7159,12 @@ test "inbound IDONTWANT records the ids and purges matching queued frames" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Hold the peer's writer at the top of open() so it does not drain the queue:
     // frames pushed after the writer pops its one priming frame stay queued, where
@@ -7196,12 +7206,12 @@ test "IDONTWANT length cap: only the first max_idontwant_length ids of one messa
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // One IDONTWANT carrying more ids than the per-message cap. Only the first
     // max_idontwant_length are recorded in dont_send; the rest are ignored.
@@ -7240,12 +7250,12 @@ test "IDONTWANT message cap: only max_idontwant_messages per heartbeat are proce
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // The peer sends more IDONTWANT messages than the per-heartbeat cap, each
     // carrying a distinct id. Only the first max_idontwant_messages are processed
@@ -7286,7 +7296,6 @@ test "send-side skip: a message whose id a peer IDONTWANTed is not enqueued to i
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // We subscribe to "t" and graft two peers P and Q into the mesh. P will
@@ -7303,6 +7312,7 @@ test "send-side skip: a message whose id a peer IDONTWANTed is not enqueued to i
     defer destroyFakeConn(allocator, conn_q);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_p, peer_p, "t"));
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_q, peer_q, "t"));
@@ -7347,7 +7357,6 @@ test "emit IDONTWANT on a large received message: to v1.2 mesh peers, not v1.1 o
     // The threshold knob is left at the default (1024); the large message below
     // clears it, the small one does not.
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -7364,6 +7373,7 @@ test "emit IDONTWANT on a large received message: to v1.2 mesh peers, not v1.1 o
     defer destroyFakeConn(allocator, conn_c);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     router.postPeerProtocol(io, peer_a, .v1_2);
     router.postPeerProtocol(io, peer_c, .v1_1);
@@ -7419,7 +7429,6 @@ test "IDONTWANT dont_send entry expires after its TTL, un-skipping the message" 
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     // Subscribe to "t", graft P (mesh) and connect S (relay source).
@@ -7430,6 +7439,7 @@ test "IDONTWANT dont_send entry expires after its TTL, un-skipping the message" 
     defer destroyFakeConn(allocator, conn_p);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_p, peer_p, "t"));
 
     const from = "origin";
@@ -7494,7 +7504,6 @@ test "direct peer receives a relayed message though it is NOT in the mesh, and i
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
         .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -7505,6 +7514,7 @@ test "direct peer receives a relayed message though it is NOT in the mesh, and i
     defer destroyFakeConn(allocator, conn_a);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Both D and A announce they subscribe to "t".
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_d, .rpc = try buildInboundSub(allocator, "t", true) } });
@@ -7549,7 +7559,6 @@ test "direct peer that is ALSO a mesh-eligible subscriber is forwarded to exactl
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
         .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -7558,6 +7567,7 @@ test "direct peer that is ALSO a mesh-eligible subscriber is forwarded to exactl
     defer destroyFakeConn(allocator, conn_d);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_d, .rpc = try buildInboundSub(allocator, "t", true) } });
     try sync(router, io);
@@ -7595,7 +7605,6 @@ test "GRAFT from a direct peer is refused: it does NOT join the mesh and is PRUN
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
         .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
-    defer router.destroy();
     try router.start();
 
     // We subscribe to "t" so that, were D a regular peer, its GRAFT would be
@@ -7604,6 +7613,7 @@ test "GRAFT from a direct peer is refused: it does NOT join the mesh and is PRUN
 
     const conn_d = try connectFakePeer(io, allocator, router, peer_d);
     defer destroyFakeConn(allocator, conn_d);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // A GRAFT from the direct peer is refused: D never enters the mesh.
     try std.testing.expectEqual(GraftOutcome.rejected, try graftAndWait(io, allocator, router, conn_d, peer_d, "t"));
@@ -7628,7 +7638,6 @@ test "heartbeat never grafts or prunes a direct peer (mesh maintenance leaves it
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
         .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -7637,6 +7646,7 @@ test "heartbeat never grafts or prunes a direct peer (mesh maintenance leaves it
     defer destroyFakeConn(allocator, conn_d);
     const conn_r = try connectFakePeer(io, allocator, router, peer_r);
     defer destroyFakeConn(allocator, conn_r);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_d, .rpc = try buildInboundSub(allocator, "t", true) } });
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_r, .rpc = try buildInboundSub(allocator, "t", true) } });
@@ -7668,11 +7678,11 @@ test "flood-publish reaches a direct peer for a topic it subscribes to" {
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{
         .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
-    defer router.destroy();
     try router.start();
 
     const conn_d = try connectFakePeer(io, allocator, router, peer_d);
     defer destroyFakeConn(allocator, conn_d);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_d, .rpc = try buildInboundSub(allocator, "t", true) } });
     try sync(router, io);
@@ -7710,7 +7720,6 @@ test "scoring bypass: a direct peer at a NEGATIVE score is still forwarded to an
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, &host_key, scoringConfig(), .{
         .direct_peers = &.{.{ .id = peer_d, .addr = direct_test_addr }},
     });
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -7719,6 +7728,7 @@ test "scoring bypass: a direct peer at a NEGATIVE score is still forwarded to an
     defer destroyFakeConn(allocator, conn_d);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Drive D well below the graylist threshold (-10): 4 invalid messages → -16.
     try driveInvalid(io, allocator, router, peer_d, "t", 4);
@@ -7802,7 +7812,6 @@ test "direct-peer auto-connect: heartbeat re-dials a disconnected direct peer bu
             .{ .id = peer_e, .addr = direct_addr_e },
         },
     });
-    defer router.destroy();
     try router.start();
     try sync(router, io);
 
@@ -7813,6 +7822,7 @@ test "direct-peer auto-connect: heartbeat re-dials a disconnected direct peer bu
     // D connects (the dial "succeeded"); E remains disconnected.
     const conn_d = try connectFakePeer(io, allocator, router, peer_d);
     defer destroyFakeConn(allocator, conn_d);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Beat exactly `direct_connect_ticks` heartbeats: the re-dial pass lands at
     // that tick (the tick is incremented before the modulo check, matching go).
@@ -7841,7 +7851,6 @@ test "direct-peer auto-connect: a dialed direct peer that then connects is treat
     const router = try FakeRouter.create(allocator, io, .{ .dial_log = &log }, local_test_peer, null, 0, null, null, .{
         .direct_peers = &.{.{ .id = peer_d, .addr = direct_addr_d }},
     });
-    defer router.destroy();
     try router.start();
     try sync(router, io);
 
@@ -7855,6 +7864,7 @@ test "direct-peer auto-connect: a dialed direct peer that then connects is treat
     defer destroyFakeConn(allocator, conn_d);
     const conn_s = try connectFakePeer(io, allocator, router, source);
     defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // D announces it subscribes to "t".
     try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer_d, .rpc = try buildInboundSub(allocator, "t", true) } });
@@ -7936,7 +7946,6 @@ test "PX emit: an over-degree prune offers the surviving mesh peers (with a stor
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, cfg, .{
         .peer_exchange_enabled = true,
     });
-    defer router.destroy();
     // Wire the app-score source onto the engine before start() (no fiber is
     // running yet, so this is race-free): P5 pins R's score very high.
     router.score.?.app_score_fn = .{ .ctx = &pinned, .score = PinnedAppScore.scoreFn };
@@ -7950,6 +7959,7 @@ test "PX emit: an over-degree prune offers the surviving mesh peers (with a stor
     const peers = try allocator.alloc(PeerId, n);
     defer allocator.free(peers);
     defer for (conns) |c| destroyFakeConn(allocator, c);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // Build the mesh with the FIRST peer being R (the record's peer-id), so its
     // offer carries the signed record; the rest carry only a peer id.
@@ -8020,7 +8030,6 @@ test "PX emit disabled: an over-degree prune carries NO PX peers" {
     // PX OFF (the default): the over-degree prune is identical to today — a bare
     // PRUNE with no peer offers.
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     try subscribeAndWait(io, allocator, router, "t");
@@ -8031,6 +8040,7 @@ test "PX emit disabled: an over-degree prune carries NO PX peers" {
     const peers = try allocator.alloc(PeerId, n);
     defer allocator.free(peers);
     defer for (conns) |c| destroyFakeConn(allocator, c);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     try oversizeMeshAndPrune(io, allocator, router, "t", n, conns, peers);
 
@@ -8070,7 +8080,6 @@ test "PX consume + dial: a PRUNE with a signed record from an above-accept-PX pe
     const router = try FakeRouter.create(allocator, io, .{ .dial_log = &log }, local_test_peer, null, 0, &host_key, cfg, .{
         .peer_exchange_enabled = true,
     });
-    defer router.destroy();
     try router.start();
 
     // The pruner P (clean, score 0) PRUNEs us on "t" with an offer for peer C: a
@@ -8078,6 +8087,7 @@ test "PX consume + dial: a PRUNE with a signed record from an above-accept-PX pe
     const pruner = testPeer(1);
     const conn_p = try connectFakePeer(io, allocator, router, pruner);
     defer destroyFakeConn(allocator, conn_p);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     var c_key = try identity.KeyPair.generate(.ED25519);
     defer c_key.deinit();
@@ -8115,12 +8125,12 @@ test "PX consume gated by accept-PX: a PRUNE from a below-threshold peer is igno
     const router = try FakeRouter.create(allocator, io, .{ .dial_log = &log }, local_test_peer, null, 0, &host_key, cfg, .{
         .peer_exchange_enabled = true,
     });
-    defer router.destroy();
     try router.start();
 
     const pruner = testPeer(1);
     const conn_p = try connectFakePeer(io, allocator, router, pruner);
     defer destroyFakeConn(allocator, conn_p);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     var c_key = try identity.KeyPair.generate(.ED25519);
     defer c_key.deinit();
@@ -8158,12 +8168,12 @@ test "PX consume: an invalid record is rejected (not stored, not dialed); a vali
     const router = try FakeRouter.create(allocator, io, .{ .dial_log = &log }, local_test_peer, null, 0, &host_key, cfg, .{
         .peer_exchange_enabled = true,
     });
-    defer router.destroy();
     try router.start();
 
     const pruner = testPeer(1);
     const conn_p = try connectFakePeer(io, allocator, router, pruner);
     defer destroyFakeConn(allocator, conn_p);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
     // A valid offer for C and a TAMPERED offer for B (its record bytes are
     // corrupted so the signature fails). The valid one must still be processed.
@@ -8214,12 +8224,12 @@ test "interned id shared across seen + dont_send + iwant_promises is one allocat
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try sync(router, io); // router parked; its maps are quiescent below.
 
     const state = router.peers.get(peerKey(&peer)).?;
@@ -8267,12 +8277,12 @@ test "tearing down a peer releases its id holders; ids also in seen survive" {
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try sync(router, io);
 
     const state = router.peers.get(peerKey(&peer)).?;
@@ -8316,12 +8326,12 @@ test "intern churn through all four maps + peer teardown empties the table (no l
     const io = threaded.io();
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
-    defer router.destroy();
     try router.start();
 
     const peer = testPeer(1);
     const conn = try connectFakePeer(io, allocator, router, peer);
     defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
     try sync(router, io);
 
     const state = router.peers.get(peerKey(&peer)).?;
