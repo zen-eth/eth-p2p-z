@@ -37,6 +37,7 @@ const signing = @import("signing.zig");
 const identity = @import("../../identity.zig");
 const io_time = @import("../../quic/io/time.zig");
 const score_mod = @import("score.zig");
+const peer_record = @import("../../peer_record.zig");
 const PeerId = @import("peer_id").PeerId;
 
 /// The libp2p pubsub message-signature policy. Picks how a published message is
@@ -154,6 +155,17 @@ pub const RouterConfig = struct {
     /// are NOT currently connected. A dial is fire-and-forget — success surfaces
     /// later as the normal connect event; a failure is logged and retried next tick.
     direct_peers: []const DirectPeer = &.{},
+    /// Peer exchange (PX) on PRUNE (go-libp2p `WithPeerExchange`, default OFF —
+    /// opt-in). When ON, a PRUNE we send on a doPX-eligible path (an over-degree
+    /// heartbeat prune) carries a sample of OTHER peers in the topic as signed
+    /// peer records, so the pruned peer has alternatives to graft toward — and an
+    /// inbound PRUNE that carries such records, from a peer whose score clears the
+    /// accept-PX threshold, makes us dial the suggested peers. Disabled is exactly
+    /// the historic behaviour: PRUNEs carry no PX peers and inbound PX is ignored.
+    /// PX is NOT emitted on a LEAVE (unsubscribe), a GRAFT-reject, or a
+    /// negative-score prune (go suppresses PX on those paths to avoid leaking the
+    /// mesh to a peer we are cutting off for cause).
+    peer_exchange_enabled: bool = false,
 };
 
 /// Invoked on the router fiber for each delivered message on a topic WE
@@ -273,6 +285,10 @@ const MeshParams = struct {
     d_high: usize = 12,
     /// Minimum outbound peers kept in a topic mesh (used by later maintenance).
     d_out: usize = 2,
+    /// How many peers a PX'd PRUNE offers (go-libp2p `GossipSubPrunePeers`, 16).
+    /// On emit we select up to this many OTHER topic peers to advertise as signed
+    /// records; on consume we process at most this many PX entries from one PRUNE.
+    prune_peers: usize = 16,
     /// How long (in heartbeat ticks; one tick is one second) a PRUNE keeps us
     /// from re-grafting the pruned peer for that topic.
     prune_backoff_ticks: u64 = 60,
@@ -372,6 +388,28 @@ const PeerSet = std.AutoHashMapUnmanaged(PeerKey, void);
 /// A set of backed-off peers for one topic: peer → the heartbeat tick at which
 /// the backoff expires (the peer becomes graftable again once the tick passes).
 const BackoffSet = std.AutoHashMapUnmanaged(PeerKey, u64);
+
+/// A verified signed peer record kept in the certified-record store, used to
+/// vouch for a peer when offering it through peer-exchange (PX). The store owns
+/// the original `envelope_bytes` (the exact wire bytes we re-emit on PX, so a
+/// receiver can re-verify the signature) plus the decoded `seq` (the record's
+/// monotonic version, used to keep only the newest) and `addrs` (the marshaled
+/// multiaddrs, retained for dialing). All owned; `deinit` frees them.
+const StoredRecord = struct {
+    seq: u64,
+    /// Marshaled-multiaddr byte slices, each an owned copy.
+    addrs: [][]u8,
+    /// The full signed Envelope wire bytes, an owned copy; re-emitted verbatim on
+    /// PX (so the offered peer's record stays verifiable end-to-end).
+    envelope_bytes: []u8,
+
+    fn deinit(self: *StoredRecord, allocator: std.mem.Allocator) void {
+        for (self.addrs) |a| allocator.free(a);
+        allocator.free(self.addrs);
+        allocator.free(self.envelope_bytes);
+        self.* = undefined;
+    }
+};
 
 /// The single-fiber gossipsub router, generic over a comptime `Transport` that
 /// supplies the per-peer outbound sink (and the opaque connection handle the
@@ -586,6 +624,19 @@ pub fn Router(comptime Transport: type) type {
         /// mutated; both the keys and the address values are freed on teardown.
         /// Keyed like `peers` (zero-padded peer bytes).
         direct: std.AutoHashMapUnmanaged(PeerKey, []const u8) = .empty,
+        /// Whether peer-exchange (PX) is enabled (go-libp2p `WithPeerExchange`,
+        /// default OFF). Gates both PX emit (attaching signed records to a
+        /// doPX-eligible PRUNE) and PX consume (dialing peers offered in an
+        /// inbound PRUNE above the accept-PX score). See
+        /// `RouterConfig.peer_exchange_enabled`.
+        peer_exchange_enabled: bool,
+        /// Certified-record store: peer → its newest verified signed peer record.
+        /// Populated by PX consume (a verified inbound record is kept here) and
+        /// read by PX emit (`getRecord`) to vouch for an offered peer. A later
+        /// step also populates it from identify. `putRecord` replaces an entry
+        /// only with a strictly-newer `seq`. Keyed like `peers`; every entry owns
+        /// its bytes and is freed on replacement and on teardown.
+        cert_store: std.AutoHashMapUnmanaged(PeerKey, StoredRecord) = .empty,
         /// Topics the local node subscribes to. Keys are owned copies; freed on
         /// unsubscribe and on teardown. We announce these to every peer (on our
         /// own subscribe, and to each newly-connected peer) and deliver matching
@@ -762,6 +813,7 @@ pub fn Router(comptime Transport: type) type {
                 .message_handler = message_handler,
                 .flood_publish = config.flood_publish,
                 .idontwant_message_threshold = config.idontwant_message_threshold,
+                .peer_exchange_enabled = config.peer_exchange_enabled,
                 .score = score_engine,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
             };
@@ -860,6 +912,7 @@ pub fn Router(comptime Transport: type) type {
             var direct_it = router.direct.valueIterator();
             while (direct_it.next()) |addr| router.allocator.free(addr.*);
             router.direct.deinit(router.allocator);
+            router.freeCertStore();
             router.freeMyTopics();
             router.freeMesh();
             router.freeBackoff();
@@ -883,6 +936,72 @@ pub fn Router(comptime Transport: type) type {
             var it = router.my_topics.keyIterator();
             while (it.next()) |key| router.allocator.free(key.*);
             router.my_topics.deinit(router.allocator);
+        }
+
+        /// Free every stored record (its addrs + envelope bytes) and the cert-store
+        /// map itself. The main fiber is joined by the time this runs.
+        fn freeCertStore(router: *Self) void {
+            var it = router.cert_store.valueIterator();
+            while (it.next()) |rec| rec.deinit(router.allocator);
+            router.cert_store.deinit(router.allocator);
+        }
+
+        // ----- certified-record store (peer exchange) ---------------------
+
+        /// Store `consumed` (a verified peer record) for `peer`, taking ownership
+        /// of owned copies of its addresses and envelope bytes. An existing entry
+        /// is REPLACED only when the new record is strictly newer (`seq` greater),
+        /// so an older or equal record is ignored (go keeps the certified address
+        /// book monotonic by seq). On replacement the old entry's owned bytes are
+        /// freed. Best-effort: on allocation failure nothing is stored (PX simply
+        /// has no record to vouch for that peer — safe). `consumed` itself is NOT
+        /// freed here; the caller owns and frees it.
+        fn putRecord(router: *Self, peer: PeerId, consumed: *const peer_record.ConsumedRecord, envelope_bytes: []const u8) void {
+            const key = peerKey(&peer);
+            if (router.cert_store.get(key)) |existing| {
+                // Keep the newest record only; an older/equal seq is ignored.
+                if (consumed.seq <= existing.seq) return;
+            }
+
+            // Build the owned StoredRecord in a fallible helper so its `errdefer`
+            // unwinds every partial allocation on OOM (an `errdefer` in this void
+            // function would never fire — `catch return` is not an error return).
+            var stored = buildStoredRecord(router.allocator, consumed, envelope_bytes) catch return;
+
+            const gop = router.cert_store.getOrPut(router.allocator, key) catch {
+                stored.deinit(router.allocator);
+                return;
+            };
+            if (gop.found_existing) gop.value_ptr.deinit(router.allocator);
+            gop.value_ptr.* = stored;
+        }
+
+        /// Build an owned `StoredRecord` from a verified record + its envelope
+        /// bytes (copying every byte). On any allocation failure the partials are
+        /// freed via `errdefer` and the error is propagated, so the caller never
+        /// leaks and never stores a half-built record.
+        fn buildStoredRecord(allocator: std.mem.Allocator, consumed: *const peer_record.ConsumedRecord, envelope_bytes: []const u8) std.mem.Allocator.Error!StoredRecord {
+            const addrs = try allocator.alloc([]u8, consumed.addrs.len);
+            var filled: usize = 0;
+            errdefer {
+                for (addrs[0..filled]) |a| allocator.free(a);
+                allocator.free(addrs);
+            }
+            for (consumed.addrs) |src| {
+                addrs[filled] = try allocator.dupe(u8, src);
+                filled += 1;
+            }
+
+            const env_owned = try allocator.dupe(u8, envelope_bytes);
+            return .{ .seq = consumed.seq, .addrs = addrs, .envelope_bytes = env_owned };
+        }
+
+        /// The stored signed-envelope bytes for `peer`, or null if we hold no
+        /// record. Borrowed from the store (valid until the entry is replaced or
+        /// the store is freed); PX emit copies them into the frame.
+        fn getRecord(router: *Self, peer: PeerId) ?[]const u8 {
+            const rec = router.cert_store.getPtr(peerKey(&peer)) orelse return null;
+            return rec.envelope_bytes;
         }
 
         /// Free every topic key + nested PeerSet in the mesh map and the map
@@ -1847,7 +1966,9 @@ pub fn Router(comptime Transport: type) type {
                 };
                 router.meshRemove(topic, state.peer);
                 router.setBackoff(topic, state.peer, mesh_params.prune_backoff_ticks);
-                router.sendPrune(state.peer, topic, mesh_params.prune_backoff_ticks);
+                // Negative-score prune: NO PX (go's `noPX[p]`) — we never offer
+                // our mesh to a peer we are cutting off for misbehaviour.
+                router.sendPrune(state.peer, topic, mesh_params.prune_backoff_ticks, false);
             }
         }
 
@@ -1873,16 +1994,28 @@ pub fn Router(comptime Transport: type) type {
             var victims: std.ArrayListUnmanaged(PeerKey) = .empty;
             defer victims.deinit(router.allocator);
             _ = router.selectPruneVictims(topic, excess, &victims);
+
+            // Remove + back off EVERY victim FIRST, then send the PRUNEs. This
+            // matches go (the heartbeat decides all prunes, then `sendGraftPrune`
+            // builds each PRUNE against the FINAL mesh): peer-exchange offers in a
+            // PRUNE are drawn from the SURVIVING mesh peers only, never a peer we
+            // are simultaneously pruning. Doing the removal in a first pass keeps
+            // the PX selection deterministic and leak-free.
             for (victims.items) |key| {
-                const peer = router.peers.get(key) orelse {
+                if (router.peers.get(key)) |peer| {
+                    router.meshRemove(topic, peer.peer);
+                    router.setBackoff(topic, peer.peer, mesh_params.prune_backoff_ticks);
+                } else if (router.mesh.getPtr(topic)) |set| {
                     // The mesh holds the key even if the peer just disconnected;
-                    // drop it from the mesh and move on (no frame to send).
-                    if (router.mesh.getPtr(topic)) |set| _ = set.remove(key);
-                    continue;
-                };
-                router.meshRemove(topic, peer.peer);
-                router.setBackoff(topic, peer.peer, mesh_params.prune_backoff_ticks);
-                router.sendPrune(peer.peer, topic, mesh_params.prune_backoff_ticks);
+                    // drop it (no frame to send for a gone peer).
+                    _ = set.remove(key);
+                }
+            }
+            for (victims.items) |key| {
+                const peer = router.peers.get(key) orelse continue;
+                // Over-degree heartbeat prune: doPX-eligible (go sets doPX here),
+                // so when peer exchange is on this PRUNE offers alternative peers.
+                router.sendPrune(peer.peer, topic, mesh_params.prune_backoff_ticks, true);
             }
         }
 
@@ -1966,7 +2099,8 @@ pub fn Router(comptime Transport: type) type {
                     router.handleGraft(source, graft.getTopicID());
                 }
                 while (control.pruneNext()) |prune| {
-                    router.handlePrune(source, prune.getTopicID(), prune.getBackoff());
+                    var pr = prune;
+                    router.handlePrune(source, &pr);
                 }
                 while (control.ihaveNext()) |ihave| {
                     var ih = ihave;
@@ -2220,7 +2354,8 @@ pub fn Router(comptime Transport: type) type {
             // (it stays a direct forward target). Matches go-libp2p, which warns
             // and PRUNEs the direct peer back without adding it to the mesh.
             if (router.isDirect(source)) {
-                router.sendPrune(source, topic, mesh_params.prune_backoff_ticks);
+                // GRAFT-reject: NO PX (go sets doPX=false on every reject branch).
+                router.sendPrune(source, topic, mesh_params.prune_backoff_ticks, false);
                 return;
             }
 
@@ -2247,38 +2382,151 @@ pub fn Router(comptime Transport: type) type {
                     if (router.score) |sc| sc.addPenalty(source, 1.0);
                 }
                 router.setBackoff(topic, source, mesh_params.prune_backoff_ticks);
-                router.sendPrune(source, topic, mesh_params.prune_backoff_ticks);
+                // GRAFT-reject (backoff/negative-score): NO PX (go doPX=false).
+                router.sendPrune(source, topic, mesh_params.prune_backoff_ticks, false);
             }
         }
 
-        /// Handle an inbound PRUNE(topic) from `source`: drop the peer from the
-        /// topic's mesh and back it off. The wire `backoff` is in seconds (≈ ticks at
-        /// one tick per second). When the peer specifies a backoff (> 0) we obey it
+        /// Handle an inbound PRUNE from `source`: drop the peer from the topic's
+        /// mesh and back it off. The wire `backoff` is in seconds (≈ ticks at one
+        /// tick per second). When the peer specifies a backoff (> 0) we obey it
         /// exactly — including a shorter one, e.g. the 10s a peer sends when it is
         /// unsubscribing — matching go (`handlePrune`: "is there a backoff specified
         /// by the peer? if so obey it"). Flooring it up to `prune_backoff_ticks` would
         /// defeat the unsubscribe backoff. A PRUNE without a backoff (0) falls back to
         /// `prune_backoff_ticks`. `setBackoff` never SHORTENS an already-later expiry
         /// (go `doAddBackoff`), so a peer cannot use this to cut an existing backoff.
-        /// Untracked source is ignored. (PX peers are ignored for now.)
-        fn handlePrune(router: *Self, source: PeerId, topic: []const u8, backoff_secs: u64) void {
+        /// Untracked source is ignored.
+        ///
+        /// Peer exchange (PX): if the PRUNE carries PX peer offers AND peer exchange
+        /// is enabled AND `source`'s score clears the accept-PX threshold (go's
+        /// `score < acceptPXThreshold` gate; with scoring disabled this is score 0
+        /// vs the threshold default, so it depends on the threshold), each offer is
+        /// consumed via `consumePxPeers`. A PRUNE with PX from a too-low-scoring
+        /// peer has its offers ignored entirely (we still apply the prune+backoff).
+        fn handlePrune(router: *Self, source: PeerId, prune: *rpc_pb.ControlPruneReader) void {
             if (!router.peers.contains(peerKey(&source))) return;
+            const topic = prune.getTopicID();
             router.meshRemove(topic, source);
+            const backoff_secs = prune.getBackoff();
             const ticks = if (backoff_secs > 0) backoff_secs else mesh_params.prune_backoff_ticks;
             router.setBackoff(topic, source, ticks);
+
+            // Peer exchange consume. Gate on the config flag first (default OFF), so
+            // a non-PX deployment never touches the offers. Then the accept-PX score
+            // gate: ignore offers from a peer we do not trust enough (go's
+            // `score < acceptPXThreshold` → "ignoring PX"). When scoring is off
+            // there is no engine, so we fall back to score 0 implicitly — but the
+            // gate still depends on the threshold (go behaves the same: with no
+            // scoring the score is 0 and the default threshold is 0, so PX is
+            // accepted; a positive threshold rejects it).
+            if (!router.peer_exchange_enabled) return;
+            if (prune.peersCount() == 0) return;
+            if (router.score) |sc| {
+                if (!sc.aboveAcceptPX(source)) return;
+            }
+            router.consumePxPeers(prune);
+        }
+
+        /// Consume the PX peer offers in `prune` (already gated on enable +
+        /// accept-PX score). For each offer carrying a signed peer record, verify
+        /// the envelope (`consumeEnvelope`), confirm the record's peer-id matches
+        /// the offer's `peerID` (an offer cannot vouch for a different peer than the
+        /// record proves — go's `rec.PeerID != p` check), store the verified record
+        /// (`putRecord`), and fire a fire-and-forget `dial` toward each of the
+        /// record's addresses so we connect to the suggested peer. An offer with an
+        /// invalid record, a peer-id mismatch, or no record at all is skipped (a
+        /// record-less offer is just a peer id — go would consult the DHT for an
+        /// address; we have none, so we cannot dial it). At most `prune_peers`
+        /// offers are processed (go shuffles + caps to PrunePeers); we cap in
+        /// iteration order (a randomised sample is a refinement).
+        fn consumePxPeers(router: *Self, prune: *rpc_pb.ControlPruneReader) void {
+            var processed: usize = 0;
+            while (prune.peersNext()) |info| {
+                if (processed >= mesh_params.prune_peers) break;
+                processed += 1;
+
+                const record_bytes = info.getSignedPeerRecord();
+                if (record_bytes.len == 0) continue; // bare peer id, no address to dial
+
+                // Verify the envelope (signature + key↔peer-id binding). A bad
+                // record is dropped; the rest of the offers still process.
+                var consumed = peer_record.consumeEnvelope(router.allocator, record_bytes) catch continue;
+                defer consumed.deinit(router.allocator);
+
+                // The record must vouch for the SAME peer the offer names; a
+                // mismatch means the offer is trying to attach another peer's
+                // (validly signed) record to a different id — reject it.
+                const offered = PeerId.fromBytes(info.getPeerID()) catch continue;
+                if (!consumed.peer_id.eql(&offered)) continue;
+
+                // Keep the verified record (newest-seq wins) so we can vouch for
+                // this peer in our own future PX, then dial each advertised address
+                // (fire-and-forget — a connect surfaces later as the normal connect
+                // event). The address bytes are the peer's marshaled multiaddr as
+                // signed; `transport.dial` takes them as the dial target.
+                router.putRecord(consumed.peer_id, &consumed, record_bytes);
+                for (consumed.addrs) |addr| router.transport.dial(router.io, addr);
+            }
         }
 
         /// Send a PRUNE(topic) to `peer` on its control lane, carrying `backoff_ticks`
-        /// as the wire backoff (in seconds, ≈ ticks) and no PX peers. The caller
-        /// passes `prune_backoff_ticks` for a mesh-maintenance prune and the shorter
+        /// as the wire backoff (in seconds, ≈ ticks). The caller passes
+        /// `prune_backoff_ticks` for a mesh-maintenance prune and the shorter
         /// `unsubscribe_backoff_ticks` when LEAVING the topic, so the receiver backs
-        /// us off for the matching duration. Framed once via `fanOut` to the single
-        /// target.
-        fn sendPrune(router: *Self, peer: PeerId, topic: []const u8, backoff_ticks: u64) void {
+        /// us off for the matching duration.
+        ///
+        /// When `do_px` is set AND peer exchange is enabled, the PRUNE also carries
+        /// up to `prune_peers` OTHER peers in the topic as peer-exchange offers
+        /// (each a `PeerInfo{ peerID, signed_peer_record }`, the record present only
+        /// if we hold one for that peer) — go's PX-on-PRUNE. Only doPX-eligible
+        /// paths pass `do_px = true` (an over-degree heartbeat prune); a LEAVE, a
+        /// GRAFT-reject and a negative-score prune pass false so we never leak our
+        /// mesh to a peer we are cutting off. `frameRpc` copies the offer bytes
+        /// synchronously inside `fanOut`, so the transient offer list is freed here.
+        /// Framed once via `fanOut` to the single target.
+        fn sendPrune(router: *Self, peer: PeerId, topic: []const u8, backoff_ticks: u64, do_px: bool) void {
             const ids = router.emptyIds() orelse return;
-            const prune = rpc.buildPrune(topic, &.{}, backoff_ticks);
+
+            var px: std.ArrayListUnmanaged(?rpc_pb.PeerInfo) = .empty;
+            defer px.deinit(router.allocator);
+            if (do_px and router.peer_exchange_enabled) router.selectPxPeers(topic, peer, &px);
+
+            const prune = rpc.buildPrune(topic, px.items, backoff_ticks);
             const ctrl = rpc_pb.ControlMessage{ .prune = &.{prune} };
             router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), ids, .{ .one = peer });
+        }
+
+        /// Append up to `prune_peers` peer-exchange offers for `topic` to `out`:
+        /// other peers in the topic's mesh, EXCLUDING the peer being pruned and any
+        /// peer with a negative score (go's `p != xp && score(xp) >= 0` filter), and
+        /// direct peers (never offered). Each offer is a `PeerInfo` borrowing the
+        /// peer's id bytes (from the live `PeerState`, valid for this call) and, if
+        /// we hold a certified record for the peer, its stored signed-envelope bytes
+        /// (otherwise only the peer id — go sends the bare id and lets the receiver
+        /// find addresses elsewhere). Iteration order is the mesh-set order;
+        /// randomised sampling is a refinement. The borrowed slices stay valid until
+        /// `fanOut` returns (it copies them), which is why `out` is freed there.
+        fn selectPxPeers(router: *Self, topic: []const u8, pruned: PeerId, out: *std.ArrayListUnmanaged(?rpc_pb.PeerInfo)) void {
+            const set = router.mesh.getPtr(topic) orelse return;
+            var it = set.keyIterator();
+            while (it.next()) |key_ptr| {
+                if (out.items.len >= mesh_params.prune_peers) break;
+                const state = router.peers.get(key_ptr.*) orelse continue;
+                const peer = state.peer;
+                if (peer.eql(&pruned)) continue;
+                if (router.isDirect(peer)) continue;
+                if (router.peerScore(peer) < 0) continue;
+                // Borrow the peer-id bytes from the HEAP-stable PeerState (not the
+                // stack-local `peer` copy, which dies when this returns) so the
+                // slice stays valid until `fanOut`'s `frameRpc` copies it. The
+                // record bytes (when present) are owned by the cert store, so they
+                // are stable too.
+                out.append(router.allocator, .{
+                    .peer_i_d = state.peer.bytes[0..state.peer.len],
+                    .signed_peer_record = router.getRecord(peer),
+                }) catch break;
+            }
         }
 
         /// Send a GRAFT(topic) to `peer` on its control lane (telling it we have
@@ -2645,7 +2893,9 @@ pub fn Router(comptime Transport: type) type {
                     // our local backoff and the wire PRUNE, so if we rejoin soon we
                     // (and the peer) can re-graft each other sooner than a normal prune.
                     router.setBackoff(topic, state.peer, mesh_params.unsubscribe_backoff_ticks);
-                    router.sendPrune(state.peer, topic, mesh_params.unsubscribe_backoff_ticks);
+                    // LEAVE (unsubscribe): NO PX — we are abandoning the topic, so
+                    // we do not advertise its mesh to the peers we are pruning.
+                    router.sendPrune(state.peer, topic, mesh_params.unsubscribe_backoff_ticks, false);
                 }
             }
             set.deinit(router.allocator);
@@ -3425,6 +3675,53 @@ fn buildInboundGraft(allocator: std.mem.Allocator, topic: []const u8) !pubsub.Ow
 fn buildInboundPrune(allocator: std.mem.Allocator, topic: []const u8, backoff: u64) !pubsub.OwnedRpc {
     const ctrl = rpc_pb.ControlMessage{ .prune = &[_]?rpc_pb.ControlPrune{rpc.buildPrune(topic, &.{}, backoff)} };
     return ownedFromRpc(allocator, rpc_pb.RPC{ .control = ctrl });
+}
+
+/// Build an OwnedRpc carrying a single control PRUNE for `topic` that carries the
+/// given PX peer offers (`px`), mirroring what an inbound reader yields for a peer
+/// that PRUNEd us WITH peer exchange. `backoff` is the wire backoff in seconds.
+fn buildInboundPrunePx(allocator: std.mem.Allocator, topic: []const u8, backoff: u64, px: []const ?rpc_pb.PeerInfo) !pubsub.OwnedRpc {
+    const ctrl = rpc_pb.ControlMessage{ .prune = &[_]?rpc_pb.ControlPrune{rpc.buildPrune(topic, px, backoff)} };
+    return ownedFromRpc(allocator, rpc_pb.RPC{ .control = ctrl });
+}
+
+/// Seal a signed peer record for `key`'s own peer-id advertising the single
+/// address `addr` (treated as opaque bytes — for the fakes a dialable multiaddr
+/// string). Returns the marshaled Envelope bytes (caller owns + frees) plus the
+/// peer-id, so a test can both put it on the wire and assert on the id.
+const SealedRecord = struct { envelope: []u8, peer_id: PeerId };
+fn sealTestRecord(allocator: std.mem.Allocator, key: *const identity.KeyPair, seq: u64, addr: []const u8) !SealedRecord {
+    const id = try key.peerId(allocator);
+    const addrs = [_][]const u8{addr};
+    const envelope = try peer_record.sealPeerRecord(allocator, key, .{ .peer_id = id, .seq = seq, .addrs = &addrs });
+    return .{ .envelope = envelope, .peer_id = id };
+}
+
+/// Collect the PX peer offers (peer-id + signed-record bytes) from the FIRST
+/// recorded PRUNE for `topic` into `out` (each entry borrows the record bytes,
+/// valid while the record lock is held — so callers assert inside the closure or
+/// copy). Returns the count found. Walks frames under the record lock.
+const PxOffer = struct { peer_id: []const u8, record: []const u8 };
+fn recordFirstPrunePxPeers(io: std.Io, record: *FakeRecord, topic: []const u8, out: *std.ArrayList(PxOffer), allocator: std.mem.Allocator) !usize {
+    record.mutex.lockUncancelable(io);
+    defer record.mutex.unlock(io);
+    var rest = record.written.items;
+    while (decodeFrame(rest)) |decoded| {
+        var reader = decoded.reader;
+        if (reader.getControl()) |ctrl_reader| {
+            var control = ctrl_reader;
+            while (control.pruneNext()) |prune| {
+                var pr = prune;
+                if (!std.mem.eql(u8, pr.getTopicID(), topic)) continue;
+                while (pr.peersNext()) |info| {
+                    try out.append(allocator, .{ .peer_id = info.getPeerID(), .record = info.getSignedPeerRecord() });
+                }
+                return out.items.len;
+            }
+        } else |_| {}
+        rest = rest[decoded.total_len..];
+    }
+    return 0;
 }
 
 /// Build an OwnedRpc carrying a single control IHAVE(`topic`, `ids`).
@@ -7340,4 +7637,326 @@ test "direct-peer auto-connect: a dialed direct peer that then connects is treat
     }
     io_time.ms(50).sleep(io) catch {};
     try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_d.record, "t", "direct"));
+}
+
+// --- peer exchange (PX): emit on PRUNE + consume/dial ----------------------
+//
+// go-libp2p `WithPeerExchange` (default OFF): an over-degree heartbeat prune (a
+// doPX path) offers up to GossipSubPrunePeers (16) OTHER topic peers as signed
+// records in the PRUNE; the receiver, if the pruner clears AcceptPXThreshold,
+// verifies each record and dials the suggested peer. These tests exercise emit
+// gating + selection and consume gating (accept-PX) + dial + invalid-record
+// rejection, all on the in-memory FakeTransport (dials recorded in a DialLog).
+
+/// Drive an over-degree mesh on `topic` with `n` grafted peers and beat one
+/// heartbeat to prune the excess down to D. Returns the connections (caller frees
+/// each with destroyFakeConn). Used by the emit tests, which then read the PRUNEs.
+fn oversizeMeshAndPrune(io: std.Io, allocator: std.mem.Allocator, router: *FakeRouter, topic: []const u8, n: usize, conns: []*FakeTransport.FakeConn, peers: []PeerId) !void {
+    for (0..n) |idx| {
+        const p = testPeer(@intCast(120 + idx));
+        peers[idx] = p;
+        conns[idx] = try connectFakePeer(io, allocator, router, p);
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = p, .rpc = try buildInboundSub(allocator, topic, true) } });
+        try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conns[idx], p, topic));
+    }
+    try std.testing.expectEqual(n, router.meshSize(topic));
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expectEqual(mesh_params.d, router.meshSize(topic));
+}
+
+/// An app-specific (P5) score source that pins ONE peer's score very high and
+/// gives everyone else zero. Used by the PX-emit test to make the record-bearing
+/// peer a GUARANTEED survivor of the lowest-score-first over-degree prune (so its
+/// offer — the one carrying a stored record — is deterministically present).
+const PinnedAppScore = struct {
+    pinned: score_mod.PeerKey,
+    fn scoreFn(ctx: *anyopaque, peer: score_mod.PeerKey) f64 {
+        const self: *const PinnedAppScore = @ptrCast(@alignCast(ctx));
+        return if (std.mem.eql(u8, &peer, &self.pinned)) 1_000_000.0 else 0.0;
+    }
+};
+
+test "PX emit: an over-degree prune offers the surviving mesh peers (with a stored record) when PX is on" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The record-bearing peer R is sealed under a known key (so we can store a
+    // VALID record for it). Pin R's app score very high so the lowest-score-first
+    // over-degree prune always RETAINS R — making R a deterministic survivor whose
+    // PX offer (the one carrying the stored record) is present in every victim's
+    // PRUNE. Scoring is otherwise neutral (all other peers at 0).
+    var key = try identity.KeyPair.generate(.ED25519);
+    defer key.deinit();
+    const sealed = try sealTestRecord(allocator, &key, 1, "/ip4/127.0.0.1/udp/5500/quic-v1");
+    defer allocator.free(sealed.envelope);
+
+    var pinned = PinnedAppScore{ .pinned = score_mod.peerKey(&sealed.peer_id) };
+    var cfg = scoringConfig();
+    cfg.params.app_specific_weight = 1.0;
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, cfg, .{
+        .peer_exchange_enabled = true,
+    });
+    defer router.destroy();
+    // Wire the app-score source onto the engine before start() (no fiber is
+    // running yet, so this is race-free): P5 pins R's score very high.
+    router.score.?.app_score_fn = .{ .ctx = &pinned, .score = PinnedAppScore.scoreFn };
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const n = mesh_params.d_high + 1;
+    const conns = try allocator.alloc(*FakeTransport.FakeConn, n);
+    defer allocator.free(conns);
+    const peers = try allocator.alloc(PeerId, n);
+    defer allocator.free(peers);
+    defer for (conns) |c| destroyFakeConn(allocator, c);
+
+    // Build the mesh with the FIRST peer being R (the record's peer-id), so its
+    // offer carries the signed record; the rest carry only a peer id.
+    peers[0] = sealed.peer_id;
+    conns[0] = try connectFakePeer(io, allocator, router, sealed.peer_id);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = sealed.peer_id, .rpc = try buildInboundSub(allocator, "t", true) } });
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conns[0], sealed.peer_id, "t"));
+    for (1..n) |idx| {
+        const p = testPeer(@intCast(120 + idx));
+        peers[idx] = p;
+        conns[idx] = try connectFakePeer(io, allocator, router, p);
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = p, .rpc = try buildInboundSub(allocator, "t", true) } });
+        try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conns[idx], p, "t"));
+    }
+    try std.testing.expectEqual(n, router.meshSize("t"));
+
+    // Store the signed record for R so an offer for it includes the bytes. The
+    // router fiber is parked after sync, so this map write is race-free (same
+    // property the private-state reads rely on).
+    try sync(router, io);
+    var consumed = try peer_record.consumeEnvelope(allocator, sealed.envelope);
+    defer consumed.deinit(allocator);
+    router.putRecord(sealed.peer_id, &consumed, sealed.envelope);
+    try std.testing.expect(router.getRecord(sealed.peer_id) != null); // stored
+
+    // One heartbeat prunes the excess (a doPX path). R is pinned high, so it
+    // survives; each PRUNE to a pruned victim carries PX offers for the SURVIVING
+    // mesh peers — which include R with its record.
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expectEqual(mesh_params.d, router.meshSize("t"));
+    try std.testing.expect(router.meshContains("t", sealed.peer_id)); // R survived
+
+    // Wait for the PRUNE control frames to land, then find a PRUNE that carries PX
+    // offers and assert (a) it offers peers OTHER than its recipient, and (b) the
+    // offer for R carries exactly the sealed record bytes.
+    var found_px = false;
+    var found_record = false;
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        for (conns, peers) |c, recipient| {
+            var offers: std.ArrayList(PxOffer) = .empty;
+            defer offers.deinit(allocator);
+            _ = recordFirstPrunePxPeers(io, &c.record, "t", &offers, allocator) catch continue;
+            if (offers.items.len == 0) continue;
+            found_px = true;
+            for (offers.items) |off| {
+                // Never offer a peer back to itself.
+                try std.testing.expect(!std.mem.eql(u8, off.peer_id, recipient.bytes[0..recipient.len]));
+                if (std.mem.eql(u8, off.peer_id, sealed.peer_id.bytes[0..sealed.peer_id.len])) {
+                    try std.testing.expectEqualSlices(u8, sealed.envelope, off.record);
+                    found_record = true;
+                }
+            }
+        }
+        if (found_px and found_record) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(found_px);
+    try std.testing.expect(found_record);
+}
+
+test "PX emit disabled: an over-degree prune carries NO PX peers" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // PX OFF (the default): the over-degree prune is identical to today — a bare
+    // PRUNE with no peer offers.
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const n = mesh_params.d_high + 1;
+    const conns = try allocator.alloc(*FakeTransport.FakeConn, n);
+    defer allocator.free(conns);
+    const peers = try allocator.alloc(PeerId, n);
+    defer allocator.free(peers);
+    defer for (conns) |c| destroyFakeConn(allocator, c);
+
+    try oversizeMeshAndPrune(io, allocator, router, "t", n, conns, peers);
+
+    // Wait for the PRUNEs, then assert NONE of them carry any PX offer.
+    const want_pruned = n - mesh_params.d;
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        var total: usize = 0;
+        for (conns) |c| total += recordCountPrunes(io, &c.record, "t");
+        if (total >= want_pruned) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    io_time.ms(50).sleep(io) catch {};
+    for (conns) |c| {
+        var offers: std.ArrayList(PxOffer) = .empty;
+        defer offers.deinit(allocator);
+        const cnt = try recordFirstPrunePxPeers(io, &c.record, "t", &offers, allocator);
+        try std.testing.expectEqual(@as(usize, 0), cnt);
+    }
+}
+
+test "PX consume + dial: a PRUNE with a signed record from an above-accept-PX peer stores it and dials its addr" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log = DialLog{ .allocator = allocator };
+    defer log.deinit(io);
+
+    // Scoring ON with accept_px_threshold = 0, so a clean pruner (score 0) clears
+    // it (the gate is `>=`). PX enabled.
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+    var cfg = scoringConfig();
+    cfg.thresholds.accept_px_threshold = 0;
+    const router = try FakeRouter.create(allocator, io, .{ .dial_log = &log }, local_test_peer, null, 0, &host_key, cfg, .{
+        .peer_exchange_enabled = true,
+    });
+    defer router.destroy();
+    try router.start();
+
+    // The pruner P (clean, score 0) PRUNEs us on "t" with an offer for peer C: a
+    // valid signed record advertising a dialable address.
+    const pruner = testPeer(1);
+    const conn_p = try connectFakePeer(io, allocator, router, pruner);
+    defer destroyFakeConn(allocator, conn_p);
+
+    var c_key = try identity.KeyPair.generate(.ED25519);
+    defer c_key.deinit();
+    const c_addr = "/ip4/127.0.0.1/udp/6001/quic-v1";
+    const sealed = try sealTestRecord(allocator, &c_key, 1, c_addr);
+    defer allocator.free(sealed.envelope);
+
+    const px = [_]?rpc_pb.PeerInfo{.{
+        .peer_i_d = sealed.peer_id.bytes[0..sealed.peer_id.len],
+        .signed_peer_record = sealed.envelope,
+    }};
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = pruner, .rpc = try buildInboundPrunePx(allocator, "t", 60, &px) } });
+    try sync(router, io);
+
+    // C's record is now in the cert store AND C's address was dialed.
+    try std.testing.expect(router.getRecord(sealed.peer_id) != null);
+    try std.testing.expectEqual(@as(usize, 1), log.count(io, c_addr));
+}
+
+test "PX consume gated by accept-PX: a PRUNE from a below-threshold peer is ignored (no store, no dial)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log = DialLog{ .allocator = allocator };
+    defer log.deinit(io);
+
+    // accept_px_threshold = 1: a clean pruner (score 0) is BELOW it, so its PX
+    // offers are ignored entirely (the prune+backoff still apply).
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+    var cfg = scoringConfig();
+    cfg.thresholds.accept_px_threshold = 1;
+    const router = try FakeRouter.create(allocator, io, .{ .dial_log = &log }, local_test_peer, null, 0, &host_key, cfg, .{
+        .peer_exchange_enabled = true,
+    });
+    defer router.destroy();
+    try router.start();
+
+    const pruner = testPeer(1);
+    const conn_p = try connectFakePeer(io, allocator, router, pruner);
+    defer destroyFakeConn(allocator, conn_p);
+
+    var c_key = try identity.KeyPair.generate(.ED25519);
+    defer c_key.deinit();
+    const c_addr = "/ip4/127.0.0.1/udp/6002/quic-v1";
+    const sealed = try sealTestRecord(allocator, &c_key, 1, c_addr);
+    defer allocator.free(sealed.envelope);
+
+    const px = [_]?rpc_pb.PeerInfo{.{
+        .peer_i_d = sealed.peer_id.bytes[0..sealed.peer_id.len],
+        .signed_peer_record = sealed.envelope,
+    }};
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = pruner, .rpc = try buildInboundPrunePx(allocator, "t", 60, &px) } });
+    try sync(router, io);
+
+    // Below the accept-PX threshold: nothing stored, nothing dialed. Give a stray
+    // dial a chance to land before asserting it did not.
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expect(router.getRecord(sealed.peer_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), log.count(io, c_addr));
+}
+
+test "PX consume: an invalid record is rejected (not stored, not dialed); a valid one beside it still processes" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log = DialLog{ .allocator = allocator };
+    defer log.deinit(io);
+
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+    var cfg = scoringConfig();
+    cfg.thresholds.accept_px_threshold = 0;
+    const router = try FakeRouter.create(allocator, io, .{ .dial_log = &log }, local_test_peer, null, 0, &host_key, cfg, .{
+        .peer_exchange_enabled = true,
+    });
+    defer router.destroy();
+    try router.start();
+
+    const pruner = testPeer(1);
+    const conn_p = try connectFakePeer(io, allocator, router, pruner);
+    defer destroyFakeConn(allocator, conn_p);
+
+    // A valid offer for C and a TAMPERED offer for B (its record bytes are
+    // corrupted so the signature fails). The valid one must still be processed.
+    var c_key = try identity.KeyPair.generate(.ED25519);
+    defer c_key.deinit();
+    const c_addr = "/ip4/127.0.0.1/udp/6003/quic-v1";
+    const sealed_c = try sealTestRecord(allocator, &c_key, 1, c_addr);
+    defer allocator.free(sealed_c.envelope);
+
+    var b_key = try identity.KeyPair.generate(.ED25519);
+    defer b_key.deinit();
+    const b_addr = "/ip4/127.0.0.1/udp/6004/quic-v1";
+    const sealed_b = try sealTestRecord(allocator, &b_key, 1, b_addr);
+    defer allocator.free(sealed_b.envelope);
+    // Tamper: flip a byte in the middle of B's envelope so consumeEnvelope fails.
+    const tampered = try allocator.dupe(u8, sealed_b.envelope);
+    defer allocator.free(tampered);
+    tampered[tampered.len / 2] ^= 0xff;
+
+    const px = [_]?rpc_pb.PeerInfo{
+        .{ .peer_i_d = sealed_b.peer_id.bytes[0..sealed_b.peer_id.len], .signed_peer_record = tampered },
+        .{ .peer_i_d = sealed_c.peer_id.bytes[0..sealed_c.peer_id.len], .signed_peer_record = sealed_c.envelope },
+    };
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = pruner, .rpc = try buildInboundPrunePx(allocator, "t", 60, &px) } });
+    try sync(router, io);
+    io_time.ms(50).sleep(io) catch {};
+
+    // B (invalid) is neither stored nor dialed; C (valid) is both.
+    try std.testing.expect(router.getRecord(sealed_b.peer_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), log.count(io, b_addr));
+    try std.testing.expect(router.getRecord(sealed_c.peer_id) != null);
+    try std.testing.expectEqual(@as(usize, 1), log.count(io, c_addr));
 }
