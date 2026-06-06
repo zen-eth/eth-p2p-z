@@ -3,6 +3,7 @@ const identify_pb = @import("../protobuf.zig").identify;
 const Stream = @import("../quic.zig").Stream;
 const identity = @import("../identity.zig");
 const peer_record = @import("../peer_record.zig");
+const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 
 pub const protocol_id = "/ipfs/id/1.0.0";
@@ -49,8 +50,12 @@ pub const IdentifyHandler = struct {
     /// supplies — pass a counter, larger meaning newer), and `options.listen_addrs`
     /// as its addresses — the SAME string-form listen addrs the plain identify
     /// already sends, so the record stays consistent with the `listenAddrs` field.
-    /// The returned handler owns the sealed bytes (freed by `deinit`). On a seal
-    /// failure the error is propagated rather than silently dropping the record.
+    /// Each listen addr is encoded to its BINARY multiaddr form for the record (and
+    /// the on-wire listen-addrs), matching go-libp2p / rust-libp2p so they parse our
+    /// addresses; the plain `listenAddrs` field is converted separately in
+    /// `writeIdentify`. The returned handler owns the sealed bytes (freed by
+    /// `deinit`). On a seal failure the error is propagated rather than silently
+    /// dropping the record.
     pub fn initWithSignedRecord(
         allocator: std.mem.Allocator,
         options: Options,
@@ -58,10 +63,17 @@ pub const IdentifyHandler = struct {
         seq: u64,
     ) !IdentifyHandler {
         const peer_id = try host_key.peerId(allocator);
+
+        // The PeerRecord carries BINARY multiaddrs (the libp2p wire form). Encode
+        // each string listen addr to bytes, seal, then free the temporaries — the
+        // sealed envelope owns its own copy.
+        const bin_addrs = try encodeListenAddrs(allocator, options.listen_addrs);
+        defer freeAddrList(allocator, bin_addrs);
+
         const record = peer_record.PeerRecord{
             .peer_id = peer_id,
             .seq = seq,
-            .addrs = options.listen_addrs,
+            .addrs = bin_addrs,
         };
         const sealed = try peer_record.sealPeerRecord(allocator, host_key, record);
         errdefer allocator.free(sealed);
@@ -94,7 +106,10 @@ pub const OwnedIdentify = struct {
 };
 
 pub fn writeIdentify(allocator: std.mem.Allocator, io: std.Io, stream: *Stream, options: Options) !void {
-    const listen_addrs = try nullableSliceList(allocator, options.listen_addrs);
+    // `listenAddrs` go on the wire as BINARY multiaddrs (so go/rust parse them).
+    const bin_addrs = try encodeListenAddrs(allocator, options.listen_addrs);
+    defer freeAddrList(allocator, bin_addrs);
+    const listen_addrs = try nullableSliceList(allocator, bin_addrs);
     defer allocator.free(listen_addrs);
     const protocols = try nullableSliceList(allocator, options.protocols);
     defer allocator.free(protocols);
@@ -162,6 +177,31 @@ pub fn consumeSignedPeerRecord(
     return consumed;
 }
 
+/// Encode each string-form listen multiaddr into its BINARY multiaddr bytes (the
+/// libp2p wire form). Returns a freshly allocated list of owned byte slices (free
+/// with `freeAddrList`). An addr that fails to encode (an unsupported protocol)
+/// propagates the error rather than being silently dropped, so a misconfigured
+/// listen addr surfaces instead of going on the wire malformed.
+fn encodeListenAddrs(allocator: std.mem.Allocator, addrs: []const []const u8) ![][]u8 {
+    const out = try allocator.alloc([]u8, addrs.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |a| allocator.free(a);
+        allocator.free(out);
+    }
+    for (addrs) |addr| {
+        const ma = Multiaddr{ .bytes = addr };
+        out[filled] = try ma.toBytes(allocator);
+        filled += 1;
+    }
+    return out;
+}
+
+fn freeAddrList(allocator: std.mem.Allocator, addrs: [][]u8) void {
+    for (addrs) |a| allocator.free(a);
+    allocator.free(addrs);
+}
+
 fn nullableSliceList(allocator: std.mem.Allocator, values: []const []const u8) std.mem.Allocator.Error![]const ?[]const u8 {
     if (values.len == 0) return &.{};
     const out = try allocator.alloc(?[]const u8, values.len);
@@ -205,7 +245,9 @@ const testing = std.testing;
 /// `writeIdentify` performs) and hand back a reader over the wire bytes, so a
 /// test can exercise the build → encode → parse round-trip without a live Stream.
 fn encodeAndRead(allocator: std.mem.Allocator, options: Options) !OwnedIdentify {
-    const listen_addrs = try nullableSliceList(allocator, options.listen_addrs);
+    const bin_addrs = try encodeListenAddrs(allocator, options.listen_addrs);
+    defer freeAddrList(allocator, bin_addrs);
+    const listen_addrs = try nullableSliceList(allocator, bin_addrs);
     defer allocator.free(listen_addrs);
     const protocols = try nullableSliceList(allocator, options.protocols);
     defer allocator.free(protocols);
@@ -261,8 +303,12 @@ test "identify response built with a signed record verifies to our peer-id and l
     try testing.expect(consumed.peer_id.eql(@constCast(&peer_id)));
     try testing.expectEqual(@as(u64, 7), consumed.seq);
     try testing.expectEqual(listen_addrs.len, consumed.addrs.len);
+    // The record's addresses are BINARY multiaddrs on the wire; decode each back
+    // to its string form and confirm it matches the listen addr we advertised.
     for (listen_addrs, consumed.addrs) |want, got| {
-        try testing.expectEqualSlices(u8, want, got);
+        var decoded = try Multiaddr.fromBytes(allocator, got);
+        defer decoded.deinit(allocator);
+        try testing.expectEqualStrings(want, decoded.bytes);
     }
 }
 

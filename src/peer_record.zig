@@ -625,16 +625,24 @@ test "consumes a real go-libp2p signed peer-record envelope (wire-compat)" {
 
     const expected_peer_id = try hexDecode(allocator, "00240801122079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664");
     defer allocator.free(expected_peer_id);
-    const expected_a1 = try hexDecode(allocator, "047f00000191020fa1cd03");
-    defer allocator.free(expected_a1);
-    const expected_a2 = try hexDecode(allocator, "04c0a8000a91022328cd03");
-    defer allocator.free(expected_a2);
 
     try testing.expectEqual(@as(u64, 0x1122334455667788), consumed.seq);
     try testing.expectEqualSlices(u8, expected_peer_id, consumed.peer_id.bytes[0..consumed.peer_id.len]);
     try testing.expectEqual(@as(usize, 2), consumed.addrs.len);
-    try testing.expectEqualSlices(u8, expected_a1, consumed.addrs[0]);
-    try testing.expectEqualSlices(u8, expected_a2, consumed.addrs[1]);
+
+    // The record's addresses are go-libp2p's BINARY multiaddrs. Decoding them with
+    // our `fromBytes` must yield the exact STRING multiaddrs go advertised, proving
+    // we read go's binary address encoding correctly.
+    const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
+    const expected_strs = [_][]const u8{
+        "/ip4/127.0.0.1/udp/4001/quic-v1",
+        "/ip4/192.168.0.10/udp/9000/quic-v1",
+    };
+    for (consumed.addrs, expected_strs) |bin, want| {
+        var decoded = try Multiaddr.fromBytes(allocator, bin);
+        defer decoded.deinit(allocator);
+        try testing.expectEqualStrings(want, decoded.bytes);
+    }
 }
 
 fn hexDecode(allocator: Allocator, hex: []const u8) ![]u8 {

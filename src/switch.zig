@@ -1266,7 +1266,10 @@ test "switch dispatches inbound streams to registered protocol handlers" {
         try std.testing.expectEqualStrings("ipfs/0.1.0", identify.reader.getProtocolVersion());
         try std.testing.expectEqualStrings("eth-p2p-z/test", identify.reader.getAgentVersion());
         try std.testing.expectEqual(@as(usize, 1), identify.reader.listenAddrsCount());
-        try std.testing.expectEqualStrings(identify_listen_addrs[0], identify.reader.listenAddrsNext().?);
+        // listenAddrs are BINARY multiaddrs on the wire; decode before comparing.
+        var got_listen = try Multiaddr.fromBytes(allocator, identify.reader.listenAddrsNext().?);
+        defer got_listen.deinit(allocator);
+        try std.testing.expectEqualStrings(identify_listen_addrs[0], got_listen.bytes);
         try std.testing.expectEqual(@as(usize, 2), identify.reader.protocolsCount());
         try std.testing.expectEqualStrings(identify_protocols[0], identify.reader.protocolsNext().?);
         try std.testing.expectEqualStrings(identify_protocols[1], identify.reader.protocolsNext().?);

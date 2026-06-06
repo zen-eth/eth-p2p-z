@@ -39,6 +39,7 @@ const identity = @import("../../identity.zig");
 const io_time = @import("../../quic/io/time.zig");
 const score_mod = @import("score.zig");
 const peer_record = @import("../../peer_record.zig");
+const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 
 /// The libp2p pubsub message-signature policy. Picks how a published message is
@@ -2668,10 +2669,17 @@ pub fn Router(comptime Transport: type) type {
                 // Keep the verified record (newest-seq wins) so we can vouch for
                 // this peer in our own future PX, then dial each advertised address
                 // (fire-and-forget — a connect surfaces later as the normal connect
-                // event). The address bytes are the peer's marshaled multiaddr as
-                // signed; `transport.dial` takes them as the dial target.
+                // event). The signed addresses are BINARY multiaddrs (the libp2p
+                // wire form go/rust emit); decode each to the STRING form
+                // `transport.dial` expects. An address we cannot decode (an
+                // unsupported transport) is skipped; `dial` copies the string, so
+                // the temporary is freed immediately after.
                 router.putRecord(consumed.peer_id, &consumed, record_bytes);
-                for (consumed.addrs) |addr| router.transport.dial(router.io, addr);
+                for (consumed.addrs) |addr| {
+                    var ma = Multiaddr.fromBytes(router.allocator, addr) catch continue;
+                    defer ma.deinit(router.allocator);
+                    router.transport.dial(router.io, ma.bytes);
+                }
             }
         }
 
@@ -3912,13 +3920,16 @@ fn buildInboundPrunePx(allocator: std.mem.Allocator, topic: []const u8, backoff:
 }
 
 /// Seal a signed peer record for `key`'s own peer-id advertising the single
-/// address `addr` (treated as opaque bytes — for the fakes a dialable multiaddr
-/// string). Returns the marshaled Envelope bytes (caller owns + frees) plus the
-/// peer-id, so a test can both put it on the wire and assert on the id.
+/// dialable multiaddr STRING `addr`, encoded to its BINARY multiaddr form (the
+/// libp2p wire form a real peer signs, so the consume path's `fromBytes` decodes
+/// it back to `addr`). Returns the marshaled Envelope bytes (caller owns + frees)
+/// plus the peer-id, so a test can both put it on the wire and assert on the id.
 const SealedRecord = struct { envelope: []u8, peer_id: PeerId };
 fn sealTestRecord(allocator: std.mem.Allocator, key: *const identity.KeyPair, seq: u64, addr: []const u8) !SealedRecord {
     const id = try key.peerId(allocator);
-    const addrs = [_][]const u8{addr};
+    const bin = try (Multiaddr{ .bytes = addr }).toBytes(allocator);
+    defer allocator.free(bin);
+    const addrs = [_][]const u8{bin};
     const envelope = try peer_record.sealPeerRecord(allocator, key, .{ .peer_id = id, .seq = seq, .addrs = &addrs });
     return .{ .envelope = envelope, .peer_id = id };
 }
