@@ -71,6 +71,18 @@ const Args = struct {
     /// Signing scheme: `strict` (default, signs+verifies) or `anonymous`
     /// (StrictNoSign, content-id dedup). See `Sign`.
     sign: Sign = .strict,
+    /// Enable peer-exchange (PX) on PRUNE (go-libp2p `WithPeerExchange`). OFF by
+    /// default — the cross-impl PX scenario opts in with `px=on`. When ON, an
+    /// over-degree heartbeat prune offers the surviving mesh peers' signed
+    /// records, and an inbound PX'd PRUNE makes us dial the offered peers.
+    px: bool = false,
+    /// Override the per-topic mesh DEGREE targets (`d`/`d_low`/`d_high`). Null
+    /// keeps the go-libp2p baseline (6/5/12). A PX emitter sets a small `d_high`
+    /// (e.g. `d_high=2`) so a tiny topology goes over-degree and the heartbeat
+    /// prunes a peer WITH PX. Each is set independently; defaults fill the rest.
+    d: ?usize = null,
+    d_low: ?usize = null,
+    d_high: ?usize = null,
 
     /// Iterate the dial targets: every entry of `peers` (split on commas) plus a
     /// lone `peer` if set. Blank entries are skipped so a trailing comma is fine.
@@ -151,6 +163,18 @@ const Args = struct {
                 } else if (std.mem.eql(u8, value, "anonymous") or std.mem.eql(u8, value, "nosign")) {
                     out.sign = .anonymous;
                 } else return error.InvalidSign;
+            } else if (std.mem.eql(u8, key, "px")) {
+                if (std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "true")) {
+                    out.px = true;
+                } else if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "false")) {
+                    out.px = false;
+                } else return error.InvalidPx;
+            } else if (std.mem.eql(u8, key, "d")) {
+                out.d = try std.fmt.parseInt(usize, value, 10);
+            } else if (std.mem.eql(u8, key, "d_low")) {
+                out.d_low = try std.fmt.parseInt(usize, value, 10);
+            } else if (std.mem.eql(u8, key, "d_high")) {
+                out.d_high = try std.fmt.parseInt(usize, value, 10);
             } else {
                 std.log.err("unknown argument key '{s}'", .{key});
                 return error.UnknownArgument;
@@ -172,6 +196,20 @@ const Args = struct {
         return out;
     }
 };
+
+/// Build a mesh-degree override from the `d`/`d_low`/`d_high` args, or null when
+/// none is set (keep the go-libp2p baseline 6/5/12). Any unset field falls back
+/// to that baseline so a scenario can lower just `d_high` to force an over-degree
+/// prune. A PX emitter typically sets `d_high` small; the values should stay
+/// consistent (`d_low <= d <= d_high`) — the router does not validate them.
+fn meshDegreeFromArgs(args: *const Args) ?gossipsub.MeshDegree {
+    if (args.d == null and args.d_low == null and args.d_high == null) return null;
+    return .{
+        .d = args.d orelse 6,
+        .d_low = args.d_low orelse 5,
+        .d_high = args.d_high orelse 12,
+    };
+}
 
 /// Records whether a message arrived and prints each received message. The
 /// router fiber (a zio worker) calls `onMessage`; `main` reads `received`.
@@ -235,10 +273,17 @@ pub fn main(init: std.process.Init) !void {
     // Scoring is left disabled here (null): the interop binary exercises the
     // base mesh/gossip behaviour against go/rust-libp2p without the score gates.
     const host_key_opt: ?*const identity.KeyPair = if (args.sign == .strict) &host_key else null;
-    const gs_config: gossipsub.RouterConfig = switch (args.sign) {
+    var gs_config: gossipsub.RouterConfig = switch (args.sign) {
         .strict => .{},
         .anonymous => .{ .signature_policy = .anonymous },
     };
+    // Peer-exchange opt-in (default OFF). When `px=on`, the router offers signed
+    // records on an over-degree prune and dials peers offered to it. The optional
+    // mesh-degree override lets a tiny topology go over-degree so the heartbeat
+    // prunes WITH PX — e.g. a `px=on d_high=2` bootstrap dialed by 3 leaves prunes
+    // one of them, offering the others' records.
+    gs_config.peer_exchange_enabled = args.px;
+    gs_config.mesh_degree = meshDegreeFromArgs(&args);
     const gs = try gossipsub.Gossipsub.init(allocator, io, switcher, local_peer, host_key_opt, recorder.handler(), null, gs_config);
     // Only runs on an error return from `runListener`/`runDialer` (the run never
     // started). The success path emits its result and hard-exits from within the
@@ -389,9 +434,13 @@ fn runListener(
     std.log.info("listener bound {s}", .{listen_text});
 
     // Register identify now that the socket is bound, so the sealed peer record
-    // advertises our real listen multiaddrs. The handler outlives the run on this
-    // fiber's stack (the service borrows it); free its owned record on return.
-    var listen_addrs = try switcher.listenMultiaddrs(allocator);
+    // advertises our listen multiaddrs. The Switch binds on 0.0.0.0, but a peer
+    // exchanged this record (PX) must be able to DIAL the address — and 0.0.0.0 is
+    // not dialable. Rewrite each to the loopback 127.0.0.1 form (the same address
+    // `buildPublishedMultiaddr` advertises for the loopback runs) so a PX-offered
+    // peer reaches us. The handler outlives the run on this fiber's stack (the
+    // service borrows it); free its owned record on return.
+    var listen_addrs = try loopbackListenAddrs(allocator, switcher);
     defer {
         for (listen_addrs.items) |addr| allocator.free(addr);
         listen_addrs.deinit(allocator);
@@ -413,7 +462,7 @@ fn runListener(
     // bootstrap of a star is dialed by every other node, so the fiber loops and
     // accepts EACH inbound connection (not just the first), starting a dispatcher
     // per connection and stashing it for teardown.
-    var accept_state = AcceptState{ .allocator = allocator, .switcher = switcher };
+    var accept_state = AcceptState{ .allocator = allocator, .io = io, .switcher = switcher, .gs = gs };
     var accept_future = try std.Io.concurrent(io, AcceptState.run, .{&accept_state});
     defer {
         // Error-path teardown only. The success path hard-exits via
@@ -424,9 +473,27 @@ fn runListener(
         accept_state.deinit();
     }
 
+    // A listener may ALSO dial upstream peers (`peers=`), making it a node that is
+    // both reachable (bound + accepting) AND a member of a star — exactly what a
+    // PX-offered leaf needs: it must be dialable so the peer the pruner offers it
+    // to can reach it. Dials are optional here (a pure bootstrap dials nothing).
+    var dial_conns: std.ArrayList(*libp2p.SwitchConnection) = .empty;
+    defer {
+        for (dial_conns.items) |conn| conn.deinit();
+        dial_conns.deinit(allocator);
+    }
+    const dialed = try dialPeers(allocator, io, switcher, gs, args, &dial_conns);
+    if (dialed != 0) std.log.info("listener also dialed {d} upstream peer(s)", .{dialed});
+
     // Always subscribe so the mesh can form (a sub-only node still needs the
     // subscription to receive; a pub node subscribes too so the peer learns it).
     try gs.subscribe(args.topic);
+
+    // Watch for PX-driven peer growth (a peer we were OFFERED and dialed, beyond
+    // the upstream peers we dialed ourselves). See `PeerCountMonitor`.
+    var px_monitor = PeerCountMonitor{ .io = io, .gs = gs, .baseline = dialed };
+    var px_future = try std.Io.concurrent(io, PeerCountMonitor.run, .{&px_monitor});
+    defer px_future.cancel(io);
 
     try runForDuration(io, gs, args);
 
@@ -448,7 +515,9 @@ fn runListener(
 
 const AcceptState = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     switcher: *libp2p.Switch,
+    gs: *gossipsub.Gossipsub,
     conns: std.ArrayList(*libp2p.SwitchConnection) = .empty,
 
     /// Accept inbound connections in a loop, starting an inbound stream
@@ -475,6 +544,14 @@ const AcceptState = struct {
                 conn.deinit();
                 continue;
             };
+            // Run identify as the CLIENT against this inbound peer too, so a
+            // listener certifies its inbound peers' signed records into the cert
+            // store. A PX emitter (an over-degree listener) can only vouch for a
+            // peer it holds a record for, so without this an accept-only bootstrap
+            // would offer bare peer-ids (no dialable address) and PX would not
+            // complete. go/rust run identify on every connection regardless of dial
+            // direction; this matches that. Best-effort — failures are logged.
+            exchangeIdentify(self.allocator, self.io, conn, self.gs);
             // The accept fiber and the teardown both touch `conns`, but never
             // concurrently: teardown first cancels this fiber (joining it) and
             // only then calls deinit, so appends here are sequenced before reads
@@ -490,6 +567,81 @@ const AcceptState = struct {
     fn deinit(self: *AcceptState) void {
         for (self.conns.items) |conn| conn.deinit();
         self.conns.deinit(self.allocator);
+    }
+};
+
+/// Dial every configured peer (`peers`/`peer`), start an inbound dispatcher and
+/// run identify-as-client against each, and append the live connection to `conns`
+/// (the caller owns teardown). Returns how many peers were successfully dialed.
+/// gossipsub forms a mesh over whatever connections exist, so a node that dials
+/// several peers grafts into a mesh spanning all of them; a failed dial to one
+/// peer does not abort the others. Shared by the dialer role and a listener that
+/// also dials upstream (a leaf that is both reachable and joins a star).
+fn dialPeers(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    switcher: *libp2p.Switch,
+    gs: *gossipsub.Gossipsub,
+    args: *const Args,
+    conns: *std.ArrayList(*libp2p.SwitchConnection),
+) !usize {
+    var it = args.dialTargets();
+    var dialed: usize = 0;
+    while (it.next()) |peer_text| {
+        std.log.info("dialing {s}", .{peer_text});
+        var remote_addr = Multiaddr.fromString(allocator, peer_text) catch |err| {
+            std.log.warn("invalid peer multiaddr {s}: {any}", .{ peer_text, err });
+            continue;
+        };
+        defer remote_addr.deinit(allocator);
+
+        const conn = switcher.dial(remote_addr, .{ .timeout = timeoutFromMs(args.duration_ms) }) catch |err| {
+            std.log.warn("dial {s} failed: {any}", .{ peer_text, err });
+            continue;
+        };
+        // Start inbound dispatch so this side's `/meshsub` inbound handler runs
+        // for this peer; without it the peers wire up but never exchange RPCs.
+        conn.startInboundDispatcher(.{}) catch |err| {
+            std.log.warn("startInboundDispatcher for {s} failed: {any}", .{ peer_text, err });
+            conn.deinit();
+            continue;
+        };
+        // Run identify as the client against the just-dialed peer: read its
+        // identify and certify its signed peer record into our gossipsub store
+        // (completing peer-exchange). Best-effort — failures are logged, the
+        // connection stays up.
+        exchangeIdentify(allocator, io, conn, gs);
+        try conns.append(allocator, conn);
+        dialed += 1;
+    }
+    return dialed;
+}
+
+/// Watches gossipsub's peer count for growth beyond a baseline (the number of
+/// peers the node explicitly dialed). When a PX'd PRUNE makes the router dial a
+/// peer it was OFFERED — one it never dialed itself — that peer connects and the
+/// count rises above the baseline. The monitor logs a single greppable
+/// `PX-CONNECT` line on the first such rise so a scenario can assert the
+/// cross-impl PX dial happened. Runs on its own fiber for the whole run; the
+/// caller cancels it on teardown.
+const PeerCountMonitor = struct {
+    io: std.Io,
+    gs: *gossipsub.Gossipsub,
+    /// Peers the node dialed itself; growth past this is a PX-offered connection.
+    baseline: usize,
+
+    fn run(self: *PeerCountMonitor) void {
+        var announced = false;
+        while (true) {
+            const count = self.gs.peerCount();
+            if (!announced and count > self.baseline) {
+                announced = true;
+                std.log.info("PX-CONNECT peer_count={d} baseline={d}", .{ count, self.baseline });
+            }
+            // Poll period well under a heartbeat; the run loop bounds the lifetime
+            // and the fiber is canceled on teardown, so an unbounded loop is fine.
+            timeoutFromMs(100).sleep(self.io) catch return;
+        }
     }
 };
 
@@ -521,40 +673,19 @@ fn runDialer(
         conns.deinit(allocator);
     }
 
-    var it = args.dialTargets();
-    var dialed: usize = 0;
-    while (it.next()) |peer_text| {
-        std.log.info("dialing {s}", .{peer_text});
-        var remote_addr = Multiaddr.fromString(allocator, peer_text) catch |err| {
-            std.log.warn("invalid peer multiaddr {s}: {any}", .{ peer_text, err });
-            continue;
-        };
-        defer remote_addr.deinit(allocator);
-
-        const conn = switcher.dial(remote_addr, .{ .timeout = timeoutFromMs(args.duration_ms) }) catch |err| {
-            std.log.warn("dial {s} failed: {any}", .{ peer_text, err });
-            continue;
-        };
-        // Start inbound dispatch so this side's `/meshsub` inbound handler runs
-        // for this peer; without it the peers wire up but never exchange RPCs.
-        conn.startInboundDispatcher(.{}) catch |err| {
-            std.log.warn("startInboundDispatcher for {s} failed: {any}", .{ peer_text, err });
-            conn.deinit();
-            continue;
-        };
-        // Run identify as the client against the just-dialed peer: read its
-        // identify and certify its signed peer record into our gossipsub store
-        // (completing peer-exchange). Best-effort — failures are logged, the
-        // connection stays up.
-        exchangeIdentify(allocator, io, conn, gs);
-        try conns.append(allocator, conn);
-        dialed += 1;
-    }
+    const dialed = try dialPeers(allocator, io, switcher, gs, args, &conns);
     std.log.info("dialer connected to {d} peer(s)", .{dialed});
     if (dialed == 0) return error.NoPeersDialed;
 
     // Always subscribe so the mesh can form on both ends.
     try gs.subscribe(args.topic);
+
+    // Watch the gossipsub peer count for growth beyond what we explicitly dialed:
+    // a PX-offered peer we dial because the bootstrap pruned us with PX shows up
+    // as an EXTRA peer here, which is the observable proof of a cross-impl PX dial.
+    var px_monitor = PeerCountMonitor{ .io = io, .gs = gs, .baseline = dialed };
+    var px_future = try std.Io.concurrent(io, PeerCountMonitor.run, .{&px_monitor});
+    defer px_future.cancel(io);
 
     try runForDuration(io, gs, args);
 
@@ -601,6 +732,36 @@ fn runForDuration(io: std.Io, gs: *gossipsub.Gossipsub, args: *const Args) !void
         const step = @min(publish_interval_ms, args.duration_ms - elapsed_ms);
         try timeoutFromMs(step).sleep(io);
     }
+}
+
+/// The Switch's listen multiaddrs with any `/ip4/0.0.0.0/` rewritten to the
+/// loopback `/ip4/127.0.0.1/`. The Switch binds on the wildcard 0.0.0.0, which is
+/// NOT a dialable address — a peer that learns this address through a signed peer
+/// record (peer-exchange) or identify must be able to dial it. The loopback form
+/// is what these on-host interop runs reach each other at (and matches the
+/// advertised `buildPublishedMultiaddr`). Caller owns each returned string.
+fn loopbackListenAddrs(
+    allocator: std.mem.Allocator,
+    switcher: *libp2p.Switch,
+) !std.ArrayList([]u8) {
+    var bound = try switcher.listenMultiaddrs(allocator);
+    defer {
+        for (bound.items) |addr| allocator.free(addr);
+        bound.deinit(allocator);
+    }
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |addr| allocator.free(addr);
+        out.deinit(allocator);
+    }
+    for (bound.items) |addr| {
+        const rewritten = if (std.mem.indexOf(u8, addr, "/ip4/0.0.0.0/")) |_|
+            try std.mem.replaceOwned(u8, allocator, addr, "/ip4/0.0.0.0/", "/ip4/127.0.0.1/")
+        else
+            try allocator.dupe(u8, addr);
+        try out.append(allocator, rewritten);
+    }
+    return out;
 }
 
 /// Build the full `/ip4/.../udp/<port>/quic-v1/p2p/<peer-id>` multiaddr from the

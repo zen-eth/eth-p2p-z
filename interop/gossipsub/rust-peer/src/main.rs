@@ -47,6 +47,10 @@ struct Args {
     duration_ms: u64,
     sign: String,      // strict (default) | anonymous (alias nosign)
     protocols: String, // empty = default (1.2/1.1/1.0); "meshsub/1.1.0" = only 1.1.0
+    px: bool,          // peer-exchange on PRUNE (do_px + prune_peers); default off
+    d_high: usize,     // mesh upper bound (mesh_n_high); 0 = default
+    d: usize,          // mesh target degree (mesh_n); 0 = default
+    d_low: usize,      // mesh lower bound (mesh_n_low); 0 = default
 }
 
 impl Args {
@@ -85,6 +89,10 @@ fn parse_args() -> Args {
         duration_ms: 12000,
         sign: "strict".into(),
         protocols: String::new(),
+        px: false,
+        d_high: 0,
+        d: 0,
+        d_low: 0,
     };
     for arg in std::env::args().skip(1) {
         let (key, val) = arg
@@ -102,6 +110,10 @@ fn parse_args() -> Args {
             "duration_ms" => a.duration_ms = val.parse().unwrap_or(12000),
             "sign" => a.sign = val.into(),
             "protocols" => a.protocols = val.into(),
+            "px" => a.px = val == "on" || val == "true",
+            "d_high" => a.d_high = val.parse().unwrap_or(0),
+            "d" => a.d = val.parse().unwrap_or(0),
+            "d_low" => a.d_low = val.parse().unwrap_or(0),
             other => fatal(&format!("unknown argument key {other:?}")),
         }
     }
@@ -231,6 +243,42 @@ fn build_behaviour(keypair: &identity::Keypair, a: &Args) -> Behaviour {
         // Advertise ONLY gossipsub 1.1.0 (not the default 1.1.0+1.0.0 set) so a
         // 1.2-capable peer must negotiate down to 1.1.0 to talk to us.
         config.protocol_id("/meshsub/1.1.0", gossipsub::Version::V1_1);
+    }
+    if a.px {
+        // Peer-exchange EMIT: do_px makes an over-degree PRUNE carry up to
+        // prune_peers other mesh peers as offers (prune_peers defaults to 0, which
+        // disables PX even with do_px, so it must be set > 0). rust-libp2p emits
+        // each offer as a bare peer id WITHOUT a signed peer record — its PeerInfo
+        // has only a peer_id field, and make_prune builds `PeerInfo { peer_id }`
+        // with no record. A consumer that needs an ADDRESS to dial a never-seen
+        // peer (the zig and go nodes both require the signed record's addresses)
+        // therefore gets nothing dialable from a rust emitter.
+        //
+        // Peer-exchange CONSUME is likewise address-blind here: px_connect dials
+        // offered peers by peer_id only and explicitly does NOT read a signed
+        // record ("Until SignedRecords are spec'd this remains a stub"), so a rust
+        // consumer can only dial a PX-offered peer whose address it ALREADY knows.
+        //
+        // So rust participates in PX framing but cannot complete a record-driven
+        // new-peer dial in either direction with libp2p-gossipsub 0.49.4. The
+        // cross-impl record-driven PX scenario uses go (which emits + consumes
+        // signed records); these knobs let rust be exercised for framing only.
+        config.do_px();
+        config.prune_peers(16);
+    }
+    if a.d_high != 0 || a.d != 0 || a.d_low != 0 {
+        // Override the mesh DEGREE so a small topology goes over-degree and the
+        // heartbeat prunes WITH PX. Each field falls back to the builder default
+        // when left at 0.
+        if a.d != 0 {
+            config.mesh_n(a.d);
+        }
+        if a.d_low != 0 {
+            config.mesh_n_low(a.d_low);
+        }
+        if a.d_high != 0 {
+            config.mesh_n_high(a.d_high);
+        }
     }
     let config = config
         .build()

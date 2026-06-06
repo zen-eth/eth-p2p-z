@@ -52,6 +52,10 @@ type args struct {
 	durationMs int
 	sign       string // strict (default) | nosign
 	protocols  string // empty = default (1.2/1.1/1.0); "meshsub/1.1.0" = advertise only 1.1.0
+	px         bool   // peer-exchange on PRUNE (WithPeerExchange); default off
+	dHigh      int    // mesh upper bound (Dhi); 0 = default. Lower it so a tiny topology over-degree-prunes WITH PX.
+	d          int    // mesh target degree (D); 0 = default
+	dLow       int    // mesh lower bound (Dlo); 0 = default
 }
 
 // dialTargets returns every peer multiaddr to dial: each comma-separated entry
@@ -107,6 +111,14 @@ func parseArgs() args {
 			a.sign = val
 		case "protocols":
 			a.protocols = val
+		case "px":
+			a.px = val == "on" || val == "true"
+		case "d_high":
+			fmt.Sscanf(val, "%d", &a.dHigh)
+		case "d":
+			fmt.Sscanf(val, "%d", &a.d)
+		case "d_low":
+			fmt.Sscanf(val, "%d", &a.dLow)
 		default:
 			fatalf("unknown argument key %q", key)
 		}
@@ -278,6 +290,38 @@ func newGossipSub(ctx context.Context, h host.Host, a args) *pubsub.PubSub {
 			return proto == pubsub.GossipSubID_v11
 		}
 		opts = append(opts, pubsub.WithGossipSubProtocols(only11, feat))
+	}
+	if a.px {
+		// Peer-exchange: when this node over-degree-prunes a mesh peer, the PRUNE
+		// carries up to PrunePeers other mesh peers as offers, each with the offered
+		// peer's SIGNED peer record drawn from the certified addr book (which
+		// go-libp2p populates automatically from each peer's identify signedPeerRecord).
+		// A peer that accepts the PX (its score clears AcceptPXThreshold — with no
+		// scoring the score is 0 and the default threshold is 0, so 0 < 0 is false and
+		// PX is accepted) verifies the records and dials the offered peers.
+		opts = append(opts, pubsub.WithPeerExchange(true))
+	}
+	if a.dHigh != 0 || a.d != 0 || a.dLow != 0 {
+		// Override the mesh DEGREE so a small topology goes over-degree and the
+		// heartbeat prunes WITH PX. go prunes the mesh down to D when it has >= Dhi
+		// peers, keeping Dscore peers by score and Dout outbound peers; with scoring
+		// off and a tiny mesh those selection sizes must not exceed the mesh, so set
+		// Dscore=0 and Dout=0 (the over-degree prune slices plst[Dscore:] and the
+		// outbound bubble-up runs over plst[D:], both of which would panic if Dscore
+		// or D exceeded the peer list). Each degree field falls back to the default.
+		params := pubsub.DefaultGossipSubParams()
+		if a.d != 0 {
+			params.D = a.d
+		}
+		if a.dLow != 0 {
+			params.Dlo = a.dLow
+		}
+		if a.dHigh != 0 {
+			params.Dhi = a.dHigh
+		}
+		params.Dscore = 0
+		params.Dout = 0
+		opts = append(opts, pubsub.WithGossipSubParams(params))
 	}
 	gs, err := pubsub.NewGossipSub(ctx, h, opts...)
 	if err != nil {
