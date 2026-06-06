@@ -239,11 +239,18 @@ const MeshParams = struct {
     /// Once `heartbeat_tick - fanout_last_pub[topic]` exceeds this the fanout
     /// peer set is dropped (we stopped publishing to a topic we don't subscribe).
     fanout_ttl_ticks: u64 = 60,
-    /// Number of gossip (IHAVE) targets per topic per heartbeat: peers subscribed
-    /// to the topic but NOT in its mesh/fanout, picked up to this many. (go-libp2p
-    /// `D_lazy`; go also uses `max(D_lazy, GossipFactor*eligible)` — the
-    /// GossipFactor scaling is a future refinement.)
+    /// Floor on the number of gossip (IHAVE) targets per topic per heartbeat:
+    /// peers subscribed to the topic but NOT in its mesh/fanout. The actual count
+    /// is `max(gossip_factor * eligible, d_lazy)` (see `gossip_factor`), so a
+    /// topic with few eligible peers still gossips to at least this many.
+    /// (go-libp2p `D_lazy`.)
     d_lazy: usize = 6,
+    /// Fraction of gossip-eligible (subscribed, non-mesh, non-fanout, above the
+    /// gossip threshold when scoring) peers that receive IHAVE each heartbeat,
+    /// when that fraction exceeds `d_lazy`. The target count is
+    /// `max(gossip_factor * eligible_count, d_lazy)`, so large topics gossip to a
+    /// proportional slice rather than a fixed floor. (go GossipSubGossipFactor.)
+    gossip_factor: f64 = 0.25,
     /// Upper bound on message-ids advertised in a single IHAVE; a longer id list
     /// is truncated. (go-libp2p `MaxIHaveLength`.)
     max_ihave_length: usize = 5000,
@@ -255,6 +262,18 @@ const MeshParams = struct {
     /// single inbound IWANT. Bounds the work one peer can ask of us per request;
     /// finer rate-limiting is a future refinement.
     max_iwant_to_serve: usize = 5000,
+    /// Maximum times we serve the SAME message id to ONE peer in response to its
+    /// IWANTs, counted within the gossip window (the counts reset each heartbeat
+    /// alongside the message-cache window shift). Beyond this, further IWANTs for
+    /// that id from that peer are ignored — an anti-spam bound so a peer cannot
+    /// make us re-send a message endlessly. (go GossipSubGossipRetransmission.)
+    gossip_retransmission: u64 = 3,
+    /// Maximum IHAVE messages we process from ONE peer per heartbeat. Once a peer
+    /// has sent this many IHAVEs in a heartbeat window, further IHAVEs from it are
+    /// ignored until the per-peer counter resets at the next heartbeat. An
+    /// anti-spam bound (distinct from `max_ihave_length`, which caps the ids in a
+    /// single IHAVE). (go GossipSubMaxIHaveMessages.)
+    max_ihave_messages: usize = 10,
     /// How long (in heartbeat ticks) a per-peer IDONTWANT entry suppresses sending
     /// that message id to the peer. After this many heartbeats the entry expires
     /// and we may send the message again. A few heartbeats is enough to cover the
@@ -398,6 +417,18 @@ pub fn Router(comptime Transport: type) type {
             /// which point the heartbeat reclaims it. Keys are owned copies (freed
             /// on expiry and on teardown). Bounded by `dont_send_cap`.
             dont_send: std.StringHashMapUnmanaged(u64) = .empty,
+            /// How many times we have served each message id to this peer via
+            /// IWANT within the current gossip window. Incremented each time we
+            /// serve the id; once it reaches `gossip_retransmission` we stop
+            /// serving that id to this peer (anti-spam). Keys are owned copies
+            /// (freed on clear and on teardown); the whole map is cleared each
+            /// heartbeat (mirroring go, which ages these with the mcache window).
+            iwant_counts: std.StringHashMapUnmanaged(u64) = .empty,
+            /// How many IHAVE messages this peer has sent us in the current
+            /// heartbeat window. Incremented on each inbound IHAVE; once it
+            /// reaches `max_ihave_messages` we ignore further IHAVEs from the peer
+            /// until the heartbeat resets it to zero (anti-spam).
+            ihave_received_this_window: usize = 0,
             /// Heap-owned (Transport-allocated) so its address is stable while
             /// the writer fiber holds it. The sink (and its stream) MUST outlive
             /// the writer fiber — torn down only after the writer is awaited.
@@ -1401,6 +1432,14 @@ pub fn Router(comptime Transport: type) type {
                         }
                     }
                 }
+
+                // Reset the per-heartbeat anti-spam counters. The IHAVE-message
+                // budget reopens for the new window (go resets it per heartbeat),
+                // and the IWANT retransmission counts age out with the gossip
+                // window (go clears these alongside the mcache slide). Freeing each
+                // owned id key keeps `iwant_counts` from leaking.
+                state_ptr.*.ihave_received_this_window = 0;
+                router.clearIWantCounts(state_ptr.*);
             }
 
             // Advance the scoring engine one tick (decays the fading counters,
@@ -1427,13 +1466,14 @@ pub fn Router(comptime Transport: type) type {
 
         /// Emit IHAVE gossip for every topic we participate in. For each topic
         /// (subscribed topics, plus active fanout topics) advertise the message ids
-        /// in the cache's gossipable windows to up to `d_lazy` peers that subscribe
+        /// in the cache's gossipable windows to a slice of the peers that subscribe
         /// to the topic but are NOT in its mesh (and, for a fanout topic, not in its
         /// fanout set) — the "lazy" peers that get gossip rather than full messages.
+        /// The slice size is `max(gossip_factor * eligible, d_lazy)`.
         ///
         /// Selection is deterministic (peer-map iteration order); a random shuffle
-        /// for anti-eclipse fairness, and `GossipFactor`-scaled fan-out, are future
-        /// refinements. Score-gated emission arrives with peer scoring.
+        /// for anti-eclipse fairness is a future refinement. Score-gated emission is
+        /// applied (peers below the gossip threshold are excluded).
         fn emitGossip(router: *Self) void {
             var topic_it = router.my_topics.keyIterator();
             while (topic_it.next()) |key| router.emitGossipForTopic(key.*);
@@ -1447,10 +1487,11 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Emit IHAVE for a single topic: gather the cache's gossipable ids for it
-        /// (truncated at `max_ihave_length`), then send an IHAVE carrying them to up
-        /// to `d_lazy` gossip-eligible peers. No-op if the cache has nothing for the
-        /// topic. The borrowed ids stay valid through the sends (no `shift` happens
-        /// before this returns) and `frameRpc` copies them into each frame.
+        /// (truncated at `max_ihave_length`), then send an IHAVE carrying them to the
+        /// gossip-eligible peers chosen by `selectGossipTargets`. No-op if the cache
+        /// has nothing for the topic. The borrowed ids stay valid through the sends
+        /// (no `shift` happens before this returns) and `frameRpc` copies them into
+        /// each frame.
         fn emitGossipForTopic(router: *Self, topic: []const u8) void {
             const ids = router.message_cache.getGossipIDs(router.allocator, topic) catch return;
             defer router.allocator.free(ids);
@@ -1467,16 +1508,20 @@ pub fn Router(comptime Transport: type) type {
             for (targets.items) |peer| router.sendIHave(peer, topic, capped);
         }
 
-        /// Append up to `d_lazy` gossip targets for `topic` to `out`: peers that
-        /// announced they subscribe to `topic` but are NOT in its mesh and NOT in
-        /// its fanout set (those already get full messages). Peer-map iteration
-        /// order is the selection order (deterministic; shuffle is a refinement).
+        /// Append the gossip targets for `topic` to `out`: a slice of the peers
+        /// that announced they subscribe to `topic` but are NOT in its mesh and NOT
+        /// in its fanout set (those already get full messages) and clear the gossip
+        /// score threshold. The slice size is `max(gossip_factor * eligible_count,
+        /// d_lazy)` — a proportional fan-out that still gossips to at least `d_lazy`
+        /// peers in small topics. All eligible peers are gathered first (so the
+        /// count is exact), then the list is truncated to the target. Peer-map
+        /// iteration order is the selection order (deterministic; shuffle is a
+        /// refinement).
         fn selectGossipTargets(router: *Self, topic: []const u8, out: *std.ArrayListUnmanaged(PeerId)) void {
             const mesh_set = router.mesh.getPtr(topic);
             const fanout_set = router.fanout.getPtr(topic);
             var it = router.peers.iterator();
             while (it.next()) |entry| {
-                if (out.items.len >= mesh_params.d_lazy) break;
                 const peer = entry.value_ptr.*.peer;
                 if (!entry.value_ptr.*.topics.contains(topic)) continue;
                 const key = peerKey(&peer);
@@ -1492,6 +1537,15 @@ pub fn Router(comptime Transport: type) type {
                 }
                 out.append(router.allocator, peer) catch break;
             }
+
+            // Target = max(gossip_factor * eligible, d_lazy). `out.items.len` is the
+            // eligible count (every appended peer is gossip-eligible). When the
+            // proportional slice is smaller than what we gathered, truncate to it;
+            // otherwise keep everyone (eligible <= target).
+            const eligible: f64 = @floatFromInt(out.items.len);
+            const scaled: usize = @intFromFloat(mesh_params.gossip_factor * eligible);
+            const target = @max(scaled, mesh_params.d_lazy);
+            if (out.items.len > target) out.shrinkRetainingCapacity(target);
         }
 
         /// Send an IHAVE(topic, ids) to `peer` on its control lane. The borrowed
@@ -1699,8 +1753,19 @@ pub fn Router(comptime Transport: type) type {
         ///
         /// Finer rate-limiting and IWANT-promise tracking (so a peer that fails to
         /// deliver what it advertised is penalised) arrive with peer scoring.
+        ///
+        /// Anti-spam: each inbound IHAVE counts against the peer's per-heartbeat
+        /// budget (`max_ihave_messages`). Once the peer has spent it for this
+        /// heartbeat window, further IHAVEs from it are dropped (no IWANT) until
+        /// the next heartbeat resets the counter.
         fn handleIHave(router: *Self, source: PeerId, ihave: *rpc_pb.ControlIHaveReader) void {
-            if (!router.peers.contains(peerKey(&source))) return;
+            const state = router.peers.get(peerKey(&source)) orelse return;
+
+            // Per-heartbeat IHAVE-message budget (go GossipSubMaxIHaveMessages):
+            // ignore this IHAVE once the peer has reached its cap for the window
+            // (the counter resets each heartbeat).
+            if (state.ihave_received_this_window >= mesh_params.max_ihave_messages) return;
+            state.ihave_received_this_window += 1;
 
             var wanted: std.ArrayListUnmanaged(?[]const u8) = .empty;
             defer wanted.deinit(router.allocator);
@@ -1723,20 +1788,50 @@ pub fn Router(comptime Transport: type) type {
         /// single-message publish RPC, so the served message re-enters the peer's
         /// normal inbound path on the other side (dedup, deliver, cache, forward).
         /// Ids we do not have are ignored. Capped at `max_iwant_to_serve` messages
-        /// per request so one peer cannot make us serve an unbounded set; finer
-        /// rate-limiting is a future refinement.
+        /// per request so one peer cannot make us serve an unbounded set.
+        ///
+        /// Anti-spam: we serve the same id to the same peer at most
+        /// `gossip_retransmission` times within the gossip window (tracked in the
+        /// peer's `iwant_counts`, reset each heartbeat). A repeat request for an id
+        /// already served that many times is ignored.
         fn handleIWant(router: *Self, source: PeerId, iwant: *rpc_pb.ControlIWantReader) void {
             const state = router.peers.get(peerKey(&source)) orelse return;
             var served: usize = 0;
             while (iwant.messageIDsNext()) |id| {
                 if (served >= mesh_params.max_iwant_to_serve) break;
+                // Retransmission cap: skip an id we have already served this peer
+                // `gossip_retransmission` times in the current window. Checked
+                // before the cache lookup so a flooded id is cheap to reject.
+                if (state.iwant_counts.get(id)) |c| {
+                    if (c >= mesh_params.gossip_retransmission) continue;
+                }
                 const frame = router.message_cache.get(id) orelse continue;
                 // Retain before pushing (the queue holds the reference; the cache
                 // keeps its own). `pushTo` releases on a rejected push, so a full
                 // queue does not leak the retained reference.
                 router.pushTo(state, .data, frame);
+                router.bumpIWantCount(state, id);
                 served += 1;
             }
+        }
+
+        /// Increment the per-peer served count for message id `id`. The first time
+        /// an id is served the key is an owned copy (freed when `iwant_counts` is
+        /// cleared each heartbeat, or on teardown); afterwards we just bump the
+        /// existing entry. Best-effort on OOM (a failed insert just means we may
+        /// serve the id one extra time — safe).
+        fn bumpIWantCount(router: *Self, state: *PeerState, id: []const u8) void {
+            const gop = state.iwant_counts.getOrPut(router.allocator, id) catch return;
+            if (!gop.found_existing) {
+                const owned = router.allocator.dupe(u8, id) catch {
+                    // Undo the placeholder entry (its key aliases borrowed bytes).
+                    _ = state.iwant_counts.remove(id);
+                    return;
+                };
+                gop.key_ptr.* = owned;
+                gop.value_ptr.* = 0;
+            }
+            gop.value_ptr.* += 1;
         }
 
         /// Handle an inbound IDONTWANT(ids) from `source`: the peer already holds
@@ -2342,6 +2437,8 @@ pub fn Router(comptime Transport: type) type {
             state.queue.deinit(router.io);
             router.freePeerTopics(state);
             router.freePeerDontSend(state);
+            router.clearIWantCounts(state);
+            state.iwant_counts.deinit(router.allocator);
             router.allocator.destroy(state.writer);
             router.allocator.destroy(state.sink);
             router.allocator.destroy(state);
@@ -2360,6 +2457,16 @@ pub fn Router(comptime Transport: type) type {
             var it = state.dont_send.keyIterator();
             while (it.next()) |key| router.allocator.free(key.*);
             state.dont_send.deinit(router.allocator);
+        }
+
+        /// Free every owned id key in a peer's IWANT retransmission-count map and
+        /// empty the map (retaining its capacity). Called each heartbeat to age the
+        /// counts out with the gossip window, and on teardown (followed there by a
+        /// `deinit`). Bounds the map's lifetime to one heartbeat window.
+        fn clearIWantCounts(router: *Self, state: *PeerState) void {
+            var it = state.iwant_counts.keyIterator();
+            while (it.next()) |key| router.allocator.free(key.*);
+            state.iwant_counts.clearRetainingCapacity();
         }
 
         fn teardownAllPeers(router: *Self) void {
@@ -3016,6 +3123,27 @@ fn recordHasIHave(io: std.Io, record: *FakeRecord, topic: []const u8, id: []cons
                 while (ih.messageIDsNext()) |mid| {
                     if (std.mem.eql(u8, mid, id)) return true;
                 }
+            }
+        } else |_| {}
+        rest = rest[decoded.total_len..];
+    }
+    return false;
+}
+
+/// Whether the recording contains any control IHAVE for `topic` (ignoring the
+/// advertised ids). Used by gossip-fan-out tests that count how many peers got an
+/// IHAVE, not which ids. Walks every recorded frame under the record lock.
+fn recordHasAnyIHave(io: std.Io, record: *FakeRecord, topic: []const u8) bool {
+    record.mutex.lockUncancelable(io);
+    defer record.mutex.unlock(io);
+    var rest = record.written.items;
+    while (decodeFrame(rest)) |decoded| {
+        var reader = decoded.reader;
+        if (reader.getControl()) |ctrl_reader| {
+            var control = ctrl_reader;
+            while (control.ihaveNext()) |ihave| {
+                var ih = ihave;
+                if (std.mem.eql(u8, ih.getTopicID(), topic)) return true;
             }
         } else |_| {}
         rest = rest[decoded.total_len..];
@@ -4527,6 +4655,234 @@ test "recovery: IHAVE -> IWANT -> served publish is delivered to a node that mis
     try std.testing.expectEqualSlices(u8, "recovered", rec.data.?);
     // And the recovered message is now cached locally too.
     try std.testing.expect(router.message_cache.get(id.bytes) != null);
+}
+
+/// Connect `n` peers (seeds `first_seed .. first_seed+n`), announce each as a
+/// non-mesh subscriber of `topic` (inbound SUBSCRIBE) and PRUNE each so the
+/// heartbeat's mesh maintenance never grafts it (a backed-off peer is not a graft
+/// candidate). The peers stay lazy gossip-eligible subscribers. Conns are written
+/// into `conns[0..n]`; the caller owns + frees them. Syncs once at the end so all
+/// peers are fully wired before the caller reads state.
+fn connectLazySubscribers(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    router: *FakeRouter,
+    topic: []const u8,
+    first_seed: u8,
+    n: usize,
+    conns: []*FakeTransport.FakeConn,
+) !void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const peer = testPeer(first_seed + @as(u8, @intCast(i)));
+        conns[i] = try connectFakePeer(io, allocator, router, peer);
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundSub(allocator, topic, true) } });
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundPrune(allocator, topic, 0) } });
+    }
+    try sync(router, io);
+}
+
+/// Count how many of the `n` recordings hold at least one IHAVE for `topic`.
+/// Spins (bounded) until the count stabilises at `expected` or the wait elapses,
+/// so the asynchronous writer flush has time to land every IHAVE.
+fn countRecordsWithIHave(io: std.Io, conns: []*FakeTransport.FakeConn, n: usize, topic: []const u8) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (recordHasAnyIHave(io, &conns[i].record, topic)) count += 1;
+    }
+    return count;
+}
+
+test "gossip factor: emits IHAVE to max(0.25*eligible, d_lazy) lazy subscribers" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    // 40 non-mesh gossip-eligible subscribers. 0.25 * 40 = 10 > d_lazy (6), so the
+    // heartbeat must IHAVE exactly 10 of them (gossip_factor scaling).
+    const n = 40;
+    var conns: [n]*FakeTransport.FakeConn = undefined;
+    try connectLazySubscribers(io, allocator, router, "t", 1, n, &conns);
+    defer for (conns) |c| destroyFakeConn(allocator, c);
+
+    // A relay source delivers a publish so the heartbeat has a cached id to gossip.
+    const source = testPeer(200);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    const from = "origin";
+    const seqno = "\x00\x00\x00\x42";
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, from, seqno, "t", "gossiped"),
+    } });
+    try sync(router, io);
+
+    try beatHeartbeats(io, router, 1);
+    // Let the asynchronous writer flush land every IHAVE before counting.
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (countRecordsWithIHave(io, &conns, n, "t") >= 10) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 10), countRecordsWithIHave(io, &conns, n, "t"));
+}
+
+test "gossip factor floor: few eligible peers still gossips to d_lazy" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    // 8 non-mesh subscribers: 0.25 * 8 = 2 < d_lazy (6), so the floor applies and
+    // the heartbeat IHAVEs all 6 it can fill (max(2, 6) capped by the 8 available).
+    const n = 8;
+    var conns: [n]*FakeTransport.FakeConn = undefined;
+    try connectLazySubscribers(io, allocator, router, "t", 1, n, &conns);
+    defer for (conns) |c| destroyFakeConn(allocator, c);
+
+    const source = testPeer(200);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    const from = "origin";
+    const seqno = "\x00\x00\x00\x43";
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, from, seqno, "t", "gossiped"),
+    } });
+    try sync(router, io);
+
+    try beatHeartbeats(io, router, 1);
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (countRecordsWithIHave(io, &conns, n, "t") >= 6) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 6), countRecordsWithIHave(io, &conns, n, "t"));
+}
+
+test "gossip retransmission: same id served at most gossip_retransmission times per peer" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+    const peer_p = testPeer(1);
+    const conn_p = try connectFakePeer(io, allocator, router, peer_p);
+    defer destroyFakeConn(allocator, conn_p);
+
+    // Cache a message (local publish) so its id is serveable by IWANT.
+    try router.inbox.putOne(io, .{ .publish = .{
+        .topic = try allocator.dupe(u8, "t"),
+        .data = try allocator.dupe(u8, "served-data"),
+    } });
+    const from = local_test_peer.bytes[0..local_test_peer.len];
+    var id = try rpc.messageId(allocator, from, "\x00\x00\x00\x00\x00\x00\x00\x00");
+    defer id.deinit(allocator);
+    try sync(router, io);
+    try std.testing.expect(router.message_cache.get(id.bytes) != null);
+
+    // P IWANTs the same id 4 times (gossip_retransmission is 3). Each IWANT is a
+    // separate handleIWant call; sync between them so the served count is updated
+    // before the next request is processed. The first 3 are served, the 4th is not.
+    var k: usize = 0;
+    while (k < 4) : (k += 1) {
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{
+            .peer = peer_p,
+            .rpc = try buildInboundIWant(allocator, &[_]?[]const u8{id.bytes}),
+        } });
+        try sync(router, io);
+    }
+
+    // The data lane carried the served publish exactly gossip_retransmission times.
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_p.record, "t", "served-data") >= mesh_params.gossip_retransmission) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    // Give any (wrong) 4th serve a chance to land before asserting the cap held.
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(
+        @as(usize, mesh_params.gossip_retransmission),
+        recordCountPublishes(io, &conn_p.record, "t", "served-data"),
+    );
+}
+
+test "max IHAVE messages: only the first max_ihave_messages IHAVEs per heartbeat are processed" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    const peer_p = testPeer(1);
+    const conn_p = try connectFakePeer(io, allocator, router, peer_p);
+    defer destroyFakeConn(allocator, conn_p);
+
+    // P sends 12 separate IHAVE messages, each advertising a distinct unseen id.
+    // Only the first max_ihave_messages (10) are processed → exactly 10 ids draw an
+    // IWANT; ids 11-12 are dropped (peer over its per-heartbeat IHAVE budget).
+    const total = 12;
+    var ids: [total][]u8 = undefined;
+    var made: usize = 0;
+    defer for (ids[0..made]) |b| allocator.free(b);
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        ids[i] = try std.fmt.allocPrint(allocator, "ihave-id-{d}", .{i});
+        made += 1;
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{
+            .peer = peer_p,
+            .rpc = try buildInboundIHave(allocator, "t", &[_]?[]const u8{ids[i]}),
+        } });
+    }
+    try sync(router, io);
+
+    // Wait for the IWANTs for the first 10 ids to flush.
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountIWants(io, &conn_p.record, ids[9]) >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    // Ids 0..9 each drew exactly one IWANT; ids 10..11 (over budget) drew none.
+    i = 0;
+    while (i < total) : (i += 1) {
+        const expected: usize = if (i < mesh_params.max_ihave_messages) 1 else 0;
+        try std.testing.expectEqual(expected, recordCountIWants(io, &conn_p.record, ids[i]));
+    }
+
+    // A heartbeat resets the per-peer IHAVE budget; P can be served IHAVEs again.
+    try beatHeartbeats(io, router, 1);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_p,
+        .rpc = try buildInboundIHave(allocator, "t", &[_]?[]const u8{ids[11]}),
+    } });
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountIWants(io, &conn_p.record, ids[11]) >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountIWants(io, &conn_p.record, ids[11]));
 }
 
 // --- peer-scoring gate fake tests ------------------------------------------
