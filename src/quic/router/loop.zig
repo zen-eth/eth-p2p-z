@@ -124,6 +124,7 @@ pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAd
         .enable_orig_dst = ep.options.endpoint.enable_orig_dst,
         .enable_rx_timestamps = ep.options.endpoint.enable_rx_timestamps,
         .socket_mark = ep.options.endpoint.socket_mark,
+        .shadow_compatible = ep.options.endpoint.shadow_compatible,
     });
     const shared_socket = try transport_mod.SharedUdpSocket.init(ep.allocator, io, socket, caps);
     socket_owned = false;
@@ -473,14 +474,30 @@ fn receiveRouterPacket(ep: Context, timeout: std.Io.Timeout) (error{Timeout} || 
     const socket = ep.socket_slot.* orelse return error.Canceled;
     const local_addr = socket.address();
     var buf: [packet_buf_len]u8 = undefined;
-    var control: [socket_control.recv_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
-    const msg = socket.receiveWithControlTimeout(io, &buf, &control, timeout) catch |err| switch (err) {
-        error.Timeout => return error.Timeout,
-        error.Canceled => return error.Canceled,
-        else => {
-            ep.addStat("router_recv_errors", 1);
-            return null;
-        },
+    // Shadow mode: a plain `recvmsg` with NO control buffer. zio maps an empty
+    // control slice to `msg_control = null`/`msg_controllen = 0`, so the kernel
+    // sees a bare datagram receive — the only form the Shadow simulator supports.
+    // The loop is driven by the `route_command` select arm for wakeup/teardown
+    // (this is always called with a `.none` timeout — see `waitRouterPacket`), so
+    // dropping the timed-control receive does not change the loop's liveness.
+    const msg = if (ep.options.endpoint.shadow_compatible)
+        socket.receive(io, &buf) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                ep.addStat("router_recv_errors", 1);
+                return null;
+            },
+        }
+    else recv: {
+        var control: [socket_control.recv_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
+        break :recv socket.receiveWithControlTimeout(io, &buf, &control, timeout) catch |err| switch (err) {
+            error.Timeout => return error.Timeout,
+            error.Canceled => return error.Canceled,
+            else => {
+                ep.addStat("router_recv_errors", 1);
+                return null;
+            },
+        };
     };
     const meta = socket_control.parseIncomingControl(&msg, local_addr) catch |err| switch (err) {
         error.PayloadTruncated => {

@@ -28,6 +28,12 @@ pub const Options = struct {
     enable_orig_dst: bool = false,
     enable_rx_timestamps: bool = true,
     socket_mark: ?u32 = null,
+    /// Restrict the socket to basic `sendmsg`/`recvmsg` with no ancillary control
+    /// data, for the Shadow network simulator. When set, none of the cmsg sockopts
+    /// (UDP GRO, `IP_PKTINFO`/`IPV6_RECVPKTINFO`, `IP_RECVORIGDSTADDR`,
+    /// `SO_TIMESTAMPNS`) and no socket mark are applied, yielding the same all-false
+    /// `Capabilities` that macOS already produces. The toggles above are ignored.
+    shadow_compatible: bool = false,
 };
 
 pub const Capabilities = struct {
@@ -71,6 +77,11 @@ pub const ParseIncomingControlError = error{
 pub fn configureUdpSocket(socket: *const std.Io.net.Socket, options: Options) ConfigureError!Capabilities {
     var caps: Capabilities = .{};
     if (builtin.os.tag != .linux) return caps;
+    // Shadow mode: skip every cmsg sockopt and the socket mark so the socket
+    // behaves exactly like the macOS path (which sets none of these and still
+    // passes QUIC interop). All capabilities stay false, so the send path emits
+    // no source-address cmsg and the receive loop takes the plain `recvmsg`.
+    if (options.shadow_compatible) return caps;
 
     const fd = socket.handle;
     const one: c_int = 1;
@@ -349,6 +360,30 @@ fn parseTimespecNs(data: []const u8) ?u64 {
     const nsec: u64 = @intCast(ts.nsec);
     if (sec > std.math.maxInt(u64) / std.time.ns_per_s) return null;
     return sec * std.time.ns_per_s + nsec;
+}
+
+test "shadow_compatible disables all cmsg capabilities" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var addr = std.Io.net.IpAddress{ .ip4 = .loopback(0) };
+    const socket = try std.Io.net.IpAddress.bind(&addr, io, .{ .mode = .dgram });
+    defer socket.close(io);
+
+    // Even with every optimization toggle on, shadow mode must produce the
+    // all-false capabilities the macOS path already yields — no GRO, no pktinfo,
+    // no orig-dst, no timestamps, no socket mark.
+    const caps = try configureUdpSocket(&socket, .{
+        .enable_udp_gro = true,
+        .enable_pktinfo = true,
+        .enable_orig_dst = true,
+        .enable_rx_timestamps = true,
+        .socket_mark = 0x42,
+        .shadow_compatible = true,
+    });
+    try std.testing.expectEqual(Capabilities{}, caps);
 }
 
 test "parseIncomingControl extracts GRO original destination and timestamp" {

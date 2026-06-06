@@ -143,6 +143,22 @@ pub const EndpointOptions = struct {
     enable_orig_dst: bool = false,
     enable_rx_timestamps: bool = true,
     socket_mark: ?u32 = null,
+    /// Restrict the UDP socket to the basic `sendmsg`/`recvmsg` syscalls with no
+    /// ancillary control data — for running under the Shadow network simulator,
+    /// which supports neither `recvmmsg`/`sendmmsg`, UDP GSO/GRO (`UDP_SEGMENT`),
+    /// `IP_PKTINFO`/`IPV6_RECVPKTINFO`, `IP_RECVORIGDSTADDR`, ECN/`IP_RECVTOS`,
+    /// nor per-packet timestamp cmsgs. When set, the socket is configured exactly
+    /// like macOS already runs (no cmsg sockopts at all) and the receive loop uses
+    /// a plain `recvmsg` with no control buffer. This forces all the GRO/pktinfo/
+    /// timestamp toggles above to be treated as off regardless of their value.
+    ///
+    /// Low-risk: macOS already sets none of these sockopts and QUIC interop passes
+    /// there, so this only makes the Linux socket behave the way macOS always has.
+    /// A shadow-compatible node loses the per-packet local-destination address
+    /// (`IP_PKTINFO`); it relies on the socket's bound address for the local side,
+    /// which is correct for a single-homed bind (the Shadow/interop node binds to a
+    /// specific address).
+    shadow_compatible: bool = false,
 };
 
 pub const Options = struct {
