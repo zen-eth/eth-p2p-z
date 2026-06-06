@@ -246,6 +246,12 @@ const MeshParams = struct {
     /// How long (in heartbeat ticks; one tick is one second) a PRUNE keeps us
     /// from re-grafting the pruned peer for that topic.
     prune_backoff_ticks: u64 = 60,
+    /// Shorter backoff (in heartbeat ticks) used when the PRUNE is because we are
+    /// LEAVING the topic (unsubscribe), not pruning for mesh maintenance. Both the
+    /// wire backoff in the emitted PRUNE and our own local backoff for the departing
+    /// peer use this value, so a node that unsubscribes then quickly resubscribes
+    /// can re-mesh sooner. (go-libp2p-pubsub `GossipSubUnsubscribeBackoff`, 10s.)
+    unsubscribe_backoff_ticks: u64 = 10,
     /// How long (in heartbeat ticks) a fanout topic survives without a publish.
     /// Once `heartbeat_tick - fanout_last_pub[topic]` exceeds this the fanout
     /// peer set is dropped (we stopped publishing to a topic we don't subscribe).
@@ -1702,7 +1708,7 @@ pub fn Router(comptime Transport: type) type {
                 };
                 router.meshRemove(topic, state.peer);
                 router.setBackoff(topic, state.peer, mesh_params.prune_backoff_ticks);
-                router.sendPrune(state.peer, topic);
+                router.sendPrune(state.peer, topic, mesh_params.prune_backoff_ticks);
             }
         }
 
@@ -1737,7 +1743,7 @@ pub fn Router(comptime Transport: type) type {
                 };
                 router.meshRemove(topic, peer.peer);
                 router.setBackoff(topic, peer.peer, mesh_params.prune_backoff_ticks);
-                router.sendPrune(peer.peer, topic);
+                router.sendPrune(peer.peer, topic, mesh_params.prune_backoff_ticks);
             }
         }
 
@@ -2088,28 +2094,36 @@ pub fn Router(comptime Transport: type) type {
                     if (router.score) |sc| sc.addPenalty(source, 1.0);
                 }
                 router.setBackoff(topic, source, mesh_params.prune_backoff_ticks);
-                router.sendPrune(source, topic);
+                router.sendPrune(source, topic, mesh_params.prune_backoff_ticks);
             }
         }
 
         /// Handle an inbound PRUNE(topic) from `source`: drop the peer from the
-        /// topic's mesh and back it off. The wire `backoff` is in seconds (≈ ticks
-        /// at one tick per second); use the larger of it and the default so a peer
-        /// cannot shorten our backoff below the floor. Untracked source is ignored.
-        /// (PX peers are ignored for now.)
+        /// topic's mesh and back it off. The wire `backoff` is in seconds (≈ ticks at
+        /// one tick per second). When the peer specifies a backoff (> 0) we obey it
+        /// exactly — including a shorter one, e.g. the 10s a peer sends when it is
+        /// unsubscribing — matching go (`handlePrune`: "is there a backoff specified
+        /// by the peer? if so obey it"). Flooring it up to `prune_backoff_ticks` would
+        /// defeat the unsubscribe backoff. A PRUNE without a backoff (0) falls back to
+        /// `prune_backoff_ticks`. `setBackoff` never SHORTENS an already-later expiry
+        /// (go `doAddBackoff`), so a peer cannot use this to cut an existing backoff.
+        /// Untracked source is ignored. (PX peers are ignored for now.)
         fn handlePrune(router: *Self, source: PeerId, topic: []const u8, backoff_secs: u64) void {
             if (!router.peers.contains(peerKey(&source))) return;
             router.meshRemove(topic, source);
-            const ticks = @max(backoff_secs, mesh_params.prune_backoff_ticks);
+            const ticks = if (backoff_secs > 0) backoff_secs else mesh_params.prune_backoff_ticks;
             router.setBackoff(topic, source, ticks);
         }
 
-        /// Send a PRUNE(topic) to `peer` on its control lane, carrying the default
-        /// backoff (in seconds, ≈ ticks) and no PX peers. Framed once via `fanOut`
-        /// to the single target.
-        fn sendPrune(router: *Self, peer: PeerId, topic: []const u8) void {
+        /// Send a PRUNE(topic) to `peer` on its control lane, carrying `backoff_ticks`
+        /// as the wire backoff (in seconds, ≈ ticks) and no PX peers. The caller
+        /// passes `prune_backoff_ticks` for a mesh-maintenance prune and the shorter
+        /// `unsubscribe_backoff_ticks` when LEAVING the topic, so the receiver backs
+        /// us off for the matching duration. Framed once via `fanOut` to the single
+        /// target.
+        fn sendPrune(router: *Self, peer: PeerId, topic: []const u8, backoff_ticks: u64) void {
             const ids = router.emptyIds() orelse return;
-            const prune = rpc.buildPrune(topic, &.{}, mesh_params.prune_backoff_ticks);
+            const prune = rpc.buildPrune(topic, &.{}, backoff_ticks);
             const ctrl = rpc_pb.ControlMessage{ .prune = &.{prune} };
             router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), ids, .{ .one = peer });
         }
@@ -2429,8 +2443,11 @@ pub fn Router(comptime Transport: type) type {
                     // meshRemove), so fire the scoring PRUNE explicitly for each
                     // departing member so the engine stops counting it in-mesh.
                     if (router.score) |sc| sc.prune(state.peer, topic);
-                    router.setBackoff(topic, state.peer, mesh_params.prune_backoff_ticks);
-                    router.sendPrune(state.peer, topic);
+                    // Leaving the topic uses the shorter unsubscribe backoff for both
+                    // our local backoff and the wire PRUNE, so if we rejoin soon we
+                    // (and the peer) can re-graft each other sooner than a normal prune.
+                    router.setBackoff(topic, state.peer, mesh_params.unsubscribe_backoff_ticks);
+                    router.sendPrune(state.peer, topic, mesh_params.unsubscribe_backoff_ticks);
                 }
             }
             set.deinit(router.allocator);
@@ -3268,6 +3285,26 @@ fn recordCountPrunes(io: std.Io, record: *FakeRecord, topic: []const u8) usize {
         rest = rest[decoded.total_len..];
     }
     return count;
+}
+
+/// The wire `backoff` (seconds) of the FIRST recorded PRUNE for `topic`, or null
+/// if none was recorded. Walks frames under the record lock; used to assert the
+/// emitted PRUNE carried the expected backoff (e.g. the shorter unsubscribe one).
+fn recordFirstPruneBackoff(io: std.Io, record: *FakeRecord, topic: []const u8) ?u64 {
+    record.mutex.lockUncancelable(io);
+    defer record.mutex.unlock(io);
+    var rest = record.written.items;
+    while (decodeFrame(rest)) |decoded| {
+        var reader = decoded.reader;
+        if (reader.getControl()) |ctrl_reader| {
+            var control = ctrl_reader;
+            while (control.pruneNext()) |prune| {
+                if (std.mem.eql(u8, prune.getTopicID(), topic)) return prune.getBackoff();
+            }
+        } else |_| {}
+        rest = rest[decoded.total_len..];
+    }
+    return null;
 }
 
 /// Count recorded frames carrying a control GRAFT for `topic`. Walks every
@@ -4735,6 +4772,151 @@ test "subscribe JOINs the mesh (eager GRAFTs); unsubscribe LEAVEs it (PRUNEs)" {
     try std.testing.expect(!router.my_topics.contains("t"));
     try std.testing.expect(!router.mesh.contains("t"));
     for (conns) |c| try std.testing.expect(waitPruneSent(io, c, "t"));
+}
+
+test "unsubscribe LEAVE uses the shorter unsubscribe backoff (wire + local), not prune_backoff" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    // Graft P into the mesh for "t".
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
+    try std.testing.expect(router.meshContains("t", peer));
+
+    // Unsubscribe → LEAVE: P gets a PRUNE and is backed off. Both the wire backoff
+    // and our local backoff must be the SHORTER unsubscribe_backoff_ticks (10), not
+    // prune_backoff_ticks (60).
+    try router.inbox.putOne(io, .{ .unsubscribe = .{ .topic = try allocator.dupe(u8, "t") } });
+    try sync(router, io);
+    try std.testing.expect(waitPruneSent(io, conn, "t"));
+
+    // The emitted PRUNE carries unsubscribe_backoff_ticks in its wire backoff.
+    try std.testing.expectEqual(
+        @as(?u64, mesh_params.unsubscribe_backoff_ticks),
+        recordFirstPruneBackoff(io, &conn.record, "t"),
+    );
+
+    // The LOCAL backoff is the SHORT one (10), not prune_backoff_ticks (60). No
+    // heartbeat has run (tick is 0), so the expiry is exactly
+    // unsubscribe_backoff_ticks. After one fewer beat P is still backed off; after
+    // the full unsubscribe window it has cleared — a normal prune (60) would still
+    // be in backoff here.
+    try std.testing.expect(router.inBackoff("t", peer));
+    try beatHeartbeats(io, router, mesh_params.unsubscribe_backoff_ticks - 1);
+    try std.testing.expect(router.inBackoff("t", peer));
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expect(!router.inBackoff("t", peer));
+
+    // Resubscribe (a GRAFT on an unsubscribed topic is rejected regardless of
+    // backoff), then a GRAFT from P is now accepted — the short backoff has expired.
+    try subscribeAndWait(io, allocator, router, "t");
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
+    try std.testing.expect(router.meshContains("t", peer));
+}
+
+test "handlePrune honors a shorter advertised backoff (not floored to prune_backoff)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // P joins the mesh, then PRUNEs us advertising the SHORT unsubscribe backoff
+    // (10) — as a peer that is leaving the topic does. We must honor 10, NOT floor
+    // it up to prune_backoff_ticks (60), or the feature is defeated.
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
+    const advertised = mesh_params.unsubscribe_backoff_ticks;
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundPrune(allocator, "t", advertised) } });
+    try sync(router, io);
+    try std.testing.expect(!router.meshContains("t", peer));
+    try std.testing.expect(router.inBackoff("t", peer));
+
+    // We backed off exactly the advertised ~10 ticks, NOT a floored 60: still in
+    // backoff one beat short of the advertised window, cleared at the window. (No
+    // heartbeat ran before the PRUNE, so the expiry is exactly `advertised`.)
+    try beatHeartbeats(io, router, advertised - 1);
+    try std.testing.expect(router.inBackoff("t", peer));
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expect(!router.inBackoff("t", peer));
+
+    // A GRAFT from P is now accepted — the short advertised backoff has expired.
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
+    try std.testing.expect(router.meshContains("t", peer));
+}
+
+test "over-degree heartbeat prune still carries prune_backoff_ticks (not the unsubscribe one)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    // Connect d_high + 1 peers, each subscribed to "t", and graft them all in so
+    // the mesh is over D_high. The heartbeat then prunes the excess down to D.
+    const n = mesh_params.d_high + 1;
+    var conns = try allocator.alloc(*FakeTransport.FakeConn, n);
+    defer allocator.free(conns);
+    var peers = try allocator.alloc(PeerId, n);
+    defer allocator.free(peers);
+    defer for (conns) |c| destroyFakeConn(allocator, c);
+    for (0..n) |idx| {
+        const p = testPeer(@intCast(70 + idx));
+        peers[idx] = p;
+        conns[idx] = try connectFakePeer(io, allocator, router, p);
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = p, .rpc = try buildInboundSub(allocator, "t", true) } });
+        try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conns[idx], p, "t"));
+    }
+    try std.testing.expectEqual(n, router.meshSize("t"));
+
+    // One heartbeat prunes the mesh back to D. Each pruned victim got a PRUNE; any
+    // such PRUNE must carry the NORMAL prune_backoff_ticks (60), not the unsubscribe
+    // backoff — this is mesh maintenance, not a LEAVE.
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expectEqual(mesh_params.d, router.meshSize("t"));
+
+    // Wait for the PRUNE control frames to land on the pruned peers' streams (the
+    // writer fibers drain asynchronously) before reading their backoff.
+    const want_pruned = n - mesh_params.d;
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        var total: usize = 0;
+        for (conns) |c| total += recordCountPrunes(io, &c.record, "t");
+        if (total >= want_pruned) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+
+    var found_prune = false;
+    for (conns) |c| {
+        if (recordFirstPruneBackoff(io, &c.record, "t")) |b| {
+            try std.testing.expectEqual(mesh_params.prune_backoff_ticks, b);
+            found_prune = true;
+        }
+    }
+    try std.testing.expect(found_prune);
 }
 
 // --- gossip: cache-on-accept + IHAVE / IWANT fake tests --------------------
