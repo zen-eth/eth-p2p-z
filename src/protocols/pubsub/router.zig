@@ -311,6 +311,14 @@ const MeshParams = struct {
     /// the next heartbeat. An anti-flood bound (distinct from `max_idontwant_length`,
     /// which caps the ids in a single IDONTWANT). (go GossipSubMaxIDontWantMessages.)
     max_idontwant_messages: usize = 1000,
+    /// How long (in heartbeat ticks, one tick ≈ one second) a peer has to deliver a
+    /// message it implicitly promised by advertising it (IHAVE) and that we then
+    /// requested (IWANT). When we send the IWANT we record a promise with deadline
+    /// `heartbeat_tick + iwant_followup_ticks`; if the message is not delivered (by
+    /// anyone) before the deadline, the heartbeat charges the promising peer a P7
+    /// behaviour penalty. This deters peers that advertise ids they do not serve.
+    /// (go GossipSubIWantFollowupTime, default 3 seconds.)
+    iwant_followup_ticks: u64 = 3,
 };
 
 const mesh_params: MeshParams = .{};
@@ -451,6 +459,15 @@ pub fn Router(comptime Transport: type) type {
             /// (freed on clear and on teardown); the whole map is cleared each
             /// heartbeat (mirroring go, which ages these with the mcache window).
             iwant_counts: std.StringHashMapUnmanaged(u64) = .empty,
+            /// Outstanding IWANT promises this peer made: message id → the
+            /// heartbeat tick by which the peer must deliver the message. A promise
+            /// is recorded when we send the peer an IWANT for an id it advertised
+            /// (IHAVE), fulfilled (removed) when any peer delivers a message with
+            /// that id, and — if still outstanding once the tick passes the
+            /// deadline — harvested by the heartbeat into a P7 behaviour penalty
+            /// (go's "broken promise"). Keys are owned copies (freed on fulfill, on
+            /// harvest, and on teardown). Populated only when scoring is enabled.
+            iwant_promises: std.StringHashMapUnmanaged(u64) = .empty,
             /// How many IHAVE messages this peer has sent us in the current
             /// heartbeat window. Incremented on each inbound IHAVE; once it
             /// reaches `max_ihave_messages` we ignore further IHAVEs from the peer
@@ -1489,6 +1506,34 @@ pub fn Router(comptime Transport: type) type {
                 state_ptr.*.ihave_received_this_window = 0;
                 state_ptr.*.idontwant_received_this_window = 0;
                 router.clearIWantCounts(state_ptr.*);
+
+                // Harvest broken IWANT promises: any promise whose deadline tick
+                // has passed (`deadline < tick`, i.e. the peer did not deliver in
+                // time — go's strict `expire.Before(now)`) is broken. Count this
+                // peer's broken promises and free each removed key; the single
+                // per-peer penalty is applied below (go's GetBrokenPromises returns
+                // a per-peer count, then AddBehaviourPenalty(p, count) once each).
+                // No-op when scoring is disabled (the map is always empty then).
+                const promises = &state_ptr.*.iwant_promises;
+                var broken: f64 = 0;
+                var changed_p = true;
+                while (changed_p) {
+                    changed_p = false;
+                    var promise_it = promises.iterator();
+                    while (promise_it.next()) |entry| {
+                        if (entry.value_ptr.* < tick) {
+                            const key = entry.key_ptr.*;
+                            _ = promises.remove(key);
+                            router.allocator.free(key);
+                            broken += 1;
+                            changed_p = true;
+                            break;
+                        }
+                    }
+                }
+                if (broken > 0) {
+                    if (router.score) |sc| sc.addPenalty(state_ptr.*.peer, broken);
+                }
             }
 
             // Advance the scoring engine one tick (decays the fading counters,
@@ -1825,10 +1870,48 @@ pub fn Router(comptime Transport: type) type {
             }
             if (wanted.items.len == 0) return;
 
+            // Track an IWANT promise so a peer that advertises an id (IHAVE) it then
+            // fails to serve is charged a P7 behaviour penalty. go records exactly
+            // ONE promise per IWANT (a random id from the requested list); we record
+            // the first requested id. Only when scoring is enabled — the penalty has
+            // nowhere to land otherwise, so we skip the bookkeeping entirely.
+            if (router.score != null) {
+                if (wanted.items[0]) |first_id| router.addPromise(state, first_id);
+            }
+
             const ids = router.emptyIds() orelse return;
             const iwant = rpc.buildIWant(wanted.items);
             const ctrl = rpc_pb.ControlMessage{ .iwant = &.{iwant} };
             router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), ids, .{ .one = source });
+        }
+
+        /// Record an IWANT promise: `state`'s peer must deliver message id `id` by
+        /// `heartbeat_tick + iwant_followup_ticks` or the heartbeat charges it a P7
+        /// behaviour penalty. An existing promise for the id is left as-is (its
+        /// earlier deadline stands, matching go, which does not refresh a promise a
+        /// peer already made). The first promise for an id owns a copy of the key
+        /// (freed on fulfill, on harvest, or on teardown). Best-effort on OOM (a
+        /// failed insert just means no promise — no penalty, which is safe).
+        fn addPromise(router: *Self, state: *PeerState, id: []const u8) void {
+            if (state.iwant_promises.contains(id)) return;
+            const owned = router.allocator.dupe(u8, id) catch return;
+            const deadline = router.heartbeat_tick +| mesh_params.iwant_followup_ticks;
+            state.iwant_promises.put(router.allocator, owned, deadline) catch {
+                router.allocator.free(owned);
+            };
+        }
+
+        /// Fulfill (clear) every outstanding IWANT promise for message id `id`
+        /// across all peers: a delivery of the message satisfies whoever promised
+        /// it, so no penalty is owed (go removes the promise for all peers on
+        /// fulfill). Frees each removed key. Cheap when no peer promised the id.
+        fn fulfillPromise(router: *Self, id: []const u8) void {
+            var it = router.peers.valueIterator();
+            while (it.next()) |state_ptr| {
+                if (state_ptr.*.iwant_promises.fetchRemove(id)) |kv| {
+                    router.allocator.free(kv.key);
+                }
+            }
         }
 
         /// Handle an inbound IWANT: the source peer requests the listed message
@@ -2119,6 +2202,15 @@ pub fn Router(comptime Transport: type) type {
             // publish paths both go through computeMessageId so they always agree.
             var id = router.computeMessageId(topic, from, seqno, data) catch return;
             defer id.deinit(router.allocator);
+
+            // A message with this id was delivered, so every outstanding IWANT
+            // promise for it is fulfilled — clear them across all peers (go fulfills
+            // on delivery from anyone). Done before the seen/duplicate check because
+            // even a duplicate delivery fulfils the promise (go fulfils as soon as a
+            // message begins validation, regardless of whether it is new). No-op
+            // when scoring is disabled (no promises were ever recorded).
+            if (router.score != null) router.fulfillPromise(id.bytes);
+
             if (router.seen.contains(id.bytes, router.heartbeat_tick)) {
                 // A duplicate of an already-seen message. If the relaying peer is
                 // a current mesh member for this topic, credit it the P3
@@ -2506,6 +2598,7 @@ pub fn Router(comptime Transport: type) type {
             state.queue.deinit(router.io);
             router.freePeerTopics(state);
             router.freePeerDontSend(state);
+            router.freePeerPromises(state);
             router.clearIWantCounts(state);
             state.iwant_counts.deinit(router.allocator);
             router.allocator.destroy(state.writer);
@@ -2526,6 +2619,15 @@ pub fn Router(comptime Transport: type) type {
             var it = state.dont_send.keyIterator();
             while (it.next()) |key| router.allocator.free(key.*);
             state.dont_send.deinit(router.allocator);
+        }
+
+        /// Free every id key in a peer's outstanding IWANT-promise map and the map
+        /// itself. Called on teardown so the owned id copies (those not yet
+        /// fulfilled or harvested) do not leak.
+        fn freePeerPromises(router: *Self, state: *PeerState) void {
+            var it = state.iwant_promises.keyIterator();
+            while (it.next()) |key| router.allocator.free(key.*);
+            state.iwant_promises.deinit(router.allocator);
         }
 
         /// Free every owned id key in a peer's IWANT retransmission-count map and
@@ -3010,6 +3112,13 @@ fn peerDontSendHas(router: *FakeRouter, peer: PeerId, id: []const u8) bool {
 fn peerDontSendCount(router: *FakeRouter, peer: PeerId) usize {
     const state = router.peers.get(peerKey(&peer)) orelse return 0;
     return state.dont_send.count();
+}
+
+/// After a `sync`, the number of outstanding IWANT promises recorded for the
+/// peer (0 if untracked). Router-owned state; read only after `sync`.
+fn peerPromiseCount(router: *FakeRouter, peer: PeerId) usize {
+    const state = router.peers.get(peerKey(&peer)) orelse return 0;
+    return state.iwant_promises.count();
 }
 
 /// Build a real OwnedRpc carrying a single subscription, mirroring what the
@@ -5501,6 +5610,151 @@ fn signedInboundPublish(
     };
     const frame = rpc_pb.RPC{ .publish = &[_]?rpc_pb.Message{msg} };
     return ownedFromRpc(allocator, frame);
+}
+
+/// The message id a signed publish from `host_key` with `seqno` will produce
+/// under StrictSign: `from ++ seqno`, where `from` is the signer's marshaled
+/// peer-id (matching `computeMessageId` → `rpc.messageId`). Caller frees the
+/// returned slice. Lets a test IHAVE the exact id a later delivery fulfills.
+fn signedMessageId(allocator: std.mem.Allocator, host_key: *const identity.KeyPair, seqno: []const u8) ![]u8 {
+    var signer = try signing.Signer.init(allocator, host_key);
+    defer signer.deinit();
+    const from = signer.fromBytes();
+    const id = try allocator.alloc(u8, from.len + seqno.len);
+    @memcpy(id[0..from.len], from);
+    @memcpy(id[from.len..], seqno);
+    return id;
+}
+
+test "broken IWANT promise: a peer that IHAVEs an id it never serves is penalized" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    const router = try scoringRouter(allocator, io, &host_key, null);
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // P advertises an unseen id (IHAVE) → we IWANT it, recording a promise that P
+    // must serve the message by `iwant_followup_ticks`. P never delivers it.
+    const id = "promised-but-never-served";
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer,
+        .rpc = try buildInboundIHave(allocator, "t", &[_]?[]const u8{id}),
+    } });
+    try sync(router, io);
+
+    // Confirm the IWANT actually went out (so a promise was created).
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountIWants(io, &conn.record, id) >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountIWants(io, &conn.record, id));
+
+    // The score before any heartbeat passes the deadline is 0 (no P-terms yet).
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), liveScore(router, peer), 1e-9);
+
+    // Beat past the deadline. The promise was recorded at tick 0, so its deadline
+    // is `iwant_followup_ticks`; it breaks once the tick exceeds that. After
+    // `iwant_followup_ticks + 1` heartbeats the harvest charges P7: behaviour
+    // penalty 1 → P7 = -(1^2) = -1 (weight -1, threshold 0, no decay).
+    try beatHeartbeats(io, router, mesh_params.iwant_followup_ticks + 1);
+    try std.testing.expectApproxEqAbs(@as(f64, -1.0), liveScore(router, peer), 1e-9);
+}
+
+test "fulfilled IWANT promise: delivering the promised message before the deadline avoids the penalty" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    const router = try scoringRouter(allocator, io, &host_key, null);
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // The id P will advertise is exactly the id the signed message below produces
+    // (`from ++ seqno`), so the delivery fulfills the promise for that id.
+    const seqno = "\x00\x00\x00\x07";
+    const id = try signedMessageId(allocator, &host_key, seqno);
+    defer allocator.free(id);
+
+    // P IHAVEs the id (unseen) → we IWANT it, recording a promise.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer,
+        .rpc = try buildInboundIHave(allocator, "t", &[_]?[]const u8{id}),
+    } });
+    try sync(router, io);
+
+    // P then DELIVERS the (signed) message before the deadline, fulfilling the
+    // promise. This is a clean first delivery, so it also credits P2 (+1).
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer,
+        .rpc = try signedInboundPublish(allocator, &host_key, seqno, "t", "served"),
+    } });
+    try beatHeartbeats(io, router, 1);
+
+    // Beat well past the deadline. No promise remains, so no P7 penalty is charged
+    // — the only live term is the P2 first-delivery credit, leaving score +1.
+    try beatHeartbeats(io, router, mesh_params.iwant_followup_ticks + 2);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), liveScore(router, peer), 1e-9);
+}
+
+test "IWANT promise tracking is skipped when scoring is disabled (no penalty, no leak)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // No score config → scoring disabled; promise bookkeeping must be skipped
+    // entirely (and the leak-checking allocator proves no id key is allocated).
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+    try std.testing.expect(router.score == null);
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // IHAVE → IWANT still works without scoring: the id is requested.
+    const id = "unserved-no-scoring";
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer,
+        .rpc = try buildInboundIHave(allocator, "t", &[_]?[]const u8{id}),
+    } });
+    try sync(router, io);
+
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountIWants(io, &conn.record, id) >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), recordCountIWants(io, &conn.record, id));
+
+    // No promise was recorded (scoring off), so beating past the followup window
+    // does nothing — and harvests nothing (no `score` engine to penalize either).
+    try beatHeartbeats(io, router, mesh_params.iwant_followup_ticks + 2);
+    // The peer's promise map stays empty; teardown (on destroy) frees nothing,
+    // and the testing allocator verifies no leak.
+    try std.testing.expectEqual(@as(usize, 0), peerPromiseCount(router, peer));
 }
 
 // --- anonymous mode (StrictNoSign) -----------------------------------------
