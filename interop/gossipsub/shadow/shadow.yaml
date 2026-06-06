@@ -1,0 +1,91 @@
+# Minimal 2-host Shadow simulation for the zig QUIC gossipsub interop node.
+#
+# Goal: prove the zio runtime + QUIC stack run under the Shadow network
+# simulator. node0 LISTENS+subscribes and node1 DIALS+publishes the topic;
+# node1's publish must reach node0's subscription over real QUIC packets that
+# Shadow intercepts at the syscall boundary. A receipt on node0 (RECV line +
+# `"received":true`) is the de-risk: it confirms QUIC handshake, meshsub
+# negotiation, and gossipsub propagation all work under Shadow's emulated UDP.
+#
+# Both nodes run in shadow=on mode (plain recvmsg/sendmsg, no GRO/GSO/IP_PKTINFO
+# /timestamp cmsgs — the only socket form Shadow supports) and bind/advertise
+# their single assigned host IP via announce=<ip>.
+#
+# Coordination is the addr_file/peer_file pair over the shared host filesystem
+# (Shadow runs processes against the real FS): node0 writes its published
+# /p2p/<peer-id> multiaddr to /tmp/node0.addr, and node1 reads it via peer_file.
+# node1 starts 2s after node0 so the listener has bound and written the file;
+# peer_file additionally polls, so the start stagger is belt-and-suspenders.
+
+general:
+  # Plenty of wall-clock budget for the handshake + mesh GRAFT + republish window
+  # (the node's own duration_ms bounds each process; the sim ends when both exit).
+  stop_time: 30s
+  # Model non-blocking syscalls as having latency. Recommended for QUIC stacks
+  # that busy-poll: without it a spinning loop can starve Shadow's scheduler.
+  model_unblocked_syscall_latency: true
+
+# Generous socket buffers, matching the upstream gossipsub-interop template — QUIC
+# bursts can overrun Shadow's small default socket buffers and drop datagrams.
+experimental:
+  socket_recv_buffer: 7500000
+  socket_send_buffer: 7500000
+
+# A single network node with a self-edge: both hosts attach to node 0, so all
+# traffic crosses the one 10ms self-loop link. Enough to exercise QUIC RTT
+# without modeling geography (the upstream framework's full graph is overkill
+# for a 2-node de-risk).
+network:
+  graph:
+    type: gml
+    inline: |
+      graph [
+        directed 0
+        node [
+          id 0
+          host_bandwidth_up "1 Gbit"
+          host_bandwidth_down "1 Gbit"
+        ]
+        edge [
+          source 0
+          target 0
+          latency "10 ms"
+          packet_loss 0.0
+        ]
+      ]
+
+hosts:
+  # Listener + subscriber. Binds and advertises its own IP, writes its multiaddr
+  # to the shared addr file. Stays up the whole run (its duration_ms), then emits
+  # the result JSON and exits 0.
+  node0:
+    network_node_id: 0
+    ip_addr: 11.0.0.1
+    processes:
+    - path: /usr/local/bin/libp2p-gossipsub-interop
+      args: >-
+        role=listen mode=sub shadow=on
+        announce=11.0.0.1 port=9000
+        topic=interop-test
+        addr_file=/tmp/node0.addr
+        duration_ms=25000
+      start_time: 0s
+      expected_final_state: {exited: 0}
+
+  # Dialer + publisher. Reads node0's multiaddr from the shared file (peer_file),
+  # dials it, subscribes, and republishes the payload until its duration elapses.
+  node1:
+    network_node_id: 0
+    ip_addr: 11.0.0.2
+    processes:
+    - path: /usr/local/bin/libp2p-gossipsub-interop
+      args: >-
+        role=dial mode=pub shadow=on
+        announce=11.0.0.2 port=9000
+        topic=interop-test
+        message=hello-shadow
+        peer_file=/tmp/node0.addr
+        duration_ms=20000
+      # Start after node0 so the listener has bound and written its addr file.
+      start_time: 2s
+      expected_final_state: {exited: 0}

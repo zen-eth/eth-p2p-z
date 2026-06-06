@@ -13,6 +13,14 @@
 //! listener writes its full `/p2p/<peer-id>` multiaddr to `addr_file` once
 //! bound, and an orchestrator hands that string to the dialers' `peers` arg.
 //!
+//! Shadow support: `shadow=on` runs the QUIC endpoint in Shadow-compatible mode
+//! (plain `recvmsg`/`sendmsg`, no GRO/GSO/`IP_PKTINFO`/timestamp cmsgs — the only
+//! socket form the Shadow network simulator supports), and `announce=<ip>` makes
+//! the listener bind and advertise a specific IP instead of the wildcard
+//! `0.0.0.0`/loopback `127.0.0.1` (Shadow hosts are single-homed, and a dialer
+//! must reach the listener's assigned IP). Both are additive and OFF by default,
+//! so every non-Shadow scenario is unchanged.
+//!
 //! This mirrors the transport interop binary's endpoint/Switch setup; the new
 //! piece is the Gossipsub service plus a message handler that prints received
 //! messages and records receipt so a smoke run can assert delivery.
@@ -65,6 +73,14 @@ const Args = struct {
     /// starts an inbound dispatcher per connection, so it meshes with each peer.
     peers: ?[]const u8 = null,
     addr_file: ?[]const u8 = null,
+    /// Read a single peer multiaddr to dial from this file (`peer_file=<path>`),
+    /// the read counterpart of the listener's `addr_file=` write. For Shadow
+    /// coordination: the listener writes its published `/p2p/<peer-id>` multiaddr
+    /// to a path on the shared host filesystem, and the dialer (started a little
+    /// later) reads it — no out-of-band peer-id exchange needed. The dialer polls
+    /// briefly for the file to appear and be non-empty, tolerating the listener's
+    /// startup. Additive to `peer`/`peers`; all configured targets are dialed.
+    peer_file: ?[]const u8 = null,
     topic: []const u8 = "interop-test",
     message: []const u8 = "hello-gossipsub",
     duration_ms: u64 = 5000,
@@ -83,6 +99,22 @@ const Args = struct {
     d: ?usize = null,
     d_low: ?usize = null,
     d_high: ?usize = null,
+    /// Run the QUIC endpoint in Shadow-compatible mode (`shadow=on`). When set,
+    /// the UDP path is restricted to plain `recvmsg`/`sendmsg` with no ancillary
+    /// control data — no GRO/GSO, no `IP_PKTINFO`, no per-packet timestamps —
+    /// which is the only socket form the Shadow network simulator supports. OFF
+    /// by default, so every non-Shadow scenario is unchanged. See `EndpointOptions
+    /// .shadow_compatible`.
+    shadow: bool = false,
+    /// The IP address this listener advertises (`announce=<ip>`). Under Shadow each
+    /// host is single-homed with one assigned IP, and a wildcard `0.0.0.0` bind is
+    /// not dialable, so the listener must publish the host's real IP for a dialer to
+    /// reach it. When set, the listener BINDS to this IP (giving quiche a correct
+    /// single-homed local path address — Shadow has no `IP_PKTINFO`) and PUBLISHES
+    /// it in the addr_file, the identify listen addrs, and the sealed peer record.
+    /// When absent, the listener keeps the wildcard `0.0.0.0` bind and advertises
+    /// the loopback `127.0.0.1` (the on-host smoke-run behavior).
+    announce: ?[]const u8 = null,
 
     /// Iterate the dial targets: every entry of `peers` (split on commas) plus a
     /// lone `peer` if set. Blank entries are skipped so a trailing comma is fine.
@@ -151,6 +183,8 @@ const Args = struct {
                 out.peers = value;
             } else if (std.mem.eql(u8, key, "addr_file")) {
                 out.addr_file = value;
+            } else if (std.mem.eql(u8, key, "peer_file")) {
+                out.peer_file = value;
             } else if (std.mem.eql(u8, key, "topic")) {
                 out.topic = value;
             } else if (std.mem.eql(u8, key, "message")) {
@@ -169,6 +203,14 @@ const Args = struct {
                 } else if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "false")) {
                     out.px = false;
                 } else return error.InvalidPx;
+            } else if (std.mem.eql(u8, key, "shadow")) {
+                if (std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "true")) {
+                    out.shadow = true;
+                } else if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "false")) {
+                    out.shadow = false;
+                } else return error.InvalidShadow;
+            } else if (std.mem.eql(u8, key, "announce")) {
+                out.announce = value;
             } else if (std.mem.eql(u8, key, "d")) {
                 out.d = try std.fmt.parseInt(usize, value, 10);
             } else if (std.mem.eql(u8, key, "d_low")) {
@@ -189,8 +231,8 @@ const Args = struct {
             std.log.err("missing required arg mode=pub|sub", .{});
             return error.MissingMode;
         }
-        if (out.role == .dial and out.peer == null and out.peers == null) {
-            std.log.err("dial role requires peer=<multiaddr> or peers=<ma1>,<ma2>,...", .{});
+        if (out.role == .dial and out.peer == null and out.peers == null and out.peer_file == null) {
+            std.log.err("dial role requires peer=<multiaddr>, peers=<ma1>,<ma2>,..., or peer_file=<path>", .{});
             return error.MissingPeer;
         }
         return out;
@@ -251,7 +293,13 @@ pub fn main(init: std.process.Init) !void {
 
     var host_key = try identity.KeyPair.generate(.ED25519);
     defer host_key.deinit();
-    const endpoint = try libp2p.QuicEndpoint.initWithIdentity(allocator, io, &host_key, .{});
+    // In Shadow mode restrict the QUIC UDP path to plain `recvmsg`/`sendmsg` with
+    // no ancillary control data: the Shadow simulator supports neither GRO/GSO nor
+    // `IP_PKTINFO`/timestamp cmsgs. OFF by default, so the non-Shadow scenarios use
+    // the full control-message path unchanged.
+    const endpoint = try libp2p.QuicEndpoint.initWithIdentity(allocator, io, &host_key, .{
+        .endpoint = .{ .shadow_compatible = args.shadow },
+    });
     defer endpoint.deinit();
     const switcher = try libp2p.Switch.init(allocator, io, endpoint);
     defer switcher.deinit();
@@ -426,21 +474,34 @@ fn runListener(
     gs: *gossipsub.Gossipsub,
     args: *const Args,
 ) !void {
-    const listen_text = try std.fmt.allocPrint(allocator, "/ip4/0.0.0.0/udp/{d}/quic-v1", .{args.port});
+    // Bind on the announce IP when given (single-homed Shadow host), else the
+    // wildcard `0.0.0.0` (the on-host smoke runs). Binding the specific IP gives
+    // quiche a correct local path address under Shadow mode, where the per-packet
+    // local-destination (`IP_PKTINFO`) is unavailable and the loop falls back to
+    // the socket's bound address.
+    const bind_ip: []const u8 = args.announce orelse "0.0.0.0";
+    const listen_text = try std.fmt.allocPrint(allocator, "/ip4/{s}/udp/{d}/quic-v1", .{ bind_ip, args.port });
     defer allocator.free(listen_text);
     var listen_addr = try Multiaddr.fromString(allocator, listen_text);
     defer listen_addr.deinit(allocator);
     try switcher.listen(listen_addr);
     std.log.info("listener bound {s}", .{listen_text});
 
+    // The IP a peer must DIAL to reach us. The Switch may bind the wildcard
+    // 0.0.0.0 (not dialable) or a single-homed Shadow IP; either way the
+    // advertised address must name a reachable IP. Use the announce IP when given
+    // (the Shadow host's assigned IP), else the loopback 127.0.0.1 of the on-host
+    // smoke runs.
+    const advertise_ip: []const u8 = args.announce orelse "127.0.0.1";
+
     // Register identify now that the socket is bound, so the sealed peer record
-    // advertises our listen multiaddrs. The Switch binds on 0.0.0.0, but a peer
-    // exchanged this record (PX) must be able to DIAL the address — and 0.0.0.0 is
-    // not dialable. Rewrite each to the loopback 127.0.0.1 form (the same address
-    // `buildPublishedMultiaddr` advertises for the loopback runs) so a PX-offered
-    // peer reaches us. The handler outlives the run on this fiber's stack (the
-    // service borrows it); free its owned record on return.
-    var listen_addrs = try loopbackListenAddrs(allocator, switcher);
+    // advertises our listen multiaddrs. The bound address may be the wildcard
+    // 0.0.0.0, but a peer that learns this record (PX) must be able to DIAL it,
+    // and 0.0.0.0 is not dialable — rewrite each to the advertised IP (the same
+    // address `buildPublishedMultiaddr` advertises). The handler outlives the run
+    // on this fiber's stack (the service borrows it); free its owned record on
+    // return.
+    var listen_addrs = try advertisedListenAddrs(allocator, switcher, advertise_ip);
     defer {
         for (listen_addrs.items) |addr| allocator.free(addr);
         listen_addrs.deinit(allocator);
@@ -449,7 +510,7 @@ fn runListener(
     try registerIdentify(allocator, switcher, host_key, listen_addrs.items, &id_handler);
     defer id_handler.deinit();
 
-    const published = try buildPublishedMultiaddr(allocator, switcher, host_key);
+    const published = try buildPublishedMultiaddr(allocator, switcher, host_key, advertise_ip);
     defer allocator.free(published);
     std.log.info("listener advertising {s}", .{published});
 
@@ -585,36 +646,108 @@ fn dialPeers(
     args: *const Args,
     conns: *std.ArrayList(*libp2p.SwitchConnection),
 ) !usize {
+    // A `peer_file` target (the read counterpart of the listener's `addr_file`):
+    // poll briefly for the file to appear and be non-empty, then dial its contents.
+    // Used for Shadow coordination where the listener publishes its multiaddr to
+    // the shared host filesystem. Read once up front; `dialTargets` handles the
+    // direct `peer`/`peers` entries.
+    var file_peer_buf: [512]u8 = undefined;
+    const file_peer: ?[]const u8 = if (args.peer_file) |path|
+        readPeerFile(io, path, &file_peer_buf) catch |err| blk: {
+            std.log.warn("peer_file {s} unreadable: {any}", .{ path, err });
+            break :blk null;
+        }
+    else
+        null;
+
     var it = args.dialTargets();
     var dialed: usize = 0;
+    if (file_peer) |peer_text| {
+        if (try dialOnePeer(allocator, io, switcher, gs, args, conns, peer_text)) dialed += 1;
+    }
     while (it.next()) |peer_text| {
-        std.log.info("dialing {s}", .{peer_text});
-        var remote_addr = Multiaddr.fromString(allocator, peer_text) catch |err| {
-            std.log.warn("invalid peer multiaddr {s}: {any}", .{ peer_text, err });
-            continue;
-        };
-        defer remote_addr.deinit(allocator);
-
-        const conn = switcher.dial(remote_addr, .{ .timeout = timeoutFromMs(args.duration_ms) }) catch |err| {
-            std.log.warn("dial {s} failed: {any}", .{ peer_text, err });
-            continue;
-        };
-        // Start inbound dispatch so this side's `/meshsub` inbound handler runs
-        // for this peer; without it the peers wire up but never exchange RPCs.
-        conn.startInboundDispatcher(.{}) catch |err| {
-            std.log.warn("startInboundDispatcher for {s} failed: {any}", .{ peer_text, err });
-            conn.deinit();
-            continue;
-        };
-        // Run identify as the client against the just-dialed peer: read its
-        // identify and certify its signed peer record into our gossipsub store
-        // (completing peer-exchange). Best-effort — failures are logged, the
-        // connection stays up.
-        exchangeIdentify(allocator, io, conn, gs);
-        try conns.append(allocator, conn);
-        dialed += 1;
+        if (try dialOnePeer(allocator, io, switcher, gs, args, conns, peer_text)) dialed += 1;
     }
     return dialed;
+}
+
+/// Dial a single peer multiaddr: dial, start its inbound dispatcher, run
+/// identify-as-client, and append the live connection to `conns`. Returns true on
+/// success. A bad multiaddr or a failed dial/dispatch is logged and returns false
+/// (so one failed peer does not abort the rest); only an OOM appending to `conns`
+/// propagates.
+fn dialOnePeer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    switcher: *libp2p.Switch,
+    gs: *gossipsub.Gossipsub,
+    args: *const Args,
+    conns: *std.ArrayList(*libp2p.SwitchConnection),
+    peer_text: []const u8,
+) !bool {
+    std.log.info("dialing {s}", .{peer_text});
+    var remote_addr = Multiaddr.fromString(allocator, peer_text) catch |err| {
+        std.log.warn("invalid peer multiaddr {s}: {any}", .{ peer_text, err });
+        return false;
+    };
+    defer remote_addr.deinit(allocator);
+
+    const conn = switcher.dial(remote_addr, .{ .timeout = timeoutFromMs(args.duration_ms) }) catch |err| {
+        std.log.warn("dial {s} failed: {any}", .{ peer_text, err });
+        return false;
+    };
+    // Start inbound dispatch so this side's `/meshsub` inbound handler runs for
+    // this peer; without it the peers wire up but never exchange RPCs.
+    conn.startInboundDispatcher(.{}) catch |err| {
+        std.log.warn("startInboundDispatcher for {s} failed: {any}", .{ peer_text, err });
+        conn.deinit();
+        return false;
+    };
+    // Run identify as the client against the just-dialed peer: read its identify
+    // and certify its signed peer record into our gossipsub store (completing
+    // peer-exchange). Best-effort — failures are logged, the connection stays up.
+    exchangeIdentify(allocator, io, conn, gs);
+    try conns.append(allocator, conn);
+    return true;
+}
+
+/// Read a peer multiaddr written by a listener's `addr_file` into `buf`, returning
+/// the trimmed first line. Polls for the file to appear and be non-empty (the
+/// dialer may start before the listener has bound and written it). Bounds the wait
+/// so a missing file fails rather than hanging the run.
+fn readPeerFile(io: std.Io, path: []const u8, buf: []u8) ![]const u8 {
+    const poll_interval_ms: u64 = 100;
+    const max_wait_ms: u64 = 10_000;
+    var waited_ms: u64 = 0;
+    while (true) {
+        if (readFileFirstLine(io, path, buf)) |line| {
+            if (line.len != 0) return line;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        if (waited_ms >= max_wait_ms) return error.PeerFileTimeout;
+        try timeoutFromMs(poll_interval_ms).sleep(io);
+        waited_ms += poll_interval_ms;
+    }
+}
+
+/// Read the first line of `path` into `buf`, trimmed of trailing whitespace. The
+/// listener writes a single multiaddr line, so the read is bounded by `buf`.
+fn readFileFirstLine(io: std.Io, path: []const u8, buf: []u8) ![]const u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    // The reader needs its own buffer distinct from the read destination `buf`; a
+    // small one suffices since a single short read drains the tiny address line.
+    var reader_buf: [128]u8 = undefined;
+    var reader = file.reader(io, &reader_buf);
+    // A short read (fewer than `buf.len` bytes, including 0 at EOF) is expected —
+    // the address line is small — so `readSliceShort` returns the byte count and
+    // only surfaces a genuine `ReadFailed`.
+    const n = try reader.interface.readSliceShort(buf);
+    const contents = buf[0..n];
+    const newline = std.mem.indexOfScalar(u8, contents, '\n') orelse contents.len;
+    return std.mem.trim(u8, contents[0..newline], " \t\r\n");
 }
 
 /// Watches gossipsub's peer count for growth beyond a baseline (the number of
@@ -734,15 +867,18 @@ fn runForDuration(io: std.Io, gs: *gossipsub.Gossipsub, args: *const Args) !void
     }
 }
 
-/// The Switch's listen multiaddrs with any `/ip4/0.0.0.0/` rewritten to the
-/// loopback `/ip4/127.0.0.1/`. The Switch binds on the wildcard 0.0.0.0, which is
-/// NOT a dialable address — a peer that learns this address through a signed peer
-/// record (peer-exchange) or identify must be able to dial it. The loopback form
-/// is what these on-host interop runs reach each other at (and matches the
-/// advertised `buildPublishedMultiaddr`). Caller owns each returned string.
-fn loopbackListenAddrs(
+/// The Switch's listen multiaddrs with any wildcard `/ip4/0.0.0.0/` rewritten to
+/// the dialable `/ip4/<advertise_ip>/`. The Switch may bind the wildcard 0.0.0.0,
+/// which is NOT a dialable address — a peer that learns this address through a
+/// signed peer record (peer-exchange) or identify must be able to dial it. The
+/// `advertise_ip` is 127.0.0.1 for on-host runs or the assigned Shadow IP under
+/// the simulator (and matches `buildPublishedMultiaddr`). An address already bound
+/// to a specific IP (the Shadow case binds the announce IP directly) is passed
+/// through unchanged. Caller owns each returned string.
+fn advertisedListenAddrs(
     allocator: std.mem.Allocator,
     switcher: *libp2p.Switch,
+    advertise_ip: []const u8,
 ) !std.ArrayList([]u8) {
     var bound = try switcher.listenMultiaddrs(allocator);
     defer {
@@ -754,22 +890,28 @@ fn loopbackListenAddrs(
         for (out.items) |addr| allocator.free(addr);
         out.deinit(allocator);
     }
+    const wildcard = "/ip4/0.0.0.0/";
     for (bound.items) |addr| {
-        const rewritten = if (std.mem.indexOf(u8, addr, "/ip4/0.0.0.0/")) |_|
-            try std.mem.replaceOwned(u8, allocator, addr, "/ip4/0.0.0.0/", "/ip4/127.0.0.1/")
-        else
-            try allocator.dupe(u8, addr);
+        const rewritten = if (std.mem.indexOf(u8, addr, wildcard)) |_| blk: {
+            const replacement = try std.fmt.allocPrint(allocator, "/ip4/{s}/", .{advertise_ip});
+            defer allocator.free(replacement);
+            break :blk try std.mem.replaceOwned(u8, allocator, addr, wildcard, replacement);
+        } else try allocator.dupe(u8, addr);
         try out.append(allocator, rewritten);
     }
     return out;
 }
 
-/// Build the full `/ip4/.../udp/<port>/quic-v1/p2p/<peer-id>` multiaddr from the
-/// Switch's first bound listen address and this node's peer id.
+/// Build the full `/ip4/<advertise_ip>/udp/<port>/quic-v1/p2p/<peer-id>` multiaddr
+/// from the Switch's first bound listen port and this node's peer id. The Switch
+/// may bind the wildcard 0.0.0.0 (not dialable) or a specific IP; either way the
+/// advertised multiaddr names `advertise_ip` — 127.0.0.1 for on-host runs, the
+/// assigned Shadow IP under the simulator — at the bound port.
 fn buildPublishedMultiaddr(
     allocator: std.mem.Allocator,
     switcher: *libp2p.Switch,
     host_key: *identity.KeyPair,
+    advertise_ip: []const u8,
 ) ![]u8 {
     var addrs = try switcher.listenMultiaddrs(allocator);
     defer {
@@ -786,11 +928,10 @@ fn buildPublishedMultiaddr(
     const peer_text = try local_peer.toString(allocator);
     defer allocator.free(peer_text);
 
-    // Bind on 0.0.0.0 but advertise 127.0.0.1 for the loopback smoke run.
     return std.fmt.allocPrint(
         allocator,
-        "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}",
-        .{ parsed.address.getPort(), peer_text },
+        "/ip4/{s}/udp/{d}/quic-v1/p2p/{s}",
+        .{ advertise_ip, parsed.address.getPort(), peer_text },
     );
 }
 
