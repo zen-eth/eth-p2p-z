@@ -284,6 +284,17 @@ const MeshParams = struct {
     /// refused (the worst case is we still send a message the peer already has —
     /// safe, just slightly wasteful). Stale entries are reclaimed each heartbeat.
     dont_send_cap: usize = 10000,
+    /// Maximum number of message-ids we process from a SINGLE inbound IDONTWANT
+    /// control message; ids past this cap are ignored (not recorded, not purged).
+    /// Bounds the work and memory one IDONTWANT can cost us, so a peer cannot
+    /// flood us with an oversized id list. (go GossipSubMaxIDontWantLength.)
+    max_idontwant_length: usize = 10,
+    /// Maximum number of IDONTWANT control messages we accept from ONE peer per
+    /// heartbeat. Once a peer has sent this many IDONTWANTs in a heartbeat window,
+    /// further IDONTWANTs from it are ignored until the per-peer counter resets at
+    /// the next heartbeat. An anti-flood bound (distinct from `max_idontwant_length`,
+    /// which caps the ids in a single IDONTWANT). (go GossipSubMaxIDontWantMessages.)
+    max_idontwant_messages: usize = 1000,
 };
 
 const mesh_params: MeshParams = .{};
@@ -429,6 +440,12 @@ pub fn Router(comptime Transport: type) type {
             /// reaches `max_ihave_messages` we ignore further IHAVEs from the peer
             /// until the heartbeat resets it to zero (anti-spam).
             ihave_received_this_window: usize = 0,
+            /// How many IDONTWANT control messages this peer has sent us in the
+            /// current heartbeat window. Incremented on each accepted inbound
+            /// IDONTWANT; once it reaches `max_idontwant_messages` we ignore further
+            /// IDONTWANTs from the peer until the heartbeat resets it to zero
+            /// (anti-flood).
+            idontwant_received_this_window: usize = 0,
             /// Heap-owned (Transport-allocated) so its address is stable while
             /// the writer fiber holds it. The sink (and its stream) MUST outlive
             /// the writer fiber — torn down only after the writer is awaited.
@@ -1433,12 +1450,14 @@ pub fn Router(comptime Transport: type) type {
                     }
                 }
 
-                // Reset the per-heartbeat anti-spam counters. The IHAVE-message
-                // budget reopens for the new window (go resets it per heartbeat),
-                // and the IWANT retransmission counts age out with the gossip
-                // window (go clears these alongside the mcache slide). Freeing each
-                // owned id key keeps `iwant_counts` from leaking.
+                // Reset the per-heartbeat anti-spam counters. The IHAVE-message and
+                // IDONTWANT-message budgets reopen for the new window (go resets
+                // both per heartbeat), and the IWANT retransmission counts age out
+                // with the gossip window (go clears these alongside the mcache
+                // slide). Freeing each owned id key keeps `iwant_counts` from
+                // leaking.
                 state_ptr.*.ihave_received_this_window = 0;
+                state_ptr.*.idontwant_received_this_window = 0;
                 router.clearIWantCounts(state_ptr.*);
             }
 
@@ -1846,8 +1865,22 @@ pub fn Router(comptime Transport: type) type {
         /// The same set drives the per-id `dont_send` inserts. Honouring IDONTWANT
         /// from any peer is harmless, so this is not version-gated. Untracked
         /// source is ignored.
+        ///
+        /// Flood protection mirrors go-libp2p: we accept at most
+        /// `max_idontwant_messages` IDONTWANT control messages from one peer per
+        /// heartbeat (tracked in the peer's `idontwant_received_this_window`, reset
+        /// each heartbeat) — once spent, further IDONTWANTs from the peer are
+        /// dropped — and we process at most `max_idontwant_length` ids from a single
+        /// IDONTWANT (ids past the cap are ignored).
         fn handleIDontWant(router: *Self, source: PeerId, idontwant: *rpc_pb.ControlIDontWantReader) void {
             const state = router.peers.get(peerKey(&source)) orelse return;
+
+            // Per-heartbeat IDONTWANT-message budget (go GossipSubMaxIDontWantMessages):
+            // drop this IDONTWANT once the peer has reached its cap for the window
+            // (the counter resets each heartbeat). Checked-then-incremented so the
+            // cap-th message is still processed.
+            if (state.idontwant_received_this_window >= mesh_params.max_idontwant_messages) return;
+            state.idontwant_received_this_window += 1;
 
             // Borrowed-key set of the IDONTWANT ids: keys alias the OwnedRpc's wire
             // bytes (valid until onInboundRpc frees them, after this returns), so no
@@ -1856,8 +1889,14 @@ pub fn Router(comptime Transport: type) type {
             var ids: std.StringHashMapUnmanaged(void) = .empty;
             defer ids.deinit(router.allocator);
 
+            // Per-message id budget (go GossipSubMaxIDontWantLength): stop after the
+            // cap so a peer cannot make us record/purge an unbounded id list from
+            // one IDONTWANT. Ids past the cap are ignored entirely.
+            var processed: usize = 0;
             const expiry = router.heartbeat_tick +| mesh_params.dont_send_ttl_ticks;
             while (idontwant.messageIDsNext()) |id| {
+                if (processed >= mesh_params.max_idontwant_length) break;
+                processed += 1;
                 ids.put(router.allocator, id, {}) catch continue;
                 router.recordDontSend(state, id, expiry);
             }
@@ -2934,6 +2973,13 @@ fn peerDataLen(io: std.Io, router: *FakeRouter, peer: PeerId) usize {
 fn peerDontSendHas(router: *FakeRouter, peer: PeerId, id: []const u8) bool {
     const state = router.peers.get(peerKey(&peer)) orelse return false;
     return state.dont_send.contains(id);
+}
+
+/// After a `sync`, the number of entries in the peer's IDONTWANT (`dont_send`)
+/// set (0 if untracked). Router-owned state; read only after `sync`.
+fn peerDontSendCount(router: *FakeRouter, peer: PeerId) usize {
+    const state = router.peers.get(peerKey(&peer)) orelse return 0;
+    return state.dont_send.count();
 }
 
 /// Build a real OwnedRpc carrying a single subscription, mirroring what the
@@ -5749,6 +5795,96 @@ test "inbound IDONTWANT records the ids and purges matching queued frames" {
     // One frame purged (X), one survives (Y). The deferred writer release above
     // then lets the writer drain Y and park before teardown frees the record.
     try std.testing.expectEqual(@as(usize, 1), peerDataLen(io, router, peer));
+}
+
+test "IDONTWANT length cap: only the first max_idontwant_length ids of one message are recorded" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // One IDONTWANT carrying more ids than the per-message cap. Only the first
+    // max_idontwant_length are recorded in dont_send; the rest are ignored.
+    const total = mesh_params.max_idontwant_length + 5;
+    var ids: [total][]u8 = undefined;
+    var made: usize = 0;
+    defer for (ids[0..made]) |b| allocator.free(b);
+    var id_views: [total]?[]const u8 = undefined;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        ids[i] = try std.fmt.allocPrint(allocator, "idw-len-{d}", .{i});
+        made += 1;
+        id_views[i] = ids[i];
+    }
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer,
+        .rpc = try buildInboundIDontWant(allocator, &id_views),
+    } });
+    try sync(router, io);
+
+    // Exactly max_idontwant_length entries recorded: the first cap ids present,
+    // the over-cap ids absent.
+    try std.testing.expectEqual(mesh_params.max_idontwant_length, peerDontSendCount(router, peer));
+    i = 0;
+    while (i < total) : (i += 1) {
+        const expected = i < mesh_params.max_idontwant_length;
+        try std.testing.expectEqual(expected, peerDontSendHas(router, peer, ids[i]));
+    }
+}
+
+test "IDONTWANT message cap: only max_idontwant_messages per heartbeat are processed; resets after a heartbeat" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+
+    // The peer sends more IDONTWANT messages than the per-heartbeat cap, each
+    // carrying a distinct id. Only the first max_idontwant_messages are processed
+    // (their ids recorded); ids from messages past the cap are dropped.
+    const total = mesh_params.max_idontwant_messages + 5;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        const id = try std.fmt.allocPrint(allocator, "idw-msg-{d}", .{i});
+        defer allocator.free(id);
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{
+            .peer = peer,
+            .rpc = try buildInboundIDontWant(allocator, &[_]?[]const u8{id}),
+        } });
+    }
+    try sync(router, io);
+
+    // Exactly max_idontwant_messages ids recorded (one per accepted message);
+    // the over-cap messages contributed nothing.
+    try std.testing.expectEqual(mesh_params.max_idontwant_messages, peerDontSendCount(router, peer));
+
+    // A heartbeat resets the per-peer IDONTWANT budget; a fresh IDONTWANT is
+    // processed again (its id recorded), so the count grows by one.
+    try beatHeartbeats(io, router, 1);
+    const after_id = "idw-msg-after-reset";
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer,
+        .rpc = try buildInboundIDontWant(allocator, &[_]?[]const u8{after_id}),
+    } });
+    try sync(router, io);
+    try std.testing.expect(peerDontSendHas(router, peer, after_id));
+    try std.testing.expectEqual(mesh_params.max_idontwant_messages + 1, peerDontSendCount(router, peer));
 }
 
 test "send-side skip: a message whose id a peer IDONTWANTed is not enqueued to it" {
