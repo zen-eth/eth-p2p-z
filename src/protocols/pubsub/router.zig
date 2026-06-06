@@ -477,6 +477,14 @@ pub fn Router(comptime Transport: type) type {
             /// only targets peers that can parse it. May arrive before or after
             /// `peer_connected`; the handler tolerates either order.
             peer_protocol: struct { peer: PeerId, version: pubsub.Version },
+            /// A verified signed peer record for `peer` (its `signedPeerRecord`
+            /// from libp2p identify, or a PX offer). The router owns
+            /// `envelope_bytes` and frees them once processed: it re-verifies the
+            /// envelope (the same statelessly-checkable bytes a producer could send)
+            /// and, on success, stores it in the certified-record store so PX can
+            /// vouch for the peer. Posted by the identify binding, off the router
+            /// fiber, so the cert store stays router-fiber-owned.
+            peer_record: struct { peer: PeerId, envelope_bytes: []u8 },
             /// An RPC arrived on a peer's inbound stream. The router owns it and
             /// must free it after parsing + forward-frame construction.
             inbound_rpc: peer_io.InboundRpc,
@@ -1004,6 +1012,26 @@ pub fn Router(comptime Transport: type) type {
             return rec.envelope_bytes;
         }
 
+        /// Handle a `peer_record` command: re-verify the signed envelope and, on
+        /// success, store it for `peer` so PX can vouch for it. `envelope_bytes`
+        /// are router-owned and freed here in every case (the store keeps its own
+        /// copy via `putRecord`). The envelope is re-verified even though the
+        /// poster already did (the verification is cheap and stateless, and it
+        /// keeps the router self-defending: a bad or peer-mismatched record is
+        /// dropped, never stored). The record's peer-id must equal `peer` — a
+        /// validly-signed record for a DIFFERENT peer would otherwise vouch for
+        /// `peer` with another node's addresses.
+        fn onPeerRecord(router: *Self, peer: PeerId, envelope_bytes: []u8) void {
+            defer router.allocator.free(envelope_bytes);
+
+            var consumed = peer_record.consumeEnvelope(router.allocator, envelope_bytes) catch return;
+            defer consumed.deinit(router.allocator);
+
+            var expected = peer;
+            if (!consumed.peer_id.eql(&expected)) return;
+            router.putRecord(consumed.peer_id, &consumed, envelope_bytes);
+        }
+
         /// Free every topic key + nested PeerSet in the mesh map and the map
         /// itself. The main fiber is joined by the time this runs, so the map is
         /// quiescent.
@@ -1411,6 +1439,7 @@ pub fn Router(comptime Transport: type) type {
                     .peer_connected => |c| router.onPeerConnected(c.peer, c.conn, c.remote_addr),
                     .peer_disconnected => |c| router.onPeerDisconnected(c.peer),
                     .peer_protocol => |c| router.onPeerProtocol(c.peer, c.version),
+                    .peer_record => |c| router.onPeerRecord(c.peer, c.envelope_bytes),
                     .inbound_rpc => |in| router.onInboundRpc(in),
                     .subscribe => |s| router.onSubscribe(s.topic),
                     .unsubscribe => |u| router.onUnsubscribe(u.topic),
@@ -1687,6 +1716,20 @@ pub fn Router(comptime Transport: type) type {
         /// inbox (the router is shutting down).
         pub fn postPeerProtocol(router: *Self, io: std.Io, peer: PeerId, version: pubsub.Version) void {
             router.inbox.putOne(io, .{ .peer_protocol = .{ .peer = peer, .version = version } }) catch {};
+        }
+
+        /// Post a peer's signed peer record (from libp2p identify) onto the router
+        /// inbox so the router fiber verifies it and stores it in the certified-
+        /// record store. `envelope_bytes` MUST be a router-allocator-owned copy:
+        /// ownership transfers to the router, which frees it after processing (and
+        /// frees it too if the inbox is closed at shutdown). Called from the
+        /// identify binding — off the router fiber — so it only posts. Best-effort:
+        /// on a closed inbox (shutting down) the bytes are freed and the post is a
+        /// no-op.
+        pub fn postPeerRecord(router: *Self, io: std.Io, peer: PeerId, envelope_bytes: []u8) void {
+            router.inbox.putOne(io, .{ .peer_record = .{ .peer = peer, .envelope_bytes = envelope_bytes } }) catch {
+                router.allocator.free(envelope_bytes);
+            };
         }
 
         /// Handle one heartbeat tick: advance the tick counter, expire stale
@@ -3134,6 +3177,7 @@ pub fn Router(comptime Transport: type) type {
                         router.allocator.free(p.topic);
                         router.allocator.free(p.data);
                     },
+                    .peer_record => |c| router.allocator.free(c.envelope_bytes),
                     .enqueue_for_test => |e| {
                         // The peer map is already torn down; release the frame
                         // reference and wake any waiter so a test post in flight at

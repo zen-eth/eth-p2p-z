@@ -38,5 +38,6 @@ test {
     _ = @import("protocols/pubsub/router.zig");
     _ = @import("protocols/pubsub/gossipsub.zig");
     _ = @import("protocols/pubsub/signing.zig");
+    _ = @import("protocols/identify.zig");
     _ = @import("peer_record.zig");
 }

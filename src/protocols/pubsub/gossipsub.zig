@@ -532,6 +532,24 @@ pub const Gossipsub = struct {
         };
     }
 
+    /// Hand a peer's signed peer record — its `signedPeerRecord` from a completed
+    /// libp2p identify exchange — to the router so it verifies and stores it in the
+    /// certified-record store. With the record on hand, our peer-exchange can vouch
+    /// for `peer` (offer its certified addresses to others) and we hold its
+    /// authenticated addresses. The caller passes the ORIGINAL envelope wire bytes
+    /// (after checking they verify + bind to `peer`); this dups them into the
+    /// router allocator and posts a `peer_record` command (the router re-verifies,
+    /// then `putRecord`s). On OOM or a closed inbox the record is dropped (PX simply
+    /// has nothing to offer for that peer — safe). Standalone-safe: a node with no
+    /// identify integration never calls this, so the cert store stays PX-only.
+    pub fn consumeIdentifyRecord(self: *Gossipsub, peer: PeerId, envelope_bytes: []const u8) void {
+        const owned = self.allocator.dupe(u8, envelope_bytes) catch {
+            std.log.warn("gossipsub: dropped identify peer record (out of memory)", .{});
+            return;
+        };
+        self.router.postPeerRecord(self.router.io, peer, owned);
+    }
+
     // The Switch peer-event callbacks: ctx is the *Router. Each posts one Command
     // to the router inbox and returns. `putOne` blocks only if the inbox is full
     // (it never drops): the inbox is sized large enough that a full inbox is not

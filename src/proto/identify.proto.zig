@@ -11,6 +11,7 @@ const IdentifyWire = struct {
     const LISTEN_ADDRS_WIRE: gremlin.ProtoWireNumber = 2;
     const OBSERVED_ADDR_WIRE: gremlin.ProtoWireNumber = 4;
     const PROTOCOLS_WIRE: gremlin.ProtoWireNumber = 3;
+    const SIGNED_PEER_RECORD_WIRE: gremlin.ProtoWireNumber = 8;
 };
 pub const Identify = struct {
     // fields
@@ -20,6 +21,7 @@ pub const Identify = struct {
     listen_addrs: ?[]const ?[]const u8 = null,
     observed_addr: ?[]const u8 = null,
     protocols: ?[]const ?[]const u8 = null,
+    signed_peer_record: ?[]const u8 = null,
     pub fn calcProtobufSize(self: *const Identify) usize {
         var res: usize = 0;
         if (self.protocol_version) |v| {
@@ -60,6 +62,11 @@ pub const Identify = struct {
                 } else {
                     res += gremlin.sizes.sizeUsize(0);
                 }
+            }
+        }
+        if (self.signed_peer_record) |v| {
+            if (v.len > 0) {
+                res += gremlin.sizes.sizeWireNumber(IdentifyWire.SIGNED_PEER_RECORD_WIRE) + gremlin.sizes.sizeUsize(v.len) + v.len;
             }
         }
         return res;
@@ -113,6 +120,11 @@ pub const Identify = struct {
                 }
             }
         }
+        if (self.signed_peer_record) |v| {
+            if (v.len > 0) {
+                target.appendBytes(IdentifyWire.SIGNED_PEER_RECORD_WIRE, v);
+            }
+        }
     }
 };
 pub const IdentifyReader = struct {
@@ -127,6 +139,7 @@ pub const IdentifyReader = struct {
     _protocols_offset: ?usize = null,
     _protocols_last_offset: ?usize = null,
     _protocols_cnt: usize = 0,
+    _signed_peer_record: ?[]const u8 = null,
     pub fn init(src: []const u8) gremlin.Error!IdentifyReader {
         const buf = gremlin.Reader.init(src);
         var res = IdentifyReader{ .buf = buf };
@@ -175,6 +188,11 @@ pub const IdentifyReader = struct {
                     }
                     res._protocols_last_offset = offset;
                     res._protocols_cnt += 1;
+                },
+                IdentifyWire.SIGNED_PEER_RECORD_WIRE => {
+                    const result = try buf.readBytes(offset);
+                    offset += result.size;
+                    res._signed_peer_record = result.value;
                 },
                 else => {
                     offset = try buf.skipData(offset, tag.wire);
@@ -251,5 +269,8 @@ pub const IdentifyReader = struct {
         }
         self._protocols_offset = null;
         return result.value;
+    }
+    pub inline fn getSignedPeerRecord(self: *const IdentifyReader) []const u8 {
+        return self._signed_peer_record orelse &[_]u8{};
     }
 };

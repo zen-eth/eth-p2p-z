@@ -220,25 +220,6 @@ pub fn main(init: std.process.Init) !void {
 
     const local_peer = try host_key.peerId(allocator);
 
-    // Register the identify protocol responder. go-libp2p (and rust-libp2p)
-    // learn which protocols a peer speaks via the `/ipfs/id/1.0.0` exchange, and
-    // their pubsub only opens a `/meshsub` stream to a peer once identify reports
-    // it supports meshsub. So the identify response must advertise identify
-    // itself plus every `/meshsub` version we speak (1.2.0, 1.1.0, 1.0.0); the
-    // peer then negotiates the best common one. Advertising 1.2.0 is what lets a
-    // 1.2-capable go/rust peer pick 1.2.0 with us. Without this go never peers us
-    // in gossipsub. The handler only reads its (immutable) options, so one shared
-    // instance serves every inbound identify stream. It must outlive the run, so
-    // it lives here on `main`'s stack (the service borrows it; deinit is a no-op).
-    var id_handler = identify.IdentifyHandler.initWithOptions(allocator, .{
-        .agent_version = "eth-p2p-z-gossipsub-interop/0.1.0",
-        .protocols = &(.{identify.protocol_id} ++ gossipsub.supported_protocols),
-    });
-    try switcher.addProtocolService(
-        identify.protocol_id,
-        libp2p.protocols.streamHandlerService(identify.IdentifyHandler, identify.IdentifyHandler.run, &id_handler),
-    );
-
     var recorder = Recorder{ .io = io };
     // Construct gossipsub BEFORE any dial/accept so its peer-event callback is
     // registered when the connection comes up.
@@ -272,7 +253,86 @@ pub fn main(init: std.process.Init) !void {
     // teardown above runs normally.
     switch (args.role) {
         .listen => try runListener(allocator, io, switcher, &host_key, &recorder, gs, &args),
-        .dial => try runDialer(allocator, io, switcher, &recorder, gs, &args),
+        .dial => try runDialer(allocator, io, switcher, &host_key, &recorder, gs, &args),
+    }
+}
+
+/// Register the identify responder, advertising our protocols AND a signed peer
+/// record (libp2p identify field 8) sealed over our `listen_addrs` so go/rust can
+/// certify our addresses (and peer-exchange us). go-libp2p (and rust-libp2p) learn
+/// which protocols a peer speaks via the `/ipfs/id/1.0.0` exchange, and their
+/// pubsub only opens a `/meshsub` stream once identify reports meshsub — so the
+/// response advertises identify plus every `/meshsub` version we speak (1.2.0,
+/// 1.1.0, 1.0.0); the peer negotiates the best common one. The handler only reads
+/// its immutable options (and the sealed record it owns), so one instance serves
+/// every inbound identify stream; the caller keeps it alive for the whole run.
+/// `listen_addrs` are the string-form listen multiaddrs identify already sends —
+/// the sealed record uses the SAME bytes so its addresses match `listenAddrs`.
+fn registerIdentify(
+    allocator: std.mem.Allocator,
+    switcher: *libp2p.Switch,
+    host_key: *const identity.KeyPair,
+    listen_addrs: []const []const u8,
+    handler_out: *identify.IdentifyHandler,
+) !void {
+    handler_out.* = try identify.IdentifyHandler.initWithSignedRecord(
+        allocator,
+        .{
+            .agent_version = "eth-p2p-z-gossipsub-interop/0.1.0",
+            .protocols = &(.{identify.protocol_id} ++ gossipsub.supported_protocols),
+            .listen_addrs = listen_addrs,
+        },
+        host_key,
+        // This node seals exactly one record per process, so a fixed seq is enough
+        // (the certified-address book keeps the highest-seq record per peer; a fresh
+        // process always advertises seq 1). A long-lived node that re-published its
+        // record after an address change would bump a monotonic counter here.
+        1,
+    );
+    try switcher.addProtocolService(
+        identify.protocol_id,
+        libp2p.protocols.streamHandlerService(identify.IdentifyHandler, identify.IdentifyHandler.run, handler_out),
+    );
+}
+
+/// Run the client side of identify against a freshly-connected `conn`: open
+/// `/ipfs/id/1.0.0`, read the peer's identify, and if it carries a verified
+/// `signedPeerRecord` for this peer, hand it to gossipsub's certified-record store
+/// (so our peer-exchange can vouch for the peer). Best-effort: any failure is
+/// logged and ignored — identify-as-responder still works, and the connection is
+/// already up. This mirrors how go/rust run identify as the dialer after
+/// connecting; the record consume is what populates PX end-to-end.
+fn exchangeIdentify(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    conn: *libp2p.SwitchConnection,
+    gs: *gossipsub.Gossipsub,
+) void {
+    const stream = conn.openProtocolStream(identify.protocol_id, .{}) catch |err| {
+        std.log.info("identify exchange: open stream failed: {any}", .{err});
+        return;
+    };
+    var owned = identify.readIdentify(allocator, io, stream) catch |err| {
+        std.log.info("identify exchange: read failed: {any}", .{err});
+        stream.close(io) catch {};
+        stream.deinit();
+        return;
+    };
+    defer owned.deinit(allocator);
+    stream.close(io) catch {};
+    stream.deinit();
+
+    const peer = conn.peerId();
+    const consumed = identify.consumeSignedPeerRecord(allocator, &owned.reader, peer) catch |err| {
+        std.log.info("identify exchange: signed peer record rejected: {any}", .{err});
+        return;
+    };
+    if (consumed) |*rec| {
+        var r = rec.*;
+        r.deinit(allocator);
+        // The original envelope bytes (verified above) go to the store verbatim.
+        gs.consumeIdentifyRecord(peer, owned.reader.getSignedPeerRecord());
+        std.log.info("identify exchange: stored signed peer record", .{});
     }
 }
 
@@ -327,6 +387,18 @@ fn runListener(
     defer listen_addr.deinit(allocator);
     try switcher.listen(listen_addr);
     std.log.info("listener bound {s}", .{listen_text});
+
+    // Register identify now that the socket is bound, so the sealed peer record
+    // advertises our real listen multiaddrs. The handler outlives the run on this
+    // fiber's stack (the service borrows it); free its owned record on return.
+    var listen_addrs = try switcher.listenMultiaddrs(allocator);
+    defer {
+        for (listen_addrs.items) |addr| allocator.free(addr);
+        listen_addrs.deinit(allocator);
+    }
+    var id_handler: identify.IdentifyHandler = undefined;
+    try registerIdentify(allocator, switcher, host_key, listen_addrs.items, &id_handler);
+    defer id_handler.deinit();
 
     const published = try buildPublishedMultiaddr(allocator, switcher, host_key);
     defer allocator.free(published);
@@ -425,10 +497,19 @@ fn runDialer(
     allocator: std.mem.Allocator,
     io: std.Io,
     switcher: *libp2p.Switch,
+    host_key: *identity.KeyPair,
     recorder: *Recorder,
     gs: *gossipsub.Gossipsub,
     args: *const Args,
 ) !void {
+    // Register identify (responder + sealed peer record). A dialer does not bind a
+    // listen socket, so it advertises no listen addrs — its record names only its
+    // peer-id, still letting a peer certify the (empty) address set and confirming
+    // identify works both ways. The handler outlives the run on this stack.
+    var id_handler: identify.IdentifyHandler = undefined;
+    try registerIdentify(allocator, switcher, host_key, &.{}, &id_handler);
+    defer id_handler.deinit();
+
     // Dial every configured peer and start an inbound dispatcher per connection.
     // gossipsub forms a mesh over whatever connections exist, so a node that
     // dials several peers can graft into a mesh spanning all of them. Every
@@ -461,6 +542,11 @@ fn runDialer(
             conn.deinit();
             continue;
         };
+        // Run identify as the client against the just-dialed peer: read its
+        // identify and certify its signed peer record into our gossipsub store
+        // (completing peer-exchange). Best-effort — failures are logged, the
+        // connection stays up.
+        exchangeIdentify(allocator, io, conn, gs);
         try conns.append(allocator, conn);
         dialed += 1;
     }
