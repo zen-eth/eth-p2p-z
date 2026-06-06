@@ -225,6 +225,13 @@ pub const RouterConfig = router_mod.RouterConfig;
 /// (dials at start, re-dials disconnected ones on a tick).
 pub const DirectPeer = router_mod.DirectPeer;
 
+/// Re-export the mesh-degree override (`d`/`d_low`/`d_high`) so a caller can
+/// drive a small topology over-degree — e.g. set `d_high = 1` on a three-node
+/// star so the centre's two-leaf mesh is pruned by the heartbeat (the
+/// peer-exchange path) — via `RouterConfig.mesh_degree` without importing
+/// router.zig. Null (the default) keeps the go-libp2p baseline.
+pub const MeshDegree = router_mod.MeshDegree;
+
 /// Re-export the signature-policy enum (and the message-id override types) so a
 /// caller can select `anonymous` (StrictNoSign) — or supply a custom message-id
 /// function — via `RouterConfig` without importing router.zig.
@@ -1058,4 +1065,369 @@ fn peerKeyOf(peer: PeerId) [64]u8 {
     var key: [64]u8 = [_]u8{0} ** 64;
     @memcpy(key[0..peer.len], peer.bytes[0..peer.len]);
     return key;
+}
+
+/// Whether `router` currently tracks `peer` as a connected peer. The router
+/// fiber mutates `peers`; this read races it, so callers poll until it settles
+/// (a transient false is fine — the poll loop retries).
+fn routerHasPeer(router: *Router, peer: PeerId) bool {
+    return router.peers.contains(peerKeyOf(peer));
+}
+
+/// Whether `router` holds a certified signed peer record for `peer` (the bytes
+/// a peer-exchange offer for `peer` would carry). Reads the cert-store field
+/// directly — keyed like `peers` (zero-padded) — so the live test can confirm
+/// identify populated the store without widening the router's method surface.
+fn routerHasRecord(router: *Router, peer: PeerId) bool {
+    return router.cert_store.contains(peerKeyOf(peer));
+}
+
+/// The number of peers in `router`'s mesh for `topic` (0 when no mesh exists).
+/// Reads the `mesh` field directly so the test can watch the centre go
+/// over-degree without a public accessor.
+fn routerMeshSize(router: *Router, topic: []const u8) usize {
+    const set = router.mesh.getPtr(topic) orelse return 0;
+    return set.count();
+}
+
+/// A live gossipsub node for the peer-exchange end-to-end test: a real
+/// QUIC endpoint + Switch + Gossipsub, an identify responder advertising a
+/// signed peer record (so a peer can certify this node's address and offer it
+/// via PX), and a background fiber that accepts EVERY inbound connection (a
+/// star centre is dialed by every leaf; a PX-offered peer is dialed out of
+/// band, so a leaf must accept that too). Accepted connections are stashed so
+/// teardown can deinit them — and thereby stop their inbound handler fibers —
+/// before the gossipsub is freed (the Switch-borrows-router lifetime rule).
+const PxNode = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    key: identity.KeyPair,
+    peer: PeerId,
+    endpoint: *quic.QuicEndpoint,
+    sw: *Switch,
+    gs: *Gossipsub,
+    id_handler: protocols.identify.IdentifyHandler,
+    /// The node's own listen multiaddrs. Owned here and kept alive for the whole
+    /// run: the identify handler BORROWS these slices and re-encodes them on
+    /// every inbound identify stream, so they must outlive the handler.
+    listen_addrs: std.ArrayList([]u8) = .empty,
+    /// Inbound connections this node accepted, owned here for teardown.
+    accepted: std.ArrayList(*SwitchConnection) = .empty,
+    accept_future: ?std.Io.Future(void) = null,
+
+    /// Bring the node up: generate a key, bind a loopback listener (port 0 →
+    /// OS-assigned, so the bound addr is a dialable `127.0.0.1:<port>`),
+    /// register identify with a signed record over the real listen addrs, start
+    /// the gossipsub, and spawn the accept fiber. `mesh_degree` lets the centre
+    /// run a tiny mesh so two leaves push it over `d_high`.
+    fn up(
+        node: *PxNode,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        mesh_degree: ?MeshDegree,
+    ) !void {
+        node.* = .{
+            .allocator = allocator,
+            .io = io,
+            .key = try identity.KeyPair.generate(.ED25519),
+            .peer = undefined,
+            .endpoint = undefined,
+            .sw = undefined,
+            .gs = undefined,
+            .id_handler = undefined,
+        };
+        errdefer node.key.deinit();
+        node.peer = try node.key.peerId(allocator);
+
+        node.endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &node.key, .{});
+        errdefer node.endpoint.deinit();
+        node.sw = try Switch.init(allocator, io, node.endpoint);
+        errdefer node.sw.deinit();
+
+        // PX enabled on every node; the centre also runs the tiny mesh degree.
+        node.gs = try Gossipsub.init(allocator, io, node.sw, node.peer, &node.key, null, null, .{
+            .peer_exchange_enabled = true,
+            .mesh_degree = mesh_degree,
+        });
+        errdefer node.gs.deinit();
+
+        var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+        defer listen_addr.deinit(allocator);
+        try node.sw.listen(listen_addr);
+
+        // Register identify with a signed record over the REAL bound listen
+        // addrs, so a peer that runs identify against us certifies a dialable
+        // address and can vouch for us in its own PX. The handler BORROWS these
+        // slices, so they are owned by the node (freed in `deinitRest`), not a
+        // local — `writeIdentify` re-reads them on every inbound stream.
+        node.listen_addrs = try node.sw.listenMultiaddrs(allocator);
+        errdefer {
+            for (node.listen_addrs.items) |item| allocator.free(item);
+            node.listen_addrs.deinit(allocator);
+        }
+        node.id_handler = try protocols.identify.IdentifyHandler.initWithSignedRecord(
+            allocator,
+            .{
+                .agent_version = "eth-p2p-z-gossipsub-px-test/0.1.0",
+                .protocols = &(.{protocols.identify.protocol_id} ++ supported_protocols),
+                .listen_addrs = node.listen_addrs.items,
+            },
+            &node.key,
+            1,
+        );
+        errdefer node.id_handler.deinit();
+        try node.sw.addProtocolService(
+            protocols.identify.protocol_id,
+            protocols.streamHandlerService(protocols.identify.IdentifyHandler, protocols.identify.IdentifyHandler.run, &node.id_handler),
+        );
+
+        node.accept_future = try std.Io.concurrent(io, acceptLoop, .{node});
+    }
+
+    /// Accept inbound connections in a loop, starting each one's inbound
+    /// `/meshsub` dispatcher and stashing it for teardown. Returns cleanly when
+    /// the listener is closed (graceful stop) or on cancel.
+    fn acceptLoop(node: *PxNode) void {
+        while (true) {
+            const conn = node.sw.accept() catch return;
+            conn.startInboundDispatcher(.{}) catch {
+                conn.deinit();
+                continue;
+            };
+            node.accepted.append(node.allocator, conn) catch {
+                conn.deinit();
+                continue;
+            };
+        }
+    }
+
+    /// This node's full dialable `/ip4/127.0.0.1/udp/<port>/quic-v1/p2p/<id>`.
+    fn dialAddr(node: *PxNode, allocator: std.mem.Allocator) ![]u8 {
+        var addrs = try node.sw.listenMultiaddrs(allocator);
+        defer {
+            for (addrs.items) |a| allocator.free(a);
+            addrs.deinit(allocator);
+        }
+        var local = try Multiaddr.fromString(allocator, addrs.items[0]);
+        defer local.deinit(allocator);
+        const parsed = try local.parseIpUdp(allocator);
+        const peer_text = try node.peer.toString(allocator);
+        defer allocator.free(peer_text);
+        return std.fmt.allocPrint(
+            allocator,
+            "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}",
+            .{ parsed.address.getPort(), peer_text },
+        );
+    }
+
+    /// Quiesce inbound accepts and join the accept fiber, then deinit every
+    /// accepted connection — stopping their inbound handler fibers — so the
+    /// gossipsub can be freed with no Switch-owned handler still holding the
+    /// router. Safe to call once; leaves the gossipsub/switch/endpoint for
+    /// `deinitRest` (which the test orders across all nodes).
+    fn quiesce(node: *PxNode) void {
+        node.sw.closeListener(node.io);
+        if (node.accept_future) |*future| {
+            future.cancel(node.io);
+            future.await(node.io);
+            node.accept_future = null;
+        }
+        for (node.accepted.items) |conn| conn.deinit();
+        node.accepted.deinit(node.allocator);
+        node.accepted = .empty;
+    }
+
+    /// Tear down the rest (gossipsub before switch: the router's per-peer state
+    /// borrows the Switch's connections, so the router must stop while the
+    /// Switch is still live) and free the key. Call after every node has been
+    /// `quiesce`d (so no accept fiber is running and no accepted connection's
+    /// inbound handler survives to post into a freed router).
+    fn deinitRest(node: *PxNode) void {
+        node.gs.deinit();
+        // The identify handler borrows `listen_addrs`; deinit it (frees only its
+        // owned sealed record) before freeing the borrowed slices.
+        node.id_handler.deinit();
+        for (node.listen_addrs.items) |item| node.allocator.free(item);
+        node.listen_addrs.deinit(node.allocator);
+        node.sw.deinit();
+        node.endpoint.deinit();
+        node.key.deinit();
+    }
+};
+
+/// Dial `target` from `from`, start the connection's inbound dispatcher, then
+/// run identify as the client and hand the peer's verified signed record to
+/// `from`'s gossipsub — exactly the path the interop node uses to populate the
+/// certified-record store that peer-exchange offers draw from. The returned
+/// connection is owned by the caller (held for teardown). Mirrors the interop
+/// `exchangeIdentify`, inlined here so the test exercises the real identify →
+/// `consumeIdentifyRecord` → cert-store chain over QUIC.
+fn dialAndIdentify(allocator: std.mem.Allocator, io: std.Io, from: *PxNode, target: *PxNode) !*SwitchConnection {
+    const addr_text = try target.dialAddr(allocator);
+    defer allocator.free(addr_text);
+    var addr = try Multiaddr.fromString(allocator, addr_text);
+    defer addr.deinit(allocator);
+
+    const conn = try from.sw.dial(addr, .{});
+    errdefer conn.deinit();
+    try conn.startInboundDispatcher(.{});
+
+    const stream = try conn.openProtocolStream(protocols.identify.protocol_id, .{});
+    var owned = try protocols.identify.readIdentify(allocator, io, stream);
+    defer owned.deinit(allocator);
+    stream.close(io) catch {};
+    stream.deinit();
+
+    const peer = conn.peerId();
+    if (try protocols.identify.consumeSignedPeerRecord(allocator, &owned.reader, peer)) |*rec| {
+        var r = rec.*;
+        r.deinit(allocator);
+        from.gs.consumeIdentifyRecord(peer, owned.reader.getSignedPeerRecord());
+    }
+    return conn;
+}
+
+test "live peer-exchange: an over-degree prune offers a signed record and the pruned peer dials it" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A three-node star: centre A meshes with leaves B and C. A runs a tiny mesh
+    // degree (target 1, prune above 1), so once both leaves are in A's mesh for
+    // the topic — two peers, above `d_high = 1` — the heartbeat prunes one. With
+    // peer-exchange on, that over-degree prune is a doPX path: A offers the
+    // SURVIVING leaf's signed record to the pruned leaf, which (its accept-PX gate
+    // open — scoring is off, so the gate is skipped) dials the offered leaf. The
+    // result is a NEW leaf↔leaf connection over real QUIC that did not exist
+    // before (each leaf had dialed only the centre). The leaves keep the default
+    // degree so they graft toward A (their only peer) and stay there.
+    const tiny_degree: MeshDegree = .{ .d = 1, .d_low = 0, .d_high = 1 };
+
+    var a: PxNode = undefined;
+    try a.up(allocator, io, tiny_degree);
+    var a_quiesced = false;
+    var a_torn = false;
+    defer if (!a_torn) {
+        if (!a_quiesced) a.quiesce();
+        a.deinitRest();
+    };
+
+    var b: PxNode = undefined;
+    try b.up(allocator, io, null);
+    var b_quiesced = false;
+    var b_torn = false;
+    defer if (!b_torn) {
+        if (!b_quiesced) b.quiesce();
+        b.deinitRest();
+    };
+
+    var c: PxNode = undefined;
+    try c.up(allocator, io, null);
+    var c_quiesced = false;
+    var c_torn = false;
+    defer if (!c_torn) {
+        if (!c_quiesced) c.quiesce();
+        c.deinitRest();
+    };
+
+    // A dials both leaves and runs identify as the client against each, so A's
+    // certified-record store holds B's and C's signed records (the addresses a PX
+    // offer for them carries). A holds the two dial connections for teardown.
+    const conn_ab = try dialAndIdentify(allocator, io, &a, &b);
+    var conn_ab_live = true;
+    defer if (conn_ab_live) conn_ab.deinit();
+    const conn_ac = try dialAndIdentify(allocator, io, &a, &c);
+    var conn_ac_live = true;
+    defer if (conn_ac_live) conn_ac.deinit();
+
+    // Confirm A learned both records before relying on PX to carry them.
+    {
+        var waited: u64 = 0;
+        while (waited < 3000) : (waited += 10) {
+            if (routerHasRecord(a.gs.router, b.peer) and routerHasRecord(a.gs.router, c.peer)) break;
+            io_time.ms(10).sleep(io) catch {};
+        }
+        try std.testing.expect(routerHasRecord(a.gs.router, b.peer));
+        try std.testing.expect(routerHasRecord(a.gs.router, c.peer));
+    }
+
+    // Everyone subscribes so a mesh can form on the topic. The leaves graft toward
+    // A; A accepts both (inbound GRAFTs have no upper-size cap — the heartbeat is
+    // what shrinks an over-full mesh).
+    try a.gs.subscribe("t");
+    try b.gs.subscribe("t");
+    try c.gs.subscribe("t");
+
+    // Wait for A's mesh to reach both leaves (over-degree), so the next heartbeat
+    // has an excess to prune with PX.
+    {
+        var waited: u64 = 0;
+        while (waited < 5000) : (waited += 10) {
+            if (routerMeshSize(a.gs.router, "t") >= 2) break;
+            io_time.ms(10).sleep(io) catch {};
+        }
+        try std.testing.expect(routerMeshSize(a.gs.router, "t") >= 2);
+    }
+
+    // Before the prune, the leaves know only the centre — they are NOT peers of
+    // each other. This is the baseline the PX dial must change.
+    try std.testing.expect(!routerHasPeer(b.gs.router, c.peer));
+    try std.testing.expect(!routerHasPeer(c.gs.router, b.peer));
+
+    // The heartbeat (one tick per second) prunes A's mesh from 2 down to 1, a doPX
+    // path: the pruned leaf is offered the surviving leaf's record and dials it.
+    // Which leaf is pruned is not deterministic (scoring off → arbitrary victim),
+    // so assert the SYMMETRIC outcome: the two leaves become peers of each other
+    // over the freshly-dialed QUIC connection. Poll with a generous bound: the dial
+    // + handshake + connect-event propagation all happen across fibers.
+    var connected = false;
+    {
+        var waited: u64 = 0;
+        while (waited < 15000) : (waited += 20) {
+            if (routerHasPeer(b.gs.router, c.peer) and routerHasPeer(c.gs.router, b.peer)) {
+                connected = true;
+                break;
+            }
+            io_time.ms(20).sleep(io) catch {};
+        }
+    }
+    try std.testing.expect(connected);
+
+    // Teardown (the established discipline: no Switch-owned inbound handler may
+    // survive into a freed router). First quiesce EVERY node — stop accepting and
+    // deinit each node's accepted connections, joining their inbound handler
+    // fibers — then deinit the dial connections A holds. After that no connection
+    // has a live inbound handler except the one PX-dialed leaf↔leaf link, whose
+    // handler reaches EOF as its peer's connections close. Only then free each
+    // node (gossipsub before switch). Done across all nodes so the order holds
+    // regardless of which leaf was pruned.
+    a.quiesce();
+    a_quiesced = true;
+    b.quiesce();
+    b_quiesced = true;
+    c.quiesce();
+    c_quiesced = true;
+
+    conn_ab.deinit();
+    conn_ab_live = false;
+    conn_ac.deinit();
+    conn_ac_live = false;
+
+    // Let the per-peer disconnects settle so the routers drop the torn-down peers
+    // (and the PX-dialed link's inbound handler EOFs) before any router is freed.
+    {
+        var waited: u64 = 0;
+        while (waited < 5000) : (waited += 20) {
+            if (a.gs.peerCount() == 0 and b.gs.peerCount() == 0 and c.gs.peerCount() == 0) break;
+            io_time.ms(20).sleep(io) catch {};
+        }
+    }
+
+    a.deinitRest();
+    a_torn = true;
+    b.deinitRest();
+    b_torn = true;
+    c.deinitRest();
+    c_torn = true;
 }

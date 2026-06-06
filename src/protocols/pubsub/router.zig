@@ -176,6 +176,34 @@ pub const RouterConfig = struct {
     /// default) accepts every message: behaviour is exactly as it was before the
     /// validator existed. See `MessageValidator` / `ValidationResult`.
     validator: ?MessageValidator = null,
+    /// Optional override of the per-topic mesh DEGREE targets (`d`, `d_low`,
+    /// `d_high`) the heartbeat's mesh maintenance uses to decide when to graft
+    /// more peers in (mesh below `d_low`, top up to `d`) and when to prune excess
+    /// out (mesh above `d_high`, shrink to `d`). Null (the default) keeps the
+    /// go-libp2p baseline (`d` 6, `d_low` 5, `d_high` 12), so behaviour is exactly
+    /// as before this knob existed. It exists so a SMALL topology can be driven
+    /// over-degree on purpose — e.g. a three-node star where the centre meshes
+    /// with two leaves can be pushed past `d_high = 1` so the heartbeat prunes one
+    /// (the peer-exchange path). Only the maintenance degree decision reads it; the
+    /// inbound-GRAFT path is unaffected (it never rejects on size, by design — the
+    /// heartbeat is what shrinks an over-full mesh). The three values must be
+    /// consistent (`d_low <= d <= d_high`); inconsistent values are not validated
+    /// here (a misconfiguration only mis-sizes this node's own mesh).
+    mesh_degree: ?MeshDegree = null,
+};
+
+/// An override of the mesh DEGREE targets (see `RouterConfig.mesh_degree`). The
+/// fields mirror `MeshParams.d`/`d_low`/`d_high`; supplying this replaces those
+/// three values for one router's mesh maintenance, leaving every other mesh
+/// parameter at its baseline. Used to drive a small topology over-degree in a
+/// test/interop node without touching the global defaults.
+pub const MeshDegree = struct {
+    /// Target mesh degree the heartbeat grafts up to / prunes down to.
+    d: usize,
+    /// Below this mesh size the heartbeat grafts more peers in (toward `d`).
+    d_low: usize,
+    /// Above this mesh size the heartbeat prunes excess peers out (toward `d`).
+    d_high: usize,
 };
 
 /// Invoked on the router fiber for each delivered message on a topic WE
@@ -826,6 +854,12 @@ pub fn Router(comptime Transport: type) type {
         /// inbound PRUNE above the accept-PX score). See
         /// `RouterConfig.peer_exchange_enabled`.
         peer_exchange_enabled: bool,
+        /// The resolved mesh DEGREE targets (`d`/`d_low`/`d_high`) the heartbeat's
+        /// mesh maintenance uses to decide graft-up / prune-down. Set once in
+        /// `create` from `RouterConfig.mesh_degree` (or the `mesh_params` baseline
+        /// when that is null) and never mutated. Only the maintenance degree
+        /// decision reads it; every other mesh parameter stays at the baseline.
+        mesh_degree: MeshDegree,
         /// Certified-record store: peer → its newest verified signed peer record.
         /// Populated by PX consume (a verified inbound record is kept here) and
         /// read by PX emit (`getRecord`) to vouch for an offered peer. A later
@@ -1027,6 +1061,14 @@ pub fn Router(comptime Transport: type) type {
                 .flood_publish = config.flood_publish,
                 .idontwant_message_threshold = config.idontwant_message_threshold,
                 .peer_exchange_enabled = config.peer_exchange_enabled,
+                // Resolve the mesh-degree targets: an explicit override is used as
+                // given; null keeps the `mesh_params` baseline, so the default path
+                // is byte-for-byte the historic behaviour.
+                .mesh_degree = config.mesh_degree orelse .{
+                    .d = mesh_params.d,
+                    .d_low = mesh_params.d_low,
+                    .d_high = mesh_params.d_high,
+                },
                 .score = score_engine,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
             };
@@ -2197,10 +2239,15 @@ pub fn Router(comptime Transport: type) type {
                 const topic = key.*;
                 router.pruneNegativeMeshPeers(topic);
                 const size = router.meshSize(topic);
-                if (size < mesh_params.d_low) {
-                    router.graftToTarget(topic, mesh_params.d - size);
-                } else if (size > mesh_params.d_high) {
-                    router.pruneToTarget(topic, size - mesh_params.d);
+                // The degree targets come from `router.mesh_degree` (the
+                // `mesh_params` baseline unless overridden via config), so a small
+                // topology can be driven over-degree on purpose. Every other mesh
+                // parameter stays at the module baseline.
+                const degree = router.mesh_degree;
+                if (size < degree.d_low) {
+                    router.graftToTarget(topic, degree.d - size);
+                } else if (size > degree.d_high) {
+                    router.pruneToTarget(topic, size - degree.d);
                 }
             }
         }
