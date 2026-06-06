@@ -22,6 +22,84 @@
 
 const std = @import("std");
 
+/// Intrusive atomic refcount: embed as a field of an owning struct; the owner
+/// calls `retain`/`release` and performs its own at-zero cleanup + free. The
+/// counter mechanics (the atomic add/sub and the happens-before fencing) live
+/// here so every owner shares one audited implementation; the struct layout,
+/// allocation, pointer types, and call sites stay the owner's own.
+///
+/// Two ordering flavors are provided, matching the two patterns already in this
+/// codebase — pick ONE per owner and use it consistently:
+///
+///   * `retain` / `release` — the lighter pattern (used by the pre-framed RPC
+///     frame on the pubsub path). `retain` bumps with `.monotonic`: a freshly
+///     retained box only becomes reachable to another thread through a
+///     synchronizing edge (queue/mutex/signal) that already carries the
+///     happens-before, so the bump itself needs no ordering. `release`
+///     decrements with `.release`; the holder that observes the 1→0 transition
+///     issues an `.acquire` fence before its cleanup, establishing
+///     happens-before with every prior holder's writes before reclamation.
+///
+///   * `retainChecked` / `releaseChecked` — the QUIC lifecycle pattern (shared
+///     connection/stream/endpoint/socket/channel state). Both directions use
+///     `.acq_rel` and assert the prior count was positive, catching a
+///     retain-after-free or an over-release in debug builds on these
+///     UAF-sensitive primitives. `.acq_rel` is strictly stronger than the
+///     lighter pattern's `.release` + acquire-fence, so the at-zero reader still
+///     observes every prior holder's writes.
+///
+/// Either way the count starts at 1 and `release*` returns `true` exactly once,
+/// on the 1→0 transition — that is the caller's signal to run cleanup and free.
+pub const AtomicRc = struct {
+    n: std.atomic.Value(usize) = .init(1),
+
+    /// Start the count at `initial` instead of the default 1, for an owner that
+    /// is minted with several intended holders at once.
+    pub fn initCount(initial: usize) AtomicRc {
+        return .{ .n = .init(initial) };
+    }
+
+    /// Add one holder (lighter pattern). Unordered: a new holder becomes
+    /// reachable to other threads only through a synchronizing edge that carries
+    /// the happens-before, so the bump needs no ordering.
+    pub fn retain(self: *AtomicRc) void {
+        _ = self.n.fetchAdd(1, .monotonic);
+    }
+
+    /// Give up one holder (lighter pattern). Returns `true` iff this was the LAST
+    /// reference; the caller must then run its cleanup + free. The decrement is
+    /// `.release` and the freeing thread issues an `.acquire` fence on the 1→0
+    /// transition, establishing happens-before with every prior holder's writes.
+    pub fn release(self: *AtomicRc) bool {
+        if (self.n.fetchSub(1, .release) != 1) return false;
+        _ = self.n.load(.acquire); // acquire fence on the 1→0 transition
+        return true;
+    }
+
+    /// Add one holder (QUIC lifecycle pattern): `.acq_rel`, asserting the prior
+    /// count was positive to catch a retain-after-free in debug builds.
+    pub fn retainChecked(self: *AtomicRc) void {
+        const previous = self.n.fetchAdd(1, .acq_rel);
+        std.debug.assert(previous > 0);
+    }
+
+    /// Give up one holder (QUIC lifecycle pattern): `.acq_rel`, asserting the
+    /// prior count was positive to catch an over-release in debug builds.
+    /// Returns `true` iff this was the LAST reference; the caller then runs its
+    /// own cleanup + free.
+    pub fn releaseChecked(self: *AtomicRc) bool {
+        const previous = self.n.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        return previous == 1;
+    }
+
+    /// Current count (best-effort, unordered) — for assertions/diagnostics, not
+    /// a synchronization primitive.
+    pub fn count(self: *const AtomicRc) usize {
+        return self.n.load(.monotonic);
+    }
+};
+
 /// An atomically reference-counted, heap-allocated `T`.
 pub fn RefCount(comptime T: type) type {
     return struct {
@@ -145,4 +223,38 @@ test "RefCount(T) calls a no-allocator deinit() exactly once at refs==0" {
     const rc = try RefCount(Counter).init(allocator, .{ .flag = &called });
     rc.release();
     try std.testing.expect(called);
+}
+
+test "AtomicRc starts at 1; release returns was-last exactly on 1->0" {
+    var rc: AtomicRc = .{};
+    try std.testing.expectEqual(@as(usize, 1), rc.count());
+    // The sole reference is the last one.
+    try std.testing.expect(rc.release());
+}
+
+test "AtomicRc retain/release balance: was-last only on the final release" {
+    var rc: AtomicRc = .{};
+    rc.retain();
+    rc.retain();
+    try std.testing.expectEqual(@as(usize, 3), rc.count());
+    try std.testing.expect(!rc.release()); // 3->2
+    try std.testing.expect(!rc.release()); // 2->1
+    try std.testing.expectEqual(@as(usize, 1), rc.count());
+    try std.testing.expect(rc.release()); // 1->0, last
+}
+
+test "AtomicRc initCount mints several holders" {
+    var rc: AtomicRc = .initCount(2);
+    try std.testing.expectEqual(@as(usize, 2), rc.count());
+    try std.testing.expect(!rc.release()); // 2->1
+    try std.testing.expect(rc.release()); // 1->0, last
+}
+
+test "AtomicRc checked variant: same balance and was-last semantics" {
+    var rc: AtomicRc = .initCount(2);
+    rc.retainChecked();
+    try std.testing.expectEqual(@as(usize, 3), rc.count());
+    try std.testing.expect(!rc.releaseChecked()); // 3->2
+    try std.testing.expect(!rc.releaseChecked()); // 2->1
+    try std.testing.expect(rc.releaseChecked()); // 1->0, last
 }

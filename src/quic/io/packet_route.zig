@@ -1,4 +1,5 @@
 const std = @import("std");
+const AtomicRc = @import("ref_count").AtomicRc;
 const channel = @import("channel.zig");
 const connection_waitset = @import("waitset.zig");
 
@@ -92,7 +93,7 @@ pub const IncomingPacketChannel = struct {
     queue: *PacketChannel.State,
     notify_mutex: std.Io.Mutex = .init,
     waitset: ?*connection_waitset.WaitSet = null,
-    refs: std.atomic.Value(usize) = .init(1),
+    rc: AtomicRc = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -137,14 +138,11 @@ pub const IncomingPacketChannel = struct {
     }
 
     pub fn retain(inbox: *IncomingPacketChannel) void {
-        const previous = inbox.refs.fetchAdd(1, .acq_rel);
-        std.debug.assert(previous > 0);
+        inbox.rc.retainChecked();
     }
 
     pub fn release(inbox: *IncomingPacketChannel) void {
-        const previous = inbox.refs.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
-        if (previous != 1) return;
+        if (!inbox.rc.releaseChecked()) return;
 
         const allocator = inbox.queue.allocator;
         inbox.queue.release();

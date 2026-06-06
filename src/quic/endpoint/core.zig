@@ -1,4 +1,5 @@
 const std = @import("std");
+const AtomicRc = @import("ref_count").AtomicRc;
 const route_commands_mod = @import("../router/route_commands.zig");
 const retry_token = @import("../router/retry_token.zig");
 
@@ -31,7 +32,7 @@ pub const EndpointStats = struct {
 pub const EndpointCore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    refs: std.atomic.Value(usize) = .init(1),
+    rc: AtomicRc = .{},
     route_commands: *route_commands_mod.Queue.State,
     retry_tokens: retry_token.Store,
     /// Live, lock-free stat counters. Best-effort observability: written with
@@ -55,14 +56,11 @@ pub const EndpointCore = struct {
     }
 
     pub fn retain(core: *EndpointCore) void {
-        const previous = core.refs.fetchAdd(1, .acq_rel);
-        std.debug.assert(previous > 0);
+        core.rc.retainChecked();
     }
 
     pub fn release(core: *EndpointCore) void {
-        const previous = core.refs.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
-        if (previous != 1) return;
+        if (!core.rc.releaseChecked()) return;
 
         const allocator = core.allocator;
         core.route_commands.close(core.io);

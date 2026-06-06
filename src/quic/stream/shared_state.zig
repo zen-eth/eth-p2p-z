@@ -17,6 +17,7 @@
 //! actor's data structures.
 
 const std = @import("std");
+const AtomicRc = @import("ref_count").AtomicRc;
 const byte_queue = @import("byte_queue.zig");
 const conn_shared = @import("../connection/shared_state.zig");
 
@@ -31,7 +32,7 @@ pub const SharedState = struct {
     io: std.Io,
     /// One ref for the handle. The record retains separately in
     /// `StreamRecord.init` and releases in its `deinit`.
-    refs: Atomic(usize) = .init(1),
+    rc: AtomicRc = .{},
 
     /// Connection this stream belongs to. The handle uses this to post
     /// commands (close, reset, ...) and to signal the actor's wake
@@ -94,14 +95,11 @@ pub const SharedState = struct {
     }
 
     pub fn retain(self: *SharedState) void {
-        const previous = self.refs.fetchAdd(1, .acq_rel);
-        std.debug.assert(previous > 0);
+        self.rc.retainChecked();
     }
 
     pub fn release(self: *SharedState) void {
-        const previous = self.refs.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
-        if (previous != 1) return;
+        if (!self.rc.releaseChecked()) return;
         self.destroy();
     }
 

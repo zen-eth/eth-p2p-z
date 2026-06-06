@@ -254,7 +254,7 @@ test "put dedups a repeated id: stored once, retained once" {
     frame.release();
 
     // Refcount is back to 1 (the cache's single reference).
-    try std.testing.expectEqual(@as(usize, 1), frame.refs.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), frame.rc.count());
     try std.testing.expect(cache.get("dup") != null);
     // The id was interned ONCE (the dedup'd second put neither re-interns nor
     // re-retains): one table entry, one holder (the cache).
@@ -341,7 +341,7 @@ test "shift evicts after history_length windows: frame released, id/topic freed"
     // on eviction without freeing the frame from under the assertion.
     frame.retain();
     frame.release(); // drop the original builder reference; cache + this test hold it now.
-    try std.testing.expectEqual(@as(usize, 2), frame.refs.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 2), frame.rc.count());
 
     // Present before eviction.
     try std.testing.expect(cache.get("ev") != null);
@@ -354,7 +354,7 @@ test "shift evicts after history_length windows: frame released, id/topic freed"
     // Evicted: gone from the index, the cache released its reference (only our
     // test reference remains), and it no longer appears in getGossipIDs.
     try std.testing.expect(cache.get("ev") == null);
-    try std.testing.expectEqual(@as(usize, 1), frame.refs.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), frame.rc.count());
     const ids = try cache.getGossipIDs(allocator, "t");
     defer allocator.free(ids);
     try std.testing.expectEqual(@as(usize, 0), ids.len);

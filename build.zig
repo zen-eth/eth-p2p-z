@@ -52,8 +52,20 @@ pub fn build(b: *std.Build) void {
     });
     multiaddr_mod.addImport("peer_id", peer_id_mod);
 
+    // Shared refcount helpers (RefCount(T) wrapper + intrusive AtomicRc). A
+    // standalone named module so it can be imported by name from any module
+    // regardless of its root directory — in particular from the zio-io-test
+    // module, which is rooted at src/quic/ and so cannot reach src/ref_count.zig
+    // via a relative @import.
+    const ref_count_mod = b.addModule("ref_count", .{
+        .root_source_file = b.path("src/ref_count.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const deps = ModuleDeps{
         .build_options = build_options,
+        .ref_count = ref_count_mod,
         .multiaddr = multiaddr_mod,
         .gremlin = b.addModule("gremlin", .{
             .root_source_file = b.path("src/gremlin.zig"),
@@ -172,7 +184,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_interop_unit_tests = b.addRunArtifact(interop_unit_tests);
 
+    // The shared refcount helpers are their own standalone module, so their
+    // in-file tests are not reached by refAllDecls on the root module; run them
+    // as a dedicated test artifact under `zig build test`.
+    const ref_count_unit_tests = b.addTest(.{
+        .root_module = ref_count_mod,
+        .filters = filters orelse &.{},
+    });
+    const run_ref_count_unit_tests = b.addRunArtifact(ref_count_unit_tests);
+
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_ref_count_unit_tests.step);
     test_step.dependOn(&run_libp2p_lib_unit_tests.step);
     test_step.dependOn(&run_libp2p_exe_unit_tests.step);
     test_step.dependOn(&run_interop_unit_tests.step);
@@ -188,6 +210,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     zio_io_test_module.addImport("zio", zio_dep.module("zio"));
+    zio_io_test_module.addImport("ref_count", ref_count_mod);
     const zio_io_unit_tests = b.addTest(.{
         .root_module = zio_io_test_module,
         .filters = filters orelse &.{},
@@ -226,6 +249,7 @@ pub fn build(b: *std.Build) void {
 
 const ModuleDeps = struct {
     build_options: *std.Build.Step.Options,
+    ref_count: *std.Build.Module,
     multiaddr: *std.Build.Module,
     gremlin: *std.Build.Module,
     peer_id: *std.Build.Module,
@@ -236,6 +260,7 @@ const ModuleDeps = struct {
 
 fn addImports(module: *std.Build.Module, deps: ModuleDeps) void {
     module.addOptions("build_options", deps.build_options);
+    module.addImport("ref_count", deps.ref_count);
     module.addImport("multiaddr", deps.multiaddr);
     module.addImport("gremlin", deps.gremlin);
     module.addImport("peer_id", deps.peer_id);

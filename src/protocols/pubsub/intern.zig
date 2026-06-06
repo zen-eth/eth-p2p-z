@@ -10,7 +10,7 @@
 //! path and the table is the single index of which ids are live.
 
 const std = @import("std");
-const RefCount = @import("../../ref_count.zig").RefCount;
+const RefCount = @import("ref_count").RefCount;
 
 /// One interned message-id: a single heap copy of the id bytes, shared across
 /// every map that references it. Wrapped in a `RefCount(MsgId)`, so it is

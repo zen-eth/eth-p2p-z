@@ -8,7 +8,7 @@ pub const protocols = @import("protocols.zig");
 pub const protobuf = @import("protobuf.zig");
 pub const peer_record = @import("peer_record.zig");
 pub const secp_context = @import("secp_context.zig");
-pub const ref_count = @import("ref_count.zig");
+pub const ref_count = @import("ref_count");
 pub const RefCount = ref_count.RefCount;
 pub const swarm = @import("switch.zig");
 // gossipsub lives on the root import path (NOT routed through protocols.zig):
@@ -42,5 +42,4 @@ test {
     _ = @import("protocols/pubsub/signing.zig");
     _ = @import("protocols/identify.zig");
     _ = @import("peer_record.zig");
-    _ = @import("ref_count.zig");
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const AtomicRc = @import("ref_count").AtomicRc;
 const channel = @import("../../quic/io/channel.zig");
 const io_time = @import("../../quic/io/time.zig");
 const pubsub = @import("pubsub.zig");
@@ -24,12 +25,12 @@ pub const Lane = enum { subscribe, control, data };
 /// bytes: length-prefixed wire bytes produced by pubsub.frameRpc; owned.
 /// message_ids: owned ids carried for IDONTWANT purge; empty (&.{}) for all
 ///   lanes except data frames that may later be IDONTWANT-purged.
-/// refs: live holder count; the frame frees itself on the 1→0 transition.
+/// rc: live holder count; the frame frees itself on the 1→0 transition.
 /// allocator: the allocator that owns bytes/ids/self, used by the final release.
 pub const OutboundFrame = struct {
     bytes: []u8,
     message_ids: [][]u8,
-    refs: std.atomic.Value(usize),
+    rc: AtomicRc,
     allocator: std.mem.Allocator,
 
     /// Mint a heap frame with `initial_refs` references (the number of intended
@@ -46,7 +47,7 @@ pub const OutboundFrame = struct {
         self.* = .{
             .bytes = bytes,
             .message_ids = message_ids,
-            .refs = .init(initial_refs),
+            .rc = .initCount(initial_refs),
             .allocator = allocator,
         };
         return self;
@@ -56,7 +57,7 @@ pub const OutboundFrame = struct {
     /// to other threads through the queue mutex / signal, which carry the
     /// happens-before edge, so the bump itself needs no ordering.
     pub fn retain(self: *OutboundFrame) void {
-        _ = self.refs.fetchAdd(1, .monotonic);
+        self.rc.retain();
     }
 
     /// Give up one holder's reference. On the 1→0 transition this frees the
@@ -65,8 +66,7 @@ pub const OutboundFrame = struct {
     /// thread issues an `.acquire` fence first, establishing happens-before with
     /// every prior holder's writes before the memory is reclaimed.
     pub fn release(self: *OutboundFrame) void {
-        if (self.refs.fetchSub(1, .release) != 1) return;
-        _ = self.refs.load(.acquire);
+        if (!self.rc.release()) return;
         const allocator = self.allocator;
         allocator.free(self.bytes);
         for (self.message_ids) |id| allocator.free(id);
@@ -525,11 +525,11 @@ test "OutboundFrame retain/release: frees only on the last release" {
     const frame = try testFrameWithIds(allocator, 0x01, &.{ "x", "y" });
     frame.retain();
     frame.retain();
-    try std.testing.expectEqual(@as(usize, 3), frame.refs.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 3), frame.rc.count());
     // Release two; the bytes are still live (no double-free, no use-after-free).
     frame.release();
     frame.release();
-    try std.testing.expectEqual(@as(usize, 1), frame.refs.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), frame.rc.count());
     try std.testing.expectEqual(@as(u8, 0x01), frame.bytes[0]);
     // The final release frees everything; testing.allocator confirms no leak.
     frame.release();

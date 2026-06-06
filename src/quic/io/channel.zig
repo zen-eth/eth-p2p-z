@@ -1,4 +1,8 @@
 const std = @import("std");
+// Imported as a named module (not a relative path) so this file also compiles
+// under the zio-io-test target, whose module is rooted at src/quic/ and so
+// cannot reach src/ref_count.zig via `../../`.
+const AtomicRc = @import("ref_count").AtomicRc;
 
 pub const Signal = struct {
     epoch: std.atomic.Value(u32) = .init(0),
@@ -67,7 +71,7 @@ pub fn Bounded(
             closed: bool = false,
             byte_capacity: usize = 0,
             used_bytes: usize = 0,
-            refs: std.atomic.Value(usize) = .init(1),
+            rc: AtomicRc = .{},
 
             pub fn init(allocator: std.mem.Allocator, io: std.Io, capacity: usize, byte_capacity: usize) std.mem.Allocator.Error!*State {
                 const state = try allocator.create(State);
@@ -111,14 +115,11 @@ pub fn Bounded(
             }
 
             pub fn retain(s: *State) void {
-                const previous = s.refs.fetchAdd(1, .acq_rel);
-                std.debug.assert(previous > 0);
+                s.rc.retainChecked();
             }
 
             pub fn release(s: *State) void {
-                const previous = s.refs.fetchSub(1, .acq_rel);
-                std.debug.assert(previous > 0);
-                if (previous != 1) return;
+                if (!s.rc.releaseChecked()) return;
 
                 const allocator = s.allocator;
                 s.discardQueued(s.io);
@@ -359,7 +360,7 @@ pub fn Unbounded(
             tail: ?*Node = null,
             ready: Signal = .{},
             closed: bool = false,
-            refs: std.atomic.Value(usize) = .init(1),
+            rc: AtomicRc = .{},
 
             const Node = struct {
                 item: T,
@@ -408,14 +409,11 @@ pub fn Unbounded(
             }
 
             pub fn retain(s: *State) void {
-                const previous = s.refs.fetchAdd(1, .acq_rel);
-                std.debug.assert(previous > 0);
+                s.rc.retainChecked();
             }
 
             pub fn release(s: *State) void {
-                const previous = s.refs.fetchSub(1, .acq_rel);
-                std.debug.assert(previous > 0);
-                if (previous != 1) return;
+                if (!s.rc.releaseChecked()) return;
 
                 const allocator = s.allocator;
                 s.freeList(s.head, s.io);

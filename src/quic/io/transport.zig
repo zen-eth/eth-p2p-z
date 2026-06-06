@@ -1,4 +1,5 @@
 const std = @import("std");
+const AtomicRc = @import("ref_count").AtomicRc;
 const endpoint_core = @import("../endpoint/core.zig");
 const route_commands_mod = @import("../router/route_commands.zig");
 const socket_control = @import("socket_control.zig");
@@ -10,7 +11,7 @@ pub const SharedUdpSocket = struct {
     io: std.Io,
     socket: std.Io.net.Socket,
     caps: socket_control.Capabilities,
-    refs: std.atomic.Value(usize) = .init(1),
+    rc: AtomicRc = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -29,14 +30,11 @@ pub const SharedUdpSocket = struct {
     }
 
     pub fn retain(shared: *SharedUdpSocket) void {
-        const previous = shared.refs.fetchAdd(1, .acq_rel);
-        std.debug.assert(previous > 0);
+        shared.rc.retainChecked();
     }
 
     pub fn release(shared: *SharedUdpSocket) void {
-        const previous = shared.refs.fetchSub(1, .acq_rel);
-        std.debug.assert(previous > 0);
-        if (previous != 1) return;
+        if (!shared.rc.releaseChecked()) return;
 
         const allocator = shared.allocator;
         shared.socket.close(shared.io);
@@ -130,6 +128,6 @@ test "network transport retains and releases its shared resources" {
     };
     transport.retainResources();
     transport.deinit();
-    try std.testing.expectEqual(@as(usize, 1), shared.refs.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), shared.rc.count());
     shared.release();
 }
