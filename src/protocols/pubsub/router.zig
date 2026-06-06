@@ -126,14 +126,6 @@ pub const RouterConfig = struct {
     message_id_fn: ?MessageIdConfig = null,
 };
 
-/// Upper bound on remembered message-ids in the seen-cache (loop/duplicate
-/// suppression). A bounded FIFO of owned id copies: once full, inserting a new id
-/// evicts the oldest. This is a deliberately minimal dedup window — a proper
-/// time-bounded seen-cache (with per-entry expiry, as go-libp2p-pubsub keeps)
-/// arrives with the message cache in a later phase. The bound guarantees no
-/// unbounded growth.
-const seen_cache_capacity = 1024;
-
 /// Invoked on the router fiber for each delivered message on a topic WE
 /// subscribe to. The `topic`/`from`/`data` slices are only valid for the
 /// duration of the call; a handler that needs to retain them must copy. Keep it
@@ -144,60 +136,79 @@ pub const MessageHandler = struct {
     on_message: *const fn (ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void,
 };
 
-/// A bounded FIFO set of owned message-id byte copies, used to suppress
-/// duplicate/looping messages. Membership is a hash set; eviction order is a ring
-/// of the same owned id slices. Inserting past `capacity` evicts (and frees) the
-/// oldest id. Owns every id copy; `deinit` frees them all.
+/// A TIME-bounded set of owned message-id byte copies, used to suppress
+/// duplicate/looping messages — the go-libp2p-pubsub seen-cache model. Each id
+/// maps to an EXPIRY heartbeat tick (the tick it was first added plus the TTL);
+/// the id reads as "seen" until that tick passes, then a per-heartbeat sweep
+/// drops it. First-seen semantics (go's `Strategy_FirstSeen`, the pubsub
+/// default): a re-add of an id already present does NOT extend its expiry, so an
+/// id stays seen for the TTL measured from the FIRST time it was observed.
+///
+/// Unlike the old count-bounded FIFO this has no hard count cap: it is bounded by
+/// TIME like go, and the per-heartbeat flood defenses (max_ihave / max_idontwant /
+/// scoring) bound the inflow of new ids within any TTL window. Owns every id copy;
+/// the sweep frees an expired entry's key and `deinit` frees them all.
 const SeenCache = struct {
     allocator: std.mem.Allocator,
-    /// Set of currently-remembered ids. Keys are owned copies (the same slices
-    /// stored in `ring`), so freeing happens exactly once, on eviction/deinit.
-    set: std.StringHashMapUnmanaged(void) = .empty,
-    /// Insertion-ordered ring of the owned id slices, for oldest-first eviction.
-    ring: []?[]u8,
-    head: usize = 0,
-    count: usize = 0,
+    /// How long (in heartbeat ticks) an id stays remembered after it is first
+    /// added. Set from `MeshParams.seen_ttl_ticks` at construction.
+    ttl_ticks: u64,
+    /// id (owned copy) → the heartbeat tick at which the entry expires (= the tick
+    /// it was first added + `ttl_ticks`). The entry is "seen" while `expiry` is
+    /// still in the future; the sweep removes it once `expiry <= now`.
+    entries: std.StringHashMapUnmanaged(u64) = .empty,
 
-    fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!SeenCache {
-        const ring = try allocator.alloc(?[]u8, seen_cache_capacity);
-        @memset(ring, null);
-        return .{ .allocator = allocator, .ring = ring };
+    fn init(allocator: std.mem.Allocator, ttl_ticks: u64) SeenCache {
+        return .{ .allocator = allocator, .ttl_ticks = ttl_ticks };
     }
 
     fn deinit(self: *SeenCache) void {
-        var it = self.set.keyIterator();
+        var it = self.entries.keyIterator();
         while (it.next()) |key| self.allocator.free(key.*);
-        self.set.deinit(self.allocator);
-        self.allocator.free(self.ring);
+        self.entries.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Whether `id` was seen recently (still in the bounded window).
-    fn contains(self: *const SeenCache, id: []const u8) bool {
-        return self.set.contains(id);
+    /// Whether `id` is currently seen: present AND not yet expired at `now_tick`.
+    /// An entry whose expiry has already passed but has not yet been swept reads
+    /// as NOT seen, so dedup never relies on the sweep having run.
+    fn contains(self: *const SeenCache, id: []const u8, now_tick: u64) bool {
+        const expiry = self.entries.get(id) orelse return false;
+        return expiry > now_tick;
     }
 
-    /// Remember `id` (copying it). No-op if already present. On capacity the
-    /// oldest id is evicted and freed first. On OOM the id is simply not
+    /// Remember `id` (copying it) until `now_tick + ttl_ticks`. First-seen: if the
+    /// id is already present its expiry is LEFT UNCHANGED (a re-add does not extend
+    /// it), matching go's default `Strategy_FirstSeen`. On OOM the id is simply not
     /// remembered (dedup degrades to forwarding a possible duplicate — safe, and
     /// the only alternative is to drop the message, which is worse).
-    fn add(self: *SeenCache, id: []const u8) void {
-        if (self.set.contains(id)) return;
+    fn add(self: *SeenCache, id: []const u8, now_tick: u64) void {
+        if (self.entries.contains(id)) return;
         const owned = self.allocator.dupe(u8, id) catch return;
-        self.set.put(self.allocator, owned, {}) catch {
+        self.entries.put(self.allocator, owned, now_tick +| self.ttl_ticks) catch {
             self.allocator.free(owned);
-            return;
         };
-        // Evict the slot we are about to overwrite (the oldest) before storing.
-        if (self.ring[self.head]) |old| {
-            std.debug.assert(self.count == self.ring.len);
-            _ = self.set.remove(old);
-            self.allocator.free(old);
-            self.count -= 1;
+    }
+
+    /// Drop (and free) every id whose expiry has passed at `now_tick`. Called once
+    /// per heartbeat. Gather-then-remove: a removal can move the unscanned tail in
+    /// an open-addressing map, so we restart the scan after each removal rather
+    /// than mutate mid-iteration.
+    fn sweep(self: *SeenCache, now_tick: u64) void {
+        var changed = true;
+        while (changed) {
+            changed = false;
+            var it = self.entries.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* <= now_tick) {
+                    const key = entry.key_ptr.*;
+                    _ = self.entries.remove(key);
+                    self.allocator.free(key);
+                    changed = true;
+                    break;
+                }
+            }
         }
-        self.ring[self.head] = owned;
-        self.head = (self.head + 1) % self.ring.len;
-        self.count += 1;
     }
 };
 
@@ -239,6 +250,11 @@ const MeshParams = struct {
     /// Once `heartbeat_tick - fanout_last_pub[topic]` exceeds this the fanout
     /// peer set is dropped (we stopped publishing to a topic we don't subscribe).
     fanout_ttl_ticks: u64 = 60,
+    /// How long (in heartbeat ticks, one tick ≈ one second) a message-id stays in
+    /// the seen-cache for duplicate suppression, measured from when the id was
+    /// FIRST observed (go's `TimeCacheDuration`, default 2 minutes / 120s; the
+    /// cache uses go's first-seen strategy, so a re-add never extends this).
+    seen_ttl_ticks: u64 = 120,
     /// Floor on the number of gossip (IHAVE) targets per topic per heartbeat:
     /// peers subscribed to the topic but NOT in its mesh/fanout. The actual count
     /// is `max(gossip_factor * eligible, d_lazy)` (see `gossip_factor`), so a
@@ -523,7 +539,8 @@ pub fn Router(comptime Transport: type) type {
         /// The heartbeat fiber's future, when one was spawned. Cancelled + awaited
         /// on destroy (mirrors the per-peer writer teardown).
         heartbeat_future: ?std.Io.Future(void) = null,
-        /// Bounded dedup window over recently-seen message ids.
+        /// Time-bounded dedup window over recently-seen message ids (TTL =
+        /// `seen_ttl_ticks` heartbeats from when each id was first observed).
         seen: SeenCache,
         /// Windowed cache of recently-forwarded/published messages (keyed by
         /// message id), holding one reference on each message's shared frame.
@@ -612,7 +629,7 @@ pub fn Router(comptime Transport: type) type {
             const inbox_storage = try allocator.alloc(Command, inbox_capacity);
             errdefer allocator.free(inbox_storage);
 
-            var seen = try SeenCache.init(allocator);
+            var seen = SeenCache.init(allocator, mesh_params.seen_ttl_ticks);
             errdefer seen.deinit();
 
             // Resolve the policy: an explicit one is used as-is; a null one is
@@ -839,6 +856,13 @@ pub fn Router(comptime Transport: type) type {
         fn meshSize(router: *Self, topic: []const u8) usize {
             const set = router.mesh.getPtr(topic) orelse return 0;
             return set.count();
+        }
+
+        /// Test-only: whether `id` is currently in the seen-cache (present and not
+        /// yet expired at the current heartbeat tick). Lets tests assert dedup
+        /// state directly without driving a forward through a mesh peer.
+        fn seenContains(router: *Self, id: []const u8) bool {
+            return router.seen.contains(id, router.heartbeat_tick);
         }
 
         /// Whether `peer` is currently backed off for `topic` (its expiry tick is
@@ -1408,6 +1432,12 @@ pub fn Router(comptime Transport: type) type {
         fn onHeartbeat(router: *Self) void {
             router.heartbeat_tick += 1;
             const tick = router.heartbeat_tick;
+
+            // Expire seen-cache ids whose TTL has elapsed (an id added at tick T
+            // expires once the tick reaches T + seen_ttl_ticks); the same id may
+            // then be processed again as new, exactly like go's time-cache sweep.
+            router.seen.sweep(tick);
+
             var topic_it = router.backoff.valueIterator();
             while (topic_it.next()) |set| {
                 // Restart the scan after each removal: removing during iteration
@@ -1790,7 +1820,7 @@ pub fn Router(comptime Transport: type) type {
             defer wanted.deinit(router.allocator);
             while (ihave.messageIDsNext()) |id| {
                 if (wanted.items.len >= mesh_params.max_iwant_request_ids) break;
-                if (router.seen.contains(id)) continue;
+                if (router.seen.contains(id, router.heartbeat_tick)) continue;
                 wanted.append(router.allocator, id) catch break;
             }
             if (wanted.items.len == 0) return;
@@ -2089,7 +2119,7 @@ pub fn Router(comptime Transport: type) type {
             // publish paths both go through computeMessageId so they always agree.
             var id = router.computeMessageId(topic, from, seqno, data) catch return;
             defer id.deinit(router.allocator);
-            if (router.seen.contains(id.bytes)) {
+            if (router.seen.contains(id.bytes, router.heartbeat_tick)) {
                 // A duplicate of an already-seen message. If the relaying peer is
                 // a current mesh member for this topic, credit it the P3
                 // mesh-delivery counter (it did relay the message to us, just not
@@ -2099,7 +2129,7 @@ pub fn Router(comptime Transport: type) type {
                 }
                 return;
             }
-            router.seen.add(id.bytes);
+            router.seen.add(id.bytes, router.heartbeat_tick);
 
             // P2/P3: the relaying peer delivered a NEW, accepted message — credit
             // its first-delivery (and, if it is a mesh member, mesh-delivery)
@@ -2389,8 +2419,8 @@ pub fn Router(comptime Transport: type) type {
             // content-based id) two identical (topic, data) publishes share an id,
             // so the second is dropped here rather than forwarded twice — matching
             // go-libp2p, which checks the seen-cache before publishing.
-            if (router.seen.contains(id.bytes)) return;
-            router.seen.add(id.bytes);
+            if (router.seen.contains(id.bytes, router.heartbeat_tick)) return;
+            router.seen.add(id.bytes, router.heartbeat_tick);
 
             router.deliverLocal(topic, from, data);
 
@@ -3438,6 +3468,150 @@ test "mesh forwarding dedups a repeated publish (same from+seqno) to forward onc
     // Give the (suppressed) second a chance to wrongly land before asserting.
     io_time.ms(50).sleep(io) catch {};
     try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_y.record, "t", "dup"));
+}
+
+test "seen-cache TTL: a duplicate is suppressed within the window, re-processed after it expires" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    // Subscribe to "t" and graft Y in so a forward has a destination; X relays.
+    try subscribeAndWait(io, allocator, router, "t");
+    const peer_x = testPeer(1);
+    const peer_y = testPeer(2);
+    const conn_x = try connectFakePeer(io, allocator, router, peer_x);
+    defer destroyFakeConn(allocator, conn_x);
+    const conn_y = try connectFakePeer(io, allocator, router, peer_y);
+    defer destroyFakeConn(allocator, conn_y);
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_y, peer_y, "t"));
+
+    // Receive the message at tick 0 (from++seqno id). It forwards once and is now
+    // seen, so the duplicate posted right after is suppressed: Y sees exactly one.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_x,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x09", "t", "ttl"),
+    } });
+    try sync(router, io);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_x,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x09", "t", "ttl"),
+    } });
+    try sync(router, io);
+
+    var waited: u64 = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_y.record, "t", "ttl") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    io_time.ms(50).sleep(io) catch {};
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_y.record, "t", "ttl"));
+
+    // Still seen at ticks 1..119 (a beat just short of the TTL leaves it in).
+    try beatHeartbeats(io, router, mesh_params.seen_ttl_ticks - 1);
+    try std.testing.expect(router.seenContains("origin\x00\x00\x00\x09"));
+
+    // The TTL-th heartbeat sweeps the id (expiry = 0 + seen_ttl_ticks <= tick).
+    try beatHeartbeats(io, router, 1);
+    try std.testing.expect(!router.seenContains("origin\x00\x00\x00\x09"));
+
+    // The same message is now processed again as NEW and forwarded a second time.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_x,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x09", "t", "ttl"),
+    } });
+    try sync(router, io);
+    waited = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_y.record, "t", "ttl") >= 2) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 2), recordCountPublishes(io, &conn_y.record, "t", "ttl"));
+}
+
+test "seen-cache keeps more ids than the old FIFO cap within the TTL window (no premature eviction)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+    const peer_x = testPeer(1);
+    const conn_x = try connectFakePeer(io, allocator, router, peer_x);
+    defer destroyFakeConn(allocator, conn_x);
+
+    // Receive 2000 distinct messages (> the old 1024 FIFO cap) within one TTL
+    // window. Each gets a unique 4-byte seqno, so a unique from++seqno id.
+    const count: u32 = 2000;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        var seqno: [4]u8 = undefined;
+        std.mem.writeInt(u32, &seqno, i, .big);
+        try router.inbox.putOne(io, .{ .inbound_rpc = .{
+            .peer = peer_x,
+            .rpc = try buildInboundPublish(allocator, "origin", &seqno, "t", "vol"),
+        } });
+    }
+    try sync(router, io);
+
+    // ALL 2000 are still seen: the time-cache (unlike the old FIFO) never evicted
+    // the earliest ones to make room — they only expire on the TTL clock.
+    i = 0;
+    while (i < count) : (i += 1) {
+        var seqno: [4]u8 = undefined;
+        std.mem.writeInt(u32, &seqno, i, .big);
+        var id: [10]u8 = undefined;
+        @memcpy(id[0..6], "origin");
+        @memcpy(id[6..10], &seqno);
+        try std.testing.expect(router.seenContains(&id));
+    }
+}
+
+test "seen-cache first-seen: re-adding an id does NOT extend its expiry" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+    const peer_x = testPeer(1);
+    const conn_x = try connectFakePeer(io, allocator, router, peer_x);
+    defer destroyFakeConn(allocator, conn_x);
+
+    // Add the id at tick 0 (expiry = seen_ttl_ticks).
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_x,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x01", "t", "fs"),
+    } });
+    try sync(router, io);
+    try std.testing.expect(router.seenContains("origin\x00\x00\x00\x01"));
+
+    // Beat partway, then re-receive the SAME id. Under first-seen (go's default)
+    // the re-add leaves the original expiry untouched — it does NOT slide forward.
+    try beatHeartbeats(io, router, 60);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_x,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x01", "t", "fs"),
+    } });
+    try sync(router, io);
+
+    // It still expires at the ORIGINAL first-insert + TTL (tick seen_ttl_ticks):
+    // after the remaining ticks the sweep drops it, even though it was re-added at
+    // tick 60. A last-seen cache would have kept it alive until 60 + TTL.
+    try beatHeartbeats(io, router, mesh_params.seen_ttl_ticks - 60);
+    try std.testing.expect(!router.seenContains("origin\x00\x00\x00\x01"));
 }
 
 test "publish to a subscribed topic forwards over the mesh and delivers locally" {
