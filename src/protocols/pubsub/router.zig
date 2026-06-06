@@ -31,6 +31,7 @@ const std = @import("std");
 const pubsub = @import("pubsub.zig");
 const peer_io = @import("peer_io.zig");
 const mcache = @import("mcache.zig");
+const RefCount = @import("../../ref_count.zig").RefCount;
 const rpc = @import("rpc.zig");
 const rpc_pb = @import("../../protobuf.zig").rpc;
 const signing = @import("signing.zig");
@@ -178,6 +179,128 @@ pub const MessageHandler = struct {
     on_message: *const fn (ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void,
 };
 
+/// One interned message-id: a single heap copy of the id bytes, shared across
+/// every router map that references it. Wrapped in a `RefCount(MsgId)`, so it is
+/// the `RefCount` that counts holders and frees the box; this struct's `deinit`
+/// runs exactly once, on the last `release` (refs 1→0), and does the id-byte
+/// teardown: it unlinks itself from the owning intern table (whose key aliases
+/// these very bytes) BEFORE freeing the bytes, so the table never indexes freed
+/// memory. `unlink`-then-`free` order is the only safe order — see `InternTable`.
+const MsgId = struct {
+    bytes: []u8,
+    table: *InternTable,
+
+    /// Must be `pub`: `RefCount(MsgId)` lives in another module and discovers this
+    /// deinit via `@hasDecl`, which only sees public declarations across modules.
+    pub fn deinit(self: *MsgId, allocator: std.mem.Allocator) void {
+        self.table.unlink(self.bytes);
+        allocator.free(self.bytes);
+    }
+};
+
+/// An interned reference to a message id: a `RefCount` box over a `MsgId`. One
+/// per distinct id while any holder is live; the same id in `seen` + a peer's
+/// `dont_send` + `iwant_promises` is ONE allocation with `refs` = the number of
+/// holders, freed only when the last holder releases.
+const InternedId = RefCount(MsgId);
+
+/// Router-owned index of live interned message ids, keyed by the id BYTES. It is
+/// the single place id bytes are allocated and freed, and the single index of
+/// which ids are live.
+///
+/// Lifecycle invariant (the whole point of interning): id bytes live exactly as
+/// long as some holder references the box (`refs > 0`). `intern` (new id) and
+/// `RefCount.retain` are the ONLY id-byte alloc / ref-add sites; `RefCount.release`
+/// is the ONLY ref-drop site; the last release runs `MsgId.deinit`, which is the
+/// ONLY id-byte free site. No `dupe`/`free` of id bytes happens anywhere else.
+///
+/// The table holds NO reference of its own: an id is in the table iff `refs > 0`.
+/// Each map entry that interns an id holds exactly one reference; the table is
+/// purely an index so duplicate `intern`s coalesce onto one allocation. The last
+/// `release` → `MsgId.deinit` → `unlink` (drop the table entry whose key aliases
+/// the bytes) → free the bytes → `RefCount` frees the box. `deinit` asserts the
+/// table is empty at router destroy (every interned id was released).
+const InternTable = struct {
+    allocator: std.mem.Allocator,
+    /// id bytes → the live interned box for that id. The key ALIASES the box's
+    /// `value.bytes` (the heap copy the box owns), so the table never owns its
+    /// keys: the box frees them in `MsgId.deinit`, after `unlink` removes the
+    /// entry. While an id is interned the key and the box's bytes are the same
+    /// allocation.
+    entries: std.StringHashMapUnmanaged(*InternedId) = .empty,
+
+    fn init(allocator: std.mem.Allocator) InternTable {
+        return .{ .allocator = allocator };
+    }
+
+    /// Every interned id has been released. Asserts the table is empty (no
+    /// straggler implies no leaked id byte copy) and frees the index storage.
+    fn deinit(self: *InternTable) void {
+        std.debug.assert(self.entries.count() == 0);
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Return an interned box for `bytes`, adding one reference for the caller:
+    ///   - already interned: `retain` the existing box (a shared holder) and
+    ///     return it; no new allocation.
+    ///   - new id: allocate one heap copy of the bytes, mint a box around it
+    ///     (refs = 1), and FIX the table key to the box's OWNED copy (not the
+    ///     borrowed lookup slice the caller passed), so the key outlives the call.
+    /// Returns null on OOM (the caller then skips recording the id — safe; the
+    /// only cost is a possible duplicate forward / a missed bookkeeping entry).
+    fn intern(self: *InternTable, bytes: []const u8) ?*InternedId {
+        const gop = self.entries.getOrPut(self.allocator, bytes) catch return null;
+        if (gop.found_existing) return gop.value_ptr.*.retain();
+
+        const owned = self.allocator.dupe(u8, bytes) catch {
+            // Undo the placeholder entry (its key aliases the borrowed slice).
+            _ = self.entries.remove(bytes);
+            return null;
+        };
+        const box = InternedId.init(self.allocator, .{ .bytes = owned, .table = self }) catch {
+            self.allocator.free(owned);
+            _ = self.entries.remove(bytes);
+            return null;
+        };
+        // Re-key the entry to the box's OWNED bytes (the placeholder key still
+        // aliases the caller's borrowed slice). After this the key aliases
+        // `box.value.bytes`, which the box frees in `MsgId.deinit` after unlink.
+        gop.key_ptr.* = box.value.bytes;
+        gop.value_ptr.* = box;
+        return box;
+    }
+
+    /// Remove the table entry for `bytes`. Called ONLY from `MsgId.deinit` on the
+    /// last release, BEFORE the bytes are freed (the key aliases them). After this
+    /// the id is no longer interned; a later `intern` of the same bytes allocates
+    /// afresh.
+    fn unlink(self: *InternTable, bytes: []const u8) void {
+        _ = self.entries.remove(bytes);
+    }
+
+    /// Number of distinct live interned ids (one per allocation). Used by tests to
+    /// assert sharing (one entry for an id held by several maps) and that the table
+    /// empties as holders release.
+    fn count(self: *const InternTable) usize {
+        return self.entries.count();
+    }
+};
+
+/// One entry in an interned-id-keyed map: the shared interned-id box plus a
+/// per-map payload. The box holds this entry's single reference (added by
+/// `intern`, dropped by `release` on remove/teardown); the map key aliases
+/// `rc.value.bytes`, so the entry must be removed from the map BEFORE its `rc` is
+/// released (the release may free those bytes). `Payload` is the per-map value:
+/// an expiry tick (`seen`, `dont_send`, `iwant_promises`) or a count
+/// (`iwant_counts`).
+fn IdEntry(comptime Payload: type) type {
+    return struct {
+        rc: *InternedId,
+        payload: Payload,
+    };
+}
+
 /// A TIME-bounded set of owned message-id byte copies, used to suppress
 /// duplicate/looping messages — the go-libp2p-pubsub seen-cache model. Each id
 /// maps to an EXPIRY heartbeat tick (the tick it was first added plus the TTL);
@@ -188,25 +311,32 @@ pub const MessageHandler = struct {
 ///
 /// Unlike the old count-bounded FIFO this has no hard count cap: it is bounded by
 /// TIME like go, and the per-heartbeat flood defenses (max_ihave / max_idontwant /
-/// scoring) bound the inflow of new ids within any TTL window. Owns every id copy;
-/// the sweep frees an expired entry's key and `deinit` frees them all.
+/// scoring) bound the inflow of new ids within any TTL window. Each entry holds
+/// one reference on a SHARED interned id (the same id in a peer's `dont_send` or
+/// `iwant_promises` is one allocation); the sweep `release`s an expired entry's
+/// reference and `deinit` releases them all — no per-id `free` here.
 const SeenCache = struct {
+    /// The router-shared intern table. `add` interns (retains) an id; the sweep
+    /// and `deinit` release. The id bytes are freed only when the LAST holder
+    /// across all maps releases (see `InternTable`).
+    intern_table: *InternTable,
     allocator: std.mem.Allocator,
     /// How long (in heartbeat ticks) an id stays remembered after it is first
     /// added. Set from `MeshParams.seen_ttl_ticks` at construction.
     ttl_ticks: u64,
-    /// id (owned copy) → the heartbeat tick at which the entry expires (= the tick
-    /// it was first added + `ttl_ticks`). The entry is "seen" while `expiry` is
-    /// still in the future; the sweep removes it once `expiry <= now`.
-    entries: std.StringHashMapUnmanaged(u64) = .empty,
+    /// id bytes (aliasing the entry's interned box) → an entry holding the box's
+    /// reference and the heartbeat tick at which it expires (= first-added tick +
+    /// `ttl_ticks`). "Seen" while `expiry` is still in the future; the sweep
+    /// removes (and releases) it once `expiry <= now`.
+    entries: std.StringHashMapUnmanaged(IdEntry(u64)) = .empty,
 
-    fn init(allocator: std.mem.Allocator, ttl_ticks: u64) SeenCache {
-        return .{ .allocator = allocator, .ttl_ticks = ttl_ticks };
+    fn init(allocator: std.mem.Allocator, intern_table: *InternTable, ttl_ticks: u64) SeenCache {
+        return .{ .intern_table = intern_table, .allocator = allocator, .ttl_ticks = ttl_ticks };
     }
 
     fn deinit(self: *SeenCache) void {
-        var it = self.entries.keyIterator();
-        while (it.next()) |key| self.allocator.free(key.*);
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry| entry.rc.release();
         self.entries.deinit(self.allocator);
         self.* = undefined;
     }
@@ -215,37 +345,40 @@ const SeenCache = struct {
     /// An entry whose expiry has already passed but has not yet been swept reads
     /// as NOT seen, so dedup never relies on the sweep having run.
     fn contains(self: *const SeenCache, id: []const u8, now_tick: u64) bool {
-        const expiry = self.entries.get(id) orelse return false;
-        return expiry > now_tick;
+        const entry = self.entries.get(id) orelse return false;
+        return entry.payload > now_tick;
     }
 
-    /// Remember `id` (copying it) until `now_tick + ttl_ticks`. First-seen: if the
-    /// id is already present its expiry is LEFT UNCHANGED (a re-add does not extend
-    /// it), matching go's default `Strategy_FirstSeen`. On OOM the id is simply not
-    /// remembered (dedup degrades to forwarding a possible duplicate — safe, and
-    /// the only alternative is to drop the message, which is worse).
+    /// Remember `id` until `now_tick + ttl_ticks`, interning it (one shared
+    /// allocation across all maps). First-seen: if the id is already present its
+    /// expiry is LEFT UNCHANGED (a re-add does not extend it), matching go's
+    /// default `Strategy_FirstSeen`. On OOM the id is simply not remembered (dedup
+    /// degrades to forwarding a possible duplicate — safe, and the only
+    /// alternative is to drop the message, which is worse).
     fn add(self: *SeenCache, id: []const u8, now_tick: u64) void {
         if (self.entries.contains(id)) return;
-        const owned = self.allocator.dupe(u8, id) catch return;
-        self.entries.put(self.allocator, owned, now_tick +| self.ttl_ticks) catch {
-            self.allocator.free(owned);
+        const rc = self.intern_table.intern(id) orelse return;
+        self.entries.put(self.allocator, rc.value.bytes, .{ .rc = rc, .payload = now_tick +| self.ttl_ticks }) catch {
+            rc.release();
         };
     }
 
-    /// Drop (and free) every id whose expiry has passed at `now_tick`. Called once
-    /// per heartbeat. Gather-then-remove: a removal can move the unscanned tail in
-    /// an open-addressing map, so we restart the scan after each removal rather
-    /// than mutate mid-iteration.
+    /// Drop every id whose expiry has passed at `now_tick`, releasing its interned
+    /// reference. Called once per heartbeat. Gather-then-remove: a removal can move
+    /// the unscanned tail in an open-addressing map, so we restart the scan after
+    /// each removal rather than mutate mid-iteration. The map entry is removed
+    /// BEFORE its `rc` is released (the key aliases the rc's bytes, which the
+    /// release may free).
     fn sweep(self: *SeenCache, now_tick: u64) void {
         var changed = true;
         while (changed) {
             changed = false;
             var it = self.entries.iterator();
             while (it.next()) |entry| {
-                if (entry.value_ptr.* <= now_tick) {
-                    const key = entry.key_ptr.*;
-                    _ = self.entries.remove(key);
-                    self.allocator.free(key);
+                if (entry.value_ptr.payload <= now_tick) {
+                    const rc = entry.value_ptr.rc;
+                    _ = self.entries.remove(entry.key_ptr.*);
+                    rc.release();
                     changed = true;
                     break;
                 }
@@ -548,25 +681,28 @@ pub fn Router(comptime Transport: type) type {
             /// Message ids this peer told us (via IDONTWANT) it already has, so we
             /// must NOT send it those messages. Maps id → expiry heartbeat tick;
             /// the entry suppresses sending until `heartbeat_tick > expiry`, at
-            /// which point the heartbeat reclaims it. Keys are owned copies (freed
-            /// on expiry and on teardown). Bounded by `dont_send_cap`.
-            dont_send: std.StringHashMapUnmanaged(u64) = .empty,
+            /// which point the heartbeat reclaims it. Each entry holds one
+            /// reference on the SHARED interned id (released on expiry and on
+            /// teardown — never an explicit byte free). Bounded by `dont_send_cap`.
+            dont_send: std.StringHashMapUnmanaged(IdEntry(u64)) = .empty,
             /// How many times we have served each message id to this peer via
             /// IWANT within the current gossip window. Incremented each time we
             /// serve the id; once it reaches `gossip_retransmission` we stop
-            /// serving that id to this peer (anti-spam). Keys are owned copies
-            /// (freed on clear and on teardown); the whole map is cleared each
-            /// heartbeat (mirroring go, which ages these with the mcache window).
-            iwant_counts: std.StringHashMapUnmanaged(u64) = .empty,
+            /// serving that id to this peer (anti-spam). Each entry holds one
+            /// reference on the SHARED interned id (released on clear and on
+            /// teardown); the whole map is cleared each heartbeat (mirroring go,
+            /// which ages these with the mcache window).
+            iwant_counts: std.StringHashMapUnmanaged(IdEntry(u64)) = .empty,
             /// Outstanding IWANT promises this peer made: message id → the
             /// heartbeat tick by which the peer must deliver the message. A promise
             /// is recorded when we send the peer an IWANT for an id it advertised
             /// (IHAVE), fulfilled (removed) when any peer delivers a message with
             /// that id, and — if still outstanding once the tick passes the
             /// deadline — harvested by the heartbeat into a P7 behaviour penalty
-            /// (go's "broken promise"). Keys are owned copies (freed on fulfill, on
-            /// harvest, and on teardown). Populated only when scoring is enabled.
-            iwant_promises: std.StringHashMapUnmanaged(u64) = .empty,
+            /// (go's "broken promise"). Each entry holds one reference on the SHARED
+            /// interned id (released on fulfill, on harvest, and on teardown).
+            /// Populated only when scoring is enabled.
+            iwant_promises: std.StringHashMapUnmanaged(IdEntry(u64)) = .empty,
             /// How many IHAVE messages this peer has sent us in the current
             /// heartbeat window. Incremented on each inbound IHAVE; once it
             /// reaches `max_ihave_messages` we ignore further IHAVEs from the peer
@@ -679,6 +815,14 @@ pub fn Router(comptime Transport: type) type {
         /// The heartbeat fiber's future, when one was spawned. Cancelled + awaited
         /// on destroy (mirrors the per-peer writer teardown).
         heartbeat_future: ?std.Io.Future(void) = null,
+        /// The single index of live interned message ids. `seen`, every peer's
+        /// `dont_send`/`iwant_counts`/`iwant_promises` all intern through this, so
+        /// an id referenced by several maps is ONE allocation shared via reference
+        /// counting (freed when the last holder releases). Address-stable because
+        /// the Router itself is heap-allocated, so `&router.intern_table` is the
+        /// stable `*InternTable` the maps and `MsgId.deinit` hold. Asserts empty at
+        /// destroy (every interned id was released).
+        intern_table: InternTable,
         /// Time-bounded dedup window over recently-seen message ids (TTL =
         /// `seen_ttl_ticks` heartbeats from when each id was first observed).
         seen: SeenCache,
@@ -769,9 +913,6 @@ pub fn Router(comptime Transport: type) type {
             const inbox_storage = try allocator.alloc(Command, inbox_capacity);
             errdefer allocator.free(inbox_storage);
 
-            var seen = SeenCache.init(allocator, mesh_params.seen_ttl_ticks);
-            errdefer seen.deinit();
-
             // Resolve the policy: an explicit one is used as-is; a null one is
             // inferred from the key (strict_sign with a key, none without) to keep
             // the historic host_key-drives-the-policy default. Then validate the
@@ -812,7 +953,11 @@ pub fn Router(comptime Transport: type) type {
                 .inbox = std.Io.Queue(Command).init(inbox_storage),
                 .peers = std.AutoHashMap(PeerKey, *PeerState).init(allocator),
                 .peer_versions = std.AutoHashMap(PeerKey, pubsub.Version).init(allocator),
-                .seen = seen,
+                // `intern_table` and `seen` are wired up just below: `seen` holds a
+                // `*InternTable` into `router.intern_table`, which only has a stable
+                // address once `router` itself is allocated.
+                .intern_table = InternTable.init(allocator),
+                .seen = undefined,
                 .message_cache = mcache.MessageCache.init(allocator),
                 .local_peer = effective_peer,
                 .signature_policy = policy,
@@ -825,6 +970,11 @@ pub fn Router(comptime Transport: type) type {
                 .score = score_engine,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
             };
+
+            // `seen` shares the router's intern table (now address-stable); every
+            // id it remembers is the same allocation a peer's dont_send /
+            // iwant_promises would intern.
+            router.seen = SeenCache.init(allocator, &router.intern_table, mesh_params.seen_ttl_ticks);
 
             // Copy the configured direct peers into the router-owned set (the
             // config slice is borrowed only for this call). Each id is stored as a
@@ -926,6 +1076,11 @@ pub fn Router(comptime Transport: type) type {
             router.freeBackoff();
             router.freeFanout();
             router.seen.deinit();
+            // Every interned id is released by now (seen.deinit above + each peer's
+            // dont_send/iwant_counts/iwant_promises released in teardownPeer), so
+            // the intern table is empty: its deinit asserts this (a straggler would
+            // be a leaked id byte copy / a missed release).
+            router.intern_table.deinit();
             router.message_cache.deinit();
             if (router.signer) |*s| s.deinit();
             if (router.score) |ps| {
@@ -1778,9 +1933,11 @@ pub fn Router(comptime Transport: type) type {
             }
 
             // Expire stale per-peer IDONTWANT entries (the id is now sendable
-            // again). The keys are owned, so each removed entry's id is freed. Same
-            // restart-after-removal pattern as the backoff scan: a removal can move
-            // the unscanned tail in an open-addressing map.
+            // again). Each removed entry releases its interned reference (no
+            // explicit byte free). Same restart-after-removal pattern as the
+            // backoff scan: a removal can move the unscanned tail in an
+            // open-addressing map. The map entry is removed BEFORE its rc is
+            // released (the key aliases the rc's bytes).
             var peer_it = router.peers.valueIterator();
             while (peer_it.next()) |state_ptr| {
                 const dont_send = &state_ptr.*.dont_send;
@@ -1789,10 +1946,10 @@ pub fn Router(comptime Transport: type) type {
                     changed = false;
                     var entry_it = dont_send.iterator();
                     while (entry_it.next()) |entry| {
-                        if (entry.value_ptr.* < tick) {
-                            const key = entry.key_ptr.*;
-                            _ = dont_send.remove(key);
-                            router.allocator.free(key);
+                        if (entry.value_ptr.payload < tick) {
+                            const rc = entry.value_ptr.rc;
+                            _ = dont_send.remove(entry.key_ptr.*);
+                            rc.release();
                             changed = true;
                             break;
                         }
@@ -1812,10 +1969,12 @@ pub fn Router(comptime Transport: type) type {
                 // Harvest broken IWANT promises: any promise whose deadline tick
                 // has passed (`deadline < tick`, i.e. the peer did not deliver in
                 // time — go's strict `expire.Before(now)`) is broken. Count this
-                // peer's broken promises and free each removed key; the single
-                // per-peer penalty is applied below (go's GetBrokenPromises returns
-                // a per-peer count, then AddBehaviourPenalty(p, count) once each).
-                // No-op when scoring is disabled (the map is always empty then).
+                // peer's broken promises and release each removed entry's interned
+                // reference; the single per-peer penalty is applied below (go's
+                // GetBrokenPromises returns a per-peer count, then
+                // AddBehaviourPenalty(p, count) once each). No-op when scoring is
+                // disabled (the map is always empty then). Entry removed BEFORE its
+                // rc is released (the key aliases the rc's bytes).
                 const promises = &state_ptr.*.iwant_promises;
                 var broken: f64 = 0;
                 var changed_p = true;
@@ -1823,10 +1982,10 @@ pub fn Router(comptime Transport: type) type {
                     changed_p = false;
                     var promise_it = promises.iterator();
                     while (promise_it.next()) |entry| {
-                        if (entry.value_ptr.* < tick) {
-                            const key = entry.key_ptr.*;
-                            _ = promises.remove(key);
-                            router.allocator.free(key);
+                        if (entry.value_ptr.payload < tick) {
+                            const rc = entry.value_ptr.rc;
+                            _ = promises.remove(entry.key_ptr.*);
+                            rc.release();
                             broken += 1;
                             changed_p = true;
                             break;
@@ -2219,22 +2378,23 @@ pub fn Router(comptime Transport: type) type {
         /// failed insert just means no promise — no penalty, which is safe).
         fn addPromise(router: *Self, state: *PeerState, id: []const u8) void {
             if (state.iwant_promises.contains(id)) return;
-            const owned = router.allocator.dupe(u8, id) catch return;
+            const rc = router.intern_table.intern(id) orelse return;
             const deadline = router.heartbeat_tick +| mesh_params.iwant_followup_ticks;
-            state.iwant_promises.put(router.allocator, owned, deadline) catch {
-                router.allocator.free(owned);
+            state.iwant_promises.put(router.allocator, rc.value.bytes, .{ .rc = rc, .payload = deadline }) catch {
+                rc.release();
             };
         }
 
         /// Fulfill (clear) every outstanding IWANT promise for message id `id`
         /// across all peers: a delivery of the message satisfies whoever promised
         /// it, so no penalty is owed (go removes the promise for all peers on
-        /// fulfill). Frees each removed key. Cheap when no peer promised the id.
+        /// fulfill). Releases each removed entry's interned reference. Cheap when no
+        /// peer promised the id.
         fn fulfillPromise(router: *Self, id: []const u8) void {
             var it = router.peers.valueIterator();
             while (it.next()) |state_ptr| {
                 if (state_ptr.*.iwant_promises.fetchRemove(id)) |kv| {
-                    router.allocator.free(kv.key);
+                    kv.value.rc.release();
                 }
             }
         }
@@ -2259,8 +2419,8 @@ pub fn Router(comptime Transport: type) type {
                 // Retransmission cap: skip an id we have already served this peer
                 // `gossip_retransmission` times in the current window. Checked
                 // before the cache lookup so a flooded id is cheap to reject.
-                if (state.iwant_counts.get(id)) |c| {
-                    if (c >= mesh_params.gossip_retransmission) continue;
+                if (state.iwant_counts.get(id)) |entry| {
+                    if (entry.payload >= mesh_params.gossip_retransmission) continue;
                 }
                 const frame = router.message_cache.get(id) orelse continue;
                 // Retain before pushing (the queue holds the reference; the cache
@@ -2273,22 +2433,24 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Increment the per-peer served count for message id `id`. The first time
-        /// an id is served the key is an owned copy (freed when `iwant_counts` is
-        /// cleared each heartbeat, or on teardown); afterwards we just bump the
-        /// existing entry. Best-effort on OOM (a failed insert just means we may
-        /// serve the id one extra time — safe).
+        /// an id is served it is interned (one reference held by this entry,
+        /// released when `iwant_counts` is cleared each heartbeat, or on teardown);
+        /// afterwards we just bump the existing entry's count. Best-effort on OOM (a
+        /// failed insert just means we may serve the id one extra time — safe).
         fn bumpIWantCount(router: *Self, state: *PeerState, id: []const u8) void {
             const gop = state.iwant_counts.getOrPut(router.allocator, id) catch return;
             if (!gop.found_existing) {
-                const owned = router.allocator.dupe(u8, id) catch {
+                const rc = router.intern_table.intern(id) orelse {
                     // Undo the placeholder entry (its key aliases borrowed bytes).
                     _ = state.iwant_counts.remove(id);
                     return;
                 };
-                gop.key_ptr.* = owned;
-                gop.value_ptr.* = 0;
+                // Re-key to the interned box's owned bytes (the placeholder key
+                // aliased the borrowed id), then start the count at zero.
+                gop.key_ptr.* = rc.value.bytes;
+                gop.value_ptr.* = .{ .rc = rc, .payload = 0 };
             }
-            gop.value_ptr.* += 1;
+            gop.value_ptr.payload += 1;
         }
 
         /// Handle an inbound IDONTWANT(ids) from `source`: the peer already holds
@@ -2369,9 +2531,9 @@ pub fn Router(comptime Transport: type) type {
         fn recordDontSend(router: *Self, state: *PeerState, id: []const u8, expiry: u64) void {
             if (state.dont_send.contains(id)) return;
             if (state.dont_send.count() >= mesh_params.dont_send_cap) return;
-            const owned = router.allocator.dupe(u8, id) catch return;
-            state.dont_send.put(router.allocator, owned, expiry) catch {
-                router.allocator.free(owned);
+            const rc = router.intern_table.intern(id) orelse return;
+            state.dont_send.put(router.allocator, rc.value.bytes, .{ .rc = rc, .payload = expiry }) catch {
+                rc.release();
             };
         }
 
@@ -3121,30 +3283,34 @@ pub fn Router(comptime Transport: type) type {
             state.topics.deinit(router.allocator);
         }
 
-        /// Free every id key in a peer's IDONTWANT (`dont_send`) map and the map
-        /// itself. Called on teardown so the owned id copies do not leak.
+        /// Release every interned reference in a peer's IDONTWANT (`dont_send`) map
+        /// and deinit the map. Called on teardown so the shared id references this
+        /// peer held are dropped (the id bytes free only if this was the last
+        /// holder across all maps).
         fn freePeerDontSend(router: *Self, state: *PeerState) void {
-            var it = state.dont_send.keyIterator();
-            while (it.next()) |key| router.allocator.free(key.*);
+            var it = state.dont_send.valueIterator();
+            while (it.next()) |entry| entry.rc.release();
             state.dont_send.deinit(router.allocator);
         }
 
-        /// Free every id key in a peer's outstanding IWANT-promise map and the map
-        /// itself. Called on teardown so the owned id copies (those not yet
-        /// fulfilled or harvested) do not leak.
+        /// Release every interned reference in a peer's outstanding IWANT-promise
+        /// map and deinit the map. Called on teardown so the shared id references
+        /// for promises not yet fulfilled or harvested are dropped.
         fn freePeerPromises(router: *Self, state: *PeerState) void {
-            var it = state.iwant_promises.keyIterator();
-            while (it.next()) |key| router.allocator.free(key.*);
+            var it = state.iwant_promises.valueIterator();
+            while (it.next()) |entry| entry.rc.release();
             state.iwant_promises.deinit(router.allocator);
         }
 
-        /// Free every owned id key in a peer's IWANT retransmission-count map and
-        /// empty the map (retaining its capacity). Called each heartbeat to age the
-        /// counts out with the gossip window, and on teardown (followed there by a
-        /// `deinit`). Bounds the map's lifetime to one heartbeat window.
+        /// Release every interned reference in a peer's IWANT retransmission-count
+        /// map and empty the map (retaining its capacity). Called each heartbeat to
+        /// age the counts out with the gossip window, and on teardown (followed
+        /// there by a `deinit`). Bounds the map's lifetime to one heartbeat window.
         fn clearIWantCounts(router: *Self, state: *PeerState) void {
-            var it = state.iwant_counts.keyIterator();
-            while (it.next()) |key| router.allocator.free(key.*);
+            _ = router; // releasing interned ids needs no allocator (kept a method
+            // for call-site symmetry with the other per-peer free helpers).
+            var it = state.iwant_counts.valueIterator();
+            while (it.next()) |entry| entry.rc.release();
             state.iwant_counts.clearRetainingCapacity();
         }
 
@@ -3678,6 +3844,22 @@ fn peerDontSendCount(router: *FakeRouter, peer: PeerId) usize {
 fn peerPromiseCount(router: *FakeRouter, peer: PeerId) usize {
     const state = router.peers.get(peerKey(&peer)) orelse return 0;
     return state.iwant_promises.count();
+}
+
+/// After a `sync`, the number of DISTINCT live interned message ids (one per
+/// allocation). Used to assert id sharing across the four maps. Router-owned
+/// state; read only after `sync`.
+fn internCount(router: *FakeRouter) usize {
+    return router.intern_table.count();
+}
+
+/// After a `sync`, the reference count of the interned box for `id` (0 if the id
+/// is not currently interned). Used to assert that an id held by several maps is
+/// ONE allocation whose refs equal the holder count. Router-owned state; read
+/// only after `sync`.
+fn internRefs(router: *FakeRouter, id: []const u8) usize {
+    const box = router.intern_table.entries.get(id) orelse return 0;
+    return box.refs.load(.monotonic);
 }
 
 /// Build a real OwnedRpc carrying a single subscription, mirroring what the
@@ -8003,4 +8185,159 @@ test "PX consume: an invalid record is rejected (not stored, not dialed); a vali
     try std.testing.expectEqual(@as(usize, 0), log.count(io, b_addr));
     try std.testing.expect(router.getRecord(sealed_c.peer_id) != null);
     try std.testing.expectEqual(@as(usize, 1), log.count(io, c_addr));
+}
+
+// ---------------------------------------------------------------------------
+// Interned message-id tests: the same id in `seen` + a peer's `dont_send` +
+// `iwant_promises` is ONE allocation shared via reference counting, freed only
+// when the last holder releases. These read/mutate router-owned state directly
+// AFTER a `sync` (the router fiber is then parked on the inbox and the tests run
+// with heartbeat_interval_ms = 0, so no concurrent fiber mutates the maps — the
+// same single-fiber-quiescent contract the accessor helpers above rely on).
+// ---------------------------------------------------------------------------
+
+test "interned id shared across seen + dont_send + iwant_promises is one allocation" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+    try sync(router, io); // router parked; its maps are quiescent below.
+
+    const state = router.peers.get(peerKey(&peer)).?;
+    const id = "shared-id-1";
+
+    // Three independent holders intern the SAME id: seen, the peer's dont_send,
+    // and the peer's iwant_promises. Interning coalesces onto one allocation.
+    router.seen.add(id, router.heartbeat_tick);
+    router.recordDontSend(state, id, router.heartbeat_tick +| 5);
+    router.addPromise(state, id);
+
+    // One table entry (one allocation) with three references (one per holder).
+    try std.testing.expectEqual(@as(usize, 1), internCount(router));
+    try std.testing.expectEqual(@as(usize, 3), internRefs(router, id));
+
+    // Drop the dont_send holder: the id survives (still in seen + promises).
+    {
+        const e = state.dont_send.fetchRemove(id).?;
+        e.value.rc.release();
+    }
+    try std.testing.expectEqual(@as(usize, 1), internCount(router));
+    try std.testing.expectEqual(@as(usize, 2), internRefs(router, id));
+
+    // Drop the promises holder: still live in seen alone.
+    {
+        const e = state.iwant_promises.fetchRemove(id).?;
+        e.value.rc.release();
+    }
+    try std.testing.expectEqual(@as(usize, 1), internCount(router));
+    try std.testing.expectEqual(@as(usize, 1), internRefs(router, id));
+
+    // Drop the last holder (seen): the id is freed and the table empties.
+    {
+        const e = router.seen.entries.fetchRemove(id).?;
+        e.value.rc.release();
+    }
+    try std.testing.expectEqual(@as(usize, 0), internCount(router));
+    try std.testing.expectEqual(@as(usize, 0), internRefs(router, id));
+}
+
+test "tearing down a peer releases its id holders; ids also in seen survive" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+    try sync(router, io);
+
+    const state = router.peers.get(peerKey(&peer)).?;
+
+    // `shared` is held by seen AND the peer (dont_send + promises): refs 3.
+    // `peer_only` is held by the peer alone (dont_send): refs 1.
+    const shared = "shared-id";
+    const peer_only = "peer-only-id";
+    router.seen.add(shared, router.heartbeat_tick);
+    router.recordDontSend(state, shared, router.heartbeat_tick +| 5);
+    router.addPromise(state, shared);
+    router.recordDontSend(state, peer_only, router.heartbeat_tick +| 5);
+
+    try std.testing.expectEqual(@as(usize, 2), internCount(router));
+    try std.testing.expectEqual(@as(usize, 3), internRefs(router, shared));
+    try std.testing.expectEqual(@as(usize, 1), internRefs(router, peer_only));
+
+    // Tear the peer down via a disconnect command: its two holders on `shared`
+    // and its one on `peer_only` are released. `peer_only` (no other holder) is
+    // freed and leaves the table; `shared` survives in seen (refs 3 → 1).
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try sync(router, io);
+
+    try std.testing.expectEqual(@as(usize, 1), internCount(router));
+    try std.testing.expectEqual(@as(usize, 1), internRefs(router, shared));
+    try std.testing.expectEqual(@as(usize, 0), internRefs(router, peer_only));
+
+    // Release the surviving seen holder so destroy's empty-table assert holds and
+    // the testing allocator confirms no leak.
+    {
+        const e = router.seen.entries.fetchRemove(shared).?;
+        e.value.rc.release();
+    }
+    try std.testing.expectEqual(@as(usize, 0), internCount(router));
+}
+
+test "intern churn through all four maps + peer teardown empties the table (no leak)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    defer router.destroy();
+    try router.start();
+
+    const peer = testPeer(1);
+    const conn = try connectFakePeer(io, allocator, router, peer);
+    defer destroyFakeConn(allocator, conn);
+    try sync(router, io);
+
+    const state = router.peers.get(peerKey(&peer)).?;
+
+    // Push many distinct ids through all four maps. Each id is interned by up to
+    // four holders; the table holds at most one entry per distinct id.
+    var buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const id = std.fmt.bufPrint(&buf, "churn-{d}", .{i}) catch unreachable;
+        router.seen.add(id, router.heartbeat_tick);
+        router.recordDontSend(state, id, router.heartbeat_tick +| 3);
+        router.addPromise(state, id);
+        router.bumpIWantCount(state, id);
+    }
+    // 200 distinct ids interned (shared across the four maps, not 800 copies).
+    try std.testing.expectEqual(@as(usize, 200), internCount(router));
+
+    // Sweep seen (everything past expiry) and clear the peer's per-heartbeat
+    // count map; both release their references.
+    router.seen.sweep(router.heartbeat_tick +| 1000);
+    router.clearIWantCounts(state);
+
+    // Tear the peer down: dont_send + iwant_promises holders released. With seen
+    // already swept and counts cleared, every id reaches refs 0 and the table is
+    // empty — proving no id leaks and no holder is missed.
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try sync(router, io);
+    try std.testing.expectEqual(@as(usize, 0), internCount(router));
 }
