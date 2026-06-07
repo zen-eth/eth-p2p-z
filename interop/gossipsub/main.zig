@@ -41,6 +41,54 @@ const identity = libp2p.identity;
 const gossipsub = libp2p.gossipsub;
 const identify = libp2p.protocols.identify;
 const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
+const testplans = @import("testplans.zig");
+
+// Pull in testplans.zig's in-file tests when this module is built as a test
+// artifact (`zig build test`).
+test {
+    _ = testplans;
+}
+
+/// Scan args for `--params <path>` (the test-plans framework invocation) and
+/// return the path, or null if absent (keeping the key=value smoke-test mode).
+/// The value may be `--params=<path>` or a separate `--params <path>` token.
+fn testPlansParamsPath(arena: std.mem.Allocator, args: std.process.Args) !?[]const u8 {
+    const slice = try std.process.Args.toSlice(args, arena);
+    var i: usize = 1; // skip program name
+    while (i < slice.len) : (i += 1) {
+        const arg: []const u8 = slice[i];
+        if (std.mem.eql(u8, arg, "--params")) {
+            if (i + 1 < slice.len) return slice[i + 1];
+            return error.MissingParamsValue;
+        }
+        if (std.mem.startsWith(u8, arg, "--params=")) {
+            return arg["--params=".len..];
+        }
+    }
+    return null;
+}
+
+/// Parse the optional local-testing overrides (`--node-id <N>`,
+/// `--connect-localhost`). The framework never passes these, so a real Shadow run
+/// uses all defaults; they let a developer run a loopback mesh without Shadow.
+fn testPlansOptions(arena: std.mem.Allocator, args: std.process.Args) !testplans.Options {
+    var opts = testplans.Options{};
+    const slice = try std.process.Args.toSlice(args, arena);
+    var i: usize = 1;
+    while (i < slice.len) : (i += 1) {
+        const arg: []const u8 = slice[i];
+        if (std.mem.eql(u8, arg, "--node-id")) {
+            if (i + 1 >= slice.len) return error.MissingNodeIdValue;
+            opts.node_id_override = try std.fmt.parseInt(u64, slice[i + 1], 10);
+            i += 1;
+        } else if (std.mem.startsWith(u8, arg, "--node-id=")) {
+            opts.node_id_override = try std.fmt.parseInt(u64, arg["--node-id=".len..], 10);
+        } else if (std.mem.eql(u8, arg, "--connect-localhost")) {
+            opts.connect_localhost = true;
+        }
+    }
+    return opts;
+}
 
 /// How often the publisher republishes its payload (mesh-formation tolerant).
 const publish_interval_ms: u64 = 500;
@@ -288,6 +336,16 @@ pub fn main(init: std.process.Init) !void {
     const runtime = try zio.Runtime.init(allocator, .{ .executors = .exact(executor_count) });
     defer runtime.deinit();
     const io = runtime.io();
+
+    // test-plans mode: when invoked as `<bin> --params <path>` (the official
+    // libp2p gossipsub-interop framework's exact invocation), run as a framework
+    // participant — deterministic key from the Shadow hostname, params.json script,
+    // analyzer-format tracer log. Every other invocation keeps the key=value
+    // smoke-test behavior below unchanged. See testplans.zig.
+    if (try testPlansParamsPath(init.arena.allocator(), init.minimal.args)) |params_path| {
+        const tp_opts = try testPlansOptions(init.arena.allocator(), init.minimal.args);
+        return testplans.run(allocator, io, params_path, tp_opts);
+    }
 
     const args = try Args.parse(init.arena.allocator(), init.minimal.args);
 

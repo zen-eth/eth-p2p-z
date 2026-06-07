@@ -238,6 +238,10 @@ pub const MeshDegree = router_mod.MeshDegree;
 pub const SignaturePolicy = router_mod.SignaturePolicy;
 pub const MessageIdFn = router_mod.MessageIdFn;
 pub const MessageIdConfig = router_mod.MessageIdConfig;
+/// The id bytes a `MessageIdFn` returns (owned, freed by the router). Re-exported
+/// so a caller supplying a custom `message_id_fn` can build its return value
+/// without importing rpc.zig.
+pub const MessageId = pubsub.rpc.MessageId;
 
 const score_mod = @import("score.zig");
 pub const default_score_config: ScoreConfig = .{

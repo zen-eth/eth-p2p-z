@@ -184,6 +184,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_interop_unit_tests = b.addRunArtifact(interop_unit_tests);
 
+    const gossipsub_interop_unit_tests = b.addTest(.{
+        .root_module = gossipsub_interop_module,
+        .filters = filters orelse &.{},
+    });
+    const run_gossipsub_interop_unit_tests = b.addRunArtifact(gossipsub_interop_unit_tests);
+
     // The shared refcount helpers are their own standalone module, so their
     // in-file tests are not reached by refAllDecls on the root module; run them
     // as a dedicated test artifact under `zig build test`.
@@ -198,6 +204,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_libp2p_lib_unit_tests.step);
     test_step.dependOn(&run_libp2p_exe_unit_tests.step);
     test_step.dependOn(&run_interop_unit_tests.step);
+    test_step.dependOn(&run_gossipsub_interop_unit_tests.step);
 
     // Multi-executor integration tests for the Layer-0 IO primitives. Runs on a
     // real zio.Runtime (>=2 executors), unlike the in-file std.Io.Threaded unit

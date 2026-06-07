@@ -103,6 +103,21 @@ pub const KeyPair = struct {
         };
     }
 
+    /// Builds an Ed25519 KeyPair deterministically from a raw 32-byte seed (the
+    /// Ed25519 private seed). The same seed always yields the same key — and the
+    /// same libp2p peer-id — so independently-running nodes (across languages) can
+    /// agree on each other's identity without coordination. The encoding matches
+    /// Go's `ed25519.NewKeyFromSeed(seed)` + `crypto.UnmarshalEd25519PrivateKey`,
+    /// so the peer-id is byte-identical to go-libp2p's for the same seed.
+    pub fn fromEd25519Seed(seed: []const u8) Error!Self {
+        const pkey = tls.ed25519KeyFromSeed(seed) catch return error.OpenSSLFailed;
+        return .{
+            .key_type = .ED25519,
+            .backend = .tls,
+            .storage = .{ .tls = pkey },
+        };
+    }
+
     /// Creates a KeyPair that takes ownership of the provided TLS key.
     pub fn fromTlsOwned(key_type: keys.KeyType, pkey: *ssl.EVP_PKEY) Self {
         return .{
@@ -186,3 +201,36 @@ pub const KeyPair = struct {
         return PeerId.fromPublicKey(allocator, &public_key);
     }
 };
+
+test "deterministic Ed25519 seed peer-id matches go-libp2p" {
+    // Cross-implementation contract: a node identity is an Ed25519 key whose
+    // 32-byte seed is `little-endian(nodeId)` in the first 8 bytes, zero after
+    // (Go's `ed25519.NewKeyFromSeed(seed)`). The derived libp2p peer-id MUST be
+    // byte-identical across implementations so nodes compute each other's
+    // peer-id without coordination. go-libp2p's own test pins the SHA-256 of the
+    // `>nodeId:peerIdBase58\n` lines for nodeId 0..9999 to this hash; reproduce
+    // it here to prove our seed->key->peer-id path matches go-libp2p exactly.
+    const allocator = std.testing.allocator;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var line_buf: [128]u8 = undefined;
+    var node_id: u64 = 0;
+    while (node_id < 10_000) : (node_id += 1) {
+        var seed = [_]u8{0} ** 32;
+        std.mem.writeInt(u64, seed[0..8], node_id, .little);
+        var kp = try KeyPair.fromEd25519Seed(&seed);
+        defer kp.deinit();
+        const pid = try kp.peerId(allocator);
+        const pid_str = try pid.toString(allocator);
+        defer allocator.free(pid_str);
+        const line = try std.fmt.bufPrint(&line_buf, ">{d}:{s}\n", .{ node_id, pid_str });
+        hasher.update(line);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    var hex_buf: [64]u8 = undefined;
+    const hex = try std.fmt.bufPrint(&hex_buf, "{x}", .{&digest});
+    try std.testing.expectEqualStrings(
+        "11395ea896d00ca25f7f648ebb336488ee092096a5498d90d76b92eaec27867a",
+        hex,
+    );
+}

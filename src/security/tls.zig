@@ -230,6 +230,23 @@ pub fn generateKeyPair(cert_key_type: keys.KeyType) !*ssl.EVP_PKEY {
     return maybe_subject_keypair orelse return error.OpenSSLFailed;
 }
 
+/// Builds an Ed25519 EVP_PKEY from a raw 32-byte seed (the Ed25519 private seed,
+/// i.e. the scalar input to key generation). This is the deterministic-key
+/// counterpart to `generateKeyPair(.ED25519)`: the same seed always yields the
+/// same key, and the encoding matches Go's `ed25519.NewKeyFromSeed(seed)` (Go's
+/// "seed" is exactly this 32-byte private seed), so the derived libp2p peer-id is
+/// byte-identical across implementations. The caller owns the returned key and
+/// must free it with `ssl.EVP_PKEY_free()`.
+pub fn ed25519KeyFromSeed(seed: []const u8) !*ssl.EVP_PKEY {
+    if (seed.len != 32) return error.InvalidKeyLength;
+    return ssl.EVP_PKEY_new_raw_private_key(
+        ssl.EVP_PKEY_ED25519,
+        null, // engine parameter (not used)
+        seed.ptr,
+        seed.len,
+    ) orelse error.OpenSSLFailed;
+}
+
 /// Builds a self-signed X.509 certificate suitable for libp2p's TLS handshake,
 /// The caller owns the returned certificate and must free it with ssl.X509.free().
 ///
