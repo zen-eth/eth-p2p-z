@@ -614,7 +614,7 @@ fn runListener(
     var px_future = try std.Io.concurrent(io, PeerCountMonitor.run, .{&px_monitor});
     defer px_future.cancel(io);
 
-    try runForDuration(io, gs, args);
+    try runForDuration(io, allocator, gs, args);
 
     // Graceful quiesce of inbound accepts: `Switch.closeListener` closes the
     // accept queue, so an accept fiber parked in `accept()` wakes with
@@ -878,7 +878,7 @@ fn runDialer(
     var px_future = try std.Io.concurrent(io, PeerCountMonitor.run, .{&px_monitor});
     defer px_future.cancel(io);
 
-    try runForDuration(io, gs, args);
+    try runForDuration(io, allocator, gs, args);
 
     // Emit the result and hard-exit, matching the listener path so every node
     // terminates promptly. A dialer has no blocking accept fiber, but hard-exiting
@@ -902,18 +902,25 @@ fn runDialer(
 /// (hence a fresh content-id) and propagates once the mesh is up. The suffix is
 /// `#<n>`, so a subscriber asserts on the message PREFIX. Signed publishes carry
 /// a fresh seqno each time, so they keep the plain payload.
-fn runForDuration(io: std.Io, gs: *gossipsub.Gossipsub, args: *const Args) !void {
+fn runForDuration(io: std.Io, allocator: std.mem.Allocator, gs: *gossipsub.Gossipsub, args: *const Args) !void {
     if (args.mode != .publish) {
         try timeoutFromMs(args.duration_ms).sleep(io);
         return;
     }
 
-    var msg_buf: [max_print_len]u8 = undefined;
+    // The anonymous anti-dedup suffix ("#<seq>") must fit the FULL payload plus
+    // the suffix. A fixed max_print_len buffer silently truncated large payloads
+    // (bufPrint overflow -> `catch args.message`), so every large anonymous
+    // publish fell back to the identical plain payload, the content-id never
+    // changed, and the seen-cache suppressed all but the (pre-mesh) first publish
+    // -> a large anonymous message never propagated. Size to the payload instead.
+    const msg_buf = try allocator.alloc(u8, args.message.len + 32);
+    defer allocator.free(msg_buf);
     var seq: u64 = 0;
     var elapsed_ms: u64 = 0;
     while (elapsed_ms < args.duration_ms) : (elapsed_ms += publish_interval_ms) {
         const payload: []const u8 = if (args.sign == .anonymous)
-            std.fmt.bufPrint(&msg_buf, "{s}#{d}", .{ args.message, seq }) catch args.message
+            std.fmt.bufPrint(msg_buf, "{s}#{d}", .{ args.message, seq }) catch args.message
         else
             args.message;
         seq += 1;
