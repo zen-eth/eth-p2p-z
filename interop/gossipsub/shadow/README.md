@@ -7,20 +7,34 @@ receive the message. Passing this proves the **zio runtime (epoll backend) + the
 QUIC stack run under Shadow** — the gating unknown before adding a zig
 participant to the upstream gossipsub-interop framework.
 
-> Shadow is Linux-only. macOS cannot run it. Build and run this on a Linux host
-> (or a Linux VM / CI runner) with Docker.
+> **Shadow runs only on Linux x86-64.** It does NOT support macOS, and it does
+> NOT support arm64/aarch64 (per Shadow's supported-platforms docs). Run this on
+> an **x86-64 Linux host** — a cloud VM, an x86-64 Linux box, or x86-64 CI (e.g.
+> GitHub Actions `ubuntu-latest`, which is where the upstream interop runs).
+>
+> On an Apple-Silicon / arm64 machine, Docker's Linux VM is arm64, so Shadow
+> cannot run there even in a container. Forcing `--platform linux/amd64` runs the
+> whole stack under x86-64 emulation (Rosetta/qemu), which Shadow's ptrace/seccomp
+> interception does not reliably support — use a real x86-64 Linux host instead.
 
 ## One command
 
-From the **repository root** (the Docker build needs the whole source tree):
+From the **repository root** (the Docker build needs the whole source tree), on
+an **x86-64 Linux host**:
 
 ```sh
 docker build -f interop/gossipsub/shadow/Dockerfile -t zig-gs-shadow . \
-  && docker run --rm --cap-add=SYS_PTRACE --security-opt seccomp=unconfined zig-gs-shadow
+  && docker run --rm \
+       --shm-size=2g \
+       --cap-add=SYS_PTRACE \
+       --security-opt seccomp=unconfined \
+       zig-gs-shadow
 ```
 
 The `docker run` flags matter:
 
+- `--shm-size=2g` — Shadow keeps its simulated process memory in `/dev/shm`; the
+  default 64 MB is far too small and Shadow fails to start without this.
 - `--cap-add=SYS_PTRACE` — Shadow intercepts managed processes via ptrace.
 - `--security-opt seccomp=unconfined` — Shadow makes syscalls the default Docker
   seccomp profile blocks. (The node itself uses the epoll backend specifically so

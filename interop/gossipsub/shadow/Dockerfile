@@ -47,9 +47,13 @@ RUN apt-get update \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+# Arch-aware: in the Linux container `uname -m` is `aarch64` or `x86_64`, which
+# matches Zig's release tarball naming (zig-<arch>-linux-<version>). This lets the
+# image build natively on both arm64 (e.g. Apple-Silicon Docker) and x86_64 CI.
+RUN ARCH="$(uname -m)" \
+    && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" \
     | tar -xJ -C /opt \
-    && mv "/opt/zig-x86_64-linux-${ZIG_VERSION}" /opt/zig
+    && mv "/opt/zig-${ARCH}-linux-${ZIG_VERSION}" /opt/zig
 
 # Rust is needed to build the vendored quiche crate (cdylib/staticlib) that the
 # QUIC stack links against — same as the transport interop Dockerfile.
@@ -66,7 +70,7 @@ COPY . .
 # blocked by the default container seccomp profile. shadow_compatible mode (the
 # plain recvmsg/sendmsg UDP path with no GRO/GSO/IP_PKTINFO/timestamp cmsgs) is
 # selected at runtime by the node's shadow=on arg — see shadow.yaml.
-RUN zig build install -Doptimize=ReleaseFast -Dcpu=x86_64 -Dzio-backend=epoll -Dlog-level=${ZIG_LOG_LEVEL}
+RUN zig build install -Doptimize=ReleaseFast -Dzio-backend=epoll -Dlog-level=${ZIG_LOG_LEVEL}
 
 # ---------------------------------------------------------------------------
 # Stage 2: build Shadow from source.
