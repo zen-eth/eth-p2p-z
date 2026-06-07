@@ -792,6 +792,17 @@ pub fn Router(comptime Transport: type) type {
         /// disconnect. Without a matching PeerState an entry is a transient note,
         /// not a leak — disconnect always purges it. Keyed like `peers`.
         peer_versions: std.AutoHashMap(PeerKey, pubsub.Version),
+        /// Topic subscriptions a peer announced on its inbound stream BEFORE its
+        /// `peer_connected` arrived (the same independent-fiber race that
+        /// `peer_versions` handles). Each value is the set of topics the peer is
+        /// currently subscribed to (its own owned key copies); `peer_connected`
+        /// drains it into the new PeerState's `topics` and removes the entry.
+        /// Without this the early SUBSCRIBE is dropped (the peer is untracked) and
+        /// never re-sent, so the peer is never recorded as a subscriber — it is
+        /// excluded from flood-publish targets AND mesh GRAFT candidates, and an
+        /// all-same-impl network fails to propagate. Keyed like `peers`; purged on
+        /// disconnect.
+        pending_subscriptions: std.AutoHashMap(PeerKey, std.StringHashMapUnmanaged(void)),
         /// Direct (explicit) peers — the go-libp2p `direct` set. A peer whose key
         /// is in here is treated as a trusted out-of-mesh forward target: it
         /// receives every valid message on a topic it subscribes to, is never
@@ -1022,6 +1033,7 @@ pub fn Router(comptime Transport: type) type {
                 .inbox = std.Io.Queue(Command).init(inbox_storage),
                 .peers = std.AutoHashMap(PeerKey, *PeerState).init(allocator),
                 .peer_versions = std.AutoHashMap(PeerKey, pubsub.Version).init(allocator),
+                .pending_subscriptions = std.AutoHashMap(PeerKey, std.StringHashMapUnmanaged(void)).init(allocator),
                 // `intern_table`, `seen`, and `message_cache` are wired up just
                 // below: `seen` and `message_cache` each hold a `*InternTable` into
                 // `router.intern_table`, which only has a stable address once
@@ -1163,6 +1175,15 @@ pub fn Router(comptime Transport: type) type {
 
             router.peers.deinit();
             router.peer_versions.deinit();
+            // Free any pre-connect subscription stashes no `peer_connected` drained
+            // (each inner set owns its topic-key copies).
+            var pend_it = router.pending_subscriptions.valueIterator();
+            while (pend_it.next()) |set| {
+                var kit = set.keyIterator();
+                while (kit.next()) |tkey| router.allocator.free(tkey.*);
+                set.deinit(router.allocator);
+            }
+            router.pending_subscriptions.deinit();
             // Free each direct peer's owned dial-address copy before the map.
             var direct_it = router.direct.valueIterator();
             while (direct_it.next()) |addr| router.allocator.free(addr.*);
@@ -1790,6 +1811,22 @@ pub fn Router(comptime Transport: type) type {
                 state.protocol_version = kv.value;
             }
 
+            // Adopt subscriptions the peer announced before this connect (stashed
+            // by applyPeerSubscription because the PeerState did not exist yet).
+            // Apply each now that it does, then free the stash. Without this the
+            // early SUBSCRIBE is lost and the peer is never seen as a subscriber,
+            // so it is excluded from flood-publish + mesh GRAFT (all-same-impl
+            // networks then fail to propagate).
+            if (router.pending_subscriptions.fetchRemove(key)) |kv| {
+                var set = kv.value;
+                var kit = set.keyIterator();
+                while (kit.next()) |tkey| {
+                    router.applyPeerSubscription(peer, tkey.*, true);
+                    router.allocator.free(tkey.*);
+                }
+                set.deinit(router.allocator);
+            }
+
             // Begin scoring the peer (a brand-new entry, or a re-activation of a
             // recently-disconnected one retained for its score) and record its
             // remote IP for the P6 colocation term. The IP is the peer's address
@@ -1889,7 +1926,13 @@ pub fn Router(comptime Transport: type) type {
         /// frames carry ids, so control/subscribe pushes are never skipped.
         fn pushTo(router: *Self, state: *PeerState, lane: peer_io.Lane, frame: *peer_io.OutboundFrame) void {
             for (frame.message_ids) |id| {
-                if (state.dont_send.contains(id)) return;
+                if (state.dont_send.contains(id)) {
+                    if (std.c.getenv("GS_DEBUG") != null) std.log.info("GS_DEBUG pushTo SKIP lane={s} (dont_send)", .{@tagName(lane)});
+                    return;
+                }
+            }
+            if (std.c.getenv("GS_DEBUG") != null and lane == .data) {
+                std.log.info("GS_DEBUG pushTo PUSH data frame bytes={d}", .{frame.bytes.len});
             }
             frame.retain();
             state.queue.push(router.io, lane, frame) catch frame.release();
@@ -1910,6 +1953,9 @@ pub fn Router(comptime Transport: type) type {
         /// genuinely multi-allocation scratch on this path, so it goes in a
         /// per-command arena that is freed in one shot — no per-entry bookkeeping.
         fn sendCurrentSubscriptions(router: *Self, state: *PeerState) void {
+            if (std.c.getenv("GS_DEBUG") != null) {
+                std.log.info("GS_DEBUG sendCurrentSubscriptions my_topics={d} peers={d}", .{ router.my_topics.count(), router.peers.count() });
+            }
             if (router.my_topics.count() == 0) return;
 
             var arena = std.heap.ArenaAllocator.init(router.allocator);
@@ -1935,6 +1981,14 @@ pub fn Router(comptime Transport: type) type {
             // tracked (an inbound stream reported a version but peer_connected
             // never arrived), so it can't outlive the connection.
             _ = router.peer_versions.remove(key);
+            // Drop any undrained pre-connect subscription stash too (it must not
+            // outlive the connection); free the inner set's topic keys first.
+            if (router.pending_subscriptions.fetchRemove(key)) |kv| {
+                var set = kv.value;
+                var kit = set.keyIterator();
+                while (kit.next()) |tkey| router.allocator.free(tkey.*);
+                set.deinit(router.allocator);
+            }
             const entry = router.peers.fetchRemove(key) orelse return;
             router.dropPeerFromMeshAndFanout(peer);
             router.teardownPeer(entry.value);
@@ -2107,6 +2161,22 @@ pub fn Router(comptime Transport: type) type {
 
             router.maintainMeshes();
             router.maintainFanout();
+
+            // TEMP DEBUG: log mesh/subscription state per topic each heartbeat.
+            if (std.c.getenv("GS_DEBUG") != null) {
+                var tit = router.my_topics.keyIterator();
+                while (tit.next()) |tk| {
+                    const topic = tk.*;
+                    var subs: usize = 0;
+                    var pit = router.peers.valueIterator();
+                    while (pit.next()) |st| {
+                        if (st.*.topics.contains(topic)) subs += 1;
+                    }
+                    std.log.info("GS_DEBUG tick={d} topic={s} peers={d} subscribers={d} mesh={d}", .{
+                        tick, topic, router.peers.count(), subs, router.meshSize(topic),
+                    });
+                }
+            }
 
             // Advertise recently-cached message ids (IHAVE) to gossip-eligible
             // non-mesh peers BEFORE sliding the window: emission reads the
@@ -2382,6 +2452,9 @@ pub fn Router(comptime Transport: type) type {
 
             // Published messages: dedup, deliver locally, forward over the mesh.
             while (reader.publishNext()) |msg| {
+                if (std.c.getenv("GS_DEBUG") != null) {
+                    std.log.info("GS_DEBUG onInboundRpc got publish topic={s} data_len={d}", .{ msg.getTopic(), msg.getData().len });
+                }
                 router.handleIncomingMessage(
                     source,
                     msg.getFrom(),
@@ -2862,7 +2935,18 @@ pub fn Router(comptime Transport: type) type {
         /// owned key copy (no-op if already present); unsubscribe removes + frees
         /// the stored key.
         fn applyPeerSubscription(router: *Self, source: PeerId, topic: []const u8, subscribe: bool) void {
-            const state = router.peers.get(peerKey(&source)) orelse return;
+            if (std.c.getenv("GS_DEBUG") != null) {
+                std.log.info("GS_DEBUG applyPeerSubscription topic={s} subscribe={} tracked={}", .{ topic, subscribe, router.peers.contains(peerKey(&source)) });
+            }
+            const state = router.peers.get(peerKey(&source)) orelse {
+                // The peer's SUBSCRIBE arrived before its `peer_connected` (the
+                // inbound-stream-vs-peer-event race). Stash it so `peer_connected`
+                // applies it once the PeerState exists, rather than dropping it —
+                // it is never re-sent, so a drop permanently loses the peer's
+                // subscription. Mirrors the `peer_versions` stash.
+                router.stashPendingSubscription(source, topic, subscribe);
+                return;
+            };
             if (subscribe) {
                 if (state.topics.contains(topic)) return;
                 const key = router.allocator.dupe(u8, topic) catch return;
@@ -2871,6 +2955,25 @@ pub fn Router(comptime Transport: type) type {
                     return;
                 };
             } else if (state.topics.fetchRemove(topic)) |kv| {
+                router.allocator.free(kv.key);
+            }
+        }
+
+        /// Record a subscription change from a not-yet-tracked peer (see
+        /// `pending_subscriptions`): `subscribe` adds the topic to the peer's
+        /// pending set, unsubscribe removes it, so a sub-then-unsub before connect
+        /// nets out. Best-effort — a failed alloc just drops that one note (no leak,
+        /// no corruption; the peer simply isn't recorded for that topic, the same
+        /// outcome as before this stash existed).
+        fn stashPendingSubscription(router: *Self, source: PeerId, topic: []const u8, subscribe: bool) void {
+            const key = peerKey(&source);
+            const gop = router.pending_subscriptions.getOrPut(key) catch return;
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            if (subscribe) {
+                if (gop.value_ptr.contains(topic)) return;
+                const tkey = router.allocator.dupe(u8, topic) catch return;
+                gop.value_ptr.put(router.allocator, tkey, {}) catch router.allocator.free(tkey);
+            } else if (gop.value_ptr.fetchRemove(topic)) |kv| {
                 router.allocator.free(kv.key);
             }
         }
@@ -3364,6 +3467,9 @@ pub fn Router(comptime Transport: type) type {
                 router.allocator.free(key);
                 return;
             };
+            if (std.c.getenv("GS_DEBUG") != null) {
+                std.log.info("GS_DEBUG onSubscribe topic={s} announcing_to_peers={d}", .{ topic, router.peers.count() });
+            }
             router.announceSubscription(topic, true);
 
             // Seed the mesh from any existing fanout peers (we were publishing to
@@ -3522,6 +3628,9 @@ pub fn Router(comptime Transport: type) type {
             if (router.flood_publish) {
                 var flood_set = router.floodTargets(topic);
                 defer flood_set.deinit(router.allocator);
+                if (std.c.getenv("GS_DEBUG") != null) {
+                    std.log.info("GS_DEBUG onPublish topic={s} peers={d} flood_targets={d} mesh={d}", .{ topic, router.peers.count(), flood_set.count(), router.meshSize(topic) });
+                }
                 router.cacheAndForward(&flood_set, null, from, seqno, topic, data, sig, key, id.bytes);
                 return;
             }
@@ -4089,6 +4198,38 @@ test "router frees an inbound RPC (peer tracked and peer absent)" {
 
     // Disconnect to flush + tear down; on test exit destroy() drains any leftover
     // inbox commands. std.testing.allocator confirms both RPCs were freed.
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try std.testing.expect(waitFor(io, peerCountIsZero, router));
+}
+
+test "router retains a SUBSCRIBE that arrives before peer_connected (race stash)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    try router.start();
+
+    const peer = try PeerId.random();
+    const conn = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
+
+    // The race: a peer's SUBSCRIBE arrives on its inbound stream BEFORE its
+    // peer_connected (the two fire on independent fibers). Pre-fix the
+    // subscription was dropped (peer untracked) and never re-sent, so the peer was
+    // never recorded as a topic subscriber — excluding it from flood-publish AND
+    // mesh GRAFT. The stash must retain it and peer_connected must apply it.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = peer, .rpc = try buildInboundRpc(allocator, "race-topic") } });
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
+    try sync(router, io);
+
+    // The early SUBSCRIBE must have landed on the now-tracked PeerState's topics
+    // (so the peer is a flood-publish target + a GRAFT candidate for the topic).
+    const st = router.peers.get(peerKey(&peer)) orelse return error.PeerNotTracked;
+    try std.testing.expect(st.topics.contains("race-topic"));
+
     try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
 }
