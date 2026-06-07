@@ -120,3 +120,64 @@ The node logic and the Shadow-compatible UDP path are verified on macOS (the
 shadow-mode 2-node interop passes there over loopback QUIC). The epoll backend
 build and the Shadow run itself can only be exercised on Linux — that is exactly
 what this image + command do.
+
+## Mixed go+zig mesh (arm64)
+
+`Dockerfile.arm.mixed` + `shadow-mixed.yaml` + `run-shadow-mixed.sh` extend the
+zig-only de-risk into a 4-node go+zig mesh on the prebuilt arm64 Shadow base
+(`kamilsa/shadow-arm`): node0 zig bootstrap (listen+sub), node1 go (sub), node2
+go (publish), node3 zig (sub). A go publish must reach all subscribers across the
+zig↔go boundary over QUIC under Shadow.
+
+```sh
+docker build --platform linux/arm64 \
+  -f interop/gossipsub/shadow/Dockerfile.arm.mixed -t zig-gs-shadow-mixed . \
+  && docker run --rm --platform linux/arm64 \
+       --security-opt seccomp=unconfined --shm-size=4g zig-gs-shadow-mixed
+```
+
+### Result: go AND zig gossip over QUIC under Shadow (verified, arm64)
+
+A run on `kamilsa/shadow-arm` (the arm64 Shadow build this image uses) PASSES:
+the go publisher's message reaches both go and zig subscribers over QUIC.
+
+```
+PASS: node0 received the publish over QUIC under Shadow   (zig)
+PASS: node1 received the publish over QUIC under Shadow   (go)
+PASS: node3 received the publish over QUIC under Shadow   (zig)
+PASS: cross-impl go+zig gossipsub propagated over QUIC under Shadow
+```
+
+`sim-stats.json` syscall counts for the run: `sendmsg`/`recvmsg` (the zig node's
+Shadow-compat path plus quic-go), `recvfrom`/`sendto`, `setsockopt`/`getsockopt`
+(succeeded — no transport abort), and notably **`recvmmsg`** (quic-go's batched
+read path), all handled by this Shadow build. No `sendmmsg`.
+
+#### Why go-libp2p / quic-go works here (and the caveat)
+
+quic-go does NOT have an explicit Shadow mode like the zig node's
+`shadow_compatible`. Whether it runs under Shadow depends entirely on the Shadow
+build's syscall coverage, because quic-go has **no fallback** to a plain
+`recvmsg`/`sendmsg` path: a `*net.UDPConn` is always treated as OOB-capable, so
+it goes through `setDF` (`IP_MTU_DISCOVER`), `newConn` (`IP_RECVTOS`/ECN), and an
+`oobConn.ReadPacket` that always calls `ReadBatch` → `recvmmsg` on Linux. None of
+these are gated by the env knobs (`QUIC_GO_DISABLE_GSO`,
+`QUIC_GO_DISABLE_ECN`, `QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING`), which only
+affect send-side GSO, ECN reading, and a log line.
+
+This `kamilsa/shadow-arm` build supports those syscalls (the run above proves it,
+with a non-zero `recvmmsg` count and a successful handshake), so quic-go works
+unmodified. The `QUIC_GO_DISABLE_*` env on the go nodes is kept as
+belt-and-suspenders.
+
+CAVEAT: Shadow's behaviour here is build-specific. The upstream Shadow **v3.3.0
+source tag** does NOT implement `recvmmsg`/`sendmmsg` (they hit the
+unsupported-syscall path → `ENOSYS`) and its UDP `setsockopt` implements only
+`SO_SNDBUF`/`SO_RCVBUF`/`SO_BROADCAST` (everything else → `ENOPROTOOPT`). On such
+a Shadow, quic-go would abort at transport setup with no env fix — which is why
+the upstream gossipsub-interop framework runs go-libp2p over **TCP** under Shadow
+(`go-libp2p/main.go`: `// TODO support QUIC in Shadow`). If you swap the Shadow
+base for one without `recvmmsg`/ECN setsockopt support, expect the go nodes to
+fail; `run-shadow-mixed.sh` prints the syscall diagnostics so the cause is
+visible. The zig node, with its explicit `shadow_compatible` mode, is robust
+across Shadow builds.

@@ -46,6 +46,7 @@ type args struct {
 	port       string
 	peer       string // a single peer multiaddr (kept for two-node runs)
 	peers      string // comma-separated peer multiaddrs for mesh runs
+	peerFile   string // poll this file for a peer multiaddr (Shadow shared-FS coordination)
 	addrFile   string
 	topic      string
 	message    string
@@ -56,6 +57,7 @@ type args struct {
 	dHigh      int    // mesh upper bound (Dhi); 0 = default. Lower it so a tiny topology over-degree-prunes WITH PX.
 	d          int    // mesh target degree (D); 0 = default
 	dLow       int    // mesh lower bound (Dlo); 0 = default
+	announce   string // when set, bind 0.0.0.0 and advertise this IP (Shadow assigns one IP per host)
 }
 
 // dialTargets returns every peer multiaddr to dial: each comma-separated entry
@@ -99,6 +101,8 @@ func parseArgs() args {
 			a.peer = val
 		case "peers":
 			a.peers = val
+		case "peer_file":
+			a.peerFile = val
 		case "addr_file":
 			a.addrFile = val
 		case "topic":
@@ -119,6 +123,8 @@ func parseArgs() args {
 			fmt.Sscanf(val, "%d", &a.d)
 		case "d_low":
 			fmt.Sscanf(val, "%d", &a.dLow)
+		case "announce":
+			a.announce = val
 		default:
 			fatalf("unknown argument key %q", key)
 		}
@@ -129,8 +135,8 @@ func parseArgs() args {
 	if a.mode != "pub" && a.mode != "sub" {
 		fatalf("mode must be pub|sub, got %q", a.mode)
 	}
-	if a.role == "dial" && a.peer == "" && a.peers == "" {
-		fatalf("dial role requires peer=<multiaddr> or peers=<ma1>,<ma2>,...")
+	if a.role == "dial" && a.peer == "" && a.peers == "" && a.peerFile == "" {
+		fatalf("dial role requires peer=<multiaddr>, peers=<ma1>,<ma2>,... or peer_file=<path>")
 	}
 	return a
 }
@@ -239,10 +245,17 @@ func newHost(a args) host.Host {
 	if err != nil {
 		fatalf("generate key: %v", err)
 	}
-	listen := fmt.Sprintf("/ip4/127.0.0.1/udp/%s/quic-v1", a.port)
+	// Default: loopback (multi-node localhost runs). Under Shadow each host has a
+	// single assigned IP and no loopback aliasing across hosts, so announce=<ip>
+	// binds 0.0.0.0 (accept on the host IP) and the listener advertises <ip>.
+	bindIP := "127.0.0.1"
+	if a.announce != "" {
+		bindIP = "0.0.0.0"
+	}
+	listen := fmt.Sprintf("/ip4/%s/udp/%s/quic-v1", bindIP, a.port)
 	if a.role == "dial" {
 		// A dialer still needs a transport-bound host; bind an ephemeral port.
-		listen = "/ip4/127.0.0.1/udp/0/quic-v1"
+		listen = fmt.Sprintf("/ip4/%s/udp/0/quic-v1", bindIP)
 	}
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
@@ -337,15 +350,25 @@ func runListener(h host.Host, a args) {
 		fatalf("p2p component: %v", err)
 	}
 	var full multiaddr.Multiaddr
-	for _, addr := range h.Addrs() {
-		// Prefer the loopback quic-v1 address.
-		if strings.Contains(addr.String(), "127.0.0.1") && strings.Contains(addr.String(), "quic-v1") {
-			full = addr.Encapsulate(p2pComponent)
-			break
+	if a.announce != "" {
+		// Shadow: bind is 0.0.0.0, so h.Addrs() reports the unspecified address.
+		// Advertise the assigned host IP on the configured port instead.
+		ann, err := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%s/quic-v1", a.announce, a.port))
+		if err != nil {
+			fatalf("build announce multiaddr: %v", err)
+		}
+		full = ann.Encapsulate(p2pComponent)
+	} else {
+		for _, addr := range h.Addrs() {
+			// Prefer the loopback quic-v1 address.
+			if strings.Contains(addr.String(), "127.0.0.1") && strings.Contains(addr.String(), "quic-v1") {
+				full = addr.Encapsulate(p2pComponent)
+				break
+			}
 		}
 	}
 	if full == nil {
-		fatalf("no loopback quic-v1 listen address found in %v", h.Addrs())
+		fatalf("no quic-v1 listen address found in %v", h.Addrs())
 	}
 	fmt.Printf("listener advertising %s\n", full)
 	if a.addrFile != "" {
@@ -355,7 +378,41 @@ func runListener(h host.Host, a args) {
 	}
 }
 
+// readPeerFile polls path until it holds a non-empty first line (a peer
+// multiaddr), returning it. Under Shadow the bootstrap writes its addr to a
+// shared-FS file after binding; a dialer that starts concurrently polls for it.
+func readPeerFile(ctx context.Context, path string) (string, error) {
+	for {
+		if data, err := os.ReadFile(path); err == nil {
+			if line := strings.TrimSpace(strings.SplitN(string(data), "\n", 2)[0]); line != "" {
+				return line, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("peer_file %q never became readable", path)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 func runDialer(ctx context.Context, h host.Host, a args) {
+	// If a peer_file was given, poll it for the bootstrap multiaddr and fold it
+	// into the dial set (Shadow shared-FS coordination, mirroring the zig node).
+	if a.peerFile != "" {
+		waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		addr, err := readPeerFile(waitCtx, a.peerFile)
+		cancel()
+		if err != nil {
+			fatalf("peer_file: %v", err)
+		}
+		if a.peers == "" {
+			a.peers = addr
+		} else {
+			a.peers = a.peers + "," + addr
+		}
+	}
+
 	// Connect to every configured peer. gossipsub forms a mesh over whatever
 	// connections exist, so a node that dials several peers can graft into a
 	// mesh spanning all of them. A failed dial to one peer does not abort the

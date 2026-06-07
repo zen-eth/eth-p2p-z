@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1
+#
+# arm64 MIXED-implementation Shadow image: our zig gossipsub-interop node PLUS a
+# go-libp2p (quic-go) peer, both dropped into the prebuilt arm64 Shadow base
+# (`kamilsa/shadow-arm`, Ubuntu 24.04 + Shadow 3.3.0). The mixed shadow.yaml runs
+# a small go+zig mesh so a published message must cross the zig<->go boundary
+# over QUIC under Shadow.
+#
+# The zig-only sibling (Dockerfile.arm) stays the canonical de-risk; this image is
+# additive and does not change it.
+#
+# Build context is the REPO ROOT:
+#   docker build --platform linux/arm64 \
+#     -f interop/gossipsub/shadow/Dockerfile.arm.mixed -t zig-gs-shadow-mixed .
+# Run (seccomp=unconfined lets Shadow ptrace; /dev/shm holds its process mem):
+#   docker run --rm --platform linux/arm64 \
+#     --security-opt seccomp=unconfined --shm-size=4g zig-gs-shadow-mixed
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG ZIG_VERSION=0.16.0
+ARG RUST_VERSION=1.85.1
+ARG GO_VERSION=1.24.0
+ARG ZIG_LOG_LEVEL=info
+ARG SHADOW_ARM_IMAGE=kamilsa/shadow-arm:latest
+
+# ---------------------------------------------------------------------------
+# Stage 1: build the zig gossipsub interop node with the epoll backend.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS zig-build
+
+ARG DEBIAN_FRONTEND
+ARG ZIG_VERSION
+ARG RUST_VERSION
+ARG ZIG_LOG_LEVEL
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        xz-utils \
+        git \
+        build-essential \
+        cmake \
+        ninja-build \
+        pkg-config \
+        perl \
+        python3 \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ARCH="$(uname -m)" \
+    && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" \
+    | tar -xJ -C /opt \
+    && mv "/opt/zig-${ARCH}-linux-${ZIG_VERSION}" /opt/zig
+
+RUN curl -fsSL https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}"
+
+ENV PATH="/root/.cargo/bin:/opt/zig:${PATH}"
+
+WORKDIR /app
+COPY . .
+
+# epoll backend (Shadow intercepts epoll/recvmsg/sendmsg; no io_uring). The
+# Shadow-compatible UDP path is selected at runtime by shadow=on.
+RUN zig build install -Doptimize=ReleaseFast -Dzio-backend=epoll -Dlog-level=${ZIG_LOG_LEVEL}
+
+# ---------------------------------------------------------------------------
+# Stage 2: build the go-libp2p (quic-go) peer for the native (arm64) arch.
+# Needs network for the module download (GOPROXY); deps are pinned in go.sum.
+# ---------------------------------------------------------------------------
+FROM golang:${GO_VERSION}-bookworm AS go-build
+
+# Module source. proxy.golang.org returns 502 (Bad Gateway) from some networks
+# even on .zip fetches, so prefer a reliable mirror first, then proxy, then
+# direct VCS. Override at build time with --build-arg GOPROXY=... if needed.
+ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
+ENV GOFLAGS=-mod=mod
+
+WORKDIR /src
+COPY interop/gossipsub/go-peer/ ./
+# Prime the FULL build closure (all transitive module zips, not just direct
+# deps) before the build, retried, so a transient proxy error does not abort the
+# image. `go mod download all` fetches what `go build` will need.
+RUN for i in 1 2 3 4 5; do go mod download all && break || sleep 5; done
+RUN go build -o /out/gspeer .
+
+# ---------------------------------------------------------------------------
+# Stage 3: runtime = the prebuilt arm64 Shadow image.
+# ---------------------------------------------------------------------------
+FROM ${SHADOW_ARM_IMAGE} AS runtime
+
+COPY --from=zig-build /app/zig-out/bin/libp2p-gossipsub-interop /usr/local/bin/libp2p-gossipsub-interop
+COPY --from=go-build /out/gspeer /usr/local/bin/gspeer
+COPY interop/gossipsub/shadow/shadow-mixed.yaml /sim/shadow-mixed.yaml
+COPY interop/gossipsub/shadow/run-shadow-mixed.sh /usr/local/bin/run-shadow-mixed.sh
+RUN chmod +x /usr/local/bin/run-shadow-mixed.sh
+
+WORKDIR /sim
+
+# The base image's entrypoint is `shadow`; override with our run+verdict script.
+ENTRYPOINT ["/usr/local/bin/run-shadow-mixed.sh"]

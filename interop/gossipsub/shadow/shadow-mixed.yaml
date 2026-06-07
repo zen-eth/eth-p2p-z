@@ -1,0 +1,121 @@
+# MIXED go+zig gossipsub mesh under Shadow over QUIC.
+#
+# Topology: a 4-node STAR. node0 (zig) is the bootstrap: it listens and writes
+# its /p2p/<peer-id> multiaddr to the shared addr file. node1 (go) and node3
+# (zig) dial node0; node2 (go) is the publisher and also dials node0. gossipsub
+# meshes over those connections. node2's published payload must reach the three
+# subscribers across the zig<->go boundary over real QUIC packets Shadow
+# intercepts at the syscall layer.
+#
+# Coordination is the addr_file/peer_file pair over the shared host filesystem
+# (Shadow runs processes against the real FS): node0 writes /tmp/boot.addr; the
+# dialers read it via peer_file (which polls), and the start stagger gives node0
+# time to bind first.
+#
+# QUIC-GO SHADOW ENV: quic-go reads these from the environment.
+# QUIC_GO_DISABLE_GSO/ECN turn off UDP segmentation offload and ECN reading;
+# QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING silences the buffer-size log. quic-go has
+# no plain-recvmsg fallback (a *net.UDPConn is always OOB-capable), so it relies
+# on the Shadow build supporting setsockopt(IP_MTU_DISCOVER/IP_RECVTOS) and the
+# recvmmsg batched read path. The kamilsa/shadow-arm build this image runs on
+# supports them, so the go nodes connect and gossip over QUIC unmodified (verified
+# PASS). The env below is belt-and-suspenders. NOTE: the upstream Shadow v3.3.0
+# source tag lacks recvmmsg + those setsockopts; on such a build the go nodes
+# would fail at transport setup with no env fix (see README).
+
+general:
+  stop_time: 60s
+  model_unblocked_syscall_latency: true
+
+experimental:
+  socket_recv_buffer: 7500000
+  socket_send_buffer: 7500000
+
+network:
+  graph:
+    type: gml
+    inline: |
+      graph [
+        directed 0
+        node [
+          id 0
+          host_bandwidth_up "1 Gbit"
+          host_bandwidth_down "1 Gbit"
+        ]
+        edge [
+          source 0
+          target 0
+          latency "10 ms"
+          packet_loss 0.0
+        ]
+      ]
+
+hosts:
+  # node0 (zig) — bootstrap: listen + subscribe, write its addr file.
+  node0:
+    network_node_id: 0
+    ip_addr: 11.0.0.1
+    processes:
+    - path: /usr/local/bin/libp2p-gossipsub-interop
+      args: >-
+        role=listen mode=sub shadow=on
+        announce=11.0.0.1 port=9000
+        topic=interop-mixed
+        addr_file=/tmp/boot.addr
+        duration_ms=50000
+      start_time: 0s
+      expected_final_state: {exited: 0}
+
+  # node1 (go) — dial bootstrap + subscribe.
+  node1:
+    network_node_id: 0
+    ip_addr: 11.0.0.2
+    processes:
+    - path: /usr/local/bin/gspeer
+      args: >-
+        role=dial mode=sub
+        announce=11.0.0.2 port=9000
+        topic=interop-mixed
+        peer_file=/tmp/boot.addr
+        duration_ms=45000
+      environment:
+        QUIC_GO_DISABLE_GSO: "true"
+        QUIC_GO_DISABLE_ECN: "true"
+        QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING: "true"
+      start_time: 3s
+      expected_final_state: {exited: 0}
+
+  # node2 (go) — dial bootstrap + PUBLISH. The cross-impl source.
+  node2:
+    network_node_id: 0
+    ip_addr: 11.0.0.3
+    processes:
+    - path: /usr/local/bin/gspeer
+      args: >-
+        role=dial mode=pub
+        announce=11.0.0.3 port=9000
+        topic=interop-mixed
+        message=hello-mixed-shadow
+        peer_file=/tmp/boot.addr
+        duration_ms=40000
+      environment:
+        QUIC_GO_DISABLE_GSO: "true"
+        QUIC_GO_DISABLE_ECN: "true"
+        QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING: "true"
+      start_time: 5s
+      expected_final_state: {exited: 0}
+
+  # node3 (zig) — dial bootstrap + subscribe.
+  node3:
+    network_node_id: 0
+    ip_addr: 11.0.0.4
+    processes:
+    - path: /usr/local/bin/libp2p-gossipsub-interop
+      args: >-
+        role=dial mode=sub shadow=on
+        announce=11.0.0.4 port=9000
+        topic=interop-mixed
+        peer_file=/tmp/boot.addr
+        duration_ms=45000
+      start_time: 3s
+      expected_final_state: {exited: 0}
