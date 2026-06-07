@@ -919,6 +919,252 @@ test "two gossipsub nodes: subscribe propagates and a publish is delivered end t
     client_gs_live = false;
 }
 
+test "two gossipsub nodes: keep-alive holds an idle connection past max_idle_timeout" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    // Short idle timeout (1s) + shorter keep-alive (200ms). The test then idles
+    // 1.6s with NO application traffic — longer than max_idle_timeout — so WITHOUT
+    // keep-alive the QUIC connection would idle-time-out (peer disconnect, and the
+    // post-idle publish would never deliver). With keep-alive the actor's periodic
+    // ack-eliciting PING resets both ends' idle timers and the connection survives.
+    // Regression guard for the gossipsub-interop idle-then-publish failure (a
+    // subscriber that waits between bursts must not silently lose its mesh).
+    const opts: quic.Options = .{ .transport = .{ .max_idle_timeout_ms = 1000, .keep_alive_period_ms = 200 } };
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, opts);
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, opts);
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    const server_peer = try server_key.peerId(allocator);
+    const client_peer = try client_key.peerId(allocator);
+
+    var rec = DeliveryRecorder{ .allocator = allocator, .io = io };
+    defer rec.deinit();
+
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, &server_key, rec.handler(), null, .{});
+    var server_gs_live = true;
+    defer if (server_gs_live) server_gs.deinit();
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, &client_key, null, null, .{});
+    var client_gs_live = true;
+    defer if (client_gs_live) client_gs.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    var client_conn_live = true;
+    defer if (client_conn_live) client_conn.deinit();
+    const server_conn = try server.accept();
+    var server_conn_live = true;
+    defer if (server_conn_live) server_conn.deinit();
+
+    try client_conn.startInboundDispatcher(.{});
+    try server_conn.startInboundDispatcher(.{});
+
+    var waited_ms: u64 = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (server_gs.peerCount() == 1 and client_gs.peerCount() == 1) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), server_gs.peerCount());
+    try std.testing.expectEqual(@as(usize, 1), client_gs.peerCount());
+
+    // B subscribes; wait for the announce to reach A (the last app traffic before idle).
+    try server_gs.subscribe("t");
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state| {
+            if (state.topics.contains("t")) break;
+        }
+        io_time.ms(10).sleep(io) catch {};
+    }
+
+    // Idle 1.6s (> max_idle_timeout 1s) with no application traffic. Keep the
+    // runtime turning so the actors can emit keep-alive PINGs; the gossipsub
+    // heartbeat is silent here (empty mcache, no mesh to GRAFT), so ONLY keep-alive
+    // can hold the connection.
+    var idled_ms: u64 = 0;
+    while (idled_ms < 1600) : (idled_ms += 50) {
+        io_time.ms(50).sleep(io) catch {};
+    }
+
+    // Connection must still be up — keep-alive held it past the idle timeout.
+    try std.testing.expectEqual(@as(usize, 1), client_gs.peerCount());
+    try std.testing.expectEqual(@as(usize, 1), server_gs.peerCount());
+
+    // And a publish after the long idle must still deliver.
+    try client_gs.publish("t", "after-idle");
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (rec.received.load(.acquire)) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+    try std.testing.expect(rec.received.load(.acquire));
+    try std.testing.expectEqualSlices(u8, "after-idle", rec.data.?);
+
+    client_conn.deinit();
+    client_conn_live = false;
+    server_conn.deinit();
+    server_conn_live = false;
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (server_gs.peerCount() == 0 and client_gs.peerCount() == 0) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+    server_gs.deinit();
+    server_gs_live = false;
+    client_gs.deinit();
+    client_gs_live = false;
+}
+
+test "two gossipsub nodes: a publish larger than the stream outbound queue is delivered" {
+    // A message bigger than the per-stream outbound byte queue forces the writer
+    // to fill the queue, block, and resume as the connection actor drains it onto
+    // the wire — the multi-chunk path a small publish never exercises. The
+    // gossipsub-interop blob scenario publishes ~96 KiB messages, so this is the
+    // path that must work for an all-zig mesh to propagate.
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    const server_peer = try server_key.peerId(allocator);
+    const client_peer = try client_key.peerId(allocator);
+
+    var rec = DeliveryRecorder{ .allocator = allocator, .io = io };
+    defer rec.deinit();
+
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, &server_key, rec.handler(), null, .{});
+    var server_gs_live = true;
+    defer if (server_gs_live) server_gs.deinit();
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, &client_key, null, null, .{});
+    var client_gs_live = true;
+    defer if (client_gs_live) client_gs.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    var client_conn_live = true;
+    defer if (client_conn_live) client_conn.deinit();
+
+    const server_conn = try server.accept();
+    var server_conn_live = true;
+    defer if (server_conn_live) server_conn.deinit();
+
+    try client_conn.startInboundDispatcher(.{});
+    try server_conn.startInboundDispatcher(.{});
+
+    var waited_ms: u64 = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (server_gs.peerCount() == 1 and client_gs.peerCount() == 1) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), server_gs.peerCount());
+    try std.testing.expectEqual(@as(usize, 1), client_gs.peerCount());
+
+    try server_gs.subscribe("t");
+
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state| {
+            if (state.topics.contains("t")) break;
+        }
+        io_time.ms(10).sleep(io) catch {};
+    }
+    {
+        const tracked = if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state|
+            state.topics.contains("t")
+        else
+            false;
+        try std.testing.expect(tracked);
+    }
+
+    // A payload twice the default per-stream outbound queue (48 KiB), so the
+    // writer cannot fit it in one go and must drain across multiple chunks.
+    const big_len: usize = 96 * 1024;
+    const big = try allocator.alloc(u8, big_len);
+    defer allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i);
+
+    try client_gs.publish("t", big);
+
+    waited_ms = 0;
+    while (waited_ms < 5000) : (waited_ms += 10) {
+        if (rec.received.load(.acquire)) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+    try std.testing.expect(rec.received.load(.acquire));
+    try std.testing.expectEqualSlices(u8, "t", rec.topic.?);
+    try std.testing.expectEqualSlices(u8, big, rec.data.?);
+
+    client_conn.deinit();
+    client_conn_live = false;
+    server_conn.deinit();
+    server_conn_live = false;
+
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (server_gs.peerCount() == 0 and client_gs.peerCount() == 0) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+
+    server_gs.deinit();
+    server_gs_live = false;
+    client_gs.deinit();
+    client_gs_live = false;
+}
+
 test "two gossipsub nodes: pub/sub survives a drop+reconnect of the connection" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});

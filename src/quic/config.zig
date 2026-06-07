@@ -34,6 +34,15 @@ pub const CongestionControl = enum {
 /// our own IO loop sees.
 pub const TransportOptions = struct {
     max_idle_timeout_ms: u64 = 30_000,
+    /// Keep-alive period in ms. When a connection has had no outbound packet for
+    /// this long, the actor sends an ack-eliciting PING
+    /// (`quiche_conn_send_ack_eliciting`) which resets BOTH peers' idle timers, so
+    /// an otherwise-idle connection survives `max_idle_timeout_ms`. This mirrors
+    /// go-libp2p/quic-go's KeepAlivePeriod (≈ idle/2): without it, a node that
+    /// publishes nothing for `max_idle_timeout_ms` (e.g. a gossipsub subscriber
+    /// waiting between bursts) silently loses every connection. Must be
+    /// `< max_idle_timeout_ms`; 0 disables keep-alive.
+    keep_alive_period_ms: u64 = 15_000,
     initial_max_data: u64 = 1024 * 1024,
     initial_max_stream_data_bidi_local: u64 = 256 * 1024,
     initial_max_stream_data_bidi_remote: u64 = 256 * 1024,

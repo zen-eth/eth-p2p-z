@@ -747,6 +747,7 @@ fn startServerConnection(
         .stream_inbound_quantum_bytes = options.actor.stream_inbound_quantum_bytes,
         .stream_outbound_quantum_bytes = options.actor.stream_outbound_quantum_bytes,
         .outbound_pending_queue_len = options.actor.outbound_pending_queue_len,
+        .keep_alive_period_ns = options.transport.keep_alive_period_ms * std.time.ns_per_ms,
     }) catch {
         ep.addStat("router_packet_drops", 1);
         return;

@@ -141,6 +141,15 @@ pub const ConnectionActor = struct {
     stream_outbound_queue_bytes: usize = 0,
     stream_inbound_quantum_bytes: usize = 0,
     stream_outbound_quantum_bytes: usize = 0,
+    /// Keep-alive period in ns (0 = disabled). When the connection has had no
+    /// outbound packet for this long the actor sends an ack-eliciting PING so an
+    /// idle connection survives the negotiated idle timeout. See
+    /// `config.TransportOptions.keep_alive_period_ms`.
+    keep_alive_period_ns: u64 = 0,
+    /// Monotonic-ns deadline for the next keep-alive PING; reset to now+period on
+    /// every flushed packet. 0 means "not yet armed" (re-armed lazily once the
+    /// connection is established).
+    keep_alive_next_ns: i96 = 0,
 
     // -- actor bookkeeping --
     /// Spawned via `std.Io.concurrent` so the runtime owns the per-fiber
@@ -173,6 +182,7 @@ pub const ConnectionActor = struct {
         stream_outbound_queue_bytes: usize = 0,
         stream_inbound_quantum_bytes: usize = 0,
         stream_outbound_quantum_bytes: usize = 0,
+        keep_alive_period_ns: u64 = 0,
     };
 
     /// Allocate a ConnectionActor on the heap and initialise its fields.
@@ -197,6 +207,7 @@ pub const ConnectionActor = struct {
             .stream_outbound_queue_bytes = params.stream_outbound_queue_bytes,
             .stream_inbound_quantum_bytes = params.stream_inbound_quantum_bytes,
             .stream_outbound_quantum_bytes = params.stream_outbound_quantum_bytes,
+            .keep_alive_period_ns = params.keep_alive_period_ns,
             .stats_snapshot = initial_stats,
         };
         self.transport.?.retainResources();
@@ -677,8 +688,24 @@ pub const ConnectionActor = struct {
             if (self.shared.handshake.deadline()) |deadline_ns| {
                 deadline = minTimeout(transport.io, deadline, deadlineFromNs(deadline_ns));
             }
+        } else if (self.keep_alive_period_ns > 0 and self.keep_alive_next_ns != 0) {
+            // Established: wake to send a keep-alive PING before the idle timeout.
+            deadline = minTimeout(transport.io, deadline, deadlineFromNs(self.keep_alive_next_ns));
         }
         return deadline;
+    }
+
+    /// Send an ack-eliciting PING if the connection has been idle for a full
+    /// keep-alive period. Quiche resets BOTH peers' idle timers on an
+    /// ack-eliciting exchange, so this keeps an otherwise-silent connection alive
+    /// past `max_idle_timeout` (matching go-libp2p/quic-go KeepAlivePeriod). The
+    /// queued PING is flushed by the `stageOnFlush` that follows in `stagePostWait`,
+    /// which in turn resets `keep_alive_next_ns`.
+    fn maybeSendKeepAlive(self: *ConnectionActor, conn: *quiche.quiche_conn, io: std.Io) void {
+        if (self.keep_alive_period_ns == 0 or self.keep_alive_next_ns == 0) return;
+        if (self.lifecycle.isHandshake() or self.shared.isClosed()) return;
+        if (io_time.monotonicNsSigned(io) < self.keep_alive_next_ns) return;
+        _ = quiche.quiche_conn_send_ack_eliciting(conn);
     }
 
     fn stagePostWait(
@@ -699,6 +726,7 @@ pub const ConnectionActor = struct {
             self.refreshStats(transport.io);
             if (self.shared.isClosed()) return;
         }
+        self.maybeSendKeepAlive(conn, transport.io);
         _ = try self.stageOnFlush(conn, transport, .{});
         self.updateHandshake(transport.io);
     }
@@ -825,6 +853,11 @@ pub const ConnectionActor = struct {
                 self.stats_snapshot.write_batches += 1;
                 self.stats_snapshot.write_packets += @intCast(batch_len);
                 for (messages[0..batch_len]) |message| self.stats_snapshot.write_bytes += message.data_len;
+                // A flushed packet resets the idle timer on both ends, so push the
+                // next keep-alive out by a full period — a busy connection never
+                // sends a redundant PING; an idle one fires after `period` of silence.
+                if (self.keep_alive_period_ns > 0)
+                    self.keep_alive_next_ns = io_time.monotonicNsSigned(transport.io) + @as(i96, @intCast(self.keep_alive_period_ns));
                 if (!paced_pending) self.write.selected_path = null;
             }
 

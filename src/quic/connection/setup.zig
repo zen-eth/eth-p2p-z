@@ -58,6 +58,8 @@ pub const ActorParams = struct {
     stream_inbound_quantum_bytes: usize,
     stream_outbound_quantum_bytes: usize,
     outbound_pending_queue_len: usize,
+    /// Keep-alive period in ns (0 = disabled). See `config.TransportOptions.keep_alive_period_ms`.
+    keep_alive_period_ns: u64 = 0,
 };
 
 pub const max_outbound_batch_size = connection_actor.max_outbound_batch_size;
@@ -177,6 +179,7 @@ pub fn createPending(params: Params) Allocator.Error!PendingConnection {
         .stream_outbound_queue_bytes = w.stream_outbound_queue_bytes,
         .stream_inbound_quantum_bytes = w.stream_inbound_quantum_bytes,
         .stream_outbound_quantum_bytes = w.stream_outbound_quantum_bytes,
+        .keep_alive_period_ns = w.keep_alive_period_ns,
     });
     conn_owned = true;
     var actor_owned = true;

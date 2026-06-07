@@ -115,6 +115,7 @@ pub fn dial(ep: Context, addr: std.Io.net.IpAddress, opts: DialOptions) DialErro
         .stream_inbound_quantum_bytes = options.actor.stream_inbound_quantum_bytes,
         .stream_outbound_quantum_bytes = options.actor.stream_outbound_quantum_bytes,
         .outbound_pending_queue_len = options.actor.outbound_pending_queue_len,
+        .keep_alive_period_ns = options.transport.keep_alive_period_ms * std.time.ns_per_ms,
     });
     ep.addStat("connections_started", 1);
     defer pending.deinit();
