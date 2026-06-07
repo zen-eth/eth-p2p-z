@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1
+#
+# arm64 variant of the Shadow gossipsub de-risk image. Upstream Shadow's docs
+# list only x86-64, but a community arm64 build is published as the Docker image
+# `kamilsa/shadow-arm` (Ubuntu 24.04 + Shadow 3.3.0, used by lean-shadow-fuzzer
+# to run QUIC eth clients under Shadow on Apple-Silicon/arm64). This image builds
+# our gossipsub-interop node with the epoll backend and drops it into that base,
+# so the zio-under-Shadow de-risk can run natively on an arm64 host.
+#
+# Build context is the REPO ROOT:
+#   docker build -f interop/gossipsub/shadow/Dockerfile.arm -t zig-gs-shadow-arm .
+# Run (seccomp=unconfined lets Shadow use ptrace; /dev/shm holds its process mem):
+#   docker run --rm --platform linux/arm64 \
+#     --security-opt seccomp=unconfined --shm-size=4g zig-gs-shadow-arm
+#
+# For x86-64 (e.g. GitHub Actions ubuntu-latest), use the sibling Dockerfile,
+# which builds Shadow from source.
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG ZIG_VERSION=0.16.0
+ARG RUST_VERSION=1.85.1
+ARG ZIG_LOG_LEVEL=info
+ARG SHADOW_ARM_IMAGE=kamilsa/shadow-arm:latest
+
+# ---------------------------------------------------------------------------
+# Stage 1: build the gossipsub interop node with the epoll backend (native arch).
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS zig-build
+
+ARG DEBIAN_FRONTEND
+ARG ZIG_VERSION
+ARG RUST_VERSION
+ARG ZIG_LOG_LEVEL
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        xz-utils \
+        git \
+        build-essential \
+        cmake \
+        ninja-build \
+        pkg-config \
+        perl \
+        python3 \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Arch-aware: `uname -m` (aarch64 / x86_64) matches Zig's tarball naming, so this
+# builds natively on arm64.
+RUN ARCH="$(uname -m)" \
+    && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" \
+    | tar -xJ -C /opt \
+    && mv "/opt/zig-${ARCH}-linux-${ZIG_VERSION}" /opt/zig
+
+# Rust builds the vendored quiche crate the QUIC stack links against.
+RUN curl -fsSL https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}"
+
+ENV PATH="/root/.cargo/bin:/opt/zig:${PATH}"
+
+WORKDIR /app
+COPY . .
+
+# epoll backend (Shadow intercepts epoll/recvmsg/sendmsg; it does not support
+# io_uring). The Shadow-compatible UDP path is selected at runtime by shadow=on.
+RUN zig build install -Doptimize=ReleaseFast -Dzio-backend=epoll -Dlog-level=${ZIG_LOG_LEVEL}
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime = the prebuilt arm64 Shadow image (Ubuntu 24.04 + Shadow 3.3.0
+# + libstdc++/zlib/libgcc, which the node needs).
+# ---------------------------------------------------------------------------
+FROM ${SHADOW_ARM_IMAGE} AS runtime
+
+COPY --from=zig-build /app/zig-out/bin/libp2p-gossipsub-interop /usr/local/bin/libp2p-gossipsub-interop
+COPY interop/gossipsub/shadow/shadow.yaml /sim/shadow.yaml
+COPY interop/gossipsub/shadow/run-shadow.sh /usr/local/bin/run-shadow.sh
+RUN chmod +x /usr/local/bin/run-shadow.sh
+
+WORKDIR /sim
+
+# The base image's entrypoint is `shadow`; override with our run+verdict script.
+ENTRYPOINT ["/usr/local/bin/run-shadow.sh"]
