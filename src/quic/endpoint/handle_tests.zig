@@ -182,7 +182,10 @@ test "quic endpoint idle timeout closes and publishes stats" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const short_idle_options: support.QuicEndpoint.Options = .{ .transport = .{ .max_idle_timeout_ms = 75 } };
+    // keep_alive_period_ms=0 disables keep-alive so this test asserts the idle
+    // timeout itself — otherwise a default-period PING would reset the idle timer
+    // and the connection would never close (and the test would assert nothing).
+    const short_idle_options: support.QuicEndpoint.Options = .{ .transport = .{ .max_idle_timeout_ms = 75, .keep_alive_period_ms = 0 } };
     var fixture = try TwoEndpoints.init(allocator, io, short_idle_options, short_idle_options);
     defer fixture.deinit();
 

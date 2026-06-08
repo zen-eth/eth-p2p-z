@@ -919,8 +919,12 @@ fn runForDuration(io: std.Io, allocator: std.mem.Allocator, gs: *gossipsub.Gossi
     var seq: u64 = 0;
     var elapsed_ms: u64 = 0;
     while (elapsed_ms < args.duration_ms) : (elapsed_ms += publish_interval_ms) {
+        // msg_buf is sized to message.len + 32 (> the "#<u64>" suffix), so bufPrint
+        // cannot overflow; `try` surfaces a real failure instead of silently falling
+        // back to the un-suffixed payload (which would re-introduce the content-id
+        // dedup that the suffix exists to avoid).
         const payload: []const u8 = if (args.sign == .anonymous)
-            std.fmt.bufPrint(msg_buf, "{s}#{d}", .{ args.message, seq }) catch args.message
+            try std.fmt.bufPrint(msg_buf, "{s}#{d}", .{ args.message, seq })
         else
             args.message;
         seq += 1;

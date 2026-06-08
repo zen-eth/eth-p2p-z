@@ -777,6 +777,10 @@ pub fn Router(comptime Transport: type) type {
 
         allocator: std.mem.Allocator,
         io: std.Io,
+        /// Cached `GS_DEBUG` env flag, resolved once at create. Gates the verbose
+        /// per-message/per-peer diagnostic logs without a `getenv` syscall on the
+        /// hot fan-out/inbound/heartbeat paths.
+        gs_debug: bool,
         /// The per-peer sink factory. Held by value: the real `SwitchTransport`
         /// is empty, so by-value avoids an extra borrowed pointer.
         transport: Transport,
@@ -1028,6 +1032,7 @@ pub fn Router(comptime Transport: type) type {
             router.* = .{
                 .allocator = allocator,
                 .io = io,
+                .gs_debug = std.c.getenv("GS_DEBUG") != null,
                 .transport = transport,
                 .inbox_storage = inbox_storage,
                 .inbox = std.Io.Queue(Command).init(inbox_storage),
@@ -1308,40 +1313,28 @@ pub fn Router(comptime Transport: type) type {
             router.putRecord(consumed.peer_id, &consumed, envelope_bytes);
         }
 
-        /// Free every topic key + nested PeerSet in the mesh map and the map
-        /// itself. The main fiber is joined by the time this runs, so the map is
-        /// quiescent.
+        /// Free every owned topic key + nested set (PeerSet/BackoffSet) in a
+        /// topic-keyed map, then the map itself. The main fiber is joined by the
+        /// time these run, so the maps are quiescent.
+        fn freeTopicKeyedMap(router: *Self, map: anytype) void {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(router.allocator);
+                router.allocator.free(entry.key_ptr.*);
+            }
+            map.deinit(router.allocator);
+        }
+
         fn freeMesh(router: *Self) void {
-            var it = router.mesh.iterator();
-            while (it.next()) |entry| {
-                entry.value_ptr.deinit(router.allocator);
-                router.allocator.free(entry.key_ptr.*);
-            }
-            router.mesh.deinit(router.allocator);
+            router.freeTopicKeyedMap(&router.mesh);
         }
 
-        /// Free every topic key + nested BackoffSet in the backoff map and the map
-        /// itself.
         fn freeBackoff(router: *Self) void {
-            var it = router.backoff.iterator();
-            while (it.next()) |entry| {
-                entry.value_ptr.deinit(router.allocator);
-                router.allocator.free(entry.key_ptr.*);
-            }
-            router.backoff.deinit(router.allocator);
+            router.freeTopicKeyedMap(&router.backoff);
         }
 
-        /// Free every topic key + nested PeerSet in the fanout map, the
-        /// fanout_last_pub map (its keys are the SAME owned topic copies as the
-        /// fanout map's, freed once above), and both maps. The main fiber is joined
-        /// by the time this runs, so the maps are quiescent.
         fn freeFanout(router: *Self) void {
-            var it = router.fanout.iterator();
-            while (it.next()) |entry| {
-                entry.value_ptr.deinit(router.allocator);
-                router.allocator.free(entry.key_ptr.*);
-            }
-            router.fanout.deinit(router.allocator);
+            router.freeTopicKeyedMap(&router.fanout);
             // fanout_last_pub's keys alias fanout's (freed above), so only the map.
             router.fanout_last_pub.deinit(router.allocator);
         }
@@ -1927,11 +1920,11 @@ pub fn Router(comptime Transport: type) type {
         fn pushTo(router: *Self, state: *PeerState, lane: peer_io.Lane, frame: *peer_io.OutboundFrame) void {
             for (frame.message_ids) |id| {
                 if (state.dont_send.contains(id)) {
-                    if (std.c.getenv("GS_DEBUG") != null) std.log.info("GS_DEBUG pushTo SKIP lane={s} (dont_send)", .{@tagName(lane)});
+                    if (router.gs_debug) std.log.info("GS_DEBUG pushTo SKIP lane={s} (dont_send)", .{@tagName(lane)});
                     return;
                 }
             }
-            if (std.c.getenv("GS_DEBUG") != null and lane == .data) {
+            if (router.gs_debug and lane == .data) {
                 std.log.info("GS_DEBUG pushTo PUSH data frame bytes={d}", .{frame.bytes.len});
             }
             frame.retain();
@@ -1953,7 +1946,7 @@ pub fn Router(comptime Transport: type) type {
         /// genuinely multi-allocation scratch on this path, so it goes in a
         /// per-command arena that is freed in one shot — no per-entry bookkeeping.
         fn sendCurrentSubscriptions(router: *Self, state: *PeerState) void {
-            if (std.c.getenv("GS_DEBUG") != null) {
+            if (router.gs_debug) {
                 std.log.info("GS_DEBUG sendCurrentSubscriptions my_topics={d} peers={d}", .{ router.my_topics.count(), router.peers.count() });
             }
             if (router.my_topics.count() == 0) return;
@@ -2163,7 +2156,7 @@ pub fn Router(comptime Transport: type) type {
             router.maintainFanout();
 
             // TEMP DEBUG: log mesh/subscription state per topic each heartbeat.
-            if (std.c.getenv("GS_DEBUG") != null) {
+            if (router.gs_debug) {
                 var tit = router.my_topics.keyIterator();
                 while (tit.next()) |tk| {
                     const topic = tk.*;
@@ -2452,7 +2445,7 @@ pub fn Router(comptime Transport: type) type {
 
             // Published messages: dedup, deliver locally, forward over the mesh.
             while (reader.publishNext()) |msg| {
-                if (std.c.getenv("GS_DEBUG") != null) {
+                if (router.gs_debug) {
                     std.log.info("GS_DEBUG onInboundRpc got publish topic={s} data_len={d}", .{ msg.getTopic(), msg.getData().len });
                 }
                 router.handleIncomingMessage(
@@ -2935,7 +2928,7 @@ pub fn Router(comptime Transport: type) type {
         /// owned key copy (no-op if already present); unsubscribe removes + frees
         /// the stored key.
         fn applyPeerSubscription(router: *Self, source: PeerId, topic: []const u8, subscribe: bool) void {
-            if (std.c.getenv("GS_DEBUG") != null) {
+            if (router.gs_debug) {
                 std.log.info("GS_DEBUG applyPeerSubscription topic={s} subscribe={} tracked={}", .{ topic, subscribe, router.peers.contains(peerKey(&source)) });
             }
             const state = router.peers.get(peerKey(&source)) orelse {
@@ -3467,7 +3460,7 @@ pub fn Router(comptime Transport: type) type {
                 router.allocator.free(key);
                 return;
             };
-            if (std.c.getenv("GS_DEBUG") != null) {
+            if (router.gs_debug) {
                 std.log.info("GS_DEBUG onSubscribe topic={s} announcing_to_peers={d}", .{ topic, router.peers.count() });
             }
             router.announceSubscription(topic, true);
@@ -3628,7 +3621,7 @@ pub fn Router(comptime Transport: type) type {
             if (router.flood_publish) {
                 var flood_set = router.floodTargets(topic);
                 defer flood_set.deinit(router.allocator);
-                if (std.c.getenv("GS_DEBUG") != null) {
+                if (router.gs_debug) {
                     std.log.info("GS_DEBUG onPublish topic={s} peers={d} flood_targets={d} mesh={d}", .{ topic, router.peers.count(), flood_set.count(), router.meshSize(topic) });
                 }
                 router.cacheAndForward(&flood_set, null, from, seqno, topic, data, sig, key, id.bytes);

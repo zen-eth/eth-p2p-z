@@ -147,8 +147,9 @@ pub const ConnectionActor = struct {
     /// `config.TransportOptions.keep_alive_period_ms`.
     keep_alive_period_ns: u64 = 0,
     /// Monotonic-ns deadline for the next keep-alive PING; reset to now+period on
-    /// every flushed packet. 0 means "not yet armed" (re-armed lazily once the
-    /// connection is established).
+    /// every flushed packet. 0 means "not yet armed" — it gets armed by the first
+    /// flushed packet (which happens during the handshake flights), so it is
+    /// non-zero well before the connection is established.
     keep_alive_next_ns: i96 = 0,
 
     // -- actor bookkeeping --
@@ -698,14 +699,19 @@ pub const ConnectionActor = struct {
     /// Send an ack-eliciting PING if the connection has been idle for a full
     /// keep-alive period. Quiche resets BOTH peers' idle timers on an
     /// ack-eliciting exchange, so this keeps an otherwise-silent connection alive
-    /// past `max_idle_timeout` (matching go-libp2p/quic-go KeepAlivePeriod). The
-    /// queued PING is flushed by the `stageOnFlush` that follows in `stagePostWait`,
-    /// which in turn resets `keep_alive_next_ns`.
+    /// past `max_idle_timeout` (matching go-libp2p/quic-go KeepAlivePeriod).
     fn maybeSendKeepAlive(self: *ConnectionActor, conn: *quiche.quiche_conn, io: std.Io) void {
         if (self.keep_alive_period_ns == 0 or self.keep_alive_next_ns == 0) return;
         if (self.lifecycle.isHandshake() or self.shared.isClosed()) return;
-        if (io_time.monotonicNsSigned(io) < self.keep_alive_next_ns) return;
-        _ = quiche.quiche_conn_send_ack_eliciting(conn);
+        const now = io_time.monotonicNsSigned(io);
+        if (now < self.keep_alive_next_ns) return;
+        // Advance the deadline HERE, not only when the following flush succeeds: a
+        // PING quiche can't put on the wire right now (cwnd-blocked / paced) would
+        // otherwise leave `keep_alive_next_ns` in the past and the actor would
+        // re-fire it every loop turn until the connection drains. A real send in
+        // the common idle case resets it again via `flushScheduled`.
+        self.keep_alive_next_ns = now + @as(i96, @intCast(self.keep_alive_period_ns));
+        if (quiche.quiche_conn_send_ack_eliciting(conn) < 0) self.stats_snapshot.write_errors += 1;
     }
 
     fn stagePostWait(
@@ -771,15 +777,19 @@ pub const ConnectionActor = struct {
         if (max_packets == 0) return true;
 
         var packets_released: usize = 0;
+        // Per-batch scratch, declared once at function scope: each iteration fully
+        // overwrites these (indexed by batch_len, which resets per iteration), so a
+        // single declaration is clearer than re-scoping ~64 KiB inside the loop and
+        // guarantees one stack slot in Debug.
+        var payloads: [max_outbound_batch_size][max_flush_packet_len]u8 = undefined;
+        var destinations: [max_outbound_batch_size]std.Io.net.IpAddress = undefined;
+        var messages: [max_outbound_batch_size]std.Io.net.OutgoingMessage = undefined;
+        var controls: [max_outbound_batch_size][socket_control.send_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
         while (packets_released < max_packets) {
             const batch_cap = @min(
                 @min(@max(transport.outbound_batch_size, @as(usize, 1)), max_outbound_batch_size),
                 max_packets - packets_released,
             );
-            var payloads: [max_outbound_batch_size][max_flush_packet_len]u8 = undefined;
-            var destinations: [max_outbound_batch_size]std.Io.net.IpAddress = undefined;
-            var messages: [max_outbound_batch_size]std.Io.net.OutgoingMessage = undefined;
-            var controls: [max_outbound_batch_size][socket_control.send_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
             var batch_len: usize = 0;
             var quiche_done = false;
             var paced_pending = false;

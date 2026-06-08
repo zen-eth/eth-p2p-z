@@ -168,6 +168,9 @@ test {
     _ = @import("peer_io.zig");
     _ = @import("mcache.zig");
     _ = @import("score.zig");
+    _ = @import("signing.zig");
+    // intern.zig has no test blocks and is already analyzed via mcache.zig, so it
+    // needs no aggregator entry; signing.zig above does (it has tests).
 }
 
 test "supported_protocols lists meshsub versions newest-first" {
