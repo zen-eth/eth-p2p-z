@@ -195,8 +195,9 @@ fn validateTransport(opts: TransportOptions) ConfigError!void {
     if (opts.max_amplification_factor == 0) return error.InvalidOptions;
     // Keep-alive must fire BEFORE the (local) idle timer, or the PING lands after
     // the connection has already idle-closed and the feature silently does nothing.
-    // (0 disables keep-alive.) This guards the local pair; the peer-negotiated idle
-    // can still be smaller — see config.TransportOptions.keep_alive_period_ms.
+    // (0 disables keep-alive.) This guards the local pair; the remote half — a peer
+    // advertising a SHORTER idle timeout — is handled at runtime by the actor
+    // clamping the period to peer_max_idle_timeout/2 (clampKeepAliveToPeerIdle).
     if (opts.keep_alive_period_ms != 0 and opts.keep_alive_period_ms >= opts.max_idle_timeout_ms) return error.InvalidOptions;
     // RFC 9000 §13.2.1 caps `max_ack_delay` at 2^14 - 1 (16383ms).
     if (opts.max_ack_delay_ms >= (1 << 14)) return error.InvalidOptions;

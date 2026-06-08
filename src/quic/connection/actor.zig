@@ -143,7 +143,9 @@ pub const ConnectionActor = struct {
     stream_outbound_quantum_bytes: usize = 0,
     /// Keep-alive period in ns (0 = disabled). When the connection has had no
     /// outbound packet for this long the actor sends an ack-eliciting PING so an
-    /// idle connection survives the negotiated idle timeout. See
+    /// idle connection survives the negotiated idle timeout. Starts at the config
+    /// value, then on handshake completion is clamped down to
+    /// `peer_max_idle_timeout/2` if smaller (see `clampKeepAliveToPeerIdle`). See
     /// `config.TransportOptions.keep_alive_period_ms`.
     keep_alive_period_ns: u64 = 0,
     /// Monotonic-ns deadline for the next keep-alive PING; reset to now+period on
@@ -714,6 +716,29 @@ pub const ConnectionActor = struct {
         if (quiche.quiche_conn_send_ack_eliciting(conn) < 0) self.stats_snapshot.write_errors += 1;
     }
 
+    /// On handshake completion, clamp the keep-alive period to the peer-negotiated
+    /// idle timeout: `min(configured, peer_max_idle_timeout/2)`, matching go-libp2p
+    /// (quic-go `min(KeepAlivePeriod, idleTimeout/2)`). Until now the period was the
+    /// local config value, which a peer advertising a SHORTER idle timeout could
+    /// outrace — the PING would fire after the negotiated idle had already closed
+    /// the connection. (`config.validateTransport` already guards the local pair;
+    /// this handles the remote half, which is only known after the handshake.)
+    fn clampKeepAliveToPeerIdle(self: *ConnectionActor, conn: *quiche.quiche_conn, io: std.Io) void {
+        if (self.keep_alive_period_ns == 0) return;
+        var tp: quiche.quiche_transport_params = undefined;
+        if (!quiche.quiche_conn_peer_transport_params(conn, &tp)) return;
+        if (tp.peer_max_idle_timeout == 0) return; // peer disabled idle → no clamp
+        const peer_half_ns: u64 = (tp.peer_max_idle_timeout *| std.time.ns_per_ms) / 2;
+        if (peer_half_ns < self.keep_alive_period_ns) {
+            // Floor at 1ms so a pathological tiny peer idle can't drive the period
+            // to 0 (which would disable keep-alive / re-arm in the past).
+            self.keep_alive_period_ns = @max(peer_half_ns, std.time.ns_per_ms);
+            // Re-arm: a handshake flush already armed the deadline with the larger
+            // config period, so move it in to the clamped period from now.
+            self.keep_alive_next_ns = io_time.monotonicNsSigned(io) + @as(i96, @intCast(self.keep_alive_period_ns));
+        }
+    }
+
     fn stagePostWait(
         self: *ConnectionActor,
         conn: *quiche.quiche_conn,
@@ -1073,7 +1098,11 @@ pub const ConnectionActor = struct {
         if (quiche.quiche_conn_is_established(conn) or quiche.quiche_conn_is_in_early_data(conn)) {
             // Record the specific cause (e.g. PeerVerifyFailed) before failing so
             // the dialer can surface it instead of an opaque HandshakeFailed.
-            self.completeHandshake(io) catch |err| {
+            if (self.completeHandshake(io)) |_| {
+                // Now established: the peer's transport params are known, so clamp
+                // the keep-alive period to the negotiated idle timeout.
+                self.clampKeepAliveToPeerIdle(conn, io);
+            } else |err| {
                 self.stats_snapshot.last_actor_error = conn_stats.ActorError.fromError(err);
                 // The connection is already established at the quiche/TLS layer, so
                 // this is our own libp2p-identity rejection (or a local fault while
@@ -1083,7 +1112,7 @@ pub const ConnectionActor = struct {
                 const empty: [0]u8 = .{};
                 _ = quiche.quiche_conn_close(conn, false, 0x1, empty[0..].ptr, 0);
                 self.failHandshakeAndStamp(io, null);
-            };
+            }
         }
     }
 

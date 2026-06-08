@@ -1040,6 +1040,122 @@ test "two gossipsub nodes: keep-alive holds an idle connection past max_idle_tim
     client_gs_live = false;
 }
 
+test "two gossipsub nodes: keep-alive clamps to a peer's shorter negotiated idle timeout" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    // Asymmetric idle timeouts. The SERVER advertises a short 600ms idle and runs
+    // NO keep-alive of its own. The CLIENT's configured keep-alive (1500ms) is
+    // LONGER than the negotiated idle (min(2000,600)=600ms) — so without the
+    // peer-idle clamp the client would PING too late and the connection would
+    // idle-close at 600ms (the server isn't keeping it alive), and the post-idle
+    // publish would never deliver. With the clamp the client drops its period to
+    // peer_idle/2 (300ms) and the connection survives. (Matches go-libp2p's
+    // min(KeepAlivePeriod, idleTimeout/2).)
+    const server_opts: quic.Options = .{ .transport = .{ .max_idle_timeout_ms = 600, .keep_alive_period_ms = 0 } };
+    const client_opts: quic.Options = .{ .transport = .{ .max_idle_timeout_ms = 2000, .keep_alive_period_ms = 1500 } };
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, server_opts);
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, client_opts);
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    const server_peer = try server_key.peerId(allocator);
+    const client_peer = try client_key.peerId(allocator);
+
+    var rec = DeliveryRecorder{ .allocator = allocator, .io = io };
+    defer rec.deinit();
+
+    const server_gs = try Gossipsub.init(allocator, io, server, server_peer, &server_key, rec.handler(), null, .{});
+    var server_gs_live = true;
+    defer if (server_gs_live) server_gs.deinit();
+    const client_gs = try Gossipsub.init(allocator, io, client, client_peer, &client_key, null, null, .{});
+    var client_gs_live = true;
+    defer if (client_gs_live) client_gs.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    var client_conn_live = true;
+    defer if (client_conn_live) client_conn.deinit();
+    const server_conn = try server.accept();
+    var server_conn_live = true;
+    defer if (server_conn_live) server_conn.deinit();
+
+    try client_conn.startInboundDispatcher(.{});
+    try server_conn.startInboundDispatcher(.{});
+
+    var waited_ms: u64 = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (server_gs.peerCount() == 1 and client_gs.peerCount() == 1) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), server_gs.peerCount());
+
+    try server_gs.subscribe("t");
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state| {
+            if (state.topics.contains("t")) break;
+        }
+        io_time.ms(10).sleep(io) catch {};
+    }
+
+    // Idle 1s — longer than the 600ms negotiated idle, and longer than the client's
+    // UNclamped 1500ms keep-alive (so without the clamp no PING fires in time).
+    var idled_ms: u64 = 0;
+    while (idled_ms < 1000) : (idled_ms += 50) {
+        io_time.ms(50).sleep(io) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), client_gs.peerCount());
+    try std.testing.expectEqual(@as(usize, 1), server_gs.peerCount());
+
+    try client_gs.publish("t", "after-idle");
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (rec.received.load(.acquire)) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+    try std.testing.expect(rec.received.load(.acquire));
+    try std.testing.expectEqualSlices(u8, "after-idle", rec.data.?);
+
+    client_conn.deinit();
+    client_conn_live = false;
+    server_conn.deinit();
+    server_conn_live = false;
+    waited_ms = 0;
+    while (waited_ms < 3000) : (waited_ms += 10) {
+        if (server_gs.peerCount() == 0 and client_gs.peerCount() == 0) break;
+        io_time.ms(10).sleep(io) catch {};
+    }
+    server_gs.deinit();
+    server_gs_live = false;
+    client_gs.deinit();
+    client_gs_live = false;
+}
+
 test "two gossipsub nodes: a publish larger than the stream outbound queue is delivered" {
     // A message bigger than the per-stream outbound byte queue forces the writer
     // to fill the queue, block, and resume as the connection actor drains it onto
