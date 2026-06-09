@@ -159,7 +159,36 @@ pub fn createSslContext(subject_key: *ssl.EVP_PKEY, cert: *ssl.X509) !*ssl.SSL_C
         return error.InitializationFailed;
     ssl.SSL_CTX_set_alpn_select_cb(ssl_ctx, alpnSelectCallbackfn, null);
 
+    // Export TLS 1.3 secrets in NSS key-log format when SSLKEYLOGFILE is set, so
+    // captured QUIC traffic can be decrypted offline (Wireshark/tshark). Wired
+    // only when the env var is present, so it is inert in normal operation.
+    if (std.c.getenv("SSLKEYLOGFILE") != null)
+        ssl.SSL_CTX_set_keylog_callback(ssl_ctx, keylogCallbackFn);
+
     return ssl_ctx;
+}
+
+/// BoringSSL key-log callback: appends one NSS-format secret line to the file
+/// named by SSLKEYLOGFILE. Lets external tools decrypt captured QUIC/TLS 1.3
+/// traffic. Best-effort — any I/O error is ignored so it never disturbs the
+/// handshake; O_APPEND with a single write keeps each entry atomic across a
+/// context's connections.
+fn keylogCallbackFn(_: ?*const ssl.SSL, line: [*c]const u8) callconv(.c) void {
+    if (line == null) return;
+    const path_z = std.c.getenv("SSLKEYLOGFILE") orelse return;
+    const line_slice = std.mem.span(@as([*:0]const u8, @ptrCast(line)));
+    var buf: [512]u8 = undefined;
+    if (line_slice.len + 1 > buf.len) return;
+    @memcpy(buf[0..line_slice.len], line_slice);
+    buf[line_slice.len] = '\n';
+    const fd = std.c.open(
+        path_z,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true },
+        @as(c_uint, 0o600),
+    );
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    _ = std.c.write(fd, &buf, line_slice.len + 1);
 }
 
 /// Generates a new key pair based on the specified key type.
