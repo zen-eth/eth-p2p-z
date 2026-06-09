@@ -25,6 +25,7 @@ instances = { min = 2, max = 50, default = 2 }
   topic            = { type = "string", desc = "gossipsub topic",                  default = "interop-test" }
   message          = { type = "string", desc = "payload the publisher sends",       default = "hello-gossipsub" }
   sign             = { type = "string", desc = "strict|anonymous",                  default = "strict" }
+  impls            = { type = "string", desc = "comma list of impls per instance by GlobalSeq (zig|go|rust)", default = "zig" }
   px               = { type = "string", desc = "peer-exchange on|off",              default = "off" }
   duration_ms      = { type = "int",    desc = "node run duration", unit = "ms",    default = 20000 }
   d                = { type = "int",    desc = "gossipsub mesh degree D",           default = 6 }

@@ -163,6 +163,18 @@ func main() {
 	switch a.role {
 	case "listen":
 		runListener(h, a)
+		// A listener may ALSO dial upstream peers (peers=/peer=/peer_file=): it is
+		// then both reachable (bound + advertised) AND a member of the mesh it
+		// dials into. The testground plan launches subscribers as role=listen with
+		// peers=<publisher> (so they advertise a data-net address yet still connect
+		// outbound to the publisher), matching the zig node whose listener also
+		// dials. Without this a go subscriber would bind and wait to be dialed, but
+		// the publisher (also role=listen) never dials it, so no connection forms
+		// and nothing is delivered. Dials are optional — a pure bootstrap (no
+		// peers=) dials nothing.
+		if a.peer != "" || a.peers != "" || a.peerFile != "" {
+			runDialer(ctx, h, a)
+		}
 	case "dial":
 		runDialer(ctx, h, a)
 	}

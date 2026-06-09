@@ -47,6 +47,7 @@ struct Args {
     duration_ms: u64,
     sign: String,      // strict (default) | anonymous (alias nosign)
     protocols: String, // empty = default (1.2/1.1/1.0); "meshsub/1.1.0" = only 1.1.0
+    announce: Option<String>, // host IP to bind 0.0.0.0 for and advertise (Shadow/testground)
     px: bool,          // peer-exchange on PRUNE (do_px + prune_peers); default off
     d_high: usize,     // mesh upper bound (mesh_n_high); 0 = default
     d: usize,          // mesh target degree (mesh_n); 0 = default
@@ -89,6 +90,7 @@ fn parse_args() -> Args {
         duration_ms: 12000,
         sign: "strict".into(),
         protocols: String::new(),
+        announce: None,
         px: false,
         d_high: 0,
         d: 0,
@@ -110,6 +112,7 @@ fn parse_args() -> Args {
             "duration_ms" => a.duration_ms = val.parse().unwrap_or(12000),
             "sign" => a.sign = val.into(),
             "protocols" => a.protocols = val.into(),
+            "announce" => a.announce = Some(val.into()),
             "px" => a.px = val == "on" || val == "true",
             "d_high" => a.d_high = val.parse().unwrap_or(0),
             "d" => a.d = val.parse().unwrap_or(0),
@@ -169,36 +172,48 @@ async fn main() {
 
     match a.role.as_str() {
         "listen" => {
-            let listen: Multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", a.port)
+            // Default: loopback (multi-node localhost runs). Under Shadow/testground
+            // each host has a single assigned IP and no loopback aliasing across
+            // hosts, so announce=<ip> binds 0.0.0.0 (accept on the host IP) and the
+            // listener advertises <ip>.
+            let bind_ip = if a.announce.is_some() {
+                "0.0.0.0"
+            } else {
+                "127.0.0.1"
+            };
+            let listen: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", bind_ip, a.port)
                 .parse()
                 .unwrap_or_else(|e| fatal(&format!("parse listen addr: {e}")));
             swarm
                 .listen_on(listen)
                 .unwrap_or_else(|e| fatal(&format!("listen_on: {e}")));
+            // Bound to 0.0.0.0, so the swarm's observed/listen addrs report the
+            // unspecified host and identify would advertise an undialable address.
+            // Register the assigned host IP as an external address so identify
+            // advertises it to peers (matching go-peer's announce advertisement).
+            if let Some(announce) = &a.announce {
+                let ext: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", announce, a.port)
+                    .parse()
+                    .unwrap_or_else(|e| fatal(&format!("parse announce addr: {e}")));
+                swarm.add_external_address(ext);
+            }
+            // A listener may ALSO dial upstream peers (peers=/peer=): it is then both
+            // reachable (bound + advertised) AND a member of the mesh it dials into.
+            // The testground plan launches subscribers as role=listen with
+            // peers=<publisher> (so they advertise a data-net address yet still
+            // connect outbound to the publisher), matching the zig node whose
+            // listener also dials. Without this a rust subscriber would bind and wait
+            // to be dialed, but the publisher (also role=listen) never dials it, so
+            // no connection forms and nothing is delivered. Dials are optional — a
+            // pure bootstrap (no peers=) dials nothing, so do not fatal on no targets.
+            if !a.dial_targets().is_empty() {
+                dial_peers(&mut swarm, &a);
+            }
         }
         "dial" => {
-            // Dial every configured peer. gossipsub forms a mesh over whatever
-            // connections exist, so a node that dials several peers can graft
-            // into a mesh spanning all of them. A failed dial to one peer does
-            // not abort the others.
-            let mut dialed = 0;
-            for peer_text in a.dial_targets() {
-                let remote: Multiaddr = match peer_text.parse() {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("parse peer multiaddr {peer_text:?}: {e}");
-                        continue;
-                    }
-                };
-                match swarm.dial(remote) {
-                    Ok(()) => {
-                        eprintln!("dialer dialing {peer_text}");
-                        dialed += 1;
-                    }
-                    Err(e) => eprintln!("dial {peer_text}: {e}"),
-                }
-            }
-            if dialed == 0 {
+            // dial role requires at least one target (enforced in parse_args), so a
+            // zero-dial outcome here means every configured dial failed — fatal.
+            if dial_peers(&mut swarm, &a) == 0 {
                 fatal("dial role: no peers dialed");
             }
         }
@@ -206,6 +221,31 @@ async fn main() {
     }
 
     run_event_loop(&mut swarm, &a, &topic, local_peer).await;
+}
+
+// Dial every configured peer (peers=/peer=). gossipsub forms a mesh over whatever
+// connections exist, so a node that dials several peers can graft into a mesh
+// spanning all of them. A failed dial to one peer does not abort the others.
+// Returns the number of peers for which the dial was successfully initiated.
+fn dial_peers(swarm: &mut Swarm<Behaviour>, a: &Args) -> usize {
+    let mut dialed = 0;
+    for peer_text in a.dial_targets() {
+        let remote: Multiaddr = match peer_text.parse() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("parse peer multiaddr {peer_text:?}: {e}");
+                continue;
+            }
+        };
+        match swarm.dial(remote) {
+            Ok(()) => {
+                eprintln!("dialer dialing {peer_text}");
+                dialed += 1;
+            }
+            Err(e) => eprintln!("dial {peer_text}: {e}"),
+        }
+    }
+    dialed
 }
 
 fn build_behaviour(keypair: &identity::Keypair, a: &Args) -> Behaviour {
@@ -342,9 +382,17 @@ async fn run_event_loop(
 
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { address, .. } => {
-                    let full = address
-                        .clone()
-                        .with(libp2p::multiaddr::Protocol::P2p(local_peer));
+                    // When announce=<ip> is set the listener is bound to 0.0.0.0, so
+                    // `address` carries the unspecified host and is undialable
+                    // cross-container. Advertise the assigned host IP on the
+                    // configured port instead (matching go-peer's announce handling).
+                    let advertised: Multiaddr = match &a.announce {
+                        Some(announce) => format!("/ip4/{}/udp/{}/quic-v1", announce, a.port)
+                            .parse()
+                            .unwrap_or_else(|e| fatal(&format!("parse announce addr: {e}"))),
+                        None => address.clone(),
+                    };
+                    let full = advertised.with(libp2p::multiaddr::Protocol::P2p(local_peer));
                     eprintln!("listener advertising {full}");
                     if let Some(path) = &a.addr_file {
                         write_addr_file(path, &full.to_string()).await;

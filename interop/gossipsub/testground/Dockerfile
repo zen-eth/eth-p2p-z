@@ -1,9 +1,13 @@
 # syntax=docker/dockerfile:1
 #
 # Multi-stage image for the Testground "gossipsub-quic" Path-B plan.
-#   Stage 1 (zig-build) : build the eth-p2p-z gossipsub node (EPOLL backend).
-#   Stage 2 (plan-build): build the Go testplan that drives the node.
-#   Stage 3 (runtime)   : carry BOTH; ENTRYPOINT = the Go plan.
+#   Stage 1 (zig-build)  : build the eth-p2p-z gossipsub node (EPOLL backend).
+#   Stage 2 (go-peer-build)  : build the go-libp2p (quic-go) gossipsub peer.
+#   Stage 3 (rust-peer-build): build the rust-libp2p (quinn) gossipsub peer.
+#   Stage 4 (plan-build) : build the Go testplan that drives a peer.
+#   Stage 5 (runtime)    : carry all THREE peer binaries + the plan;
+#                          ENTRYPOINT = the Go plan, which picks the peer binary
+#                          per instance from the `impls` param (zig|go|rust).
 #
 # docker:generic (testground-quic/pkg/build/docker_generic.go) invokes THIS
 # Dockerfile with:
@@ -18,6 +22,12 @@ ARG image=golang:1.21-bookworm
 ARG ZIG_VERSION=0.16.0
 ARG RUST_VERSION=1.85.1
 ARG ZIG_LOG_LEVEL=info
+# go-peer's go.mod requires go >= 1.24, so its build stage pins a newer toolchain
+# than the plan-build stage (the plan itself only needs go 1.19).
+ARG GO_PEER_VERSION=1.24
+# go module proxy for the go-peer's dependency download (mirror first, then the
+# canonical proxy, then direct VCS). Override with --build-arg GOPROXY=... .
+ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
 
 # --------------------------------------------------------------------------
 # Stage 1: build the eth-p2p-z gossipsub node with the EPOLL zio backend.
@@ -50,7 +60,39 @@ RUN rm -rf .zig-cache zig-out \
 # artifact: /src/zig-out/bin/libp2p-gossipsub-interop
 
 # --------------------------------------------------------------------------
-# Stage 2: build the Go testplan.
+# Stage 2: build the go-libp2p (quic-go) gossipsub peer.
+# Pure-Go (CGO disabled) static-ish QUIC node; needs the module download.
+# --------------------------------------------------------------------------
+FROM golang:${GO_PEER_VERSION}-bookworm AS go-peer-build
+ARG GOPROXY
+ENV CGO_ENABLED=0
+ENV GOPROXY=${GOPROXY}
+ENV GOFLAGS=-mod=mod
+WORKDIR /src
+# The imported tree is at ./plan/ in the build context; the go-peer sources live
+# under plan/interop/gossipsub/go-peer.
+COPY plan/interop/gossipsub/go-peer/ ./
+# Prime the FULL build closure (all transitive module zips), retried, so a
+# transient proxy error does not abort the image.
+RUN for i in 1 2 3 4 5; do go mod download all && break || sleep 5; done
+RUN go build -o /gspeer-go .
+# artifact: /gspeer-go
+
+# --------------------------------------------------------------------------
+# Stage 3: build the rust-libp2p (quinn) gossipsub peer.
+# quinn uses rustls (no native OpenSSL); the rustup gnu toolchain links glibc,
+# matching the debian:bookworm runtime.
+# --------------------------------------------------------------------------
+FROM rust:${RUST_VERSION}-bookworm AS rust-peer-build
+WORKDIR /src
+# The imported tree is at ./plan/ in the build context; the rust-peer sources
+# live under plan/interop/gossipsub/rust-peer.
+COPY plan/interop/gossipsub/rust-peer/ ./
+RUN cargo build --release
+# artifact: /src/target/release/gspeer
+
+# --------------------------------------------------------------------------
+# Stage 4: build the Go testplan.
 # --------------------------------------------------------------------------
 FROM ${image} AS plan-build
 ARG PLAN_PATH
@@ -64,14 +106,20 @@ COPY plan/${PLAN_PATH}/ ./
 RUN go build -a -o /testplan .
 
 # --------------------------------------------------------------------------
-# Stage 3: runtime carrying BOTH binaries; ENTRYPOINT = the Go plan.
+# Stage 5: runtime carrying ALL THREE peer binaries + the plan; ENTRYPOINT =
+# the Go plan, which selects the peer per instance from the `impls` param.
 # --------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
+# libstdc++6/zlib1g cover the zig node; the go peer is pure-Go (CGO disabled) and
+# the rust peer links only glibc + rustls (no native OpenSSL), so the base libc
+# already present suffices for both.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libstdc++6 zlib1g iproute2 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=zig-build  /src/zig-out/bin/libp2p-gossipsub-interop /usr/local/bin/libp2p-gossipsub-interop
-COPY --from=plan-build /testplan /testplan
+COPY --from=zig-build       /src/zig-out/bin/libp2p-gossipsub-interop /usr/local/bin/libp2p-gossipsub-interop
+COPY --from=go-peer-build   /gspeer-go                                /usr/local/bin/gspeer-go
+COPY --from=rust-peer-build /src/target/release/gspeer                /usr/local/bin/gspeer-rust
+COPY --from=plan-build      /testplan                                 /testplan
 ENV GOSSIPSUB_BIN=/usr/local/bin/libp2p-gossipsub-interop
 # Testground health/pprof port.
 EXPOSE 6060

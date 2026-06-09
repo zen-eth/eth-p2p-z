@@ -30,6 +30,32 @@ import (
 // Dockerfile. Override with GOSSIPSUB_BIN if you relocate it.
 const defaultBinPath = "/usr/local/bin/libp2p-gossipsub-interop"
 
+// implBin maps an implementation name (from the `impls` param) to the binary the
+// Dockerfile installs for it. The zig path is also the GOSSIPSUB_BIN default, so
+// the existing zig-only run is unchanged. go/rust are the cross-impl peers.
+var implBin = map[string]string{
+	"zig":  defaultBinPath,
+	"go":   "/usr/local/bin/gspeer-go",
+	"rust": "/usr/local/bin/gspeer-rust",
+}
+
+// splitImpls parses the comma-separated `impls` param into a non-empty list of
+// implementation names, trimming whitespace and dropping blank entries (a
+// trailing comma is fine). An empty/all-blank value falls back to ["zig"] so the
+// default single-impl run is preserved.
+func splitImpls(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"zig"}
+	}
+	return out
+}
+
 // addrTopic carries each publisher's full /p2p/<id> multiaddr (a string) to the
 // subscribers. NewTopic's second arg is a SAMPLE value used to derive the
 // payload type via reflection; "" => the topic carries strings.
@@ -48,6 +74,7 @@ func publishDeliver(runenv *runtime.RunEnv, initCtx *run.InitContext) error {
 	message := runenv.StringParam("message")
 	sign := runenv.StringParam("sign")
 	durationMs := runenv.IntParam("duration_ms")
+	impls := runenv.StringParam("impls")
 	px := runenv.StringParam("px")
 	d := runenv.IntParam("d")
 	dLow := runenv.IntParam("d_low")
@@ -94,6 +121,30 @@ func publishDeliver(runenv *runtime.RunEnv, initCtx *run.InitContext) error {
 		role = "publisher"
 	}
 
+	// --- impl election: map this instance to an implementation by its 1-based
+	// GlobalSeq. `impls` is a comma list (e.g. "zig,go,rust"); instance seq picks
+	// impls[(seq-1) % len]. So seq==1 (the publisher) always gets impls[0]. The
+	// default "zig" makes every instance zig, preserving the verified zig-only run.
+	implList := splitImpls(impls)
+	impl := implList[(int(seq)-1)%len(implList)]
+	bin, ok := implBin[impl]
+	if !ok {
+		err := fmt.Errorf("unknown impl %q (want zig|go|rust)", impl)
+		runenv.RecordFailure(err)
+		return err
+	}
+	// GOSSIPSUB_BIN, if set, only overrides the zig binary (the default). go/rust
+	// always use their fixed install paths so a mixed run resolves correctly.
+	if impl == "zig" {
+		if env := os.Getenv("GOSSIPSUB_BIN"); env != "" {
+			bin = env
+		}
+	}
+	// px/d/d_low/d_high are ZIG-ONLY knobs: go-peer and rust-peer FATAL on any
+	// unknown argument key, so these MUST NOT be passed to them.
+	isZig := impl == "zig"
+	runenv.RecordMessage("impl=%s bin=%s role=%s seq=%d", impl, bin, role, seq)
+
 	// The announce IP MUST be the routable data-network IP (NOT 127.0.0.1) so the
 	// published multiaddr is dialable from the other containers over the shaped
 	// link. Fall back to 0.0.0.0 only when there is no traffic shaping.
@@ -111,6 +162,7 @@ func publishDeliver(runenv *runtime.RunEnv, initCtx *run.InitContext) error {
 
 	if isPublisher {
 		// --- PHASE 2 (publisher): launch node, mint addr_file, publish multiaddr ---
+		// Common args every impl understands.
 		args := []string{
 			"role=listen", "mode=pub",
 			portArg,
@@ -119,13 +171,18 @@ func publishDeliver(runenv *runtime.RunEnv, initCtx *run.InitContext) error {
 			"topic=" + topic,
 			"message=" + message,
 			"sign=" + sign,
-			"px=" + px,
-			fmt.Sprintf("d=%d", d),
-			fmt.Sprintf("d_low=%d", dLow),
-			fmt.Sprintf("d_high=%d", dHigh),
 			durArg,
 		}
-		cmd, recvSeen, scanWG, err := startNode(ctx, runenv, args, topic)
+		// Zig-only mesh/PX knobs (go/rust FATAL on these unknown keys).
+		if isZig {
+			args = append(args,
+				"px="+px,
+				fmt.Sprintf("d=%d", d),
+				fmt.Sprintf("d_low=%d", dLow),
+				fmt.Sprintf("d_high=%d", dHigh),
+			)
+		}
+		cmd, recvSeen, scanWG, err := startNode(ctx, runenv, bin, args, topic)
 		if err != nil {
 			runenv.RecordFailure(err)
 			return err
@@ -184,6 +241,7 @@ func publishDeliver(runenv *runtime.RunEnv, initCtx *run.InitContext) error {
 	runenv.RecordMessage("subscriber dialing peers: %s", strings.Join(peers, ","))
 
 	// --- PHASE 2 (subscriber): launch node pointing at the publisher(s) ---
+	// Common args every impl understands.
 	args := []string{
 		"role=listen", "mode=sub",
 		portArg,
@@ -191,13 +249,18 @@ func publishDeliver(runenv *runtime.RunEnv, initCtx *run.InitContext) error {
 		"peers=" + strings.Join(peers, ","),
 		"topic=" + topic,
 		"sign=" + sign,
-		"px=" + px,
-		fmt.Sprintf("d=%d", d),
-		fmt.Sprintf("d_low=%d", dLow),
-		fmt.Sprintf("d_high=%d", dHigh),
 		durArg,
 	}
-	cmd, recvSeen, scanWG, err := startNode(ctx, runenv, args, topic)
+	// Zig-only mesh/PX knobs (go/rust FATAL on these unknown keys).
+	if isZig {
+		args = append(args,
+			"px="+px,
+			fmt.Sprintf("d=%d", d),
+			fmt.Sprintf("d_low=%d", dLow),
+			fmt.Sprintf("d_high=%d", dHigh),
+		)
+	}
+	cmd, recvSeen, scanWG, err := startNode(ctx, runenv, bin, args, topic)
 	if err != nil {
 		runenv.RecordFailure(err)
 		return err
@@ -222,15 +285,13 @@ func publishDeliver(runenv *runtime.RunEnv, initCtx *run.InitContext) error {
 	return nil
 }
 
-// startNode spawns the eth-p2p-z gossipsub node, streams stdout+stderr into the
-// instance log, and flags recvSeen on the first delivery (a "RECV topic=<topic>"
-// line) or a final JSON "received":true. The returned WaitGroup is Done()'d by
-// the two scan goroutines once they drain their pipe to EOF (see finishNode).
-func startNode(ctx context.Context, runenv *runtime.RunEnv, args []string, topic string) (*exec.Cmd, *atomic.Bool, *stdsync.WaitGroup, error) {
-	bin := os.Getenv("GOSSIPSUB_BIN")
-	if bin == "" {
-		bin = defaultBinPath
-	}
+// startNode spawns the gossipsub node at `bin` (the impl picked by GlobalSeq),
+// streams stdout+stderr into the instance log, and flags recvSeen on the first
+// delivery (a "RECV topic=<topic>" line) or a final JSON "received":true. The
+// "RECV topic=" + final "received":true convention is shared by all three peer
+// binaries (zig/go/rust). The returned WaitGroup is Done()'d by the two scan
+// goroutines once they drain their pipe to EOF (see finishNode).
+func startNode(ctx context.Context, runenv *runtime.RunEnv, bin string, args []string, topic string) (*exec.Cmd, *atomic.Bool, *stdsync.WaitGroup, error) {
 	runenv.RecordMessage("exec %s %s", bin, strings.Join(args, " "))
 
 	cmd := exec.CommandContext(ctx, bin, args...)
