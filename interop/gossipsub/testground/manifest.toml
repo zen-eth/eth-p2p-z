@@ -1,0 +1,37 @@
+name = "gossipsub-quic"
+
+[defaults]
+builder = "docker:generic"
+runner  = "local:docker"
+
+[builders."docker:generic"]
+enabled = true
+# The build context for docker:generic is the IMPORTED plan tree. We import the
+# eth-p2p-z REPO ROOT (so the Zig stage sees the whole source) and point `path`
+# at the Go-plan subdir, which fixes the Dockerfile location
+# (/plan/<path>/Dockerfile) and the auto-injected PLAN_PATH build-arg.
+path = "interop/gossipsub/testground"
+  [builders."docker:generic".build_args]
+  # Base image for the Go-plan build stage.
+  image = "golang:1.21-bookworm"
+
+[runners."local:docker"]
+enabled = true
+
+[[testcases]]
+name = "publish-deliver"
+instances = { min = 2, max = 50, default = 2 }
+  [testcases.params]
+  topic            = { type = "string", desc = "gossipsub topic",                  default = "interop-test" }
+  message          = { type = "string", desc = "payload the publisher sends",       default = "hello-gossipsub" }
+  sign             = { type = "string", desc = "strict|anonymous",                  default = "strict" }
+  px               = { type = "string", desc = "peer-exchange on|off",              default = "off" }
+  duration_ms      = { type = "int",    desc = "node run duration", unit = "ms",    default = 20000 }
+  d                = { type = "int",    desc = "gossipsub mesh degree D",           default = 6 }
+  d_low            = { type = "int",    desc = "mesh D_low",                        default = 5 }
+  d_high           = { type = "int",    desc = "mesh D_high",                       default = 12 }
+  port             = { type = "int",    desc = "QUIC/UDP port the node binds",      default = 9000 }
+  n_publishers     = { type = "int",    desc = "number of publisher instances",     default = 1 }
+  latency_ms       = { type = "int",    desc = "injected link latency", unit = "ms", default = 50 }
+  bandwidth_mb     = { type = "int",    desc = "link bandwidth", unit = "MiB",       default = 100 }
+  setup_slack_secs = { type = "int",    desc = "extra time budget beyond duration", unit = "s", default = 60 }

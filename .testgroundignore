@@ -1,0 +1,12 @@
+# Consulted ONLY by `testground plan import` (NOT .gitignore / .dockerignore).
+# The eth-p2p-z repo root is imported as the "gossipsub-quic" plan
+# (interop/gossipsub/testground), so the Zig build stage gets the whole source.
+# Exclude heavy build artifacts so the packed plan context stays small; the
+# Dockerfile also `rm -rf .zig-cache zig-out` as a stale-cache safety net.
+.git
+zig-out
+.zig-cache
+interop/gossipsub/rust-peer/target
+interop/gossipsub/go-peer/gspeer
+interop/transport/rust-peer/target
+interop/gossipsub/testground/eth-p2p-z
