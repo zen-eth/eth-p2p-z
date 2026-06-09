@@ -248,6 +248,12 @@ func main() {
 	<-done
 
 	fmt.Printf("{\"role\":\"%s\",\"mode\":\"%s\",\"received\":%t}\n", a.role, a.mode, received)
+	// Hard-exit after the final result line. The deferred h.Close() would otherwise
+	// run a graceful go-libp2p/quic-go shutdown that lingers ~2s on CONNECTION_CLOSE,
+	// making this node exit well after the zig/rust peers (which hard-exit). Under
+	// testground that lag desyncs the per-instance teardown and the run client can
+	// report "canceled" instead of success. We are done here, so exit immediately.
+	os.Exit(0)
 }
 
 func newHost(a args) host.Host {
