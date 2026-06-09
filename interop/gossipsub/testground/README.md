@@ -37,8 +37,9 @@ simulator (which can't carry eth-p2p-z's QUIC transport).
 Prereqs: a running `testground daemon` (own terminal) + Docker.
 
 ```sh
-# 0) one-time: generate go.sum (needs network) — the Docker stage `go mod download` needs it
-cd interop/gossipsub/testground && go mod tidy && cd -
+# go.sum is committed, so STEP 0 is NOT needed. (`go build`/`go vet` are verified
+# green against the real sdk-go.) Only run this if you change deps:
+#   cd interop/gossipsub/testground && go mod tidy && cd -
 
 # 1) import (stages the manifest at the repo root, imports, verifies, cleans up)
 bash interop/gossipsub/testground/import.sh
