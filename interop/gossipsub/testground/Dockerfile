@@ -21,6 +21,9 @@
 ARG image=golang:1.21-bookworm
 ARG ZIG_VERSION=0.16.0
 ARG RUST_VERSION=1.85.1
+# rust-peer (libp2p 0.56) pulls icu_* 2.x transitive deps that require rustc >= 1.86,
+# so its build stage uses a newer toolchain than the zig/quiche stage (RUST_VERSION).
+ARG RUST_PEER_VERSION=1.90
 ARG ZIG_LOG_LEVEL=info
 # go-peer's go.mod requires go >= 1.24, so its build stage pins a newer toolchain
 # than the plan-build stage (the plan itself only needs go 1.19).
@@ -83,7 +86,7 @@ RUN go build -o /gspeer-go .
 # quinn uses rustls (no native OpenSSL); the rustup gnu toolchain links glibc,
 # matching the debian:bookworm runtime.
 # --------------------------------------------------------------------------
-FROM rust:${RUST_VERSION}-bookworm AS rust-peer-build
+FROM rust:${RUST_PEER_VERSION}-bookworm AS rust-peer-build
 WORKDIR /src
 # The imported tree is at ./plan/ in the build context; the rust-peer sources
 # live under plan/interop/gossipsub/rust-peer.
