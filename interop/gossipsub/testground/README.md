@@ -65,8 +65,34 @@ testground run single --plan gossipsub-quic --testcase publish-deliver \
 `{"role":"listen","mode":"sub","received":true}` → `RecordSuccess`; the publisher
 passes on clean exit. A subscriber miss fails that instance (and the run).
 
+## Cross-impl matrix (zig ↔ go ↔ rust)
+
+The image bundles all three peers (zig `libp2p-gossipsub-interop`, go-libp2p
+`gspeer-go`, rust-libp2p `gspeer-rust`). The `impls` param (a comma list) selects
+each instance's implementation by `GlobalSeq`; instance 1 (the publisher) gets the
+first entry. So `impls=zig,go,rust` → zig publishes, go+rust subscribe. The
+zig-only knobs (`px`/`d`/`d_low`/`d_high`) are passed only to the zig peer (go/rust
+abort on unknown args). Default `impls=zig` keeps the single-impl run.
+
+```sh
+for m in zig,go,rust go,zig,rust rust,zig,go; do
+  testground run single --plan gossipsub-quic --testcase publish-deliver \
+      --builder docker:generic --runner local:docker --instances 3 --wait \
+      --test-param impls=$m
+done
+```
+
+All three directions pass `outcome = success (single:3/3)` — every impl works as
+both publisher and subscriber.
+
+> **Required testground fix:** multi-instance runs trip a sync-client teardown
+> panic in the testground **daemon** (`send on closed channel`). Apply
+> `patches/sdk-go-responsesworker-panic.patch` and rebuild the daemon first — see
+> `patches/README.md`. (A testground/sdk-go platform bug, not eth-p2p-z.)
+
 ## Params
-`topic`, `message`, `sign` (strict|anonymous), `px` (on|off), `duration_ms`,
+`topic`, `message`, `sign` (strict|anonymous), `impls` (comma list of zig|go|rust
+per instance), `px` (on|off), `duration_ms`,
 `d`/`d_low`/`d_high` (mesh degrees), `port`, `n_publishers`, `latency_ms`,
 `bandwidth_mb`, `setup_slack_secs`. See `manifest.toml` for defaults.
 

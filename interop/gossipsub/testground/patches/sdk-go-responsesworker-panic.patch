@@ -1,0 +1,18 @@
+diff --git a/sync/client_conn.go b/sync/client_conn.go
+--- a/sync/client_conn.go
++++ b/sync/client_conn.go
+@@ -40,7 +40,13 @@
+ 		if ch == nil {
+ 			c.log.Warnf("no handler available for response: %s", res.ID)
+ 		} else {
+-			ch <- res
++			// ch may be closed concurrently by makeRequest's ctx-cancel goroutine
++			// at teardown (it locks, closes, deletes). A late response would then
++			// panic on send-to-closed; recover and drop it (handler is already gone).
++			func() {
++				defer func() { _ = recover() }()
++				ch <- res
++			}()
+ 		}
+ 	}
+ 
