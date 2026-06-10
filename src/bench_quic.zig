@@ -20,6 +20,131 @@ const io_time = @import("quic/io/time.zig");
 const TwoEndpoints = support.TwoEndpoints;
 const AcceptCtx = support.AcceptCtx;
 
+/// Wraps an allocator and tracks NET live heap bytes (allocs minus frees),
+/// so the footprint scenario can attribute per-connection heap cost. Thread-
+/// safe (atomics): zio executors allocate concurrently.
+const ByteCounting = struct {
+    parent: std.mem.Allocator,
+    live: std.atomic.Value(isize) = .init(0),
+
+    fn allocator(self: *ByteCounting) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ByteCounting = @ptrCast(@alignCast(ctx));
+        const p = self.parent.vtable.alloc(self.parent.ptr, len, alignment, ret_addr) orelse return null;
+        _ = self.live.fetchAdd(@intCast(len), .monotonic);
+        return p;
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ByteCounting = @ptrCast(@alignCast(ctx));
+        if (!self.parent.vtable.resize(self.parent.ptr, memory, alignment, new_len, ret_addr)) return false;
+        _ = self.live.fetchAdd(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)), .monotonic);
+        return true;
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *ByteCounting = @ptrCast(@alignCast(ctx));
+        const p = self.parent.vtable.remap(self.parent.ptr, memory, alignment, new_len, ret_addr) orelse return null;
+        _ = self.live.fetchAdd(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)), .monotonic);
+        return p;
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ByteCounting = @ptrCast(@alignCast(ctx));
+        self.parent.vtable.free(self.parent.ptr, memory, alignment, ret_addr);
+        _ = self.live.fetchSub(@intCast(memory.len), .monotonic);
+    }
+};
+
+fn maxRssBytes() usize {
+    const ru = std.posix.getrusage(std.posix.rusage.SELF);
+    // macOS reports bytes; Linux reports KiB.
+    const raw: usize = @intCast(ru.maxrss);
+    return if (@import("builtin").os.tag == .linux) raw * 1024 else raw;
+}
+
+const MultiAccept = struct {
+    endpoint: *support.QuicEndpoint,
+    conns: []?*support.Connection,
+    err: ?anyerror = null,
+
+    fn run(self: *MultiAccept) void {
+        for (self.conns) |*slot| {
+            slot.* = self.endpoint.accept() catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    }
+};
+
+/// P5 footprint probe: open N idle connections and attribute the per-conn
+/// cost two ways — net live HEAP bytes (via the counting allocator wrapping
+/// both the endpoints AND the zio runtime) and peak-RSS growth (catches what
+/// the allocator does not, e.g. mmap'd fiber stacks).
+fn runFootprint(counting: *ByteCounting, io: std.Io, conn_count: usize) !void {
+    const allocator = counting.allocator();
+    var fixture = try TwoEndpoints.init(allocator, io, .{}, .{});
+    defer fixture.deinit();
+    const server_addr = try fixture.bindServerLoopback();
+    _ = try fixture.bindClientLoopback();
+
+    const server_conns = try allocator.alloc(?*support.Connection, conn_count);
+    defer allocator.free(server_conns);
+    @memset(server_conns, null);
+    const client_conns = try allocator.alloc(?*support.Connection, conn_count);
+    defer allocator.free(client_conns);
+    @memset(client_conns, null);
+
+    var acceptor = MultiAccept{ .endpoint = fixture.server, .conns = server_conns };
+    var accept_future = try std.Io.concurrent(io, MultiAccept.run, .{&acceptor});
+
+    // Baseline AFTER the endpoints are up, BEFORE any connection.
+    io_time.ms(100).sleep(io) catch {};
+    const heap_before = counting.live.load(.monotonic);
+    const rss_before = maxRssBytes();
+
+    for (client_conns) |*slot| {
+        slot.* = try fixture.client.dial(server_addr, .{
+            .timeout = support.receiveTimeout(support.default_handshake_timeout_ns),
+        });
+    }
+    accept_future.await(io);
+    if (acceptor.err) |err| return err;
+
+    io_time.ms(200).sleep(io) catch {}; // settle: handshake fibers unwind
+    const heap_after = counting.live.load(.monotonic);
+    const rss_after = maxRssBytes();
+
+    const pairs_f = @as(f64, @floatFromInt(conn_count));
+    std.debug.print(
+        "footprint {d} conns   heap {d:.1} KiB/conn-pair ({d:.1} MiB total)   peak-rss {d:.1} KiB/conn-pair ({d:.1} MiB total)\n",
+        .{
+            conn_count,
+            @as(f64, @floatFromInt(heap_after - heap_before)) / 1024.0 / pairs_f,
+            @as(f64, @floatFromInt(heap_after - heap_before)) / 1024.0 / 1024.0,
+            @as(f64, @floatFromInt(rss_after -| rss_before)) / 1024.0 / pairs_f,
+            @as(f64, @floatFromInt(rss_after -| rss_before)) / 1024.0 / 1024.0,
+        },
+    );
+
+    for (client_conns) |slot| if (slot) |c| {
+        c.close(io, 0, "bench done") catch {};
+        c.deinit();
+    };
+    for (server_conns) |slot| if (slot) |c| c.deinit();
+}
+
 const bulk_total: usize = 256 * 1024 * 1024;
 const bulk_chunk: usize = 64 * 1024;
 const small_total: usize = 32 * 1024 * 1024;
@@ -130,7 +255,8 @@ fn runScenario(
 }
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    var counting = ByteCounting{ .parent = init.gpa };
+    const allocator = counting.allocator();
     const cpu_count = std.Thread.getCpuCount() catch 2;
     const executor_count: u8 = @intCast(std.math.clamp(cpu_count, 2, 64));
     const runtime = try zio.Runtime.init(allocator, .{ .executors = .exact(executor_count) });
@@ -138,6 +264,19 @@ pub fn main(init: std.process.Init) !void {
     const io = runtime.io();
 
     std.debug.print("quic loopback bench: executors={d}\n\n", .{executor_count});
+    // BENCH_FOOTPRINT_ONLY: run just the footprint probe. Peak-RSS is a
+    // process-lifetime high-water mark, so the RSS column is only meaningful
+    // in this mode (a prior throughput scenario inflates it past relevance).
+    // In the default combined run the footprint goes LAST and only its
+    // heap-live column is meaningful. (Running it FIRST is not an option:
+    // 50 churned connection pairs reproducibly degrade the subsequent
+    // loopback scenarios ~30x with packet drops — recorded as a lead in the
+    // bench-bimodality investigation, see docs/benchmarks.)
+    if (std.c.getenv("BENCH_FOOTPRINT_ONLY") != null) {
+        try runFootprint(&counting, io, 50);
+        return;
+    }
     try runScenario(allocator, io, "bulk 64KiB chunks", bulk_total, bulk_chunk);
     try runScenario(allocator, io, "small 1200B chunks", small_total, small_chunk);
+    try runFootprint(&counting, io, 50);
 }
