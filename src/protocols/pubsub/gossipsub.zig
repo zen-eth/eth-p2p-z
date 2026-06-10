@@ -99,9 +99,20 @@ pub const StreamSink = struct {
 /// errors so the reader loop exits.
 pub const StreamSource = struct {
     stream: *Stream,
+    /// Persistent buffered reader over the stream (initialized lazily on the
+    /// first read, when an `io` is in hand). One frame's over-read stays
+    /// buffered for the next, and the length varint costs buffered byte-takes
+    /// instead of one locked stream read PER BYTE. The source must not move
+    /// after the first read (the reader's vtable resolves through its own
+    /// address) — it lives as a stack local in the inbound handler fiber.
+    reader: ?Stream.Reader = null,
+    buffer: [read_buffer_len]u8 = undefined,
+
+    const read_buffer_len = 4096;
 
     pub fn read(self: *StreamSource, allocator: std.mem.Allocator, io: std.Io) !pubsub.OwnedRpc {
-        return pubsub.readRpc(allocator, io, self.stream);
+        if (self.reader == null) self.reader = self.stream.reader(io, &self.buffer);
+        return pubsub.readRpcBuffered(allocator, &self.reader.?.interface);
     }
 };
 

@@ -129,6 +129,47 @@ pub fn readRpc(allocator: std.mem.Allocator, io: std.Io, stream: *Stream) ReadRp
     };
 }
 
+pub const ReadRpcBufferedError = error{ EndOfStream, ReadFailed, VarintTooLong, MessageTooLarge } || gremlin.Error;
+
+/// Like `readRpc` but through a PERSISTENT buffered `std.Io.Reader` over the
+/// stream: the length varint comes from the buffer (one stream round trip per
+/// REFILL instead of one mutex-guarded `readAll` per varint BYTE), and any
+/// over-read bytes stay buffered for the next frame — which is why the reader
+/// must live as long as the stream (one per inbound handler, see
+/// gossipsub.StreamSource). Large bodies stream straight into the owned
+/// allocation once the buffer drains, so big messages pay no extra copy.
+pub fn readRpcBuffered(allocator: std.mem.Allocator, r: *std.Io.Reader) ReadRpcBufferedError!OwnedRpc {
+    const len = try readUvarintBuffered(r);
+    if (len > max_rpc_message_len) return error.MessageTooLarge;
+
+    const bytes = try allocator.alloc(u8, len);
+    errdefer allocator.free(bytes);
+    r.readSliceAll(bytes) catch |err| switch (err) {
+        error.EndOfStream => return error.EndOfStream,
+        error.ReadFailed => return error.ReadFailed,
+    };
+    return .{
+        .bytes = bytes,
+        .reader = try rpc_pb.RPCReader.init(bytes),
+    };
+}
+
+fn readUvarintBuffered(r: *std.Io.Reader) error{ EndOfStream, ReadFailed, VarintTooLong }!usize {
+    var result: usize = 0;
+    var shift: usize = 0;
+    var i: usize = 0;
+    while (i < max_varint_len) : (i += 1) {
+        const byte = r.takeByte() catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        result |= @as(usize, byte & 0x7f) << @intCast(shift);
+        if ((byte & 0x80) == 0) return result;
+        shift += 7;
+    }
+    return error.VarintTooLong;
+}
+
 /// Write `value` as an unsigned LEB128 varint into `out`, returning the byte
 /// count written. A usize varint is at most max_varint_len bytes, so the buffer
 /// is always large enough.
