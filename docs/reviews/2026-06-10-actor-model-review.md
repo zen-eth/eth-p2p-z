@@ -392,5 +392,7 @@ architecture — no rewrite):
 | 5 | P4 expiry wheel + global promise map; P6 shared IHAVE encode + control coalescing | S–M | open |
 | 6 | H1 delivery queue / tryPublish; H2 handle lifetime contract; M1/M2 hardenings; P5 fiber/memory diet | M | open |
 
+| — | Two-inbox split (Part IV (d)): control/verdicts prioritized over data ingress | S | **done** (`f29492c`; bench: burst 601→1977 delivered, self-starvation eliminated) |
+
 None of these disturb the ownership architecture — which is the part that is
 already right.
