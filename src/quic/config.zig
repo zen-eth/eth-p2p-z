@@ -141,6 +141,21 @@ pub const ActorOptions = struct {
 /// per-connection handshake deadline.
 pub const EndpointOptions = struct {
     connection_accept_queue_len: usize = 64,
+    /// Receive-slab pool for the endpoint's recv fiber: received datagrams
+    /// become zero-copy views into pooled buffers instead of per-packet heap
+    /// copies (a GRO super-datagram splits into sibling views of one slab).
+    /// `recv_slab_slots` bounds how many slabs may be pinned at once by
+    /// in-flight packets; an exhausted pool degrades to the heap-copy path.
+    /// 0 disables the pool entirely.
+    recv_slab_slots: usize = 64,
+    /// Bytes per slab; must hold at least one maximum UDP datagram (65_535).
+    /// The default IS one maximum datagram — a per-packet buffer pool. Larger
+    /// values turn each slab into a multi-datagram bump arena (fewer pool
+    /// round-trips, but a slab stays pinned until its LAST view releases);
+    /// loopback benchmarking on macOS showed pathological pacing interactions
+    /// with multi-datagram slabs, so bigger sizes should be adopted only with
+    /// platform-specific measurements in hand.
+    recv_slab_slot_bytes: usize = 65_535,
     handshake_timeout_ns: u64 = default_handshake_timeout_ns,
     enable_udp_gro: bool = true,
     /// Opt-in because packet-info rewrites quiche's local path address on
@@ -230,6 +245,9 @@ fn validateActor(opts: ActorOptions) ConfigError!void {
 fn validateEndpoint(opts: EndpointOptions) ConfigError!void {
     if (opts.connection_accept_queue_len == 0) return error.InvalidOptions;
     if (opts.handshake_timeout_ns == 0) return error.InvalidOptions;
+    // A slab must hold at least one maximum UDP datagram or the recv path
+    // could never use it (permanent silent fallback).
+    if (opts.recv_slab_slots > 0 and opts.recv_slab_slot_bytes < 65_535) return error.InvalidOptions;
 }
 
 pub fn buildQuicheConfig(opts: Options) ConfigError!*quiche.quiche_config {

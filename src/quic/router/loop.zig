@@ -22,6 +22,7 @@ const Connection = connection_mod.Connection;
 const IncomingPacketChannel = packet_route.IncomingPacketChannel;
 const RoutedPacket = packet_route.RoutedPacket;
 const RouteTable = route_table_mod.RouteTable;
+pub const SlabPool = packet_route.SlabPool;
 pub const AcceptChannel = accept_queue.Channel;
 pub const ListenError = error{AlreadyBound} || std.Io.net.IpAddress.BindError || socket_control.ConfigureError || std.mem.Allocator.Error || std.Io.ConcurrentError;
 const packet_buf_len = packet_route.max_udp_payload_len;
@@ -72,6 +73,11 @@ pub const Context = struct {
     /// and returns. A persistent flag, not `Future.cancel` (which is one-shot
     /// and unreliable as the sole teardown signal — see `closeListener`).
     stopping: *std.atomic.Value(bool),
+    /// Slot for the recv fiber's slab pool (zero-copy packet views). Filled on
+    /// `bind` (when `recv_slab_slots > 0`), endpoint reference dropped by
+    /// `closeListener`; in-flight views keep their slabs (and the pool) alive
+    /// past that. Null = every received packet is heap-copied.
+    slab_pool_slot: *?*packet_route.SlabPool,
     raw: endpoint_raw.Context,
 
     pub fn addStat(ctx: Context, comptime field: []const u8, value: u64) void {
@@ -138,6 +144,17 @@ pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAd
         ep.accept_available.store(0, .release);
     }
     ep.setStat("cid_map_entries", 0);
+    if (ep.options.endpoint.recv_slab_slots > 0) {
+        ep.slab_pool_slot.* = try packet_route.SlabPool.init(
+            ep.allocator,
+            ep.options.endpoint.recv_slab_slots,
+            ep.options.endpoint.recv_slab_slot_bytes,
+        );
+    }
+    errdefer if (ep.slab_pool_slot.*) |pool| {
+        pool.release();
+        ep.slab_pool_slot.* = null;
+    };
     // Clear any stop signal from a previous listener before (re-)spawning.
     ep.stopping.store(false, .release);
     ep.router_future_slot.* = try std.Io.concurrent(io, routerSocketLoop, .{ep});
@@ -201,6 +218,12 @@ pub fn closeListener(ep: Context) void {
     // self-clearing on success and tracked in a Group; `cancel` blocks
     // until each finishes its post-call cleanup.
     ep.handshake_waiters.cancel(io);
+    // Drop the endpoint's pool reference; slabs pinned by in-flight packet
+    // views (sitting in connection inboxes) free themselves on last release.
+    if (ep.slab_pool_slot.*) |pool| {
+        pool.release();
+        ep.slab_pool_slot.* = null;
+    }
     if (ep.accept_queue_slot.*) |state| {
         state.close(io);
         state.discardQueued(io);
@@ -234,9 +257,11 @@ fn routerSocketLoop(ep: Context) RouterLoopError!void {
     // through this loop at all (writers mutate the shared table directly), so
     // the only wake this loop needs is a datagram: real traffic, or
     // closeListener's zero-length loopback wake.
+    var recv_slab = RecvSlab{ .pool = ep.slab_pool_slot.* };
+    defer recv_slab.retire();
     while (true) {
         if (ep.stopping.load(.acquire)) break;
-        var packet = (receiveRouterPacket(ep, .none) catch |err| switch (err) {
+        var packet = (receiveRouterPacket(ep, &recv_slab, .none) catch |err| switch (err) {
             // The teardown backstop (`closeListener` cancels only if its wake
             // datagram could not be sent) — or a stray cancel; either way the
             // loop-top `stopping` check decides.
@@ -249,6 +274,42 @@ fn routerSocketLoop(ep: Context) RouterLoopError!void {
         };
     }
 }
+
+/// The recv fiber's bump cursor over the current receive slab: datagrams land
+/// in the slab's tail and become zero-copy packet views; the slab is retired
+/// to a fresh one when the tail can no longer hold a maximum-size datagram.
+/// Single-fiber state — only the recv loop touches it.
+const RecvSlab = struct {
+    pool: ?*packet_route.SlabPool,
+    current: ?*packet_route.SlabPool.Slab = null,
+    fill: usize = 0,
+
+    /// The writable tail (≥ one max datagram), or null when the pool is
+    /// absent/exhausted and the caller must fall back to a heap copy.
+    fn tail(rs: *RecvSlab) ?[]u8 {
+        const pool = rs.pool orelse return null;
+        if (rs.current) |slab| {
+            if (slab.buf.len - rs.fill >= packet_buf_len) return slab.buf[rs.fill..];
+            slab.release(); // drop the cursor hold; views keep it pinned
+            rs.current = null;
+        }
+        rs.current = pool.acquire() orelse return null;
+        rs.fill = 0;
+        return rs.current.?.buf;
+    }
+
+    /// Bump past `len` bytes the kernel just filled at the tail's front.
+    fn consume(rs: *RecvSlab, len: usize) void {
+        rs.fill += len;
+    }
+
+    fn retire(rs: *RecvSlab) void {
+        if (rs.current) |slab| {
+            slab.release();
+            rs.current = null;
+        }
+    }
+};
 
 /// Wake the recv fiber out of its blocking `recvmsg` for teardown: send a
 /// zero-length datagram to the bound socket (loopback-substituted when bound
@@ -361,19 +422,23 @@ fn unmapRoute(ep: Context, cid: CidKey) void {
     if (ep.core.route_table.unmap(ep.io, cid)) ep.subStat("cid_map_entries", 1);
 }
 
-fn receiveRouterPacket(ep: Context, timeout: std.Io.Timeout) (error{Timeout} || std.Io.Cancelable)!?RoutedPacket {
+fn receiveRouterPacket(ep: Context, rs: *RecvSlab, timeout: std.Io.Timeout) (error{Timeout} || std.Io.Cancelable)!?RoutedPacket {
     const io = ep.io;
     const socket = ep.socket_slot.* orelse return error.Canceled;
     const local_addr = socket.address();
-    var buf: [packet_buf_len]u8 = undefined;
+    // Receive straight into the current slab's tail (the packet then becomes a
+    // zero-copy VIEW); when the pool is dry, degrade to a stack buffer + the
+    // old per-packet heap copy.
+    var fallback_buf: [packet_buf_len]u8 = undefined;
+    const slab_tail = rs.tail();
+    const buf: []u8 = if (slab_tail) |t| t[0..packet_buf_len] else fallback_buf[0..];
     // Shadow mode: a plain `recvmsg` with NO control buffer. zio maps an empty
     // control slice to `msg_control = null`/`msg_controllen = 0`, so the kernel
-    // sees a bare datagram receive — the only form the Shadow simulator supports.
-    // The loop is driven by the `route_command` select arm for wakeup/teardown
-    // (this is always called with a `.none` timeout — see `waitRouterPacket`), so
-    // dropping the timed-control receive does not change the loop's liveness.
+    // sees a bare datagram receive — the only form the Shadow simulator
+    // supports. Wakeup/teardown is the loopback wake datagram, so dropping the
+    // timed-control receive does not change the loop's liveness.
     const msg = if (ep.options.endpoint.shadow_compatible)
-        socket.receive(io, &buf) catch |err| switch (err) {
+        socket.receive(io, buf) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             else => {
                 ep.addStat("router_recv_errors", 1);
@@ -382,7 +447,7 @@ fn receiveRouterPacket(ep: Context, timeout: std.Io.Timeout) (error{Timeout} || 
         }
     else recv: {
         var control: [socket_control.recv_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
-        break :recv socket.receiveWithControlTimeout(io, &buf, &control, timeout) catch |err| switch (err) {
+        break :recv socket.receiveWithControlTimeout(io, buf, &control, timeout) catch |err| switch (err) {
             error.Timeout => return error.Timeout,
             error.Canceled => return error.Canceled,
             else => {
@@ -403,11 +468,23 @@ fn receiveRouterPacket(ep: Context, timeout: std.Io.Timeout) (error{Timeout} || 
             return null;
         },
     };
-    return (RoutedPacket.initWithMeta(ep.allocator, msg.data, msg.from, controlDestination(meta, local_addr), .{
+    const packet_meta = RoutedPacket.Meta{
         .rx_mono_ns = rxMonoNs(io),
         .rx_system_ns = meta.rx_system_ns,
         .gro_segment_size = meta.gro_segment_size,
-    }) catch {
+    };
+    if (slab_tail != null) {
+        // `msg.data` is the kernel-filled front of the slab tail: wrap it as a
+        // view (one slab retain) and bump the cursor past it. Zero copies.
+        const slab = rs.current.?;
+        const packet = RoutedPacket.initView(slab, msg.data, msg.from, controlDestination(meta, local_addr), packet_meta) orelse {
+            ep.addStat("router_packet_drops", 1);
+            return null;
+        };
+        rs.consume(msg.data.len);
+        return packet;
+    }
+    return (RoutedPacket.initWithMeta(ep.allocator, msg.data, msg.from, controlDestination(meta, local_addr), packet_meta) catch {
         ep.addStat("router_packet_drops", 1);
         return null;
     }) orelse {
@@ -438,22 +515,32 @@ fn processRouterGroPacket(ep: Context, packet: *const RoutedPacket, segment_size
     var offset: usize = 0;
     while (offset < packet.data.len) {
         const end = @min(offset + @as(usize, segment_size), packet.data.len);
-        var segment = (RoutedPacket.initWithMeta(
-            ep.allocator,
-            packet.data[offset..end],
-            packet.from,
-            packet.to,
-            .{
-                .rx_mono_ns = packet.rx_mono_ns,
-                .rx_system_ns = packet.rx_system_ns,
-            },
-        ) catch {
-            ep.addStat("router_packet_drops", 1);
-            return;
-        }) orelse {
-            ep.addStat("router_packet_drops", 1);
-            return;
+        const segment_meta = RoutedPacket.Meta{
+            .rx_mono_ns = packet.rx_mono_ns,
+            .rx_system_ns = packet.rx_system_ns,
         };
+        // A slab-backed super-datagram splits into sibling VIEWS of the same
+        // bytes (one retain each, zero copies); the heap-copy fallback dupes
+        // per segment as before.
+        var segment = if (packet.slab) |slab|
+            (RoutedPacket.initView(slab, packet.data[offset..end], packet.from, packet.to, segment_meta) orelse {
+                ep.addStat("router_packet_drops", 1);
+                return;
+            })
+        else
+            ((RoutedPacket.initWithMeta(
+                ep.allocator,
+                packet.data[offset..end],
+                packet.from,
+                packet.to,
+                segment_meta,
+            ) catch {
+                ep.addStat("router_packet_drops", 1);
+                return;
+            }) orelse {
+                ep.addStat("router_packet_drops", 1);
+                return;
+            });
         errdefer segment.deinit();
         try processRouterSinglePacket(ep, &segment);
         segment.deinit();
@@ -875,6 +962,7 @@ test "router splits GRO datagrams before CID dispatch" {
     var router_future_slot: ?std.Io.Future(RouterLoopError!void) = null;
     var handshake_waiters: std.Io.Group = .init;
     var stopping: std.atomic.Value(bool) = .init(false);
+    var slab_pool_slot: ?*packet_route.SlabPool = null;
     const ep = Context{
         .allocator = allocator,
         .io = io,
@@ -886,6 +974,7 @@ test "router splits GRO datagrams before CID dispatch" {
         .router_future_slot = &router_future_slot,
         .handshake_waiters = &handshake_waiters,
         .stopping = &stopping,
+        .slab_pool_slot = &slab_pool_slot,
         .raw = undefined,
     };
 

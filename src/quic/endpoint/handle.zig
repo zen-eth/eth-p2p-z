@@ -207,6 +207,9 @@ const Impl = struct {
     /// Cooperative teardown flag for the router fiber. See `router.closeListener`
     /// for why teardown sets this + sends the loopback wake rather than cancelling.
     router_stopping: std.atomic.Value(bool) = .init(false),
+    /// Recv-fiber slab pool (see router.Context.slab_pool_slot). Filled on
+    /// bind, endpoint reference dropped by closeListener.
+    recv_slab_pool: ?*router.SlabPool = null,
 };
 
 fn rawContext(e: *QuicEndpoint) raw.Context {
@@ -232,6 +235,7 @@ fn routerContext(e: *QuicEndpoint) router.Context {
         .router_future_slot = &endpoint.router_future,
         .handshake_waiters = &endpoint.handshake_waiters,
         .stopping = &endpoint.router_stopping,
+        .slab_pool_slot = &endpoint.recv_slab_pool,
         .raw = rawContext(e),
     };
 }

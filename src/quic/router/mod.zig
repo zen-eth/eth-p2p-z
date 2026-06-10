@@ -10,6 +10,7 @@ pub const AcceptError = loop.AcceptError;
 pub const CidMap = loop.CidMap;
 pub const ListenError = loop.ListenError;
 pub const RouteRegistrar = loop.RouteRegistrar;
+pub const SlabPool = loop.SlabPool;
 pub const RouterLoopError = loop.RouterLoopError;
 
 pub const bind = loop.bind;
