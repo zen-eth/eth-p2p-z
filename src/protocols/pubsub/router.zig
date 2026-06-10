@@ -395,6 +395,9 @@ const inbox_capacity = 256;
 /// one heartbeat, one shutdown. It must never backpressure against a data
 /// flood — that coupling is the thing the second queue exists to remove.
 const control_inbox_capacity = 256;
+/// Bound on peers with a pre-connect subscription stash (see
+/// stashPendingSubscription) — garbage-bounded, churn-tolerant.
+const max_pending_subscription_peers = 512;
 
 /// A peer key usable as an AutoHashMap key. A PeerId is `[64]u8` plus a length;
 /// the bytes past `len` are undefined, so the struct is not directly hashable.
@@ -1842,8 +1845,15 @@ pub fn Router(comptime Transport: type) type {
             while (true) {
                 const n = router.control_inbox.getUncancelable(router.io, &buf, 0) catch return true;
                 if (n == 0) return false;
-                for (buf[0..n]) |command| {
-                    if (router.dispatch(command)) return true;
+                for (buf[0..n], 0..) |command, i| {
+                    if (router.dispatch(command)) {
+                        // Commands batched BEHIND the shutdown are already out
+                        // of the queue — the teardown drain can never see them,
+                        // so free them here (a validation_result's context, a
+                        // peer_record's bytes) instead of leaking.
+                        for (buf[i + 1 .. n]) |stranded| router.freeCommand(stranded);
+                        return true;
+                    }
                 }
             }
         }
@@ -3168,6 +3178,20 @@ pub fn Router(comptime Transport: type) type {
         /// outcome as before this stash existed).
         fn stashPendingSubscription(router: *Self, source: PeerId, topic: []const u8, subscribe: bool) void {
             const key = peerKey(&source);
+            // Cap the stash map: a SUBSCRIBE that trails its peer's disconnect
+            // (the disconnect rides the priority control inbox, so it can
+            // overtake queued data from the same peer) creates an entry no
+            // `peer_connected` will ever adopt and no disconnect will sweep
+            // again. The cap bounds that garbage — and adversarial
+            // connect/SUBSCRIBE/disconnect churn — at a fixed size; dropping a
+            // stash for a genuinely-pending peer is the pre-existing
+            // best-effort behaviour (the peer re-announces on its next
+            // subscription change or reconnect).
+            if (!router.pending_subscriptions.contains(key) and
+                router.pending_subscriptions.count() >= max_pending_subscription_peers)
+            {
+                return;
+            }
             const gop = router.pending_subscriptions.getOrPut(key) catch return;
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             if (subscribe) {
@@ -4062,41 +4086,50 @@ pub fn Router(comptime Transport: type) type {
             while (true) {
                 const n = queue.getUncancelable(router.io, &buf, 0) catch return;
                 if (n == 0) return;
-                for (buf[0..n]) |command| switch (command) {
-                    .inbound_rpc => |in| {
-                        var owned = in;
-                        owned.rpc.deinit(router.allocator);
-                    },
-                    .subscribe => |s| router.allocator.free(s.topic),
-                    .unsubscribe => |u| router.allocator.free(u.topic),
-                    .publish => |p| {
-                        router.allocator.free(p.topic);
-                        router.allocator.free(p.data);
-                    },
-                    .peer_record => |c| router.allocator.free(c.envelope_bytes),
-                    .enqueue_for_test => |e| {
-                        // The peer map is already torn down; release the frame
-                        // reference and wake any waiter so a test post in flight at
-                        // shutdown neither leaks nor hangs.
-                        e.frame.release();
-                        e.reply.set(router.io);
-                    },
-                    // Wake a sync barrier in flight at shutdown so its awaiter
-                    // does not hang.
-                    .sync => |s| s.reply.set(router.io),
-                    // An async validation that posted its result before the inbox
-                    // closed but never got processed by the main loop: free its held
-                    // context here (the fiber that produced it handed off ownership on
-                    // the successful post, so the drain is the sole remaining owner).
-                    // Freed exactly once — a processed result is freed in
-                    // `onValidationResult`, and a fiber whose post FAILS (inbox closed
-                    // before it posted) frees its own context, so it never reaches the
-                    // inbox to be drained here. `destroy` cancels + joins the
-                    // validation group AFTER this drain, so no fiber posts a new result
-                    // into the (now-closed) inbox past this point.
-                    .validation_result => |r| r.ctx.deinit(router.allocator),
-                    else => {},
-                };
+                for (buf[0..n]) |command| router.freeCommand(command);
+            }
+        }
+
+        /// Release whatever an UNDISPATCHED command owns (and wake any waiter
+        /// embedded in it). Used by the teardown drain, and by drainControl for
+        /// commands batched out of the queue BEHIND a shutdown — once a command
+        /// has been dequeued, the drain can never see it again, so its owner of
+        /// last resort is whoever holds the batch buffer.
+        fn freeCommand(router: *Self, command: Command) void {
+            switch (command) {
+                .inbound_rpc => |in| {
+                    var owned = in;
+                    owned.rpc.deinit(router.allocator);
+                },
+                .subscribe => |s| router.allocator.free(s.topic),
+                .unsubscribe => |u| router.allocator.free(u.topic),
+                .publish => |p| {
+                    router.allocator.free(p.topic);
+                    router.allocator.free(p.data);
+                },
+                .peer_record => |c| router.allocator.free(c.envelope_bytes),
+                .enqueue_for_test => |e| {
+                    // The peer map is (or is about to be) torn down; release the
+                    // frame reference and wake any waiter so a test post in
+                    // flight at shutdown neither leaks nor hangs.
+                    e.frame.release();
+                    e.reply.set(router.io);
+                },
+                // Wake a sync barrier in flight at shutdown so its awaiter
+                // does not hang.
+                .sync => |s| s.reply.set(router.io),
+                // An async validation that posted its result before the inbox
+                // closed but never got processed by the main loop: free its held
+                // context here (the fiber that produced it handed off ownership on
+                // the successful post, so the drain is the sole remaining owner).
+                // Freed exactly once — a processed result is freed in
+                // `onValidationResult`, a fiber whose post FAILS frees its own
+                // context, and the shutdown-batch path in drainControl frees
+                // exactly the commands it stranded. `destroy` cancels + joins the
+                // validation group AFTER the teardown drain, so no fiber posts a
+                // new result into the (now-closed) inbox past this point.
+                .validation_result => |r| r.ctx.deinit(router.allocator),
+                else => {},
             }
         }
 
