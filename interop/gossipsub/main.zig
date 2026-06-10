@@ -381,12 +381,14 @@ pub fn main(init: std.process.Init) !void {
     const host_key_opt: ?*const identity.KeyPair = if (args.sign == .strict) &host_key else null;
     var gs_config: gossipsub.RouterConfig = switch (args.sign) {
         // Under strict signing run the go-parity ASYNC validation pipeline:
-        // inbound signature verification happens on validation fibers (up to 4
-        // in flight), never on the router fiber. This is the production
-        // configuration for signed gossip, and running it here means every
-        // strict-sign interop run (native suite, Shadow, testground) exercises
-        // the off-fiber verify + verdict-re-entry path end-to-end.
-        .strict => .{ .validation_concurrency = 4 },
+        // inbound signature verification happens on validation fibers, never on
+        // the router fiber. The in-flight cap follows go-libp2p, whose worker
+        // count defaults to runtime.NumCPU(): one validation per executor keeps
+        // every core usable for crypto while bounding held message snapshots.
+        // This is the production configuration for signed gossip, and running
+        // it here means every strict-sign interop run (native suite, Shadow,
+        // testground) exercises the off-fiber verify + verdict-re-entry path.
+        .strict => .{ .validation_concurrency = executor_count },
         .anonymous => .{ .signature_policy = .anonymous },
     };
     // Peer-exchange opt-in (default OFF). When `px=on`, the router offers signed
