@@ -390,6 +390,11 @@ const SeenCache = struct {
 /// fiber drains it continuously, so this only needs to absorb bursts of
 /// connect/disconnect/inbound-rpc events between drains.
 const inbox_capacity = 256;
+/// The control inbox is sized for its bounded producers: validation verdicts
+/// (at most `validation_concurrency` in flight), peer lifecycle (churn-bound),
+/// one heartbeat, one shutdown. It must never backpressure against a data
+/// flood — that coupling is the thing the second queue exists to remove.
+const control_inbox_capacity = 256;
 
 /// A peer key usable as an AutoHashMap key. A PeerId is `[64]u8` plus a length;
 /// the bytes past `len` are undefined, so the struct is not directly hashable.
@@ -688,6 +693,11 @@ pub fn Router(comptime Transport: type) type {
             /// acts on current identity. Best-effort: dropped when the inbox is
             /// full, the heartbeat's own reap pass is the lossless fallback.
             reap_dead_writers,
+            /// Wake marker a control post drops into the DATA inbox so a
+            /// consumer parked in `getOne` re-runs its control drain. Carries
+            /// nothing and is dispatched as a no-op; dropped (best-effort)
+            /// when the data inbox is full — the consumer is awake then.
+            control_ready,
         };
 
         /// The combined outcome of an ASYNC validation fiber: the StrictSign
@@ -847,6 +857,10 @@ pub fn Router(comptime Transport: type) type {
         transport: Transport,
         inbox_storage: []Command,
         inbox: std.Io.Queue(Command),
+        control_storage: []Command,
+        /// Drained COMPLETELY before each data command (see mainLoop). Carries
+        /// validation verdicts, peer lifecycle, heartbeat, and shutdown.
+        control_inbox: std.Io.Queue(Command),
         /// Keyed by zero-padded peer bytes (see PeerKey). Values are heap-owned.
         peers: std.AutoHashMap(PeerKey, *PeerState),
         /// Negotiated /meshsub version for peers whose inbound stream reported it
@@ -1064,6 +1078,8 @@ pub fn Router(comptime Transport: type) type {
         ) !*Self {
             const inbox_storage = try allocator.alloc(Command, inbox_capacity);
             errdefer allocator.free(inbox_storage);
+            const control_storage = try allocator.alloc(Command, control_inbox_capacity);
+            errdefer allocator.free(control_storage);
 
             // Resolve the policy: an explicit one is used as-is; a null one is
             // inferred from the key (strict_sign with a key, none without) to keep
@@ -1104,6 +1120,8 @@ pub fn Router(comptime Transport: type) type {
                 .transport = transport,
                 .inbox_storage = inbox_storage,
                 .inbox = std.Io.Queue(Command).init(inbox_storage),
+                .control_storage = control_storage,
+                .control_inbox = std.Io.Queue(Command).init(control_storage),
                 .peers = std.AutoHashMap(PeerKey, *PeerState).init(allocator),
                 .peer_versions = std.AutoHashMap(PeerKey, pubsub.Version).init(allocator),
                 .pending_subscriptions = std.AutoHashMap(PeerKey, std.StringHashMapUnmanaged(void)).init(allocator),
@@ -1199,7 +1217,8 @@ pub fn Router(comptime Transport: type) type {
         fn heartbeatLoop(router: *Self) void {
             while (!router.stopping.load(.acquire)) {
                 io_time.ms(router.heartbeat_interval_ms).sleep(router.io) catch break;
-                router.inbox.putOneUncancelable(router.io, .heartbeat) catch break;
+                router.control_inbox.putOneUncancelable(router.io, .heartbeat) catch break;
+                router.notifyControl();
             }
         }
 
@@ -1229,7 +1248,8 @@ pub fn Router(comptime Transport: type) type {
             // but the main loop also tears peers down on Closed via
             // `teardownAllPeers`, so either path is safe. Use the uncancelable
             // post to avoid losing it.
-            router.inbox.putOneUncancelable(router.io, .shutdown) catch {};
+            router.control_inbox.putOneUncancelable(router.io, .shutdown) catch {};
+            router.notifyControl();
 
             if (router.main_future) |*future| {
                 // The main loop exits on shutdown / closed inbox; cancel is a
@@ -1297,6 +1317,7 @@ pub fn Router(comptime Transport: type) type {
             }
             router.score_snapshot.deinit(router.allocator);
             router.allocator.free(router.inbox_storage);
+            router.allocator.free(router.control_storage);
             router.allocator.destroy(router);
         }
 
@@ -1777,38 +1798,88 @@ pub fn Router(comptime Transport: type) type {
         // ----- main fiber --------------------------------------------------
 
         fn mainLoop(router: *Self) void {
-            // On any exit (shutdown, closed inbox, cancellation) tear down every
-            // peer and drain the inbox so nothing leaks. Close the inbox FIRST:
-            // close wakes every producer parked on a full queue with
-            // error.Closed — including a writer's disconnect post — BEFORE
-            // teardownAllPeers joins those writer fibers. The reverse order
-            // would await a fiber parked on a queue that only this (now
-            // tearing-down) fiber drains. drainInbox's own close is idempotent.
+            // On any exit (shutdown, closed inboxes, cancellation) tear down
+            // every peer and drain both inboxes so nothing leaks. Close the
+            // inboxes FIRST: close wakes every producer parked on a full queue
+            // with error.Closed — including a writer's disconnect post —
+            // BEFORE teardownAllPeers joins those writer fibers. The reverse
+            // order would await a fiber parked on a queue that only this (now
+            // tearing-down) fiber drains. drainInbox's own closes are
+            // idempotent.
             defer {
+                router.control_inbox.close(router.io);
                 router.inbox.close(router.io);
                 router.teardownAllPeers();
                 router.drainInbox();
             }
 
+            // TWO inboxes, control before data: every iteration drains ALL
+            // queued CONTROL commands (validation verdicts — which free the
+            // bounded in-flight validation slots — peer lifecycle, the
+            // heartbeat, shutdown) before taking ONE data command. With a
+            // single FIFO inbox a data flood queued ahead of the verdicts that
+            // recycle validation slots, so a burst starved the async pipeline
+            // into throttle-dropping ~97% of itself (measured in
+            // bench-gossipsub); lifecycle events were likewise backpressured
+            // behind data. Control latency is now bounded by ONE data
+            // command's processing time. Wakeups need no extra primitive: a
+            // control producer follows its post with a best-effort
+            // `.control_ready` marker into the DATA queue (see notifyControl)
+            // — if the data queue is full the consumer is necessarily awake
+            // already, so the dropped marker loses nothing.
             while (true) {
+                if (router.drainControl()) return;
                 const command = router.inbox.getOne(router.io) catch return; // Closed/Canceled
-                switch (command) {
-                    .peer_connected => |c| router.onPeerConnected(c.peer, c.conn, c.remote_addr),
-                    .peer_disconnected => |c| router.onPeerDisconnected(c.peer, c.conn),
-                    .peer_protocol => |c| router.onPeerProtocol(c.peer, c.version),
-                    .peer_record => |c| router.onPeerRecord(c.peer, c.envelope_bytes),
-                    .inbound_rpc => |in| router.onInboundRpc(in),
-                    .subscribe => |s| router.onSubscribe(s.topic),
-                    .unsubscribe => |u| router.onUnsubscribe(u.topic),
-                    .publish => |p| router.onPublish(p.topic, p.data),
-                    .enqueue_for_test => |e| router.onEnqueueForTest(e.peer, e.frame, e.reply),
-                    .sync => |s| s.reply.set(router.io),
-                    .validation_result => |r| router.onValidationResult(r.ctx, r.verdict),
-                    .reap_dead_writers => router.reapDeadWriters(),
-                    .heartbeat => router.onHeartbeat(),
-                    .shutdown => return,
+                if (command == .control_ready) continue; // wake marker; control drained above
+                if (router.dispatch(command)) return;
+            }
+        }
+
+        /// Drain every queued control command. Returns true when the loop must
+        /// exit (shutdown dispatched, or the control inbox is closed).
+        fn drainControl(router: *Self) bool {
+            var buf: [16]Command = undefined;
+            while (true) {
+                const n = router.control_inbox.getUncancelable(router.io, &buf, 0) catch return true;
+                if (n == 0) return false;
+                for (buf[0..n]) |command| {
+                    if (router.dispatch(command)) return true;
                 }
             }
+        }
+
+        /// Apply one command on the router fiber (the single shared dispatch
+        /// for both inboxes — the queues split PRIORITY, not meaning, so a
+        /// command works from either; tests post everything to the data inbox
+        /// for strict FIFO determinism). Returns true for shutdown.
+        fn dispatch(router: *Self, command: Command) bool {
+            switch (command) {
+                .peer_connected => |c| router.onPeerConnected(c.peer, c.conn, c.remote_addr),
+                .peer_disconnected => |c| router.onPeerDisconnected(c.peer, c.conn),
+                .peer_protocol => |c| router.onPeerProtocol(c.peer, c.version),
+                .peer_record => |c| router.onPeerRecord(c.peer, c.envelope_bytes),
+                .inbound_rpc => |in| router.onInboundRpc(in),
+                .subscribe => |s| router.onSubscribe(s.topic),
+                .unsubscribe => |u| router.onUnsubscribe(u.topic),
+                .publish => |p| router.onPublish(p.topic, p.data),
+                .enqueue_for_test => |e| router.onEnqueueForTest(e.peer, e.frame, e.reply),
+                .sync => |s| s.reply.set(router.io),
+                .validation_result => |r| router.onValidationResult(r.ctx, r.verdict),
+                .reap_dead_writers => router.reapDeadWriters(),
+                .heartbeat => router.onHeartbeat(),
+                .control_ready => {},
+                .shutdown => return true,
+            }
+            return false;
+        }
+
+        /// Best-effort wake for a control post: a `.control_ready` marker into
+        /// the data inbox unparks a consumer blocked in `getOne`. Non-blocking
+        /// (`min = 0`): a FULL data inbox means the consumer is awake and will
+        /// drain control at its next loop top, so dropping the marker is safe —
+        /// the marker is ONLY a waker, never a carrier.
+        pub fn notifyControl(router: *Self) void {
+            _ = router.inbox.putUncancelable(router.io, &.{.control_ready}, 0) catch 0;
         }
 
         /// Handle a peer connecting: dedup, then create per-peer state and spawn
@@ -2122,7 +2193,8 @@ pub fn Router(comptime Transport: type) type {
         /// not the router fiber — so it must only post. Best-effort on a closed
         /// inbox (the router is shutting down).
         pub fn postPeerProtocol(router: *Self, io: std.Io, peer: PeerId, version: pubsub.Version) void {
-            router.inbox.putOne(io, .{ .peer_protocol = .{ .peer = peer, .version = version } }) catch {};
+            router.control_inbox.putOne(io, .{ .peer_protocol = .{ .peer = peer, .version = version } }) catch {};
+            router.notifyControl();
         }
 
         /// Post a peer's signed peer record (from libp2p identify) onto the router
@@ -2134,9 +2206,11 @@ pub fn Router(comptime Transport: type) type {
         /// on a closed inbox (shutting down) the bytes are freed and the post is a
         /// no-op.
         pub fn postPeerRecord(router: *Self, io: std.Io, peer: PeerId, envelope_bytes: []u8) void {
-            router.inbox.putOne(io, .{ .peer_record = .{ .peer = peer, .envelope_bytes = envelope_bytes } }) catch {
+            router.control_inbox.putOne(io, .{ .peer_record = .{ .peer = peer, .envelope_bytes = envelope_bytes } }) catch {
                 router.allocator.free(envelope_bytes);
+                return;
             };
+            router.notifyControl();
         }
 
         /// Tear down every peer whose `writer_dead` flag is set — the writer
@@ -3460,11 +3534,13 @@ pub fn Router(comptime Transport: type) type {
                 // Signature-only offload (no app validator configured).
                 break :blk .accept;
             };
-            router.inbox.putOne(router.io, .{ .validation_result = .{ .ctx = ctx, .verdict = outcome } }) catch {
+            router.control_inbox.putOne(router.io, .{ .validation_result = .{ .ctx = ctx, .verdict = outcome } }) catch {
                 // Closed (shutting down) or Canceled (teardown): no one will process
                 // the result, so this fiber frees the held context.
                 ctx.deinit(router.allocator);
+                return;
             };
+            router.notifyControl();
         }
 
         /// Apply an async validation outcome on the router fiber (the deferred
@@ -3971,14 +4047,20 @@ pub fn Router(comptime Transport: type) type {
             router.peers.clearRetainingCapacity();
         }
 
-        /// Drain and free any commands still buffered in the inbox after the loop
-        /// exits, so an inbound RPC posted concurrently with teardown is not
-        /// leaked.
+        /// Drain and free any commands still buffered in BOTH inboxes after the
+        /// loop exits, so an inbound RPC (data) or validation result / peer
+        /// record (control) posted concurrently with teardown is not leaked.
         fn drainInbox(router: *Self) void {
+            router.control_inbox.close(router.io);
             router.inbox.close(router.io);
+            router.drainOneQueue(&router.control_inbox);
+            router.drainOneQueue(&router.inbox);
+        }
+
+        fn drainOneQueue(router: *Self, queue: *std.Io.Queue(Command)) void {
             var buf: [16]Command = undefined;
             while (true) {
-                const n = router.inbox.getUncancelable(router.io, &buf, 0) catch return;
+                const n = queue.getUncancelable(router.io, &buf, 0) catch return;
                 if (n == 0) return;
                 for (buf[0..n]) |command| switch (command) {
                     .inbound_rpc => |in| {
@@ -4045,7 +4127,8 @@ pub fn Router(comptime Transport: type) type {
             const state: *PeerState = @ptrCast(@alignCast(ctx.?));
             const router = state.router_for_disconnect;
             state.writer_dead.store(true, .release);
-            _ = router.inbox.putUncancelable(router.io, &.{.reap_dead_writers}, 0) catch 0;
+            _ = router.control_inbox.putUncancelable(router.io, &.{.reap_dead_writers}, 0) catch 0;
+            router.notifyControl();
         }
     };
 }

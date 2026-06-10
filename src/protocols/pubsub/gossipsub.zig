@@ -583,21 +583,25 @@ pub const Gossipsub = struct {
         self.router.postPeerRecord(self.router.io, peer, owned);
     }
 
-    // The Switch peer-event callbacks: ctx is the *Router. Each posts one Command
-    // to the router inbox and returns. `putOne` blocks only if the inbox is full
-    // (it never drops): the inbox is sized large enough that a full inbox is not
-    // expected in practice, so the post is effectively non-blocking, but the
-    // blocking variant is the safe choice — dropping a `peer_disconnected` would
-    // leak a peer. The callbacks must stay cheap (just this post); on a closed
-    // inbox the post fails and is swallowed (the router is shutting down anyway).
+    // The Switch peer-event callbacks: ctx is the *Router. Each posts one
+    // Command to the router's CONTROL inbox and returns — lifecycle events are
+    // drained with priority over data, so a connect/disconnect can never be
+    // backpressured behind an inbound-RPC flood (and the dial/accept fiber the
+    // callback runs on can no longer be stalled by one). `putOne` blocks only
+    // if the control inbox is full (its producers are churn-bound, so that is
+    // not expected in practice); dropping a `peer_disconnected` would leak a
+    // peer, so the blocking variant stays the safe choice. The callbacks must
+    // stay cheap (just this post); on a closed inbox the post fails and is
+    // swallowed (the router is shutting down anyway).
 
     fn onConnected(ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection, remote_addr: std.Io.net.IpAddress) void {
         const router: *Router = @ptrCast(@alignCast(ctx));
-        router.inbox.putOne(router.io, .{ .peer_connected = .{
+        router.control_inbox.putOne(router.io, .{ .peer_connected = .{
             .peer = peer,
             .conn = conn,
             .remote_addr = remote_addr,
-        } }) catch {};
+        } }) catch return;
+        router.notifyControl();
     }
 
     fn onDisconnected(ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection) void {
@@ -606,7 +610,8 @@ pub const Gossipsub = struct {
         // only when the connection its PeerState is bound to dies, so the close
         // of a dedup'd duplicate connection (simultaneous dial) cannot destroy
         // the live peer's state.
-        router.inbox.putOne(router.io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } }) catch {};
+        router.control_inbox.putOne(router.io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } }) catch return;
+        router.notifyControl();
     }
 };
 
