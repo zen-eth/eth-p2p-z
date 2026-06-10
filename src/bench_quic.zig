@@ -254,6 +254,95 @@ fn runScenario(
     client_conn.close(io, 0, "bench done") catch {};
 }
 
+/// Investigation harness (BENCH_POISON=1): reproduce the churn-degraded mode
+/// (footprint first), then run bulk and dump the FULL endpoint-stats delta of
+/// both endpoints — attributing exactly which counter moves in degraded runs.
+fn runPoisonDiag(counting: *ByteCounting, io: std.Io, footprint_first: bool) !void {
+    if (footprint_first) try runFootprint(counting, io, 50);
+    const allocator = counting.allocator();
+
+    var fixture = try TwoEndpoints.init(allocator, io, .{}, .{});
+    defer fixture.deinit();
+    const server_addr = try fixture.bindServerLoopback();
+    _ = try fixture.bindClientLoopback();
+    var accept_ctx = AcceptCtx{ .endpoint = fixture.server };
+    var accept_future = try std.Io.concurrent(io, AcceptCtx.run, .{&accept_ctx});
+    const client_conn = fixture.client.dial(server_addr, .{
+        .timeout = support.receiveTimeout(support.default_handshake_timeout_ns),
+    }) catch |err| {
+        accept_future.cancel(io);
+        accept_future.await(io);
+        return err;
+    };
+    defer client_conn.deinit();
+    accept_future.await(io);
+    const server_conn = accept_ctx.conn orelse return error.AcceptFailed;
+    defer server_conn.deinit();
+    const outbound = try client_conn.openStream(io);
+    defer outbound.deinit();
+    try outbound.writeAll(io, "x", .{});
+    const inbound = try server_conn.acceptStream(io, .{ .timeout = support.timeout_s(5) });
+    defer inbound.deinit();
+    var first: [1]u8 = undefined;
+    try inbound.readAll(io, &first, .{});
+
+    // 256 MiB in 32 MiB segments, per-segment timing + stat deltas: shows the
+    // SHAPE of a degraded run (sudden flip vs gradual vs stall/recover) and
+    // which counters move when it happens.
+    const total: usize = 256 * 1024 * 1024;
+    const segment: usize = 32 * 1024 * 1024;
+    const chunk = try allocator.alloc(u8, bulk_chunk);
+    defer allocator.free(chunk);
+    @memset(chunk, 0x5a);
+    var drain = ReadDrain{ .stream = inbound, .io = io, .total = total };
+    var drain_future = try std.Io.concurrent(io, ReadDrain.run, .{&drain});
+    var srv_prev = fixture.server.stats();
+    var cli_prev = fixture.client.stats();
+    const t0 = io_time.monotonicNs(io);
+    var seg_t0 = t0;
+    var sent: usize = 0;
+    while (sent < total) {
+        const n = @min(bulk_chunk, total - sent);
+        try outbound.writeAll(io, chunk[0..n], .{});
+        sent += n;
+        if (sent % segment == 0) {
+            const now = io_time.monotonicNs(io);
+            const secs = @as(f64, @floatFromInt(now - seg_t0)) / 1e9;
+            const srv_now = fixture.server.stats();
+            const cli_now = fixture.client.stats();
+            std.debug.print("  seg {d:>2}: {d:>7.3} Gbit/s ({d:>6.2} s)  srv recv +{d} drops +{d} errs +{d} | cli recv +{d} drops +{d}\n", .{
+                sent / segment,
+                (@as(f64, @floatFromInt(segment)) * 8.0) / 1e9 / secs,
+                secs,
+                srv_now.router_packets_recv - srv_prev.router_packets_recv,
+                srv_now.router_packet_drops - srv_prev.router_packet_drops,
+                srv_now.router_recv_errors - srv_prev.router_recv_errors,
+                cli_now.router_packets_recv - cli_prev.router_packets_recv,
+                cli_now.router_packet_drops - cli_prev.router_packet_drops,
+            });
+            srv_prev = srv_now;
+            cli_prev = cli_now;
+            seg_t0 = now;
+        }
+    }
+    drain_future.await(io);
+    const t1 = io_time.monotonicNs(io);
+    const secs_total = @as(f64, @floatFromInt(t1 - t0)) / 1e9;
+    std.debug.print("poison-diag bulk 256MiB total: {d:.3} Gbit/s  {d:.2} s\n", .{ (@as(f64, @floatFromInt(total)) * 8.0) / 1e9 / secs_total, secs_total });
+    outbound.close(io) catch {};
+    inbound.close(io) catch {};
+    client_conn.close(io, 0, "bench done") catch {};
+}
+
+fn dumpStatsDelta(name: []const u8, before: anytype, after: @TypeOf(before)) void {
+    std.debug.print("  [{s}]\n", .{name});
+    inline for (@typeInfo(@TypeOf(before)).@"struct".fields) |f| {
+        const b = @field(before, f.name);
+        const a = @field(after, f.name);
+        if (a != b) std.debug.print("    {s}: +{d}\n", .{ f.name, a -| b });
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     var counting = ByteCounting{ .parent = init.gpa };
     const allocator = counting.allocator();
@@ -268,12 +357,27 @@ pub fn main(init: std.process.Init) !void {
     // process-lifetime high-water mark, so the RSS column is only meaningful
     // in this mode (a prior throughput scenario inflates it past relevance).
     // In the default combined run the footprint goes LAST and only its
-    // heap-live column is meaningful. (Running it FIRST is not an option:
-    // 50 churned connection pairs reproducibly degrade the subsequent
-    // loopback scenarios ~30x with packet drops — recorded as a lead in the
-    // bench-bimodality investigation, see docs/benchmarks.)
+    // heap-live column is meaningful.
+    //
+    // RUN THE BINARY DIRECTLY for valid numbers on macOS: under `zig build`
+    // the child process sometimes lands in background QoS, whose timer
+    // coalescing (~4 ms slack) lockstep-throttles the pacing timers ~30x
+    // (reproduce deliberately with `taskpolicy -c background`); see
+    // docs/benchmarks/2026-06-10-p0-baseline.md.
     if (std.c.getenv("BENCH_FOOTPRINT_ONLY") != null) {
         try runFootprint(&counting, io, 50);
+        return;
+    }
+    if (std.c.getenv("BENCH_POISON") != null) {
+        try runPoisonDiag(&counting, io, true);
+        return;
+    }
+    if (std.c.getenv("BENCH_TRACE") != null) {
+        try runPoisonDiag(&counting, io, false);
+        return;
+    }
+    if (std.c.getenv("BENCH_BULK_ONLY") != null) {
+        try runScenario(allocator, io, "bulk 64KiB chunks", 32 * 1024 * 1024, bulk_chunk);
         return;
     }
     try runScenario(allocator, io, "bulk 64KiB chunks", bulk_total, bulk_chunk);
