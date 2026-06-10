@@ -44,6 +44,13 @@ const Stream = quic.Stream;
 /// On open it proposes the full `/meshsub` version list (1.2.0, 1.1.0, 1.0.0)
 /// and uses whichever the peer accepts, recording the negotiated protocol id in
 /// `selected` so the router can learn our outbound version for the peer.
+/// Per-chunk write deadline for the outbound gossip stream — matches the
+/// switch's multistream negotiation timeout, so every network-facing wait in
+/// the writer's loop is bounded by the same order of patience.
+const write_timeout: std.Io.Timeout = .{
+    .duration = .{ .raw = .fromNanoseconds(10 * std.time.ns_per_s), .clock = .awake },
+};
+
 pub const StreamSink = struct {
     conn: *SwitchConnection,
     /// The protocol id the peer accepted on the most recent open, or null before
@@ -66,9 +73,14 @@ pub const StreamSink = struct {
     }
 
     /// Write one framed RPC to the current stream. Errors propagate so the
-    /// writer can tear the stream down and re-open.
+    /// writer can tear the stream down and re-open. Each chunk write is bounded
+    /// by `write_timeout`: a STALLED-but-alive peer (flow-control frozen, not
+    /// reading) otherwise parks the writer fiber forever with the peer's whole
+    /// lane backlog pinned. A slow-but-progressing peer never trips it (the
+    /// timeout is per write call, refreshed on progress); repeated timeouts are
+    /// converted into a disconnect by the writer's give-up counter.
     pub fn writeFrame(self: *StreamSink, io: std.Io, bytes: []const u8) !void {
-        try self.current.?.writeAll(io, bytes, .{});
+        try self.current.?.writeAll(io, bytes, .{ .timeout = write_timeout });
     }
 
     /// Tear down the current stream. Idempotent: safe when none is open. The

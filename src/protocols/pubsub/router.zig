@@ -1124,6 +1124,9 @@ pub fn Router(comptime Transport: type) type {
         /// Messages dropped because the delivery queue was full (the local
         /// subscriber lagged) or the copy failed. Router-fiber-only writes.
         delivery_drops: u64 = 0,
+        /// Outbound frames dropped because a peer's lane was full (slow peer)
+        /// or its queue closed mid-push. Router-fiber-only writes.
+        lane_drops: u64 = 0,
         /// When true (go-libp2p default), a message the local node ORIGINATES is
         /// flooded to every topic subscriber above the publish threshold rather
         /// than only its mesh/fanout. Relayed messages are unaffected (always
@@ -2275,7 +2278,14 @@ pub fn Router(comptime Transport: type) type {
                 std.log.info("GS_DEBUG pushTo PUSH data frame bytes={d}", .{frame.bytes.len});
             }
             frame.retain();
-            state.queue.push(router.io, lane, frame) catch frame.release();
+            state.queue.push(router.io, lane, frame) catch {
+                frame.release();
+                // Full lane or closed queue: the frame is dropped for THIS peer
+                // only (go's bounded-outbound-queue semantics). Router-fiber-only
+                // counter; the slow peer itself is reaped by the writer's
+                // give-up paths, this just makes the drops observable.
+                router.lane_drops += 1;
+            };
         }
 
         /// Allocate an empty owned id slice for a frame that carries no message
@@ -4426,6 +4436,9 @@ const FakeSink = struct {
     /// Number of leading open() calls that should fail. `maxInt` = every open
     /// fails, driving the writer to exhaust its retries and give up.
     fail_open_count: usize,
+    /// Number of leading writeFrame() calls that should fail. `maxInt` = every
+    /// write fails, driving the writer's consecutive-write-failure give-up.
+    fail_write_count: usize = 0,
 
     pub fn open(self: *FakeSink, io: std.Io) anyerror!void {
         self.record.open_calls += 1;
@@ -4449,6 +4462,8 @@ const FakeSink = struct {
         // never races a read of the ArrayList's buffer/len.
         self.record.mutex.lockUncancelable(io);
         defer self.record.mutex.unlock(io);
+        self.record.write_calls += 1;
+        if (self.record.write_calls <= self.fail_write_count) return error.WriteFailed;
         try self.record.written.appendSlice(self.allocator, bytes);
     }
 
@@ -4464,6 +4479,7 @@ const FakeRecord = struct {
     allocator: std.mem.Allocator,
     open_calls: usize = 0,
     streams_opened: usize = 0,
+    write_calls: usize = 0,
     written: std.ArrayList(u8) = .empty,
     /// Guards `written` against the writer-fiber append vs. test-fiber read race.
     /// The peer's writer fiber appends under this lock in FakeSink.writeFrame; the
@@ -4531,6 +4547,10 @@ const FakeTransport = struct {
     /// When non-zero every sink made by this transport fails its first N opens
     /// (use `maxInt` for "always fail"), exercising the writer give-up path.
     fail_open_count: usize = 0,
+    /// When non-zero every sink made by this transport fails its first N frame
+    /// writes (use `maxInt` for "always fail"), exercising the writer's
+    /// consecutive-write-failure give-up path (the stalled-peer defense).
+    fail_write_count: usize = 0,
     /// Where `dial` records requested addresses, or null to ignore dials (the
     /// default, so existing `.{}` call sites that never dial still compile).
     dial_log: ?*DialLog = null,
@@ -4550,6 +4570,7 @@ const FakeTransport = struct {
             .allocator = allocator,
             .record = &conn.record,
             .fail_open_count = self.fail_open_count,
+            .fail_write_count = self.fail_write_count,
         };
         return sink;
     }
@@ -4758,6 +4779,37 @@ test "router tears the peer down when the writer exhausts open retries" {
     // The give-up freed the popped frame and the router freed the sink/state; no
     // leak. The writer never opened a stream.
     try std.testing.expectEqual(@as(usize, 0), conn.record.streams_opened);
+}
+
+test "router tears the peer down after consecutive write failures (stalled peer)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Opens succeed but EVERY frame write fails (the fake stand-in for a
+    // stalled peer's write timeouts). The writer closes + reopens after each
+    // failure and, after max_write_failures consecutive ones, fires
+    // on_disconnect — the router tears the peer down on its own.
+    const router = try FakeRouter.create(allocator, io, .{ .fail_write_count = std.math.maxInt(usize) }, local_test_peer, null, 0, null, null, .{});
+    try router.start();
+
+    const peer = try PeerId.random();
+    const conn = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn);
+    defer router.destroy(); // joins writers before records free; see destroyFakeConn
+
+    try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
+    try std.testing.expect(waitFor(io, peerCountIsOne, router));
+
+    // Feed enough frames for the give-up: each failed write consumes one frame
+    // (lost in-flight), and the writer gives up on the max_write_failures-th
+    // consecutive failure.
+    for (0..4) |_| try router.enqueueDataForTest(peer, try testDataFrame(allocator));
+
+    try std.testing.expect(waitFor(io, peerCountIsZero, router));
+    // Nothing was ever successfully written.
+    try std.testing.expectEqual(@as(usize, 0), conn.record.written.items.len);
 }
 
 test "writer give-up with a FULL inbox neither parks the writer nor wedges teardown" {

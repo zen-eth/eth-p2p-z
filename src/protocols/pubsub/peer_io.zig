@@ -80,6 +80,12 @@ pub const Options = struct {
     control_cap: usize = 4096,
     /// Max un-popped frames the data lane will hold; further pushes fail.
     data_cap: usize = 1024,
+    /// Max un-popped frames the subscribe lane will hold; further pushes fail.
+    /// Subscriptions are rare (one frame per local topic change, plus the
+    /// full-set announce to a new peer), so this cap only ever binds when the
+    /// writer is wedged on a stalled peer — where an unbounded lane would
+    /// otherwise grow without limit (every other lane is capped).
+    subscribe_cap: usize = 256,
 };
 
 /// A single-lane bounded FIFO of frame references, backed by a std.ArrayList plus
@@ -182,8 +188,8 @@ const LaneFifo = struct {
 /// lock before unlocking, so a notify that races after unlock advances the epoch
 /// and the subsequent wait() returns immediately.
 ///
-/// Lanes are drained by priority subscribe > control > data. The subscribe lane
-/// is unbounded; control and data are bounded by the matching Options cap.
+/// Lanes are drained by priority subscribe > control > data; each lane is
+/// bounded by its matching Options cap.
 pub const OutboundQueue = struct {
     allocator: std.mem.Allocator,
     mutex: std.Io.Mutex,
@@ -198,7 +204,7 @@ pub const OutboundQueue = struct {
             .allocator = allocator,
             .mutex = .init,
             .signal = .{},
-            .sub_lane = .{ .cap = 0 }, // unbounded
+            .sub_lane = .{ .cap = opts.subscribe_cap },
             .ctrl_lane = .{ .cap = opts.control_cap },
             .data_lane = .{ .cap = opts.data_cap },
             .closed = false,
@@ -351,6 +357,13 @@ pub fn PeerWriter(comptime Sink: type) type {
         sink: *Sink,
         /// Open attempts before giving up on the peer (each followed by backoff).
         max_open_retries: usize = 5,
+        /// Consecutive failed frame writes (each followed by a stream re-open)
+        /// before giving up on the peer. A STALLED-but-alive peer fails every
+        /// write at the sink's write timeout; without this bound the writer
+        /// would cycle write-timeout -> reopen forever, draining one dropped
+        /// frame per timeout while the peer pins its queue caps. Resets on any
+        /// successful write.
+        max_write_failures: usize = 3,
         /// Sleep between open attempts, in milliseconds.
         reopen_backoff_ms: u64 = 50,
         /// Invoked once if open retries are exhausted, so the router can tear the
@@ -373,6 +386,7 @@ pub fn PeerWriter(comptime Sink: type) type {
         /// Always releases the current stream on exit.
         pub fn run(self: *Self, io: std.Io) void {
             defer self.sink.close(io);
+            var write_failures: usize = 0;
             while (true) {
                 const frame = self.queue.popBlocking(io) catch return; // Closed/Canceled
                 if (!self.have_stream) {
@@ -386,14 +400,23 @@ pub fn PeerWriter(comptime Sink: type) type {
                     }
                 }
                 self.sink.writeFrame(io, frame.bytes) catch {
-                    // The stream died mid-write. Lose only this in-flight frame,
-                    // close the stream, and re-open lazily next iteration so the
-                    // surviving queue drains onto a fresh stream.
+                    // The stream died or the write timed out (a stalled peer).
+                    // Lose only this in-flight frame, close the stream, and
+                    // re-open lazily next iteration — unless this keeps
+                    // happening: after max_write_failures consecutive failures
+                    // the peer is hopeless (stalled or flapping), so give it
+                    // back to the router instead of cycling forever.
                     self.sink.close(io);
                     self.have_stream = false;
                     frame.release();
+                    write_failures += 1;
+                    if (write_failures >= self.max_write_failures) {
+                        if (self.on_disconnect) |cb| cb(self.disconnect_ctx);
+                        return;
+                    }
                     continue;
                 };
+                write_failures = 0;
                 frame.release();
             }
         }
