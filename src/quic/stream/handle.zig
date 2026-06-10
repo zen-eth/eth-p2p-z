@@ -360,20 +360,71 @@ pub const StreamReader = struct {
     fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
         const r: *StreamReader = @alignCast(@fieldParentPtr("interface", io_r));
         var iovecs_buffer: [8][]u8 = undefined;
-        const dest_n, _ = try io_r.writableVector(&iovecs_buffer, data);
+        const dest_n, const data_capacity = try io_r.writableVector(&iovecs_buffer, data);
         const dest = iovecs_buffer[0..dest_n];
         std.debug.assert(dest.len > 0);
         std.debug.assert(dest[0].len > 0);
 
-        return r.stream.read(r.io, dest[0], .{}) catch |err| switch (err) {
-            error.EndOfStream => error.EndOfStream,
+        const n = r.stream.read(r.io, dest[0], .{}) catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
             else => {
                 r.err = err;
                 return error.ReadFailed;
             },
         };
+        if (data_capacity == 0) {
+            // writableVector queues the caller's `data` slices ahead of the
+            // reader's own buffer, so zero caller capacity means the read
+            // landed in `interface.buffer`: those bytes are accounted for by
+            // advancing `end`, and the return value (bytes delivered to
+            // `data`) must be 0 — returning `n` here makes the fill loop
+            // re-read and silently drop this read's bytes.
+            io_r.end += n;
+            return 0;
+        }
+        return n;
     }
 };
+
+test "StreamReader: a refill into the reader's own buffer surfaces the bytes" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const conn_state = try shared_state_mod.ConnSharedState.create(allocator, io, .{
+        .inbox_capacity = 1,
+        .accept_capacity = 1,
+    });
+    defer {
+        conn_state.release();
+        conn_state.release();
+    }
+
+    const state = try SharedState.create(allocator, io, conn_state, .{
+        .stream_id = 0,
+        .inbound_queue_bytes = 1024,
+        .outbound_queue_bytes = 1024,
+    });
+    const stream = try create(allocator, state);
+    defer stream.deinit();
+
+    // Actor side: three bytes arrive, then FIN.
+    try std.testing.expect(state.inbound_queue.?.tryPutAll(io, "abc"));
+    state.closeInbound();
+
+    // takeByte refills through StreamReader.readVec with no caller slices, so
+    // the underlying read lands in the reader's internal buffer. Each byte
+    // must come out in order, then EndOfStream — a refill that forgets to
+    // advance `end` silently discards the bytes it just read and reports a
+    // premature end of stream instead.
+    var buffer: [16]u8 = undefined;
+    var r = stream.reader(io, &buffer);
+    try std.testing.expectEqual(@as(u8, 'a'), try r.interface.takeByte());
+    try std.testing.expectEqual(@as(u8, 'b'), try r.interface.takeByte());
+    try std.testing.expectEqual(@as(u8, 'c'), try r.interface.takeByte());
+    try std.testing.expectError(error.EndOfStream, r.interface.takeByte());
+}
 
 pub const StreamWriter = struct {
     io: std.Io,
