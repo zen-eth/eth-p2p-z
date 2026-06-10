@@ -151,6 +151,39 @@ pub fn build(b: *std.Build) void {
     const gossipsub_interop_step = b.step("gossipsub-interop", "Run the gossipsub interop binary");
     gossipsub_interop_step.dependOn(&gossipsub_interop_run_cmd.step);
 
+    // P0 micro-benchmarks. Rooted in src/ so they can reach internals (the
+    // Router generic, the endpoint test fixture) by relative import; run them
+    // with -Doptimize=ReleaseFast for meaningful numbers.
+    const bench_gossipsub_module = b.createModule(.{
+        .root_source_file = b.path("src/bench_gossipsub.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addImports(bench_gossipsub_module, deps);
+    bench_gossipsub_module.addImport("zio", zio_dep.module("zio"));
+    const bench_gossipsub_exe = b.addExecutable(.{
+        .name = "bench-gossipsub",
+        .root_module = bench_gossipsub_module,
+    });
+    const bench_gossipsub_run = b.addRunArtifact(bench_gossipsub_exe);
+    const bench_gossipsub_step = b.step("bench-gossipsub", "Run the gossipsub router micro-benchmark");
+    bench_gossipsub_step.dependOn(&bench_gossipsub_run.step);
+
+    const bench_quic_module = b.createModule(.{
+        .root_source_file = b.path("src/bench_quic.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addImports(bench_quic_module, deps);
+    bench_quic_module.addImport("zio", zio_dep.module("zio"));
+    const bench_quic_exe = b.addExecutable(.{
+        .name = "bench-quic",
+        .root_module = bench_quic_module,
+    });
+    const bench_quic_run = b.addRunArtifact(bench_quic_exe);
+    const bench_quic_step = b.step("bench-quic", "Run the QUIC loopback benchmark");
+    bench_quic_step.dependOn(&bench_quic_run.step);
+
     const run_cmd = b.addRunArtifact(libp2p_exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
