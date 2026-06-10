@@ -2493,8 +2493,17 @@ pub fn Router(comptime Transport: type) type {
             var targets: std.ArrayListUnmanaged(PeerId) = .empty;
             defer targets.deinit(router.allocator);
             router.selectGossipTargets(topic, &targets);
+            if (targets.items.len == 0) return;
 
-            for (targets.items) |peer| router.sendIHave(peer, topic, capped);
+            // Build the IHAVE frame ONCE and hand each target a refcounted
+            // reference: every target gets the identical id list today (the cap
+            // is a deterministic prefix), so the old per-peer sendIHave
+            // protobuf-encoded the same bytes once per target — at the eth2
+            // shape (5000 ids ≈ 170 KB per encode × ~16 targets per topic per
+            // heartbeat) that was megabytes of redundant encoding every second.
+            // If per-target shuffle SAMPLING of the over-cap id set is added
+            // for go-parity later, this sharing must give way for that case.
+            router.sendIHaveShared(topic, capped, targets.items);
         }
 
         /// Append the gossip targets for `topic` to `out`: a slice of the peers
@@ -2542,11 +2551,15 @@ pub fn Router(comptime Transport: type) type {
             if (out.items.len > target) out.shrinkRetainingCapacity(target);
         }
 
-        /// Send an IHAVE(topic, ids) to `peer` on its control lane. The borrowed
-        /// `ids` are copied by `frameRpc`, so they need only outlive this call. The
-        /// IHAVE builder takes `[]const ?[]const u8`, so the ids are wrapped through
-        /// a small scratch array of optionals (freed once the frame is built).
-        fn sendIHave(router: *Self, peer: PeerId, topic: []const u8, ids: []const []const u8) void {
+        /// Send one IHAVE(topic, ids) frame to every peer in `targets` on their
+        /// control lanes: the RPC is protobuf-encoded once and the resulting
+        /// frame shared by reference (`pushTo` retains per accepted push; the
+        /// builder reference is released at the end, so a total push failure
+        /// frees the frame). The borrowed `ids` are copied by `frameRpc`, so
+        /// they need only outlive this call. The IHAVE builder takes
+        /// `[]const ?[]const u8`, so the ids are wrapped through a small
+        /// scratch array of optionals (freed once the frame is built).
+        fn sendIHaveShared(router: *Self, topic: []const u8, ids: []const []const u8, targets: []const PeerId) void {
             const opt_ids = router.allocator.alloc(?[]const u8, ids.len) catch return;
             defer router.allocator.free(opt_ids);
             for (ids, 0..) |id, i| opt_ids[i] = id;
@@ -2554,7 +2567,20 @@ pub fn Router(comptime Transport: type) type {
             const empty_ids = router.emptyIds() orelse return;
             const ihave = rpc.buildIHave(topic, opt_ids);
             const ctrl = rpc_pb.ControlMessage{ .ihave = &.{ihave} };
-            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), empty_ids, .{ .one = peer });
+            const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .control = ctrl }).toRpc()) catch {
+                router.allocator.free(empty_ids);
+                return;
+            };
+            const frame = peer_io.OutboundFrame.create(router.allocator, framed, empty_ids, 1) catch {
+                router.allocator.free(framed);
+                router.allocator.free(empty_ids);
+                return;
+            };
+            defer frame.release();
+            for (targets) |peer| {
+                const state = router.peers.get(peerKey(&peer)) orelse continue;
+                router.pushTo(state, .control, frame);
+            }
         }
 
         /// Mesh maintenance for every subscribed topic: first (when scoring is

@@ -389,7 +389,7 @@ architecture — no rewrite):
 | 2 | P1 check-seen-before-verify; verify in validation workers; throttle-drop at cap | S–M | **done** (`68f159e`; promise fulfilment follows go's tracer carve-out — fulfilled on duplicate/throttle/post-signature verdicts, never on a signature reject) |
 | 3 | P2 sendmmsg + GSO in zio + flushScheduled | M | open |
 | 4 | P3 persistent recv fiber + sharded CID map + slab ring | M | **done** (`67cf084` + `3ee2bb1`: loopback 7-11x, pps 4-6x; bump-arena slabs deferred pending Linux profiling) |
-| 5 | P4 expiry wheel + global promise map; P6 shared IHAVE encode + control coalescing | S–M | expiry wheel **done** (359×: 3.2 s → 9 ms at 100 k-id expiry); promise map **closed by measurement** (+0.24 µs/msg at 64 peers — not worth it); P6 open |
+| 5 | P4 expiry wheel + global promise map; P6 shared IHAVE encode + control coalescing | S–M | expiry wheel **done** (359×); promise map **closed by measurement** (+0.24 µs/msg at 64 peers); P6-a shared IHAVE **done** (6×: 0.85 → 0.14 ms/tick, allocs 58→6); P6-b coalescing **closed** (steady-state emits zero grafts/prunes — unmeasurable) |
 | 6 | H1 delivery queue / tryPublish; H2 handle lifetime contract; M1/M2 hardenings; P5 fiber/memory diet | M | open |
 
 | — | Two-inbox split (Part IV (d)): control/verdicts prioritized over data ingress | S | **done** (`f29492c`; bench: burst 601→1977 delivered, self-starvation eliminated) |

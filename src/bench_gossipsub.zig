@@ -507,6 +507,78 @@ fn runHeartbeatScenario(counting: *CountingAllocator, io: std.Io) !void {
     std.debug.print("  post-expiry tick: {d:.2} ms\n", .{@as(f64, @floatFromInt(timedHeartbeat(r, io))) / 1e6});
 }
 
+/// Heartbeat gossip-emission cost: a full IHAVE window (max_ihave_length ids
+/// in the current mcache gossip slot) advertised to the gossip fringe — 64
+/// non-mesh peers that announced the topic. Measures the per-tick cost of
+/// emitGossip: today the IDENTICAL IHAVE RPC is protobuf-encoded and
+/// frame-allocated once PER TARGET PEER (P6); the frames/bytes/alloc counters
+/// attribute it.
+fn runGossipEmitScenario(counting: *CountingAllocator, io: std.Io) !void {
+    const allocator = counting.allocator();
+    var counters = SinkCounters{};
+    var deliveries = DeliveryCounter{};
+    const transport = BenchTransport{ .counters = &counters };
+    const local_peer = try PeerId.random();
+    const r = try BenchRouter.create(allocator, io, transport, local_peer, deliveries.handler(), 0, null, null, .{ .signature_policy = .anonymous });
+    defer r.destroy();
+    try r.start();
+    {
+        const t = try allocator.dupe(u8, topic);
+        try r.inbox.putOne(io, .{ .subscribe = .{ .topic = t } });
+    }
+
+    // One relay feeds the mcache; 64 fringe peers announce the topic without
+    // grafting, making them gossip-eligible (subscribed, not mesh, not fanout).
+    const fringe = 64;
+    const relay = try PeerId.random();
+    var relay_conn = BenchConn{};
+    try r.inbox.putOne(io, .{ .peer_connected = .{ .peer = relay, .conn = &relay_conn, .remote_addr = .{ .ip4 = .loopback(5100) } } });
+    const conns = try allocator.alloc(BenchConn, fringe);
+    defer allocator.free(conns);
+    for (0..fringe) |i| {
+        conns[i] = .{};
+        const peer = try PeerId.random();
+        try r.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = &conns[i], .remote_addr = .{ .ip4 = .loopback(@intCast(5200 + i)) } } });
+        try r.inbox.putOne(io, .{ .inbound_rpc = .{
+            .peer = peer,
+            .rpc = try ownedFromRpc(allocator, .{ .subscriptions = &[_]?rpc_pb.RPC.SubOpts{.{ .subscribe = true, .topicid = topic }} }),
+        } });
+    }
+    syncRouter(r, io);
+
+    // Fill the current mcache gossip slot to the IHAVE cap (no heartbeat in
+    // between, so every id sits in the freshest window slice).
+    const window_msgs: usize = 5000; // = mesh_params.max_ihave_length
+    var workload = try buildWorkload(allocator, null, window_msgs, 1, 0xc000_0000);
+    for (workload.rpcs) |owned| {
+        try r.inbox.putOne(io, .{ .inbound_rpc = .{ .peer = relay, .rpc = owned } });
+    }
+    syncRouter(r, io);
+    workload.deinit(allocator);
+
+    std.debug.print("\ngossip emission, {d} ids x {d} fringe peers:\n", .{ window_msgs, fringe });
+    for (0..3) |i| {
+        const frames_before = counters.frames.load(.monotonic);
+        const bytes_before = counters.bytes.load(.monotonic);
+        const alloc_before = counting.snapshot();
+        const t0 = io_time.monotonicNs(io);
+        r.inbox.putOneUncancelable(io, .heartbeat) catch return;
+        syncRouter(r, io);
+        const dt = io_time.monotonicNs(io) - t0;
+        // Writer fibers drain asynchronously; settle so the frame counters
+        // cover this tick's emission.
+        io_time.ms(50).sleep(io) catch {};
+        const alloc_after = counting.snapshot();
+        std.debug.print("  gossip tick {d}: {d:.2} ms  ihave-frames {d} ({d:.2} MiB)  allocs {d}\n", .{
+            i + 1,
+            @as(f64, @floatFromInt(dt)) / 1e6,
+            counters.frames.load(.monotonic) - frames_before,
+            @as(f64, @floatFromInt(counters.bytes.load(.monotonic) - bytes_before)) / (1024.0 * 1024.0),
+            alloc_after[0] - alloc_before[0],
+        });
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const base = init.gpa;
     var counting = CountingAllocator{ .parent = base };
@@ -549,4 +621,5 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\n", .{});
     try runHeartbeatScenario(&counting, io);
+    try runGossipEmitScenario(&counting, io);
 }
