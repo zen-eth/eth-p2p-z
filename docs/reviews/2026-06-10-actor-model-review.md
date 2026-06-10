@@ -177,6 +177,18 @@ command processing, and parked callers cannot be cancelled. **Fix:** bound
 `sendMany` with a deadline, and/or make reply waits cancelable via actor-owned
 refcounted reply slots (Tokio-oneshot shape).
 
+Note (2026-06-10): upstream Zig PR 35564 (codeberg.org/ziglang/zig/pulls/35564,
+open) fixes a `std.Io.Condition` signal-vs-cancel race that swallows
+`error.Canceled` and "leaves the task in an uncancelable state" —
+`std.Io.Queue` (our inbox) is built on `Condition`, so today a cancel racing a
+queue signal can be silently lost. This is part of why the codebase leans on
+uncancelable waits + persistent signals. Once that fix lands, the cancelable
+reply-wait rework here becomes safe to do (it still ALSO needs the rc'd reply
+slots so an abandoned waiter cannot UAF). The teardown-protocol "last words"
+posts (`shutdown`, `reap_dead_writers`) must stay uncancelable regardless —
+their requirement is delivery-while-being-cancelled, which no cancel-semantics
+fix changes.
+
 ### Minor (correctness-adjacent)
 
 - Integration tests read `router.peers` off-fiber while the router runs
