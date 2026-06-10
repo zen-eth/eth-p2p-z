@@ -1062,6 +1062,14 @@ pub fn Router(comptime Transport: type) type {
         /// would make every publish after a process restart reuse an already-seen
         /// id and be silently dropped network-wide until the TTL expires.
         seqno: u64,
+        /// PRNG behind every peer-selection shuffle (graft candidates, prune
+        /// victims, gossip targets, PX offers, fanout replenishment): each
+        /// selection gathers ALL eligible candidates, shuffles, then truncates,
+        /// so selection cannot be steered by whoever controls peer-map insertion
+        /// order (an eclipse-attack lever; go-libp2p shuffles every candidate
+        /// list for the same reason). Seeded from OS entropy at create. Only
+        /// ever touched on the router fiber.
+        prng: std.Random.DefaultPrng,
         /// Our own peer id, used as Message.from on publish (under strict_sign /
         /// none; under anonymous publish omits `from` entirely).
         local_peer: PeerId,
@@ -1261,6 +1269,7 @@ pub fn Router(comptime Transport: type) type {
                 .score = score_engine,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
                 .seqno = initialSeqno(io),
+                .prng = std.Random.DefaultPrng.init(selectionSeed()),
             };
 
             // `seen` and `message_cache` share the router's intern table (now
@@ -1297,6 +1306,16 @@ pub fn Router(comptime Transport: type) type {
             const wall_ns: i96 = std.Io.Clock.real.now(io).toNanoseconds();
             if (wall_ns <= 0) return 0;
             return @intCast(@min(wall_ns, @as(i96, std.math.maxInt(u64))));
+        }
+
+        /// OS-entropy seed for the selection PRNG. arc4random_buf is in libc
+        /// on macOS and glibc >= 2.36 Linux (the interop images build natively
+        /// on bookworm = 2.36; this build links libc) and cannot fail — the
+        /// same pattern PeerId.random uses.
+        fn selectionSeed() u64 {
+            var seed: u64 = undefined;
+            std.c.arc4random_buf(std.mem.asBytes(&seed), @sizeOf(u64));
+            return seed;
         }
 
         /// Spawn the main fiber (and, when the heartbeat interval is non-zero, the
@@ -1787,15 +1806,14 @@ pub fn Router(comptime Transport: type) type {
         /// Select up to `n` peers to GRAFT into `topic`'s mesh: peers that
         /// announced they subscribe to `topic`, are not already in its mesh, and
         /// are not in backoff for it. Appends the chosen peers to `out` (capped at
-        /// `n`) and returns the count appended. Iteration order of the peer map is
-        /// the selection order; randomised shuffle for fairness/anti-eclipse is a
-        /// future refinement.
+        /// `n`) and returns the count appended. ALL eligible candidates are
+        /// gathered, shuffled, and truncated to `n`, so grafts are a uniform
+        /// sample of the topic's peers rather than peer-map order (anti-eclipse;
+        /// go-libp2p shuffles its graft candidates the same way).
         fn selectGraftCandidates(router: *Self, topic: []const u8, n: usize, out: *std.ArrayListUnmanaged(PeerId)) usize {
             if (n == 0) return 0;
-            var added: usize = 0;
             var it = router.peers.iterator();
             while (it.next()) |entry| {
-                if (added >= n) break;
                 const peer = entry.value_ptr.*.peer;
                 if (!entry.value_ptr.*.topics.contains(topic)) continue;
                 // Never graft a direct (explicit) peer into a mesh — it is an
@@ -1809,9 +1827,13 @@ pub fn Router(comptime Transport: type) type {
                 // when scoring is disabled (peerScore is 0).
                 if (router.peerScore(peer) < 0) continue;
                 out.append(router.allocator, peer) catch break;
-                added += 1;
             }
-            return added;
+            // ALL eligible candidates were gathered; shuffle, then keep `n`, so
+            // mesh membership is drawn uniformly rather than in peer-map
+            // insertion order (which an attacker can pace connections to steer).
+            router.prng.random().shuffle(PeerId, out.items);
+            if (out.items.len > n) out.shrinkRetainingCapacity(n);
+            return out.items.len;
         }
 
         /// Select up to `n` current members of `topic`'s mesh to PRUNE out (used to
@@ -1822,9 +1844,9 @@ pub fn Router(comptime Transport: type) type {
         /// mesh members are sorted by score (descending) and the bottom `n` are
         /// dropped, so the heartbeat retains the highest-scoring ~D peers (a
         /// simplified form of go-libp2p's score-aware prune; the finer D_out
-        /// outbound-quota retention is a future refinement). With scoring
-        /// disabled the victims are arbitrary excess in mesh-iteration order
-        /// (unchanged from before scoring existed).
+        /// outbound-quota retention is a future refinement; ties within equal
+        /// scores break randomly via a pre-sort shuffle). With scoring disabled
+        /// the victims are a uniform shuffled sample of the mesh.
         fn selectPruneVictims(router: *Self, topic: []const u8, n: usize, out: *std.ArrayListUnmanaged(PeerKey)) usize {
             if (n == 0) return 0;
             const set = router.mesh.getPtr(topic) orelse return 0;
@@ -1841,6 +1863,11 @@ pub fn Router(comptime Transport: type) type {
                     const sc = if (router.score_snapshot.get(key_ptr.*)) |s| s else 0;
                     scored.append(router.allocator, .{ .key = key_ptr.*, .score = sc }) catch break;
                 }
+                // Shuffle BEFORE sorting so equal scores (the common case when
+                // most peers behave) break ties randomly instead of in map
+                // order — go shuffles its peer list ahead of the score sort for
+                // exactly this reason.
+                router.prng.random().shuffle(Scored, scored.items);
                 std.mem.sort(Scored, scored.items, {}, struct {
                     fn lessThan(_: void, a: Scored, b: Scored) bool {
                         return a.score < b.score;
@@ -1855,14 +1882,15 @@ pub fn Router(comptime Transport: type) type {
                 return added;
             }
 
-            var added: usize = 0;
             var it = set.keyIterator();
             while (it.next()) |key_ptr| {
-                if (added >= n) break;
                 out.append(router.allocator, key_ptr.*) catch break;
-                added += 1;
             }
-            return added;
+            // Scoring off: every member is an equal candidate — shuffle, then
+            // keep `n`, so the victims are uniform rather than mesh-set order.
+            router.prng.random().shuffle(PeerKey, out.items);
+            if (out.items.len > n) out.shrinkRetainingCapacity(n);
+            return out.items.len;
         }
 
         // ----- fanout helpers ---------------------------------------------
@@ -1905,18 +1933,30 @@ pub fn Router(comptime Transport: type) type {
 
         /// Top `set` up to D peers with peers subscribed to `topic` that are not
         /// already in it (used both to seed a fresh fanout and to replenish a
-        /// shrunken one). Peer-map iteration order is the selection order.
+        /// shrunken one). Candidates are shuffled before the top-up, so fanout
+        /// membership is a uniform sample of the topic's peers.
         fn fanoutReplenish(router: *Self, topic: []const u8, set: *PeerSet) void {
             if (set.count() >= mesh_params.d) return;
+            // Gather every eligible candidate not already in the set, shuffle,
+            // then top up to `d`: fanout membership is a uniform sample of the
+            // topic's peers, not the peer-map prefix (go picks fanout peers
+            // randomly for the same reason).
+            var candidates: std.ArrayListUnmanaged(PeerId) = .empty;
+            defer candidates.deinit(router.allocator);
             var it = router.peers.iterator();
             while (it.next()) |entry| {
-                if (set.count() >= mesh_params.d) break;
                 const peer = entry.value_ptr.*.peer;
                 if (!entry.value_ptr.*.topics.contains(topic)) continue;
                 // A direct (explicit) peer is never placed in a fanout set: it is
                 // an out-of-mesh trusted forward target, reached via the direct
                 // path on every publish (go filters direct peers out of fanout).
                 if (router.isDirect(peer)) continue;
+                if (set.contains(peerKey(&peer))) continue;
+                candidates.append(router.allocator, peer) catch break;
+            }
+            router.prng.random().shuffle(PeerId, candidates.items);
+            for (candidates.items) |peer| {
+                if (set.count() >= mesh_params.d) break;
                 set.put(router.allocator, peerKey(&peer), {}) catch break;
             }
         }
@@ -2632,9 +2672,9 @@ pub fn Router(comptime Transport: type) type {
         /// score threshold. The slice size is `max(gossip_factor * eligible_count,
         /// d_lazy)` — a proportional fan-out that still gossips to at least `d_lazy`
         /// peers in small topics. All eligible peers are gathered first (so the
-        /// count is exact), then the list is truncated to the target. Peer-map
-        /// iteration order is the selection order (deterministic; shuffle is a
-        /// refinement).
+        /// count is exact), then SHUFFLED and truncated to the target, so the
+        /// gossip fringe is a uniform sample rather than peer-map order
+        /// (go-libp2p shuffles its gossip candidates the same way).
         fn selectGossipTargets(router: *Self, topic: []const u8, out: *std.ArrayListUnmanaged(PeerId)) void {
             const mesh_set = router.mesh.getPtr(topic);
             const fanout_set = router.fanout.getPtr(topic);
@@ -2663,8 +2703,9 @@ pub fn Router(comptime Transport: type) type {
 
             // Target = max(gossip_factor * eligible, d_lazy). `out.items.len` is the
             // eligible count (every appended peer is gossip-eligible). When the
-            // proportional slice is smaller than what we gathered, truncate to it;
-            // otherwise keep everyone (eligible <= target).
+            // proportional slice is smaller than what we gathered, truncate to a
+            // SHUFFLED sample; otherwise keep everyone (eligible <= target).
+            router.prng.random().shuffle(PeerId, out.items);
             const eligible: f64 = @floatFromInt(out.items.len);
             const scaled: usize = @intFromFloat(mesh_params.gossip_factor * eligible);
             const target = @max(scaled, mesh_params.d_lazy);
@@ -3294,27 +3335,38 @@ pub fn Router(comptime Transport: type) type {
         /// peer's id bytes (from the live `PeerState`, valid for this call) and, if
         /// we hold a certified record for the peer, its stored signed-envelope bytes
         /// (otherwise only the peer id — go sends the bare id and lets the receiver
-        /// find addresses elsewhere). Iteration order is the mesh-set order;
-        /// randomised sampling is a refinement. The borrowed slices stay valid until
-        /// `fanOut` returns (it copies them), which is why `out` is freed there.
+        /// find addresses elsewhere). Eligible members are shuffled before the
+        /// `prune_peers` cut, so the offer is a uniform sample of the mesh. The
+        /// borrowed slices stay valid until `fanOut` returns (it copies them),
+        /// which is why `out` is freed there.
         fn selectPxPeers(router: *Self, topic: []const u8, pruned: PeerId, out: *std.ArrayListUnmanaged(?rpc_pb.PeerInfo)) void {
             const set = router.mesh.getPtr(topic) orelse return;
+            // Gather every eligible mesh member first, shuffle, then offer the
+            // first `prune_peers`: the PX offer is a uniform sample of the mesh,
+            // not its set-iteration prefix (a pruned peer eclipse-probing us
+            // would otherwise see a stable, steerable offer set).
+            var candidates: std.ArrayListUnmanaged(*PeerState) = .empty;
+            defer candidates.deinit(router.allocator);
             var it = set.keyIterator();
             while (it.next()) |key_ptr| {
-                if (out.items.len >= mesh_params.prune_peers) break;
                 const state = router.peers.get(key_ptr.*) orelse continue;
                 const peer = state.peer;
                 if (peer.eql(&pruned)) continue;
                 if (router.isDirect(peer)) continue;
                 if (router.peerScore(peer) < 0) continue;
-                // Borrow the peer-id bytes from the HEAP-stable PeerState (not the
-                // stack-local `peer` copy, which dies when this returns) so the
-                // slice stays valid until `fanOut`'s `frameRpc` copies it. The
-                // record bytes (when present) are owned by the cert store, so they
-                // are stable too.
+                candidates.append(router.allocator, state) catch break;
+            }
+            router.prng.random().shuffle(*PeerState, candidates.items);
+            const take = @min(candidates.items.len, mesh_params.prune_peers);
+            for (candidates.items[0..take]) |state| {
+                // Borrow the peer-id bytes from the HEAP-stable PeerState (not a
+                // stack-local copy, which dies when this returns) so the slice
+                // stays valid until `fanOut`'s `frameRpc` copies it. The record
+                // bytes (when present) are owned by the cert store, so they are
+                // stable too.
                 out.append(router.allocator, .{
                     .peer_i_d = state.peer.bytes[0..state.peer.len],
-                    .signed_peer_record = router.getRecord(peer),
+                    .signed_peer_record = router.getRecord(state.peer),
                 }) catch break;
             }
         }
