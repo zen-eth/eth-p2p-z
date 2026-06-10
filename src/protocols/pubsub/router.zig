@@ -2207,21 +2207,15 @@ pub fn Router(comptime Transport: type) type {
         /// the builder reference at the end so the frame frees itself iff no queue
         /// kept a copy). No per-peer copy of the (up-to-1 MiB) wire bytes.
         ///
-        /// Takes ownership of `ids` (the message ids carried in the frame for a
-        /// later IDONTWANT purge; pass an empty owned slice for non-data frames):
-        /// on success the frame owns them; on a framing/allocation failure they are
-        /// freed here. Best-effort throughout (a void return): a framing failure or
-        /// a per-peer push failure logs nothing and simply drops that copy.
-        fn fanOut(router: *Self, lane: peer_io.Lane, rpc_frame: rpc_pb.RPC, ids: [][]u8, targets: Targets) void {
-            const framed = pubsub.frameRpc(router.allocator, rpc_frame) catch {
-                for (ids) |id| router.allocator.free(id);
-                router.allocator.free(ids);
-                return;
-            };
-            const frame = peer_io.OutboundFrame.create(router.allocator, framed, ids, 1) catch {
+        /// The frames built here carry no message id: only data frames need one
+        /// (for IDONTWANT matching) and the sole data-frame producer is
+        /// `cacheAndForward`, which builds its frame directly. Best-effort
+        /// throughout (a void return): a framing failure or a per-peer push
+        /// failure logs nothing and simply drops that copy.
+        fn fanOut(router: *Self, lane: peer_io.Lane, rpc_frame: rpc_pb.RPC, targets: Targets) void {
+            const framed = pubsub.frameRpc(router.allocator, rpc_frame) catch return;
+            const frame = peer_io.OutboundFrame.create(router.allocator, framed, null, 1) catch {
                 router.allocator.free(framed);
-                for (ids) |id| router.allocator.free(id);
-                router.allocator.free(ids);
                 return;
             };
             // Builder reference dropped at the end; queues hold the rest. If no
@@ -2262,13 +2256,13 @@ pub fn Router(comptime Transport: type) type {
         /// Hand one shared-frame reference to a peer's lane queue: retain before
         /// the push, release on a rejected push (the queue did not take it).
         ///
-        /// Honours the peer's IDONTWANT (`dont_send`): if any id the frame carries
+        /// Honours the peer's IDONTWANT (`dont_send`): if the id the frame carries
         /// is one the peer told us it already has, the frame is SKIPPED (not
         /// enqueued) — saving the bandwidth IDONTWANT is for. A skipped target
         /// simply does not `retain`, so the refcount stays balanced. Only data
-        /// frames carry ids, so control/subscribe pushes are never skipped.
+        /// frames carry an id, so control/subscribe pushes are never skipped.
         fn pushTo(router: *Self, state: *PeerState, lane: peer_io.Lane, frame: *peer_io.OutboundFrame) void {
-            for (frame.message_ids) |id| {
+            if (frame.message_id) |id| {
                 if (state.dont_send.contains(id)) {
                     if (router.gs_debug) std.log.info("GS_DEBUG pushTo SKIP lane={s} (dont_send)", .{@tagName(lane)});
                     return;
@@ -2286,13 +2280,6 @@ pub fn Router(comptime Transport: type) type {
                 // give-up paths, this just makes the drops observable.
                 router.lane_drops += 1;
             };
-        }
-
-        /// Allocate an empty owned id slice for a frame that carries no message
-        /// ids (every lane except data forwards). Returns null on OOM so the
-        /// caller can bail before framing.
-        fn emptyIds(router: *Self) ?[][]u8 {
-            return router.allocator.alloc([]u8, 0) catch null;
         }
 
         /// Send the local node's full current subscription set to one peer's
@@ -2318,8 +2305,7 @@ pub fn Router(comptime Transport: type) type {
                 subs.append(scratch, rpc.buildSubscription(key.*, true)) catch return;
             }
 
-            const ids = router.emptyIds() orelse return;
-            router.fanOut(.subscribe, (rpc.RpcOut{ .subscriptions = subs.items }).toRpc(), ids, .{ .one = state.peer });
+            router.fanOut(.subscribe, (rpc.RpcOut{ .subscriptions = subs.items }).toRpc(), .{ .one = state.peer });
         }
 
         /// Handle a connection to a peer dying: tear the peer down ONLY when the
@@ -2698,16 +2684,11 @@ pub fn Router(comptime Transport: type) type {
             defer router.allocator.free(opt_ids);
             for (ids, 0..) |id, i| opt_ids[i] = id;
 
-            const empty_ids = router.emptyIds() orelse return;
             const ihave = rpc.buildIHave(topic, opt_ids);
             const ctrl = rpc_pb.ControlMessage{ .ihave = &.{ihave} };
-            const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .control = ctrl }).toRpc()) catch {
-                router.allocator.free(empty_ids);
-                return;
-            };
-            const frame = peer_io.OutboundFrame.create(router.allocator, framed, empty_ids, 1) catch {
+            const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .control = ctrl }).toRpc()) catch return;
+            const frame = peer_io.OutboundFrame.create(router.allocator, framed, null, 1) catch {
                 router.allocator.free(framed);
-                router.allocator.free(empty_ids);
                 return;
             };
             defer frame.release();
@@ -2965,10 +2946,9 @@ pub fn Router(comptime Transport: type) type {
                 if (wanted.items[0]) |first_id| router.addPromise(state, first_id);
             }
 
-            const ids = router.emptyIds() orelse return;
             const iwant = rpc.buildIWant(wanted.items);
             const ctrl = rpc_pb.ControlMessage{ .iwant = &.{iwant} };
-            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), ids, .{ .one = source });
+            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), .{ .one = source });
         }
 
         /// Record an IWANT promise: `state`'s peer must deliver message id `id` by
@@ -3112,15 +3092,13 @@ pub fn Router(comptime Transport: type) type {
             _ = state.queue.removeData(router.io, ids_ptr, dontWantPred);
         }
 
-        /// `removeData` predicate: true if ANY of the frame's carried message ids
-        /// is in the IDONTWANT id set `ids` (so the frame must be dropped from the
+        /// `removeData` predicate: true if the frame's carried message id is in
+        /// the IDONTWANT id set `ids` (so the frame must be dropped from the
         /// peer's queue). Frames carry the single id of the message they hold (or
         /// none for control frames, which never reach the data lane).
         fn dontWantPred(ids: *const std.StringHashMapUnmanaged(void), frame: *const peer_io.OutboundFrame) bool {
-            for (frame.message_ids) |id| {
-                if (ids.contains(id)) return true;
-            }
-            return false;
+            const id = frame.message_id orelse return false;
+            return ids.contains(id);
         }
 
         /// Record (a copy of) message id `id` in the peer's `dont_send` set with
@@ -3300,15 +3278,13 @@ pub fn Router(comptime Transport: type) type {
         /// synchronously inside `fanOut`, so the transient offer list is freed here.
         /// Framed once via `fanOut` to the single target.
         fn sendPrune(router: *Self, peer: PeerId, topic: []const u8, backoff_ticks: u64, do_px: bool) void {
-            const ids = router.emptyIds() orelse return;
-
             var px: std.ArrayListUnmanaged(?rpc_pb.PeerInfo) = .empty;
             defer px.deinit(router.allocator);
             if (do_px and router.peer_exchange_enabled) router.selectPxPeers(topic, peer, &px);
 
             const prune = rpc.buildPrune(topic, px.items, backoff_ticks);
             const ctrl = rpc_pb.ControlMessage{ .prune = &.{prune} };
-            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), ids, .{ .one = peer });
+            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), .{ .one = peer });
         }
 
         /// Append up to `prune_peers` peer-exchange offers for `topic` to `out`:
@@ -3347,10 +3323,9 @@ pub fn Router(comptime Transport: type) type {
         /// added it to our mesh for the topic). Framed once via `fanOut` to the
         /// single target.
         fn sendGraft(router: *Self, peer: PeerId, topic: []const u8) void {
-            const ids = router.emptyIds() orelse return;
             const graft = rpc.buildGraft(topic);
             const ctrl = rpc_pb.ControlMessage{ .graft = &.{graft} };
-            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), ids, .{ .one = peer });
+            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), .{ .one = peer });
         }
 
         /// Apply one inbound SUBSCRIBE/UNSUBSCRIBE from `source` to that peer's
@@ -3890,10 +3865,9 @@ pub fn Router(comptime Transport: type) type {
         /// copies), and the frame carries no message ids of its own (control frames
         /// are never IDONTWANT-purged).
         fn sendIDontWant(router: *Self, peer: PeerId, id: []const u8) void {
-            const empty_ids = router.emptyIds() orelse return;
             const idontwant = rpc.buildIDontWant(&[_]?[]const u8{id});
             const ctrl = rpc_pb.ControlMessage{ .idontwant = &.{idontwant} };
-            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), empty_ids, .{ .one = peer });
+            router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), .{ .one = peer });
         }
 
         /// Frame a single message ONCE, store it in the message cache (so a later
@@ -3926,27 +3900,27 @@ pub fn Router(comptime Transport: type) type {
             key: ?[]const u8,
             id: []const u8,
         ) void {
-            // The data frame carries one message id (owned by the frame, for a
-            // later IDONTWANT purge); free it on any pre-frame failure.
-            const ids = router.allocator.alloc([]u8, 1) catch return;
-            ids[0] = router.allocator.dupe(u8, id) catch {
-                router.allocator.free(ids);
-                return;
-            };
+            // The data frame carries one PRIVATE copy of the message id (for a
+            // later IDONTWANT purge). `id` is interned, and an interned id's
+            // LAST release unlinks it from the unsynchronized, router-fiber-
+            // owned intern table — but a frame's last reference is usually
+            // dropped on a writer fiber (the refcount is atomic; the table is
+            // not), so a frame must never hold an interned reference. The one
+            // small dupe per accepted message is the price of that confinement.
+            // Freed on any pre-frame failure.
+            const id_copy = router.allocator.dupe(u8, id) catch return;
             // The cached/forwarded frame carries whatever signature/key the
             // message was published or relayed with (null under the none policy),
             // so IWANT-served and mesh-forwarded copies stay byte-identical and
             // keep the original publisher's signature.
             const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data, .signature = signature, .key = key };
             const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .publish = &.{msg} }).toRpc()) catch {
-                router.allocator.free(ids[0]);
-                router.allocator.free(ids);
+                router.allocator.free(id_copy);
                 return;
             };
-            const frame = peer_io.OutboundFrame.create(router.allocator, framed, ids, 1) catch {
+            const frame = peer_io.OutboundFrame.create(router.allocator, framed, id_copy, 1) catch {
                 router.allocator.free(framed);
-                router.allocator.free(ids[0]);
-                router.allocator.free(ids);
+                router.allocator.free(id_copy);
                 return;
             };
             // Builder reference dropped at the end; the cache and any accepting
@@ -4091,9 +4065,8 @@ pub fn Router(comptime Transport: type) type {
         /// Announce a single (un)subscription to every peer's `.subscribe` lane:
         /// framed once and fanned out (see `fanOut`).
         fn announceSubscription(router: *Self, topic: []const u8, subscribe: bool) void {
-            const ids = router.emptyIds() orelse return;
             const sub = rpc.buildSubscription(topic, subscribe);
-            router.fanOut(.subscribe, (rpc.RpcOut{ .subscriptions = &.{sub} }).toRpc(), ids, .all);
+            router.fanOut(.subscribe, (rpc.RpcOut{ .subscriptions = &.{sub} }).toRpc(), .all);
         }
 
         /// Local publish: build a Message from us, dedup it, deliver locally if we
@@ -4985,23 +4958,19 @@ fn testDataFrame(allocator: std.mem.Allocator) !*peer_io.OutboundFrame {
     const bytes = try allocator.alloc(u8, 1);
     errdefer allocator.free(bytes);
     bytes[0] = 0x7f;
-    const ids = try allocator.alloc([]u8, 0);
-    errdefer allocator.free(ids);
-    return peer_io.OutboundFrame.create(allocator, bytes, ids, 1);
+    return peer_io.OutboundFrame.create(allocator, bytes, null, 1);
 }
 
 /// Build a one-byte shared data frame (one reference) carrying a single owned
-/// copy of `id` in its `message_ids`, matching the shape `cacheAndForward`
+/// copy of `id` as its `message_id`, matching the shape `cacheAndForward`
 /// produces — so a router IDONTWANT purge has a real id to match against.
 fn testDataFrameWithId(allocator: std.mem.Allocator, id: []const u8) !*peer_io.OutboundFrame {
     const bytes = try allocator.alloc(u8, 1);
     errdefer allocator.free(bytes);
     bytes[0] = 0x7f;
-    const ids = try allocator.alloc([]u8, 1);
-    errdefer allocator.free(ids);
-    ids[0] = try allocator.dupe(u8, id);
-    errdefer allocator.free(ids[0]);
-    return peer_io.OutboundFrame.create(allocator, bytes, ids, 1);
+    const owned_id = try allocator.dupe(u8, id);
+    errdefer allocator.free(owned_id);
+    return peer_io.OutboundFrame.create(allocator, bytes, owned_id, 1);
 }
 
 /// After a `sync`, the data-lane length of the peer tracked under `peer` (0 if

@@ -18,35 +18,41 @@ pub const Lane = enum { subscribe, control, data };
 ///
 /// Ownership is the reference count: each holder (the builder, every queue that
 /// accepts a push, the writer that pops it) owns exactly one reference. A holder
-/// gives up its reference with `release`; the frame frees its own bytes/ids/self
+/// gives up its reference with `release`; the frame frees its own bytes/id/self
 /// when the last reference is released. Use `create` to mint one (which sets the
 /// initial count to the number of intended holders) and `retain` to add a holder.
 ///
 /// bytes: length-prefixed wire bytes produced by pubsub.frameRpc; owned.
-/// message_ids: owned ids carried for IDONTWANT purge; empty (&.{}) for all
-///   lanes except data frames that may later be IDONTWANT-purged.
+/// message_id: owned id carried for IDONTWANT purge; null for every lane
+///   except data frames that may later be IDONTWANT-purged.
 /// rc: live holder count; the frame frees itself on the 1→0 transition.
-/// allocator: the allocator that owns bytes/ids/self, used by the final release.
+/// allocator: the allocator that owns bytes/id/self, used by the final release.
 pub const OutboundFrame = struct {
     bytes: []u8,
-    message_ids: [][]u8,
+    /// The id of the message a data frame carries (for IDONTWANT matching);
+    /// null for control/subscribe frames. Owned by the frame — a PRIVATE copy,
+    /// never a reference into the router's intern table: an interned id's
+    /// LAST release unlinks it from the unsynchronized, router-fiber-owned
+    /// intern hash table, and a frame's last reference is usually dropped on
+    /// a writer fiber (the refcount itself is atomic; the table is not).
+    message_id: ?[]u8,
     rc: AtomicRc,
     allocator: std.mem.Allocator,
 
     /// Mint a heap frame with `initial_refs` references (the number of intended
     /// holders — e.g. 1 for a builder that will `retain` per target before each
-    /// push). Takes ownership of `bytes` and `message_ids`; on the final release
+    /// push). Takes ownership of `bytes` and `message_id`; on the final release
     /// it frees both plus itself with `allocator`.
     pub fn create(
         allocator: std.mem.Allocator,
         bytes: []u8,
-        message_ids: [][]u8,
+        message_id: ?[]u8,
         initial_refs: usize,
     ) std.mem.Allocator.Error!*OutboundFrame {
         const self = try allocator.create(OutboundFrame);
         self.* = .{
             .bytes = bytes,
-            .message_ids = message_ids,
+            .message_id = message_id,
             .rc = .initCount(initial_refs),
             .allocator = allocator,
         };
@@ -61,7 +67,7 @@ pub const OutboundFrame = struct {
     }
 
     /// Give up one holder's reference. On the 1→0 transition this frees the
-    /// bytes, every id, the id slice, and the frame itself. Writers release from
+    /// bytes, the carried message id, and the frame itself. Writers release from
     /// different executor threads, so the decrement is `.release` and the freeing
     /// thread issues an `.acquire` fence first, establishing happens-before with
     /// every prior holder's writes before the memory is reclaimed.
@@ -69,8 +75,7 @@ pub const OutboundFrame = struct {
         if (!self.rc.release()) return;
         const allocator = self.allocator;
         allocator.free(self.bytes);
-        for (self.message_ids) |id| allocator.free(id);
-        allocator.free(self.message_ids);
+        if (self.message_id) |id| allocator.free(id);
         allocator.destroy(self);
     }
 };
@@ -496,35 +501,26 @@ pub fn PeerReader(comptime Source: type, comptime Poster: type) type {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Build a minimal shared frame for testing: 1 byte, no message_ids, one
+/// Build a minimal shared frame for testing: 1 byte, no message id, one
 /// reference. The caller owns that reference (release it, push it, or hand it to
 /// a queue.deinit).
 fn testFrame(allocator: std.mem.Allocator, byte: u8) !*OutboundFrame {
     const bytes = try allocator.alloc(u8, 1);
     errdefer allocator.free(bytes);
     bytes[0] = byte;
-    const ids = try allocator.alloc([]u8, 0);
-    errdefer allocator.free(ids);
-    return OutboundFrame.create(allocator, bytes, ids, 1);
+    return OutboundFrame.create(allocator, bytes, null, 1);
 }
 
-/// Build a shared frame carrying `ids` (each copied) so the final release has
-/// real per-id allocations to free. Used to pin the message_ids ownership
-/// contract. One reference, owned by the caller.
-fn testFrameWithIds(allocator: std.mem.Allocator, byte: u8, ids: []const []const u8) !*OutboundFrame {
+/// Build a shared frame carrying a copy of `id` so the final release has a
+/// real id allocation to free. Used to pin the message_id ownership contract.
+/// One reference, owned by the caller.
+fn testFrameWithId(allocator: std.mem.Allocator, byte: u8, id: []const u8) !*OutboundFrame {
     const bytes = try allocator.alloc(u8, 1);
     errdefer allocator.free(bytes);
     bytes[0] = byte;
-
-    const owned_ids = try allocator.alloc([]u8, ids.len);
-    errdefer allocator.free(owned_ids);
-    var filled: usize = 0;
-    errdefer for (owned_ids[0..filled]) |id| allocator.free(id);
-    for (ids) |id| {
-        owned_ids[filled] = try allocator.dupe(u8, id);
-        filled += 1;
-    }
-    return OutboundFrame.create(allocator, bytes, owned_ids, 1);
+    const owned_id = try allocator.dupe(u8, id);
+    errdefer allocator.free(owned_id);
+    return OutboundFrame.create(allocator, bytes, owned_id, 1);
 }
 
 test "OutboundFrame release frees owned slices" {
@@ -534,18 +530,18 @@ test "OutboundFrame release frees owned slices" {
     // testing.allocator detects leaks at test end.
 }
 
-test "OutboundFrame release frees carried message_ids" {
+test "OutboundFrame release frees the carried message id" {
     const allocator = std.testing.allocator;
-    const frame = try testFrameWithIds(allocator, 0x42, &.{ "id-a", "id-b", "id-c" });
-    try std.testing.expectEqual(@as(usize, 3), frame.message_ids.len);
+    const frame = try testFrameWithId(allocator, 0x42, "id-a");
+    try std.testing.expectEqualStrings("id-a", frame.message_id.?);
     frame.release();
-    // testing.allocator detects a leak if any id (or the id slice) is missed.
+    // testing.allocator detects a leak if the id is missed.
 }
 
 test "OutboundFrame retain/release: frees only on the last release" {
     const allocator = std.testing.allocator;
     // One holder, then add two more: three references total.
-    const frame = try testFrameWithIds(allocator, 0x01, &.{ "x", "y" });
+    const frame = try testFrameWithId(allocator, 0x01, "x");
     frame.retain();
     frame.retain();
     try std.testing.expectEqual(@as(usize, 3), frame.rc.count());

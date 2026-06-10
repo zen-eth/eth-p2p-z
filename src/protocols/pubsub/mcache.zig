@@ -216,9 +216,7 @@ fn testFrame(allocator: std.mem.Allocator, byte: u8) !*peer_io.OutboundFrame {
     const bytes = try allocator.alloc(u8, 1);
     errdefer allocator.free(bytes);
     bytes[0] = byte;
-    const ids = try allocator.alloc([]u8, 0);
-    errdefer allocator.free(ids);
-    return peer_io.OutboundFrame.create(allocator, bytes, ids, 1);
+    return peer_io.OutboundFrame.create(allocator, bytes, null, 1);
 }
 
 test "put/get round-trip and miss returns null" {
