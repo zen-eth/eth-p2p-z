@@ -43,6 +43,11 @@ const header_info_token_buf_len: usize = 256;
 // VN packet itself is small, but this is the scratch we hand quiche).
 const version_negotiation_buf_len: usize = 1500;
 
+// Upper bound on a fresh connection's initial source CIDs copied for the
+// accept-path route rollback (a new connection registers one or two; sized
+// with a wide margin).
+const max_accept_route_cids: usize = 16;
+
 pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -204,14 +209,21 @@ pub fn closeListener(ep: Context) void {
     // point, and the loop maps `Canceled` back to a `stopping` re-check.
     ep.stopping.store(true, .release);
     if (ep.router_future_slot.*) |*future| {
-        if (!sendWakeDatagram(ep)) {
-            // Backstop only. cancel is idempotent and caches the result, so the
-            // await below re-reads it without double-consuming the future.
-            future.cancel(io) catch {};
-        }
+        // TWO independent wakers, belt and suspenders: the loopback wake
+        // datagram is the primary signal, and the one-shot cancel ALWAYS
+        // follows as the backstop — a wake can be SENT successfully yet never
+        // delivered (an environment dropping self-addressed UDP), and an
+        // unbounded await on a fire-and-forget datagram would hang teardown
+        // forever. Either signal alone suffices (the loop maps Canceled to a
+        // `stopping` re-check); cancel is idempotent and caches the result,
+        // so the await below re-reads it without double-consuming the future.
+        _ = sendWakeDatagram(ep);
+        future.cancel(io) catch {};
         // Exits cleanly (void) on `stopping`; surface, don't swallow, any error.
-        future.await(io) catch |err|
-            std.log.warn("router teardown: loop exited with error {}", .{err});
+        future.await(io) catch |err| switch (err) {
+            error.Canceled => {}, // the backstop fired first: a clean stop
+            else => std.log.warn("router teardown: loop exited with error {}", .{err}),
+        };
         ep.router_future_slot.* = null;
     }
     // Then drain any handshake waiters spawned by the router accept path. These are
@@ -734,19 +746,31 @@ fn startServerConnection(
 
     // RETRY validation already pinned the connection's SCID (= retried
     // Initial's DCID = the new_scid we picked when we sent the Retry packet).
-    // The actor's CID registry was populated at construction; we just need
-    // to map each registered CID into the router's cid_map.
+    // The actor's CID registry was populated at construction; we just need to
+    // map each registered CID into the shared route table. The rollback works
+    // from an OWNED stack copy of the keys: `reg.cids` borrows the actor's
+    // heap registry, which is freed once `spawn` + `conn.deinit()` tear the
+    // actor down on the post-spawn failure path below — a rollback iterating
+    // the borrow there would read freed memory and could unmap a LIVE
+    // connection's routes if the block had been reused. (The dialer's
+    // RouteRegistrar.register copies for the same reason.)
     const reg = pending.routeRegistration();
+    var mapped_keys: [max_accept_route_cids]CidKey = undefined;
+    if (reg.cids.len > mapped_keys.len) {
+        ep.addStat("router_packet_drops", 1);
+        return;
+    }
     var mapped_routes: usize = 0;
     var routes_committed = false;
     defer if (!routes_committed) {
-        for (reg.cids[0..mapped_routes]) |cid| unmapRoute(ep, cid);
+        for (mapped_keys[0..mapped_routes]) |cid| unmapRoute(ep, cid);
     };
     for (reg.cids) |cid| {
         if (!mapRoute(ep, cid, reg.channel)) {
             ep.addStat("router_packet_drops", 1);
             return;
         }
+        mapped_keys[mapped_routes] = cid;
         mapped_routes += 1;
     }
     switch (pending.enqueueInboundPacket(initial_packet)) {

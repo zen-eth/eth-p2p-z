@@ -149,12 +149,12 @@ pub const EndpointOptions = struct {
     /// 0 disables the pool entirely.
     recv_slab_slots: usize = 64,
     /// Bytes per slab; must hold at least one maximum UDP datagram (65_535).
-    /// The default IS one maximum datagram — a per-packet buffer pool. Larger
-    /// values turn each slab into a multi-datagram bump arena (fewer pool
-    /// round-trips, but a slab stays pinned until its LAST view releases);
-    /// loopback benchmarking on macOS showed pathological pacing interactions
-    /// with multi-datagram slabs, so bigger sizes should be adopted only with
-    /// platform-specific measurements in hand.
+    /// The default IS one maximum datagram — a per-packet buffer pool, the
+    /// finest pinning granularity (a slab frees as soon as its one packet is
+    /// consumed). Larger values turn each slab into a multi-datagram bump
+    /// arena: fewer pool round-trips, but the slab stays pinned until its
+    /// LAST view releases, so a single slow connection can hold whole slabs
+    /// hostage. Adopt larger sizes with measurements in hand.
     recv_slab_slot_bytes: usize = 65_535,
     handshake_timeout_ns: u64 = default_handshake_timeout_ns,
     enable_udp_gro: bool = true,

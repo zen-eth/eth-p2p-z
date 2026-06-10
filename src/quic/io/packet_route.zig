@@ -218,7 +218,13 @@ pub const SlabPool = struct {
     }
 
     fn recycle(pool: *SlabPool, slab: *Slab) void {
-        var destroy_pool = false;
+        // The pool reference is dropped only AFTER the spin lock is released:
+        // a 1->0 observer that destroyed the pool while still inside the lock
+        // could free it under another fiber spinning in lock() — any such
+        // fiber still holds its own (not yet dropped) slab reference, so
+        // deferring the drop past the unlock makes the last decrementer
+        // provably the last toucher.
+        var drop_ref = false;
         {
             pool.lock();
             defer pool.unlock();
@@ -226,7 +232,7 @@ pub const SlabPool = struct {
                 pool.allocator.free(slab.buf);
                 pool.allocator.destroy(slab);
                 pool.live_slabs -= 1;
-                destroy_pool = pool.rc.releaseChecked();
+                drop_ref = true;
             } else {
                 pool.free.append(pool.allocator, slab) catch {
                     // OOM growing the free list: destroy the slab instead of
@@ -234,11 +240,11 @@ pub const SlabPool = struct {
                     pool.allocator.free(slab.buf);
                     pool.allocator.destroy(slab);
                     pool.live_slabs -= 1;
-                    destroy_pool = pool.rc.releaseChecked();
+                    drop_ref = true;
                 };
             }
         }
-        if (destroy_pool) pool.destroy();
+        if (drop_ref and pool.rc.releaseChecked()) pool.destroy();
     }
 
     fn destroy(pool: *SlabPool) void {

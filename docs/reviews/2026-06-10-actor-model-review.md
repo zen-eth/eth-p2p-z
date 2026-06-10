@@ -388,7 +388,7 @@ architecture — no rewrite):
 | 1 | C1 writer-teardown deadlock; C2 seqno seed; C3 connection-identity lifecycle | S (C2 is one line) | **done** (`ff993a9`, `b54027b`, `962a009` + ABA follow-up `9839fec`) |
 | 2 | P1 check-seen-before-verify; verify in validation workers; throttle-drop at cap | S–M | **done** (`68f159e`; promise fulfilment follows go's tracer carve-out — fulfilled on duplicate/throttle/post-signature verdicts, never on a signature reject) |
 | 3 | P2 sendmmsg + GSO in zio + flushScheduled | M | open |
-| 4 | P3 persistent recv fiber + sharded CID map + slab ring | M | open |
+| 4 | P3 persistent recv fiber + sharded CID map + slab ring | M | **done** (`67cf084` + `3ee2bb1`: loopback 7-11x, pps 4-6x; bump-arena slabs deferred pending Linux profiling) |
 | 5 | P4 expiry wheel + global promise map; P6 shared IHAVE encode + control coalescing | S–M | open |
 | 6 | H1 delivery queue / tryPublish; H2 handle lifetime contract; M1/M2 hardenings; P5 fiber/memory diet | M | open |
 
