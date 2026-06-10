@@ -446,9 +446,15 @@ pub const ConnectionActor = struct {
     }
 
     fn shutdownAndCleanup(self: *ConnectionActor) void {
-        if (self.shutdown_requested.load(.acquire) or self.shared.isClosed()) {
-            self.closeApplicationQueues();
-        }
+        // Close the application-facing queues UNCONDITIONALLY: every exit of
+        // the actor loop must wake uncancelably-parked posters, whatever path
+        // got us here. (This used to be gated on shutdown_requested/isClosed —
+        // correct only because the sole canceller sets the flag first; any new
+        // cancellation site would silently strand posters against queues that
+        // only the FINAL SharedState release closes, which a parked poster's
+        // own retain prevents — a deadlock. The closes are idempotent, so the
+        // gate bought nothing.)
+        self.closeApplicationQueues();
         if (self.conn) |conn| {
             if (self.transport) |transport| {
                 if (quiche.quiche_conn_is_closed(conn) or self.shutdown_requested.load(.acquire)) {

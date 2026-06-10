@@ -93,6 +93,12 @@ pub const Stream = opaque {
         return @ptrCast(@alignCast(self));
     }
 
+    /// Destroy the handle. CONTRACT — external synchronization required: no
+    /// other fiber may be inside, or subsequently enter, ANY method of this
+    /// handle once deinit starts; the handle memory is freed here, so a racing
+    /// call is a use-after-free (the internal lock only serializes the
+    /// state-pointer swap, exactly like Connection's — see that handle's
+    /// `Impl.handle_lock` for why an internal refcount could not do better).
     pub fn deinit(self: *Stream) void {
         self.impl().deinit();
     }

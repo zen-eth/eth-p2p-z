@@ -48,6 +48,15 @@ const Impl = struct {
     state: ?*SharedState,
     // Teardown-only ownership. Normal handle methods must go through `state`.
     spawned_actor: *ConnectionActor,
+    /// Guards only the `state` POINTER: concurrent handle methods read it
+    /// atomically, and a deinit nulls it exactly once. It deliberately does
+    /// NOT make `deinit` safe against CONCURRENT method calls — `deinit`
+    /// frees the Impl, including this very lock, so a fiber still inside (or
+    /// entering) a handle method would dereference freed memory. No internal
+    /// refcount could deliver that guarantee either: a caller entering after
+    /// the free corrupts the count itself. Keeping the handle's MEMORY alive
+    /// until all users are done is necessarily the OWNER's job (the same
+    /// contract as Rust's Arc-owned quinn handles and go's net.Conn docs).
     handle_lock: std.atomic.Value(u8) = .init(0),
 
     fn lockHandle(self: *Impl) void {
@@ -102,6 +111,13 @@ pub const Connection = opaque {
         return @ptrCast(@alignCast(self));
     }
 
+    /// Destroy the handle. CONTRACT — external synchronization required: no
+    /// other fiber may be inside, or subsequently enter, ANY method of this
+    /// handle once deinit starts; the handle memory is freed here, so a racing
+    /// call is a use-after-free (the internal lock only serializes the
+    /// state-pointer swap — see `Impl.handle_lock`). Note also that deinit
+    /// JOINS the connection's actor fiber (blocks until it fully unwinds), so
+    /// it can take as long as a full connection teardown.
     pub fn deinit(self: *Connection) void {
         self.impl().deinit();
     }
