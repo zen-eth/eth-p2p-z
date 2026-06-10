@@ -112,17 +112,32 @@ pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAd
     if (ep.socket_slot.* != null) return error.AlreadyBound;
     const io = ep.io;
     var bind_addr = addr;
-    // std.Io's `ip6_only` is applied inverted by the backends: setting it yields
-    // IPV6_V6ONLY=0 (dual-stack), the opposite of the field's name, but consistently
-    // across Threaded/Kqueue/Uring. We want dual-stack for IPv6 binds so peers can
-    // arrive over IPv4-mapped addresses.
+    // `ip6_only` stays UNSET: the std and zio backends apply that flag with
+    // OPPOSITE meanings (std.Io.Threaded inverts it — true sets IPV6_V6ONLY=0,
+    // dual-stack — while zio is literal: true sets IPV6_V6ONLY=1, v6-only), so
+    // any value picks the wrong behavior on one of them. We want dual-stack on
+    // IPv6 binds (IPv4 peers arrive as v4-mapped addresses), which is the OS
+    // default for an AF_INET6 socket on both Linux and macOS; V6ONLY can only
+    // be CHANGED before bind (the socket is already bound when we get it), so
+    // the default is verified right after bind instead of set.
     const bind_options: std.Io.net.IpAddress.BindOptions = .{
         .mode = .dgram,
-        .ip6_only = bind_addr == .ip6,
     };
     const socket = try std.Io.net.IpAddress.bind(&bind_addr, io, bind_options);
     var socket_owned = true;
     errdefer if (socket_owned) socket.close(io);
+    if (bind_addr == .ip6) {
+        // A v6-only wildcard listener silently drops every IPv4 peer — an
+        // operational outage, not a preference. Only a non-default kernel
+        // policy (e.g. net.ipv6.bindv6only=1) gets here, and the listener
+        // still serves IPv6, so warn loudly rather than fail the bind.
+        if (socket_control.dualStackEnabled(&socket)) |dual_stack| {
+            if (!dual_stack) std.log.warn(
+                "ipv6 listener is v6-only (IPV6_V6ONLY=1, non-default kernel policy): IPv4 peers cannot reach it",
+                .{},
+            );
+        }
+    }
     const caps = try socket_control.configureUdpSocket(&socket, .{
         .enable_udp_gro = ep.options.endpoint.enable_udp_gro,
         .enable_pktinfo = ep.options.endpoint.enable_pktinfo,

@@ -262,3 +262,58 @@ test "switch connection teardown: parked dispatcher unblocks on exact(4)" {
     }.root);
 }
 
+
+// ---------------------------------------------------------------------------
+// Dual-stack listener on the production (zio) backend.
+//
+// Regression guard for the `ip6_only` backend divergence: std.Io.Threaded
+// applies the flag INVERTED (true -> IPV6_V6ONLY=0, dual-stack) while zio is
+// literal (true -> IPV6_V6ONLY=1, v6-only). The bind path therefore sets no
+// flag at all and relies on the OS default (dual-stack on Linux and macOS),
+// verifying it post-bind. This test pins the production-backend behavior the
+// std-backend twin in router/loop_tests.zig cannot see: a [::] listener must
+// accept an IPv4 dial. Before the fix, the zio bind requested v6-only and this
+// dial timed out.
+
+/// Bind the server on `[::]:0`, dial it over IPv4 loopback: the dual-stack
+/// listener must complete the handshake with the v4-mapped peer.
+fn loopbackDualStackDial(io: std.Io) !void {
+    const allocator = testing.allocator;
+
+    var fixture = try TwoEndpoints.init(
+        allocator,
+        io,
+        .{ .endpoint = .{ .connection_accept_queue_len = 1 } },
+        .{},
+    );
+    defer fixture.deinit();
+
+    const server_addr = fixture.server.bind(.{ .ip6 = .unspecified(0) }) catch |err| switch (err) {
+        // Some sandboxes lack IPv6 entirely; skip rather than fail there.
+        error.AddressUnavailable, error.AddressFamilyUnsupported, error.OptionUnsupported => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    _ = try fixture.bindClientLoopback();
+
+    var accept_ctx = AcceptCtx{ .endpoint = fixture.server };
+    var accept_future = try std.Io.concurrent(io, AcceptCtx.run, .{&accept_ctx});
+
+    const dial_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(server_addr.getPort()) };
+    const client_conn = try fixture.client.dial(dial_addr, .{
+        .timeout = receiveTimeout(default_handshake_timeout_ns),
+    });
+    defer client_conn.deinit();
+
+    accept_future.await(io);
+    if (accept_ctx.err) |err| return err;
+    const server_conn = accept_ctx.conn orelse return error.TestExpectedConn;
+    defer server_conn.deinit();
+}
+
+test "endpoint loopback: ipv6 unspecified listener accepts an ipv4 dial on exact(2)" {
+    try runRoot(2, struct {
+        fn root(io: std.Io) !void {
+            try loopbackDualStackDial(io);
+        }
+    }.root);
+}

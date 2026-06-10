@@ -50,6 +50,30 @@ pub const Capabilities = struct {
 
 pub const ConfigureError = std.posix.SetSockOptError;
 
+/// IPV6_V6ONLY's optname (`std.posix.IPV6` is `void` on macOS, so the numeric
+/// values live here): 26 on Linux, 27 on the BSDs/macOS.
+const ipv6_v6only_optname: u32 = if (builtin.os.tag == .linux) 26 else 27;
+
+/// Whether an AF_INET6 UDP socket accepts IPv4-mapped traffic
+/// (IPV6_V6ONLY == 0). Read-only and therefore safe AFTER bind — the option
+/// itself can only be changed before bind, which is why the bind path relies
+/// on the OS default (dual-stack on both Linux and macOS) and verifies it
+/// here instead of setting anything. Returns null when the platform cannot
+/// report the option.
+pub fn dualStackEnabled(socket: *const std.Io.net.Socket) ?bool {
+    var value: c_int = -1;
+    var len: std.posix.socklen_t = @sizeOf(c_int);
+    const rc = std.c.getsockopt(
+        socket.handle,
+        std.posix.IPPROTO.IPV6,
+        ipv6_v6only_optname,
+        @ptrCast(&value),
+        &len,
+    );
+    if (rc != 0) return null;
+    return value == 0;
+}
+
 pub fn sourceControlEnabled(caps: Capabilities, from: std.Io.net.IpAddress) bool {
     return switch (from) {
         .ip4 => caps.pktinfo_v4,
