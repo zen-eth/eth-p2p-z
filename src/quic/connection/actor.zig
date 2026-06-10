@@ -1187,11 +1187,13 @@ pub const ConnectionActor = struct {
     }
 
     fn queueCidUnmap(self: *ConnectionActor, transport: *const NetworkTransport, cid: CidKey) void {
-        const queued = transport.route_updates.sender().trySend(transport.io, .{ .unmap_cid = cid }) catch {
-            self.noteRouteCommandFailure(transport.io);
-            return;
-        };
-        if (!queued) self.noteRouteCommandFailure(transport.io);
+        _ = self;
+        // Direct, synchronous removal from the shared route table (the recv
+        // fiber only reads it). A missing entry is a harmless overlap with the
+        // listener-teardown clear — not a failure.
+        if (transport.route_table.unmap(transport.io, cid)) {
+            transport.subStat("cid_map_entries", 1);
+        }
     }
 
     /// Free function (no actor state): reads quiche's current source CID for `conn`.
@@ -1241,12 +1243,21 @@ pub const ConnectionActor = struct {
             const rc = quiche.quiche_conn_new_scid(conn, &cid, cid.len, &reset_token, false, &seq);
             if (rc < 0) return error.QuicheCidFailed;
             if (try self.registerCid(&cid)) issued += 1;
-            const queued = try transport.route_updates.sender().trySend(transport.io, .{
-                .map_cid = .{ .existing_cid = existing_cid, .new_cid = new_cid },
-            });
-            if (!queued) {
-                self.noteRouteCommandFailure(transport.io);
-                return error.QuicheCidFailed;
+            // Map the new CID directly into the shared route table — routable
+            // the instant quiche_conn_new_scid returns, BEFORE the
+            // NEW_CONNECTION_ID frame reaches the peer (the old command-channel
+            // hop left a window where packets to the new CID were dropped).
+            switch (transport.route_table.mapFromExisting(transport.io, existing_cid, new_cid)) {
+                .mapped => transport.addStat("cid_map_entries", 1),
+                .already_mapped => {},
+                // The connection's routes were already cleared (listener
+                // teardown won the race): packets to the new CID would drop
+                // loss-like anyway. Count it; not an actor error.
+                .unknown_existing => transport.addStat("cid_map_unknown_existing", 1),
+                .failed => {
+                    self.noteRouteCommandFailure(transport.io);
+                    return error.QuicheCidFailed;
+                },
             }
         }
         _ = self.drainRetiredSourceCids();

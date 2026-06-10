@@ -337,9 +337,11 @@ test "select-nested recv loop: cancelling the outer fiber tears down cleanly" {
     }.root, {});
 }
 
-// The router's SECOND select branch is `route_commands.wait` == `io.futexWait`,
-// not a timer. Cancelling a futex-blocked fiber — directly, then nested in a
-// Select alongside an unbounded recv (the exact router shape) — also wakes it.
+// Several wake paths in the stack (the connection WaitSet's epoch signal, the
+// channel signals) park via `io.futexWait`, not a timer. Cancelling a
+// futex-blocked fiber — directly, then nested in a Select alongside an
+// unbounded recv — also wakes it. (The endpoint router itself no longer uses
+// a Select: it is one persistent recv fiber woken by a loopback datagram.)
 const FutexFut = std.Io.Future(std.Io.Cancelable!void);
 
 fn futexBlockForever(io: std.Io) std.Io.Cancelable!void {

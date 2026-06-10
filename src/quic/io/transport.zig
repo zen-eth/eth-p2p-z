@@ -1,7 +1,7 @@
 const std = @import("std");
 const AtomicRc = @import("ref_count").AtomicRc;
 const endpoint_core = @import("../endpoint/core.zig");
-const route_commands_mod = @import("../router/route_commands.zig");
+const route_table_mod = @import("../router/route_table.zig");
 const socket_control = @import("socket_control.zig");
 
 /// Refcounted UDP socket resource shared between the endpoint's router fiber
@@ -76,8 +76,10 @@ pub const NetworkTransport = struct {
     peer: std.Io.net.IpAddress,
     /// Retained/released via retainResources()/deinit() (refcounted).
     core: *endpoint_core.EndpointCore,
-    /// BORROWED pointer into `core` (lifetime tied to core); NOT released here.
-    route_updates: *route_commands_mod.Queue.State,
+    /// BORROWED pointer into `core` (lifetime tied to core, which this
+    /// transport retains); NOT released here. The actor writes its CID
+    /// routes directly into this table — see route_table.zig.
+    route_table: *route_table_mod.RouteTable,
     outbound_batch_size: usize = 32,
 
     pub fn retainResources(t: *const NetworkTransport) void {
@@ -124,7 +126,7 @@ test "network transport retains and releases its shared resources" {
         .local = socket.address,
         .peer = socket.address,
         .core = core,
-        .route_updates = core.route_commands,
+        .route_table = &core.route_table,
     };
     transport.retainResources();
     transport.deinit();

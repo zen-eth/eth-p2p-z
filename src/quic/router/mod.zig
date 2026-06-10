@@ -20,6 +20,6 @@ pub const localAddr = loop.localAddr;
 pub const mapRoute = loop.mapRoute;
 
 test {
-    _ = @import("route_commands.zig");
+    _ = @import("route_table.zig");
     _ = @import("loop_tests.zig");
 }

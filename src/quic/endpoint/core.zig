@@ -1,6 +1,6 @@
 const std = @import("std");
 const AtomicRc = @import("ref_count").AtomicRc;
-const route_commands_mod = @import("../router/route_commands.zig");
+const route_table_mod = @import("../router/route_table.zig");
 const retry_token = @import("../router/retry_token.zig");
 
 pub const EndpointStats = struct {
@@ -33,7 +33,12 @@ pub const EndpointCore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     rc: AtomicRc = .{},
-    route_commands: *route_commands_mod.Queue.State,
+    /// The shared CID → packet-inbox routing table. Written directly by
+    /// connection actors / the dialer / the server accept path, read by the
+    /// router's recv fiber — see route_table.zig for the locking model. Lives
+    /// here because every actor retains the core for its whole life, so a
+    /// writer can never outlive the table.
+    route_table: route_table_mod.RouteTable,
     retry_tokens: retry_token.Store,
     /// Live, lock-free stat counters. Best-effort observability: written with
     /// monotonic atomics from any executor (router / connection fibers) and read
@@ -49,7 +54,7 @@ pub const EndpointCore = struct {
         core.* = .{
             .allocator = allocator,
             .io = io,
-            .route_commands = try route_commands_mod.Queue.State.init(allocator, io),
+            .route_table = route_table_mod.RouteTable.init(allocator),
             .retry_tokens = try retry_token.Store.init(),
         };
         return core;
@@ -63,9 +68,9 @@ pub const EndpointCore = struct {
         if (!core.rc.releaseChecked()) return;
 
         const allocator = core.allocator;
-        core.route_commands.close(core.io);
-        core.route_commands.discardQueued(core.io);
-        core.route_commands.release();
+        // Backstop: the recv loop's exit already cleared the table; this frees
+        // any entry registered after that (e.g. a dial racing endpoint close).
+        core.route_table.deinit(core.io);
         allocator.destroy(core);
     }
 

@@ -102,7 +102,7 @@ pub fn dial(ep: Context, addr: std.Io.net.IpAddress, opts: DialOptions) DialErro
             .peer = addr,
             .outbound_batch_size = options.actor.outbound_batch_size,
             .core = ep.core,
-            .route_updates = registrar.route_updates,
+            .route_table = &registrar.core.route_table,
         },
         .control_queue_len = options.actor.control_queue_len,
         .stream_accept_queue_len = options.actor.stream_accept_queue_len,

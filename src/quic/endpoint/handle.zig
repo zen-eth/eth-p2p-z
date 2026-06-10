@@ -205,7 +205,7 @@ const Impl = struct {
     /// `cancel` on this group, draining all in-flight tasks.
     handshake_waiters: std.Io.Group = .init,
     /// Cooperative teardown flag for the router fiber. See `router.closeListener`
-    /// for why teardown sets this + closes `route_commands` rather than cancelling.
+    /// for why teardown sets this + sends the loopback wake rather than cancelling.
     router_stopping: std.atomic.Value(bool) = .init(false),
 };
 
@@ -254,7 +254,7 @@ fn routeRegistrar(e: *QuicEndpoint) router.RouteRegistrar {
     return .{
         .allocator = endpoint.allocator,
         .io = endpoint.io,
-        .route_updates = endpoint.core.route_commands,
+        .core = endpoint.core,
     };
 }
 
