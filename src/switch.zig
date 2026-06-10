@@ -64,7 +64,15 @@ pub const Switch = struct {
     pub const PeerEventCallback = struct {
         ctx: *anyopaque,
         on_connected: *const fn (ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection, remote_addr: std.Io.net.IpAddress) void,
-        on_disconnected: *const fn (ctx: *anyopaque, peer: PeerId) void,
+        /// Fired once per CONNECTION unregister, not per peer: with two
+        /// connections to one peer (simultaneous dial) each close fires its own
+        /// event. `conn` identifies WHICH connection died so the observer can
+        /// ignore the death of a connection it never adopted — tearing peer
+        /// state down keyed on PeerId alone would let a redundant connection's
+        /// close destroy the live peer's state. The pointer is only an identity
+        /// token here: the connection may already be torn down, so the observer
+        /// must not dereference it.
+        on_disconnected: *const fn (ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection) void,
     };
 
     pub const Options = struct {
@@ -358,7 +366,7 @@ pub const Switch = struct {
         }
 
         if (did_unregister) {
-            if (sw.peer_event_callback) |cb| cb.on_disconnected(cb.ctx, peer_id);
+            if (sw.peer_event_callback) |cb| cb.on_disconnected(cb.ctx, peer_id, conn);
         }
     }
 
@@ -1486,7 +1494,8 @@ test "switch fires peer connect and disconnect events on both ends" {
             self.connected.append(std.testing.allocator, peer) catch unreachable;
         }
 
-        fn onDisconnected(ctx: *anyopaque, peer: PeerId) void {
+        fn onDisconnected(ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection) void {
+            _ = conn;
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);

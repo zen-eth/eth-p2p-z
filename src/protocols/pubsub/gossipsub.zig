@@ -600,9 +600,13 @@ pub const Gossipsub = struct {
         } }) catch {};
     }
 
-    fn onDisconnected(ctx: *anyopaque, peer: PeerId) void {
+    fn onDisconnected(ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection) void {
         const router: *Router = @ptrCast(@alignCast(ctx));
-        router.inbox.putOne(router.io, .{ .peer_disconnected = .{ .peer = peer } }) catch {};
+        // `conn` rides along as an identity token: the router tears a peer down
+        // only when the connection its PeerState is bound to dies, so the close
+        // of a dedup'd duplicate connection (simultaneous dial) cannot destroy
+        // the live peer's state.
+        router.inbox.putOne(router.io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } }) catch {};
     }
 };
 

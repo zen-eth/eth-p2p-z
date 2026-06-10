@@ -589,8 +589,13 @@ pub fn Router(comptime Transport: type) type {
                 conn: ConnHandle,
                 remote_addr: std.Io.net.IpAddress,
             },
-            /// A peer's connection is gone. Tear the peer down.
-            peer_disconnected: struct { peer: PeerId },
+            /// A connection to a peer is gone. Fired once per CONNECTION, so
+            /// with two connections to one peer (simultaneous dial) each close
+            /// posts its own event. `conn` is an identity token only — it names
+            /// WHICH connection died (the handler compares it against the
+            /// PeerState's bound connection and ignores a non-matching one) and
+            /// must not be dereferenced: the connection may already be freed.
+            peer_disconnected: struct { peer: PeerId, conn: ConnHandle },
             /// The /meshsub protocol version a peer negotiated, learned when it
             /// opens an inbound stream to us (the peer proposes its best version;
             /// we accept it, so this is the highest version that peer supports).
@@ -749,6 +754,13 @@ pub fn Router(comptime Transport: type) type {
             /// IDONTWANTs from the peer until the heartbeat resets it to zero
             /// (anti-flood).
             idontwant_received_this_window: usize = 0,
+            /// The connection this peer's state is bound to — the one whose
+            /// sink the writer drains into. Identity token only (never
+            /// dereferenced after connect): `onPeerDisconnected` tears the peer
+            /// down only when THIS connection dies, so the close of a dedup'd
+            /// duplicate connection (simultaneous dial) leaves the live peer
+            /// untouched. Set before the writer fiber spawns; immutable after.
+            conn: ConnHandle,
             /// Heap-owned (Transport-allocated) so its address is stable while
             /// the writer fiber holds it. The sink (and its stream) MUST outlive
             /// the writer fiber — torn down only after the writer is awaited.
@@ -1741,7 +1753,7 @@ pub fn Router(comptime Transport: type) type {
                 const command = router.inbox.getOne(router.io) catch return; // Closed/Canceled
                 switch (command) {
                     .peer_connected => |c| router.onPeerConnected(c.peer, c.conn, c.remote_addr),
-                    .peer_disconnected => |c| router.onPeerDisconnected(c.peer),
+                    .peer_disconnected => |c| router.onPeerDisconnected(c.peer, c.conn),
                     .peer_protocol => |c| router.onPeerProtocol(c.peer, c.version),
                     .peer_record => |c| router.onPeerRecord(c.peer, c.envelope_bytes),
                     .inbound_rpc => |in| router.onInboundRpc(in),
@@ -1783,6 +1795,7 @@ pub fn Router(comptime Transport: type) type {
 
             state.* = .{
                 .peer = peer,
+                .conn = conn,
                 .queue = peer_io.OutboundQueue.init(router.allocator, .{}),
                 .sink = sink,
                 .writer = writer,
@@ -2000,11 +2013,25 @@ pub fn Router(comptime Transport: type) type {
             router.fanOut(.subscribe, (rpc.RpcOut{ .subscriptions = subs.items }).toRpc(), ids, .{ .one = state.peer });
         }
 
-        /// Handle a peer disconnecting: look up, tear down its writer + state.
-        /// Absent peer (already removed, or a dedup'd second connection) is a
-        /// no-op.
-        fn onPeerDisconnected(router: *Self, peer: PeerId) void {
+        /// Handle a connection to a peer dying: tear the peer down ONLY when the
+        /// dead connection is the one its PeerState is bound to. The event fires
+        /// once per connection, so in the simultaneous-dial case (both sides
+        /// dial; the second connect was dedup'd by onPeerConnected) the dedup'd
+        /// duplicate's close arrives here too — keyed on PeerId alone it would
+        /// destroy the LIVE peer's mesh/writer/score state out from under its
+        /// healthy connection. An absent peer (already removed) is a no-op.
+        fn onPeerDisconnected(router: *Self, peer: PeerId, conn: ConnHandle) void {
             const key = peerKey(&peer);
+            if (router.peers.get(key)) |state| {
+                if (state.conn != conn) {
+                    // A connection this peer's state never adopted died. The
+                    // duplicate produced no router state of its own (dedup'd at
+                    // connect, before makeSink), so there is nothing to clean —
+                    // and the pre-connect stashes below belong to the live
+                    // peer's streams, not to it. Ignore entirely.
+                    return;
+                }
+            }
             // Drop any pending version note even if the peer was never fully
             // tracked (an inbound stream reported a version but peer_connected
             // never arrived), so it can't outlive the connection.
@@ -2090,7 +2117,7 @@ pub fn Router(comptime Transport: type) type {
                 while (it.next()) |state_ptr| {
                     const state = state_ptr.*;
                     if (state.writer_dead.load(.acquire)) {
-                        router.onPeerDisconnected(state.peer);
+                        router.onPeerDisconnected(state.peer, state.conn);
                         continue :reap;
                     }
                 }
@@ -3864,7 +3891,7 @@ pub fn Router(comptime Transport: type) type {
             state.writer_dead.store(true, .release);
             _ = router.inbox.putUncancelable(
                 router.io,
-                &.{.{ .peer_disconnected = .{ .peer = state.peer } }},
+                &.{.{ .peer_disconnected = .{ .peer = state.peer, .conn = state.conn } }},
                 0,
             ) catch 0;
         }
@@ -4157,7 +4184,7 @@ test "router peer lifecycle: connect makes a sink + writer, disconnect tears dow
     try router.inbox.putOne(io, .{ .peer_connected = .{ .peer = peer, .conn = conn, .remote_addr = dummy_addr } });
     try std.testing.expect(waitFor(io, peerCountIsOne, router));
 
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
     // The sink was freed in teardown; the conn's record still lives (it is the
     // test's, freed by destroyFakeConn). std.testing.allocator confirms the
@@ -4195,7 +4222,16 @@ test "router dedups a second peer_connected for the same peer id" {
     try std.testing.expectEqual(@as(usize, 1), router.peerCount());
     try std.testing.expectEqual(@as(usize, 0), conn_b.record.open_calls);
 
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    // The dedup'd duplicate's close must NOT tear down the live peer: the
+    // event names the dying connection, and the PeerState is bound to conn_a.
+    // (Simultaneous dial: both sides dial, one connection is redundant; its
+    // close used to destroy the surviving peer's state keyed on PeerId alone.)
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn_b } });
+    try sync(router, io);
+    try std.testing.expectEqual(@as(usize, 1), router.peerCount());
+
+    // The BOUND connection's close does tear it down.
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn_a } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
 }
 
@@ -4319,7 +4355,7 @@ test "router frees an inbound RPC (peer tracked and peer absent)" {
 
     // Disconnect to flush + tear down; on test exit destroy() drains any leftover
     // inbox commands. std.testing.allocator confirms both RPCs were freed.
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
 }
 
@@ -4351,7 +4387,7 @@ test "router retains a SUBSCRIBE that arrives before peer_connected (race stash)
     const st = router.peers.get(peerKey(&peer)) orelse return error.PeerNotTracked;
     try std.testing.expect(st.topics.contains("race-topic"));
 
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
 }
 
@@ -5843,7 +5879,7 @@ test "peer disconnect cleans the peer out of mesh but keeps its backoff" {
     // Disconnect P: it must be removed from every mesh, but its prune-backoff
     // must PERSIST (backoff is keyed by peer+topic, independent of the
     // connection — otherwise a quick reconnect would bypass it).
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
 
     // Sync so the disconnect (mesh cleanup) is fully applied before the reads.
@@ -5880,7 +5916,7 @@ test "prune-backoff persists across a disconnect+reconnect (a reconnect cannot b
     // P disconnects, then immediately reconnects (fresh conn so its record starts
     // clean). The backoff must survive the disconnect: clearing it here is exactly
     // the bug — it would let a pruned peer bypass the backoff by reconnecting.
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
     try sync(router, io);
     try std.testing.expect(router.inBackoff("t", peer));
@@ -5942,7 +5978,7 @@ test "disconnect+reconnect churn: mesh reforms and pub/sub resumes with clean st
     try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn.record, "t", "before"));
 
     // P disconnects: it leaves the mesh, but only P (not S).
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } });
     try std.testing.expect(waitFor(io, peerCountIsOne, router)); // only S remains
     try sync(router, io);
     try std.testing.expect(!router.meshContains("t", peer));
@@ -5999,7 +6035,7 @@ test "many disconnect+reconnect churn cycles leave no leak, no crash, and clean 
         try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn, peer, "t"));
         try std.testing.expect(router.meshContains("t", peer));
 
-        try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+        try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } });
         try std.testing.expect(waitFor(io, peerCountIsZero, router));
         try sync(router, io);
         try std.testing.expect(!router.meshContains("t", peer));
@@ -7763,7 +7799,7 @@ test "router adopts a version reported before peer_connected (inbound-before-con
     try std.testing.expect(router.peerSupportsV12(peer));
 
     // Disconnect purges the version (the pending map too); tear down leak-clean.
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
 }
 
@@ -7777,12 +7813,16 @@ test "router purges a pending version when the peer disconnects without ever con
     try router.start();
 
     const peer = testPeer(0x55);
+    // The connection that broke; the peer was never tracked, so the handler's
+    // identity check is moot — any handle names the dead connection.
+    const broken_conn = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, broken_conn);
 
     // A version note arrives but the matching peer_connected never does; a later
     // disconnect (e.g. the stream broke during negotiation) must drop the note so
     // it cannot leak or be inherited by a future connection.
     router.postPeerProtocol(io, peer, .v1_2);
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = broken_conn } });
 
     // Now connect for real: the peer must start at the baseline, not the purged
     // 1.2 note. All three commands run in order on the one router fiber, so the
@@ -7799,7 +7839,7 @@ test "router purges a pending version when the peer disconnects without ever con
     try std.testing.expectEqual(pubsub.Version.v1_1, peerVersionOf(router, peer).?);
     try std.testing.expect(!router.peerSupportsV12(peer));
 
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } });
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
 }
 
@@ -8983,7 +9023,7 @@ test "tearing down a peer releases its id holders; ids also in seen survive" {
     // Tear the peer down via a disconnect command: its two holders on `shared`
     // and its one on `peer_only` are released. `peer_only` (no other holder) is
     // freed and leaves the table; `shared` survives in seen (refs 3 → 1).
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } });
     try sync(router, io);
 
     try std.testing.expectEqual(@as(usize, 1), internCount(router));
@@ -9038,7 +9078,7 @@ test "intern churn through all four maps + peer teardown empties the table (no l
     // Tear the peer down: dont_send + iwant_promises holders released. With seen
     // already swept and counts cleared, every id reaches refs 0 and the table is
     // empty — proving no id leaks and no holder is missed.
-    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer } });
+    try router.inbox.putOne(io, .{ .peer_disconnected = .{ .peer = peer, .conn = conn } });
     try sync(router, io);
     try std.testing.expectEqual(@as(usize, 0), internCount(router));
 }
