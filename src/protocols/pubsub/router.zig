@@ -328,15 +328,45 @@ const SeenCache = struct {
     /// `ttl_ticks`). "Seen" while `expiry` is still in the future; the sweep
     /// removes (and releases) it once `expiry <= now`.
     entries: std.StringHashMapUnmanaged(IdEntry(u64)) = .empty,
+    /// The expiry wheel: `ttl_ticks + 1` per-tick buckets; an id added with
+    /// expiry tick E lands in `buckets[E % buckets.len]`, and `sweep(T)` drains
+    /// exactly `buckets[T % buckets.len]` — O(expired-this-tick), no map scans.
+    /// (The old shape iterated the WHOLE map per heartbeat and restarted the
+    /// iteration after every removal: O(n*k). At eth2 rates — ~180k retained
+    /// ids, ~1.5k expiring per tick — that was a measured multi-SECOND
+    /// router-fiber stall per heartbeat; the wheel makes it ~k list pops.)
+    ///
+    /// Bucket slots are NON-owning copies of the entry's `rc` pointer: the map
+    /// entry holds the one reference, and nothing but the sweep ever removes a
+    /// live entry, so a bucket slot stays valid exactly until its own drain.
+    /// Generation safety: with `ttl + 1` buckets, a bucket index is drained
+    /// (at its expiry tick E) strictly before any id that would reuse the same
+    /// index can be added (the earliest such add is at tick E+1), so
+    /// generations never mix; an id re-added after its sweep simply starts a
+    /// new life in a new bucket.
+    buckets: []Bucket,
+    /// The last tick `sweep` ran for; the next sweep drains every bucket in
+    /// (last_swept, now] so the PUBLIC contract stays "remove everything
+    /// expired at now" even when ticks jump (tests do; production advances by
+    /// one). A jump of a full revolution or more means every live id has
+    /// expired, so all buckets drain.
+    last_swept: u64 = 0,
 
-    fn init(allocator: std.mem.Allocator, intern_table: *InternTable, ttl_ticks: u64) SeenCache {
-        return .{ .intern_table = intern_table, .allocator = allocator, .ttl_ticks = ttl_ticks };
+    const Bucket = std.ArrayListUnmanaged(*InternedId);
+
+    fn init(allocator: std.mem.Allocator, intern_table: *InternTable, ttl_ticks: u64) std.mem.Allocator.Error!SeenCache {
+        const buckets = try allocator.alloc(Bucket, @intCast(ttl_ticks + 1));
+        for (buckets) |*bucket| bucket.* = .empty;
+        return .{ .intern_table = intern_table, .allocator = allocator, .ttl_ticks = ttl_ticks, .buckets = buckets };
     }
 
     fn deinit(self: *SeenCache) void {
+        // The map holds the references (bucket slots are non-owning aliases).
         var it = self.entries.valueIterator();
         while (it.next()) |entry| entry.rc.release();
         self.entries.deinit(self.allocator);
+        for (self.buckets) |*bucket| bucket.deinit(self.allocator);
+        self.allocator.free(self.buckets);
         self.* = undefined;
     }
 
@@ -357,32 +387,50 @@ const SeenCache = struct {
     fn add(self: *SeenCache, id: []const u8, now_tick: u64) void {
         if (self.entries.contains(id)) return;
         const rc = self.intern_table.intern(id) orelse return;
-        self.entries.put(self.allocator, rc.value.bytes, .{ .rc = rc, .payload = now_tick +| self.ttl_ticks }) catch {
+        const expiry = now_tick +| self.ttl_ticks;
+        self.entries.put(self.allocator, rc.value.bytes, .{ .rc = rc, .payload = expiry }) catch {
+            rc.release();
+            return;
+        };
+        self.buckets[@intCast(expiry % self.buckets.len)].append(self.allocator, rc) catch {
+            // No wheel slot means no sweep would ever free it: forget the id
+            // now instead (remove BEFORE release — the key aliases the rc's
+            // bytes). Dedup degrades to best-effort exactly like the put-OOM
+            // path above.
+            _ = self.entries.remove(rc.value.bytes);
             rc.release();
         };
     }
 
-    /// Drop every id whose expiry has passed at `now_tick`, releasing its interned
-    /// reference. Called once per heartbeat. Gather-then-remove: a removal can move
-    /// the unscanned tail in an open-addressing map, so we restart the scan after
-    /// each removal rather than mutate mid-iteration. The map entry is removed
-    /// BEFORE its `rc` is released (the key aliases the rc's bytes, which the
-    /// release may free).
+    /// Drop every id whose expiry has passed at `now_tick`: drain the wheel
+    /// buckets for (last_swept, now] — O(expired this span), no map iteration.
+    /// Each map entry is removed BEFORE its `rc` is released (the key aliases
+    /// the rc's bytes, which the release may free).
     fn sweep(self: *SeenCache, now_tick: u64) void {
-        var changed = true;
-        while (changed) {
-            changed = false;
-            var it = self.entries.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.payload <= now_tick) {
-                    const rc = entry.value_ptr.rc;
-                    _ = self.entries.remove(entry.key_ptr.*);
-                    rc.release();
-                    changed = true;
-                    break;
-                }
+        if (now_tick <= self.last_swept) return;
+        if (now_tick - self.last_swept >= self.buckets.len) {
+            // The jump spans a full wheel revolution: every live id's expiry
+            // (at most last_swept's adds + ttl) is in the past — drain all.
+            for (self.buckets) |*bucket| self.drainBucket(bucket, now_tick);
+        } else {
+            var t = self.last_swept + 1;
+            while (t <= now_tick) : (t += 1) {
+                self.drainBucket(&self.buckets[@intCast(t % self.buckets.len)], now_tick);
             }
         }
+        self.last_swept = now_tick;
+    }
+
+    fn drainBucket(self: *SeenCache, bucket: *Bucket, now_tick: u64) void {
+        for (bucket.items) |rc| {
+            std.debug.assert(blk: {
+                const entry = self.entries.get(rc.value.bytes) orelse break :blk false;
+                break :blk entry.payload <= now_tick;
+            });
+            _ = self.entries.remove(rc.value.bytes);
+            rc.release();
+        }
+        bucket.clearRetainingCapacity();
     }
 };
 
@@ -1162,7 +1210,7 @@ pub fn Router(comptime Transport: type) type {
             // address-stable); every id they hold is the same allocation a peer's
             // dont_send / iwant_promises would intern, so an id in both the cache
             // and seen is ONE heap copy freed only on the last release.
-            router.seen = SeenCache.init(allocator, &router.intern_table, mesh_params.seen_ttl_ticks);
+            router.seen = try SeenCache.init(allocator, &router.intern_table, mesh_params.seen_ttl_ticks);
             router.message_cache = mcache.MessageCache.init(allocator, &router.intern_table);
 
             // Copy the configured direct peers into the router-owned set (the
