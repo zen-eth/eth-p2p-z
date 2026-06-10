@@ -254,12 +254,64 @@ const Scenario = struct {
     /// barrier between batches, so verdict re-entries are never starved behind
     /// queued ingress — measures the pipeline's sustained validated capacity.
     /// Unpaced (open-loop) posts everything at memcpy speed and measures burst
-    /// behaviour: with the FIFO inbox, queued ingress delays the verdicts that
-    /// free in-flight slots, so most of an unpaced burst throttle-drops (this
-    /// coupling is itself a finding — go's workers complete without the
-    /// processLoop's help).
+    /// behaviour. (The control-inbox split keeps verdicts ahead of queued
+    /// ingress; the remaining unpaced shortfall is the real
+    /// offered-vs-verification capacity gap.)
     paced: bool = false,
+    /// Enable peer scoring: every accepted message then runs the per-message
+    /// promise fulfilment probe (today O(all peers): one iwant_promises map
+    /// probe per connected peer per message) plus the P2 first-delivery
+    /// bookkeeping — the cost the global-promise-map rework targets.
+    scoring: bool = false,
+    /// Extra NON-mesh connected peers, to scale the O(peers) terms the way a
+    /// real node's peer set (mesh + gossip fringe) does.
+    extra_peers: usize = 0,
 };
+
+/// A neutral scoring config: live P2/P4/P7 terms, undecayed, thresholds out of
+/// the way — enough to turn the scoring engine (and its per-message probes) ON
+/// without any peer ever crossing a gate during the bench.
+fn benchScoringConfig() router_mod.ScoreConfig {
+    return .{
+        .params = .{
+            .app_specific_weight = 0,
+            .ip_colocation_factor_weight = 0,
+            .ip_colocation_factor_threshold = 0,
+            .behaviour_penalty_weight = -1.0,
+            .behaviour_penalty_threshold = 0,
+            .behaviour_penalty_decay = 1.0,
+            .decay_interval_ticks = 1,
+            .decay_to_zero = 0.0001,
+            .retain_score_ticks = 1000,
+            .topic_default = .{
+                .topic_weight = 1.0,
+                .time_in_mesh_weight = 0,
+                .time_in_mesh_quantum_ticks = 1,
+                .time_in_mesh_cap = 0,
+                .first_message_deliveries_weight = 1.0,
+                .first_message_deliveries_decay = 1.0,
+                .first_message_deliveries_cap = 100.0,
+                .mesh_message_deliveries_weight = 0,
+                .mesh_message_deliveries_decay = 1.0,
+                .mesh_message_deliveries_threshold = 0,
+                .mesh_message_deliveries_cap = 100.0,
+                .mesh_message_deliveries_activation_ticks = 100,
+                .mesh_message_deliveries_window_ticks = 0,
+                .mesh_failure_penalty_weight = 0,
+                .mesh_failure_penalty_decay = 1.0,
+                .invalid_message_deliveries_weight = -1.0,
+                .invalid_message_deliveries_decay = 1.0,
+            },
+        },
+        .thresholds = .{
+            .gossip_threshold = -1000.0,
+            .publish_threshold = -1000.0,
+            .graylist_threshold = -1000.0,
+            .accept_px_threshold = 1000.0,
+            .opportunistic_graft_threshold = 1000.0,
+        },
+    };
+}
 
 const ScenarioResult = struct {
     name: []const u8,
@@ -289,7 +341,8 @@ fn runScenario(
         .{ .signature_policy = .anonymous, .validation_concurrency = sc.validation_concurrency }
     else
         .{ .validation_concurrency = sc.validation_concurrency };
-    const r = try BenchRouter.create(allocator, io, transport, local_peer, deliveries.handler(), 0, sc.host_key, null, cfg);
+    const score_cfg: ?router_mod.ScoreConfig = if (sc.scoring) benchScoringConfig() else null;
+    const r = try BenchRouter.create(allocator, io, transport, local_peer, deliveries.handler(), 0, sc.host_key, score_cfg, cfg);
     var destroyed = false;
     defer if (!destroyed) r.destroy();
     try r.start();
@@ -299,9 +352,16 @@ fn runScenario(
         const t = try allocator.dupe(u8, topic);
         try r.inbox.putOne(io, .{ .subscribe = .{ .topic = t } });
     }
-    var conns: [mesh_peers]BenchConn = undefined;
-    var peers: [mesh_peers]PeerId = undefined;
-    for (0..mesh_peers) |i| {
+    // Mesh peers (grafted) + optional non-mesh extras: the extras receive no
+    // traffic but scale every O(connected peers) per-message term (promise
+    // fulfilment probes, IHAVE candidate scans) the way a real node's gossip
+    // fringe does.
+    const total_peers = mesh_peers + sc.extra_peers;
+    const conns = try allocator.alloc(BenchConn, total_peers);
+    defer allocator.free(conns);
+    const peers = try allocator.alloc(PeerId, total_peers);
+    defer allocator.free(peers);
+    for (0..total_peers) |i| {
         conns[i] = .{};
         peers[i] = try PeerId.random();
         try r.inbox.putOne(io, .{ .peer_connected = .{
@@ -309,6 +369,7 @@ fn runScenario(
             .conn = &conns[i],
             .remote_addr = .{ .ip4 = .loopback(@intCast(4000 + i)) },
         } });
+        if (i >= mesh_peers) continue;
         const graft = rpc_pb.ControlMessage{ .graft = &[_]?rpc_pb.ControlGraft{rpc.buildGraft(topic)} };
         try r.inbox.putOne(io, .{ .inbound_rpc = .{
             .peer = peers[i],
@@ -474,6 +535,11 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "strict/async burst", .host_key = &host_key, .validation_concurrency = executor_count, .dup_factor = 1, .msgs = default_msgs },
         .{ .name = "strict/async dupx4 paced", .host_key = &host_key, .validation_concurrency = executor_count, .dup_factor = 4, .msgs = default_msgs, .paced = true },
         .{ .name = "anonymous/inline", .host_key = null, .validation_concurrency = 0, .dup_factor = 1, .msgs = default_msgs },
+        // Scoring pair: same paced-async pipeline, scoring ON, 8 vs 64 connected
+        // peers — isolates the per-message O(peers) scoring/promise cost that
+        // the global-promise-map rework targets.
+        .{ .name = "strict/async score p8", .host_key = &host_key, .validation_concurrency = executor_count, .dup_factor = 1, .msgs = default_msgs, .paced = true, .scoring = true },
+        .{ .name = "strict/async score p64", .host_key = &host_key, .validation_concurrency = executor_count, .dup_factor = 1, .msgs = default_msgs, .paced = true, .scoring = true, .extra_peers = 56 },
     };
     for (scenarios) |sc| {
         const signer_arg: ?*const signing.Signer = if (sc.host_key != null) &origin_signer else null;
