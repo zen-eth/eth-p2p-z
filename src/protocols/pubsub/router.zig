@@ -355,7 +355,7 @@ const SeenCache = struct {
     const Bucket = std.ArrayListUnmanaged(*InternedId);
 
     fn init(allocator: std.mem.Allocator, intern_table: *InternTable, ttl_ticks: u64) std.mem.Allocator.Error!SeenCache {
-        const buckets = try allocator.alloc(Bucket, @intCast(ttl_ticks + 1));
+        const buckets = try allocator.alloc(Bucket, @intCast(ttl_ticks +| 1));
         for (buckets) |*bucket| bucket.* = .empty;
         return .{ .intern_table = intern_table, .allocator = allocator, .ttl_ticks = ttl_ticks, .buckets = buckets };
     }
@@ -430,6 +430,10 @@ const SeenCache = struct {
             _ = self.entries.remove(rc.value.bytes);
             rc.release();
         }
+        // Retains capacity: each bucket pins its historical per-tick expiry
+        // peak (8 bytes/slot) for the cache's lifetime — the same non-shrinking
+        // trade the id map itself makes, in exchange for allocation-free
+        // steady-state churn.
         bucket.clearRetainingCapacity();
     }
 };
@@ -9314,11 +9318,10 @@ test "interned id shared across seen + dont_send + iwant_promises is one allocat
     try std.testing.expectEqual(@as(usize, 1), internCount(router));
     try std.testing.expectEqual(@as(usize, 1), internRefs(router, id));
 
-    // Drop the last holder (seen): the id is freed and the table empties.
-    {
-        const e = router.seen.entries.fetchRemove(id).?;
-        e.value.rc.release();
-    }
+    // Drop the last holder (seen) THROUGH the wheel (a jump-sweep past expiry):
+    // removing from `seen.entries` directly would leave a dangling non-owning
+    // slot in a wheel bucket — only the sweep may remove live entries.
+    router.seen.sweep(router.heartbeat_tick +| mesh_params.seen_ttl_ticks +| 1);
     try std.testing.expectEqual(@as(usize, 0), internCount(router));
     try std.testing.expectEqual(@as(usize, 0), internRefs(router, id));
 }
@@ -9364,11 +9367,9 @@ test "tearing down a peer releases its id holders; ids also in seen survive" {
     try std.testing.expectEqual(@as(usize, 0), internRefs(router, peer_only));
 
     // Release the surviving seen holder so destroy's empty-table assert holds and
-    // the testing allocator confirms no leak.
-    {
-        const e = router.seen.entries.fetchRemove(shared).?;
-        e.value.rc.release();
-    }
+    // the testing allocator confirms no leak — THROUGH the wheel (a jump-sweep
+    // past expiry); a direct map remove would leave a dangling bucket slot.
+    router.seen.sweep(router.heartbeat_tick +| mesh_params.seen_ttl_ticks +| 1);
     try std.testing.expectEqual(@as(usize, 0), internCount(router));
 }
 
