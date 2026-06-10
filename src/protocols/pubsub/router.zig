@@ -180,21 +180,27 @@ pub const RouterConfig = struct {
     /// default) accepts every message: behaviour is exactly as it was before the
     /// validator existed. See `MessageValidator` / `ValidationResult`.
     validator: ?MessageValidator = null,
-    /// How many topic-message validations may run OFF the router fiber at once
-    /// (go-libp2p-pubsub's async validator-worker model, bounded by its
-    /// `validateThrottle` semaphore). Zero (the default) runs the `validator`
-    /// INLINE on the single router fiber — the historic, backward-compatible
-    /// behaviour, fine for a cheap validator. A value > 0 enables ASYNC validation:
-    /// a received message that passes the signature + seen checks is handed to a
-    /// validation fiber (spawned in a router-owned group, up to this many in
-    /// flight) so an EXPENSIVE validator does not stall every other peer's events;
-    /// the verdict is posted back to the router as a command, which then applies the
-    /// accept/reject/ignore effects (forwarding is DEFERRED until accept). When this
-    /// many validations are already in flight a further message falls back to inline
-    /// validation rather than spawning an unbounded number of fibers — go drops the
-    /// over-throttle message; inline-fallback is the gentler choice here (the message
-    /// is still validated, just on the router fiber). No effect when `validator` is
-    /// null (no validator runs at all). See `MessageValidator`.
+    /// How many message validations may run OFF the router fiber at once
+    /// (go-libp2p-pubsub's validation-worker model, bounded by its
+    /// `validateThrottle` semaphore). Zero (the default) runs everything INLINE
+    /// on the single router fiber — the historic, backward-compatible
+    /// behaviour, fine for a cheap validator and light message rates. A value
+    /// > 0 enables the ASYNC pipeline for BOTH the StrictSign SIGNATURE check
+    /// and the app `validator` (go's worker validate() runs exactly these two,
+    /// in this order; its processLoop never touches crypto): a received message
+    /// that passes the seen check is snapshotted and handed to a validation
+    /// fiber (spawned in a router-owned group, up to this many in flight), and
+    /// the combined outcome is posted back as a command which applies ALL
+    /// effects — the seen mark, scoring, delivery, and forwarding. Under
+    /// strict_sign this is the throughput lever: inline Ed25519 (~60-100µs per
+    /// message) otherwise serializes every peer's traffic on the one router
+    /// fiber. When this many validations are already in flight a further
+    /// message is throttle-DROPPED exactly like go ("validation throttled:
+    /// queue full; dropping") — neither marked seen (a later copy can still be
+    /// validated) nor penalized; the old inline-fallback let a validation flood
+    /// stall the router fiber, the very thing the offload exists to prevent.
+    /// No effect when there is nothing to offload (no signer AND no validator).
+    /// See `MessageValidator`.
     validation_concurrency: usize = 0,
     /// Optional override of the per-topic mesh DEGREE targets (`d`, `d_low`,
     /// `d_high`) the heartbeat's mesh maintenance uses to decide when to graft
@@ -249,16 +255,21 @@ pub const MessageHandler = struct {
 ///   - `ignore`: drop the message (no deliver, no forward) but do NOT penalize the
 ///     relaying peer — the sender did nothing wrong; we simply choose not to
 ///     propagate it (e.g. a stale-but-well-formed message).
-/// In all three cases the message has already been marked seen, so a duplicate is
-/// suppressed before the validator runs again (go marks seen right after the
-/// signature check, before invoking user validators).
+/// In all three cases the message ends up marked seen, so a later duplicate is
+/// suppressed without re-validating (go marks seen right after the signature
+/// check, before invoking user validators). One async-path nuance, shared with
+/// go: copies of one id that arrive while its validation is still IN FLIGHT
+/// (before the verdict marks it seen) are validated too — the verdicts converge
+/// on the router fiber, where every copy after the first is handled as a
+/// duplicate. A validator must therefore tolerate being invoked more than once
+/// for the same message under duplicate-heavy arrival.
 pub const ValidationResult = enum { accept, reject, ignore };
 
 /// An optional, application-supplied topic message validator, matching the
 /// validate-then-forward gate of go-libp2p-pubsub (`RegisterTopicValidator`) and
 /// rust-libp2p (`report_message_validation_result`). When set on `RouterConfig`,
-/// every received published message — AFTER it passes the signature check and is
-/// found to be new (not a seen duplicate) — is handed to `validate`, whose verdict
+/// every received published message — found to be new (not a seen duplicate) and
+/// past the StrictSign signature check — is handed to `validate`, whose verdict
 /// gates delivery + forwarding (see `ValidationResult`). When null, every message
 /// is accepted (the historic accept-all behaviour, unchanged).
 ///
@@ -659,13 +670,14 @@ pub fn Router(comptime Transport: type) type {
             /// router fiber owns that state exclusively, so a test must never read it
             /// concurrently with the fiber; this barrier is how a test serializes.
             sync: struct { reply: *std.Io.Event },
-            /// An ASYNC topic-message validation finished off the router fiber: its
-            /// verdict is `verdict` and `ctx` holds the owned message context the
-            /// post-verdict effects need (built before the validation fiber spawned;
-            /// freed once this command is processed, or on the inbox-drain at
-            /// teardown). Posted by a validation fiber; only enabled when
-            /// `validation_concurrency > 0`. See `ValidationContext`.
-            validation_result: struct { ctx: *ValidationContext, verdict: ValidationResult },
+            /// An ASYNC message validation finished off the router fiber: its
+            /// outcome is `verdict` (signature check + app validator combined —
+            /// see `ValidationOutcome`) and `ctx` holds the owned message context
+            /// the post-verdict effects need (built before the validation fiber
+            /// spawned; freed once this command is processed, or on the
+            /// inbox-drain at teardown). Posted by a validation fiber; only
+            /// enabled when `validation_concurrency > 0`. See `ValidationContext`.
+            validation_result: struct { ctx: *ValidationContext, verdict: ValidationOutcome },
             /// Prompt-wake for the dead-writer reap (see `reapDeadWriters`).
             /// Posted by a writer fiber after it sets its PeerState's
             /// `writer_dead` flag. Deliberately carries NO payload — in
@@ -677,6 +689,15 @@ pub fn Router(comptime Transport: type) type {
             /// full, the heartbeat's own reap pass is the lossless fallback.
             reap_dead_writers,
         };
+
+        /// The combined outcome of an ASYNC validation fiber: the StrictSign
+        /// signature check folded together with the app validator's verdict
+        /// (go's worker validate() runs exactly these two, in this order).
+        /// `reject_signature` is distinct from `reject_validator` because their
+        /// seen-cache effects differ: a validator-rejected message IS marked
+        /// seen (later copies must not re-validate), while a signature-rejected
+        /// one is NOT (a forged (from, seqno) must not censor the real message).
+        const ValidationOutcome = enum { accept, reject_validator, ignore, reject_signature };
 
         /// An owned, self-contained snapshot of a received message, HELD from the
         /// moment an async validation is spawned until its verdict is applied (then
@@ -970,11 +991,14 @@ pub fn Router(comptime Transport: type) type {
         validation_concurrency: usize,
         /// How many async validations are currently in flight (spawned, verdict not
         /// yet applied). Incremented when a validation fiber is spawned, decremented
-        /// when its `validation_result` is processed (or drained at teardown).
+        /// when its `validation_result` is processed. (The teardown drain does NOT
+        /// decrement — by then the main loop has exited and nothing reads the
+        /// counter again, so the stale value is dead state.)
         /// Mutated ONLY on the router fiber (the spawn happens in
         /// `handleIncomingMessage`, the decrement in `onValidationResult` / the
         /// drain), so it needs no atomic. Bounds spawning against
-        /// `validation_concurrency`; over the cap a message validates inline.
+        /// `validation_concurrency`; over the cap a message is throttle-DROPPED
+        /// (go parity), never validated inline.
         validations_in_flight: usize = 0,
         /// Owns every async validation fiber. Cancelled + awaited in `destroy`
         /// BEFORE any router state the post-verdict effects touch (peers, intern
@@ -3119,38 +3143,32 @@ pub fn Router(comptime Transport: type) type {
             signature: []const u8,
             key: []const u8,
         ) void {
-            // StrictSign: reject (drop — no deliver, no cache, no forward) any
-            // message whose signature does not verify against the key carried on
-            // the wire AND whose `from` is not that key's peer-id. An unsigned
-            // message (empty signature/key) also fails verification, so it is
-            // dropped. Under the none policy we accept everything (current
-            // behaviour) and the message's signature/key — if any — pass through
-            // unchanged on forward.
-            if (router.signer != null) {
-                if (!signing.verifyMessage(router.allocator, from, seqno, topic, data, signature, key)) {
-                    // P4: the SENDING peer (the inbound stream's peer, not the
-                    // message's `from`) relayed an invalid message. Charge it the
-                    // squared invalid-delivery penalty before dropping the message.
-                    if (router.score) |sc| sc.rejectMessage(exclude, topic);
-                    return;
-                }
-            }
-
             // The id is policy-derived: content-based under anonymous (where the
             // message has no from/seqno), from++seqno otherwise. The receive and
             // publish paths both go through computeMessageId so they always agree.
+            // Computed FIRST — before any crypto — so a duplicate can be dropped
+            // without paying signature verification (go checks seen in shouldPush
+            // before pushing to its validation workers; a gossipsub mesh delivers
+            // each message up to D times, so for sub-IDONTWANT-threshold messages
+            // this is the difference between 1 verify and ~D verifies per id).
             var id = router.computeMessageId(topic, from, seqno, data) catch return;
             defer id.deinit(router.allocator);
 
-            // A message with this id was delivered, so every outstanding IWANT
-            // promise for it is fulfilled — clear them across all peers (go fulfills
-            // on delivery from anyone). Done before the seen/duplicate check because
-            // even a duplicate delivery fulfils the promise (go fulfils as soon as a
-            // message begins validation, regardless of whether it is new). No-op
-            // when scoring is disabled (no promises were ever recorded).
-            if (router.score != null) router.fulfillPromise(id.bytes);
+            // IWANT-promise fulfilment follows go's gossip tracer exactly: a
+            // promise is fulfilled by a duplicate delivery (DuplicateMessage), a
+            // throttle-dropped delivery (RejectValidationThrottled is NOT in the
+            // tracer's carve-out), and any post-signature verdict — but NOT by a
+            // message whose SIGNATURE fails (go's RejectMessage explicitly skips
+            // fulfilment for RejectInvalidSignature/RejectMissingSignature, so
+            // the promise stays pending, expires, and draws the P7 broken-promise
+            // penalty: a peer cannot make good on an IHAVE with garbage). So the
+            // fulfilment sites are: the duplicate return + the throttle-drop
+            // return + the inline post-verify point below, and the verdict
+            // re-entry for the async path (`onValidationResult`) — never before
+            // verification.
 
             if (router.seen.contains(id.bytes, router.heartbeat_tick)) {
+                if (router.score != null) router.fulfillPromise(id.bytes);
                 // A duplicate of an already-seen message. If the relaying peer is
                 // a current mesh member for this topic, credit it the P3
                 // mesh-delivery counter (it did relay the message to us, just not
@@ -3160,15 +3178,84 @@ pub fn Router(comptime Transport: type) type {
                 }
                 return;
             }
+
+            // ASYNC pipeline (go-libp2p's validation-worker model): with
+            // `validation_concurrency > 0`, BOTH the StrictSign signature check
+            // and the app validator run OFF the router fiber — go's validate()
+            // does exactly this (signature first, then user validators) on its
+            // NumCPU worker pool, and its processLoop never touches crypto. We
+            // HOLD an owned copy of the message (the wire slices here are freed
+            // when `onInboundRpc` returns), spawn a validation fiber, and DEFER
+            // every effect — including the seen MARK — to its `validation_result`
+            // command (see onValidationResult for why seen is marked there).
+            //
+            // At the in-flight cap the message is throttle-DROPPED, exactly like
+            // go ("message validation throttled: queue full; dropping"): the
+            // inline fallback we used to run here let a validation flood stall
+            // the router fiber — the very thing the offload exists to prevent.
+            // The drop neither marks seen (a later copy can still be validated)
+            // nor penalizes the sender (the message was never judged).
+            const needs_signature_check = router.signer != null;
+            if ((needs_signature_check or router.validator != null) and
+                router.validation_concurrency > 0)
+            {
+                if (router.validations_in_flight >= router.validation_concurrency) {
+                    // The peer did deliver — a throttled drop still fulfils its
+                    // IWANT promise (go: RejectValidationThrottled fulfils).
+                    if (router.score != null) router.fulfillPromise(id.bytes);
+                    if (router.gs_debug) {
+                        std.log.debug("gossipsub: validation throttled (in-flight {d} >= cap {d}); dropping message", .{ router.validations_in_flight, router.validation_concurrency });
+                    }
+                    return;
+                }
+                if (router.spawnValidation(exclude, from, seqno, topic, data, signature, key, id.bytes)) {
+                    // Spawned: verdict + ALL effects come via the result command.
+                    return;
+                }
+                // Building the owned snapshot / spawning failed (OOM — not
+                // attacker-drivable load, which the cap already bounds): degrade
+                // to the inline path below rather than dropping outright.
+            }
+
+            // INLINE path (`validation_concurrency == 0`, or the OOM fallback).
+            //
+            // StrictSign: reject (drop — no deliver, no cache, no forward) any
+            // message whose signature does not verify against the key carried on
+            // the wire AND whose `from` is not that key's peer-id. An unsigned
+            // message (empty signature/key) also fails verification, so it is
+            // dropped. Under the none policy we accept everything and the
+            // message's signature/key — if any — pass through unchanged on
+            // forward. Runs AFTER the seen check (above): duplicates never pay
+            // verification. P4: the SENDING peer (the inbound stream's peer, not
+            // the message's `from`) relayed the invalid message and is charged
+            // the squared invalid-delivery penalty. The id is deliberately NOT
+            // marked seen on a bad signature — a forged (from, seqno) must not
+            // be able to censor the real message (go returns before markSeen).
+            if (needs_signature_check) {
+                if (!signing.verifyMessage(router.allocator, from, seqno, topic, data, signature, key)) {
+                    // Deliberately NO fulfillPromise here: a garbage-signed
+                    // message must not make good on an IHAVE promise (P7).
+                    if (router.score) |sc| sc.rejectMessage(exclude, topic);
+                    return;
+                }
+            }
+
+            // Past the signature gate: the delivery now counts for any pending
+            // IWANT promise regardless of the app validator's verdict (go
+            // fulfils on deliver, duplicate, AND validator-reject/ignore).
+            if (router.score != null) router.fulfillPromise(id.bytes);
+
+            // Marked seen only now — after the signature verified (go: "we can
+            // mark the message as seen now that we have verified the signature
+            // and avoid invoking user validators more than once") and before the
+            // app validator, so a duplicate of an ignored/rejected message is
+            // suppressed by the seen-cache and never re-validated or re-forwarded.
             router.seen.add(id.bytes, router.heartbeat_tick);
 
             // Application topic-message validator (go-libp2p-pubsub's
             // validate-then-forward gate / rust-libp2p's MessageAcceptance). The
             // message is new and signature-checked; the app's verdict decides
-            // whether we propagate it. Marked seen ABOVE (before validating) so a
-            // duplicate of an ignored/rejected message is suppressed by the
-            // seen-cache and never re-validated or re-forwarded — matching go,
-            // which marks seen right after the signature check.
+            // whether we propagate it.
             //   - reject: the message is invalid; do NOT deliver/forward, and charge
             //     the relaying peer the squared invalid-delivery penalty (P4), the
             //     same penalty a bad signature draws. Keyed on the SENDING peer
@@ -3177,33 +3264,6 @@ pub fn Router(comptime Transport: type) type {
             //   - accept: fall through to the normal P2/deliver/IDONTWANT/forward
             //     path below (the historic behaviour).
             // No validator (null) means accept-all, so the behaviour is unchanged.
-            //
-            // ASYNC validation (go-libp2p's validator-worker model): when a validator
-            // is set and `validation_concurrency > 0` and we are under the in-flight
-            // cap, run the validator OFF the router fiber so an expensive validator
-            // does not stall every other peer's events. We HOLD an owned copy of the
-            // message (the wire slices here are freed when `onInboundRpc` returns,
-            // before the validation finishes), spawn a validation fiber, and DEFER
-            // all accept/reject/ignore effects until its `validation_result` command
-            // is applied — so we return WITHOUT delivering or forwarding here. If we
-            // are at the in-flight cap (go would throttle-drop), or the held copy /
-            // spawn fails, we fall back to validating INLINE below rather than
-            // spawning unboundedly. With no validator, or `validation_concurrency == 0`,
-            // the validator (if any) runs inline exactly as before.
-            if (router.validator != null and
-                router.validation_concurrency > 0 and
-                router.validations_in_flight < router.validation_concurrency)
-            {
-                if (router.spawnValidation(exclude, from, seqno, topic, data, signature, key, id.bytes)) {
-                    // Spawned: the verdict + effects come later via the result command.
-                    return;
-                }
-                // Spawn/copy failed: fall through to inline validation (below).
-            }
-
-            // Inline validation (the default, and the async fall-back when at the cap
-            // or on a spawn failure): run the validator on the router fiber and apply
-            // the verdict immediately.
             if (router.validator) |v| {
                 switch (v.validate(v.ctx, topic, from, data)) {
                     .accept => {},
@@ -3368,41 +3428,95 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Validation-fiber body (one per async-validated message; runs OFF the
-        /// router fiber in `validation_group`). Runs the validator on the held copy,
-        /// then posts the verdict + the context back to the router inbox as a
-        /// `validation_result` command. The validator call is CPU-bound (no
-        /// cancellation point); the inbox post IS a cancellation point, so a teardown
-        /// `cancel` collapses it — on a closed/cancelled post we free the held
-        /// context HERE (this fiber is then its sole owner). On a successful post the
-        /// router (or the inbox drain) owns + frees the context: freed EXACTLY once.
-        /// The validator must be thread-safe (it can run on this fiber concurrently
-        /// with the router fiber).
+        /// router fiber in `validation_group`). Runs go's worker pipeline on the
+        /// held copy — the StrictSign SIGNATURE check first, then the app
+        /// validator (go's validate() order; either may be absent) — and posts
+        /// the combined outcome + the context back to the router inbox as a
+        /// `validation_result` command. `router.signer` and `router.validator`
+        /// are set once in `create` and never reassigned, so reading them off
+        /// the router fiber is safe; `verifyMessage`'s scratch allocation uses
+        /// the same thread-safe-allocator contract as `ctx.deinit` below. The
+        /// crypto/validator calls are CPU-bound (no cancellation point); the
+        /// inbox post IS a cancellation point, so a teardown `cancel` collapses
+        /// it — on a closed/cancelled post we free the held context HERE (this
+        /// fiber is then its sole owner). On a successful post the router (or
+        /// the inbox drain) owns + frees the context: freed EXACTLY once.
+        /// The validator must be thread-safe (it can run on this fiber
+        /// concurrently with the router fiber).
         fn validationFiber(router: *Self, ctx: *ValidationContext) void {
-            const v = router.validator.?;
-            const verdict = v.validate(v.ctx, ctx.topic, ctx.from, ctx.data);
-            router.inbox.putOne(router.io, .{ .validation_result = .{ .ctx = ctx, .verdict = verdict } }) catch {
+            const outcome: ValidationOutcome = blk: {
+                if (router.signer != null and
+                    !signing.verifyMessage(router.allocator, ctx.from, ctx.seqno, ctx.topic, ctx.data, ctx.signature, ctx.key))
+                {
+                    break :blk .reject_signature;
+                }
+                if (router.validator) |v| {
+                    break :blk switch (v.validate(v.ctx, ctx.topic, ctx.from, ctx.data)) {
+                        .accept => .accept,
+                        .reject => .reject_validator,
+                        .ignore => .ignore,
+                    };
+                }
+                // Signature-only offload (no app validator configured).
+                break :blk .accept;
+            };
+            router.inbox.putOne(router.io, .{ .validation_result = .{ .ctx = ctx, .verdict = outcome } }) catch {
                 // Closed (shutting down) or Canceled (teardown): no one will process
                 // the result, so this fiber frees the held context.
                 ctx.deinit(router.allocator);
             };
         }
 
-        /// Apply an async validation verdict on the router fiber (the deferred tail
-        /// of `handleIncomingMessage`'s accept/reject/ignore, now that the off-fiber
-        /// validator has returned). ACCEPT runs the SHARED accept effects
-        /// (`applyAccept`) — identical to the inline accept path; REJECT charges the
-        /// relaying peer the P4 penalty; IGNORE does nothing. Always decrements the
-        /// in-flight counter and frees the held context (freed exactly once — the
-        /// teardown drain frees only contexts that never reach here).
-        fn onValidationResult(router: *Self, ctx: *ValidationContext, verdict: ValidationResult) void {
+        /// Apply an async validation outcome on the router fiber (the deferred
+        /// tail of `handleIncomingMessage`, now that the off-fiber signature
+        /// check + validator have returned). This is also where the seen MARK
+        /// happens for the async path: `seen` (and the intern table under it)
+        /// is router-fiber-confined, so the worker cannot mark it — go marks
+        /// seen inside its worker because its timecache is locked; ours moves
+        /// the mark to the verdict re-entry instead. Consequences, both matching
+        /// go's semantics:
+        ///   - A bad-signature message is NEVER marked (go returns before
+        ///     markSeen): a forged (from, seqno) cannot censor the real message.
+        ///   - Two copies of one id can both be IN FLIGHT (both passed the seen
+        ///     CHECK before either was MARKED — go has the same window between
+        ///     shouldPush and the worker's markSeen). Verdicts apply serially
+        ///     here: the first marks seen and applies; a later one finds the id
+        ///     seen and is handled as a duplicate (go: markSeen=false →
+        ///     DuplicateMessage), crediting the relayer's P3 like any duplicate.
+        /// ACCEPT runs the SHARED accept effects (`applyAccept`) — identical to
+        /// the inline accept path; a validator REJECT charges the relaying peer
+        /// the P4 penalty (and IS marked seen, so later copies never
+        /// re-validate); IGNORE just marks seen. Always decrements the in-flight
+        /// counter and frees the held context (freed exactly once — the teardown
+        /// drain frees only contexts that never reach here).
+        fn onValidationResult(router: *Self, ctx: *ValidationContext, verdict: ValidationOutcome) void {
             defer {
                 router.validations_in_flight -= 1;
                 ctx.deinit(router.allocator);
             }
+            if (verdict == .reject_signature) {
+                // Deliberately NO fulfillPromise: a garbage-signed message must
+                // not make good on an IHAVE promise — the promise expires and
+                // draws P7 (go's tracer carve-out for RejectInvalidSignature).
+                if (router.score) |sc| sc.rejectMessage(ctx.exclude, ctx.topic);
+                return;
+            }
+            // Past the signature gate: this delivery fulfils any pending IWANT
+            // promise whatever the verdict (accept / validator-reject / ignore /
+            // duplicate — go fulfils on all four).
+            if (router.score != null) router.fulfillPromise(ctx.id);
+            if (router.seen.contains(ctx.id, router.heartbeat_tick)) {
+                if (router.score) |sc| {
+                    if (router.meshContains(ctx.topic, ctx.exclude)) sc.duplicateMessage(ctx.exclude, ctx.topic);
+                }
+                return;
+            }
+            router.seen.add(ctx.id, router.heartbeat_tick);
             switch (verdict) {
                 .accept => router.applyAccept(ctx.exclude, ctx.from, ctx.seqno, ctx.topic, ctx.data, ctx.signature, ctx.key, ctx.id),
-                .reject => if (router.score) |sc| sc.rejectMessage(ctx.exclude, ctx.topic),
+                .reject_validator => if (router.score) |sc| sc.rejectMessage(ctx.exclude, ctx.topic),
                 .ignore => {},
+                .reject_signature => unreachable, // handled above, before the seen mark
             }
         }
 
@@ -4565,6 +4679,23 @@ fn buildInboundPublish(
     data: []const u8,
 ) !pubsub.OwnedRpc {
     const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data };
+    const frame = rpc_pb.RPC{ .publish = &[_]?rpc_pb.Message{msg} };
+    return ownedFromRpc(allocator, frame);
+}
+
+/// Like `buildInboundPublish` but carrying the publisher's signature + marshaled
+/// public key, for StrictSign inbound paths (the wire shape a signing publisher
+/// produces).
+fn buildInboundPublishSigned(
+    allocator: std.mem.Allocator,
+    from: []const u8,
+    seqno: []const u8,
+    topic: []const u8,
+    data: []const u8,
+    signature: []const u8,
+    key: []const u8,
+) !pubsub.OwnedRpc {
+    const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data, .signature = signature, .key = key };
     const frame = rpc_pb.RPC{ .publish = &[_]?rpc_pb.Message{msg} };
     return ownedFromRpc(allocator, frame);
 }
@@ -9591,7 +9722,7 @@ test "async validator: a SLOW validation does not block other router commands" {
     try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "slow"));
 }
 
-test "async validator: in-flight validations are bounded by the concurrency cap (inline fallback)" {
+test "async validation cap: over-cap messages are throttle-DROPPED (go parity) and NOT marked seen" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -9599,11 +9730,13 @@ test "async validator: in-flight validations are bounded by the concurrency cap 
 
     var rec = RecordingHandler{ .allocator = allocator };
     defer rec.deinit();
-    // A slow ACCEPT validator with a cap of 1: the first message validates async
-    // (and sleeps); further messages posted while it is in flight exceed the cap and
-    // fall back to INLINE validation (still accepted, on the router fiber) rather
-    // than spawning more fibers. Every message is ultimately delivered + forwarded;
-    // the cap just bounds how many run off-fiber at once.
+    // A slow ACCEPT validator with a cap of 1: the first message occupies the
+    // single async slot (and sleeps); further messages posted while it is in
+    // flight exceed the cap and are throttle-DROPPED, exactly like go
+    // ("validation throttled: queue full; dropping") — never validated inline
+    // (the old fallback let a validation flood stall the router fiber), never
+    // delivered, never forwarded. The drop does NOT mark the id seen, so a
+    // later re-delivery of a dropped message validates normally.
     var val = AsyncValidator{ .io = io, .verdict = .accept, .sleep_ms = 200 };
 
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{ .validator = val.validator(), .validation_concurrency = 1 });
@@ -9621,9 +9754,8 @@ test "async validator: in-flight validations are bounded by the concurrency cap 
 
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
 
-    // Post several DISTINCT messages back-to-back. The first occupies the single
-    // async slot (and sleeps); the rest, posted while it is in flight, fall back to
-    // inline validation. All are accepted and forwarded — the cap never drops one.
+    // Post several DISTINCT messages back-to-back. m0 takes the async slot; the
+    // rest arrive while it is in flight and are dropped at the cap.
     const datas = [_][]const u8{ "m0", "m1", "m2", "m3", "m4" };
     for (datas, 0..) |d, i| {
         var seqno: [4]u8 = undefined;
@@ -9634,23 +9766,217 @@ test "async validator: in-flight validations are bounded by the concurrency cap 
         } });
     }
 
-    // Every one of the five distinct messages must eventually be forwarded to A.
+    // m0's verdict eventually lands and it is forwarded; the over-cap rest never are.
     var waited: u64 = 0;
     while (waited < 3000) : (waited += 5) {
-        var all = true;
-        for (datas) |d| {
-            if (recordCountPublishes(io, &conn_a.record, "t", d) < 1) {
-                all = false;
-                break;
-            }
-        }
-        if (all) break;
+        if (recordCountPublishes(io, &conn_a.record, "t", "m0") >= 1) break;
         io_time.ms(5).sleep(io) catch {};
     }
     try sync(router, io);
-    for (datas) |d| {
-        try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", d));
+    io_time.ms(50).sleep(io) catch {}; // grace: a wrong forward would land here
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "m0"));
+    for (datas[1..]) |d| {
+        try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_a.record, "t", d));
     }
+    // Exactly one validation ran: the dropped messages were never validated
+    // (neither async nor inline).
+    try std.testing.expectEqual(@as(usize, 1), val.calls.load(.acquire));
+
+    // The drop did not mark m1 seen: re-delivering it (same from/seqno => same
+    // id) with the slot now free validates and forwards normally.
+    var seqno1: [4]u8 = undefined;
+    std.mem.writeInt(u32, &seqno1, @as(u32, 0x11), .big);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", &seqno1, "t", "m1"),
+    } });
+    waited = 0;
+    while (waited < 3000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_a.record, "t", "m1") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try sync(router, io);
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "m1"));
+}
+
+test "async validation: two in-flight copies of one id converge to a single forward" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    // Seen is MARKED at verdict re-entry (it is router-fiber-confined, so the
+    // worker cannot mark it). Two copies of one id that both pass the seen CHECK
+    // before either verdict lands are BOTH validated — go has the same window
+    // between shouldPush and the worker's markSeen — but the verdicts apply
+    // serially on the router fiber: the first marks seen + forwards, the second
+    // is handled as a duplicate. The message must be forwarded exactly once.
+    var val = AsyncValidator{ .io = io, .verdict = .accept, .sleep_ms = 150 };
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, null, null, .{ .validator = val.validator(), .validation_concurrency = 4 });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const s1 = testPeer(3);
+    const s2 = testPeer(4);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s1 = try connectFakePeer(io, allocator, router, s1);
+    defer destroyFakeConn(allocator, conn_s1);
+    const conn_s2 = try connectFakePeer(io, allocator, router, s2);
+    defer destroyFakeConn(allocator, conn_s2);
+    defer router.destroy();
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+
+    // The SAME message (same from/seqno => same id) relayed by two peers
+    // back-to-back, while the slow validator holds both verdicts in flight.
+    const seqno = "\x00\x00\x00\x77";
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = s1,
+        .rpc = try buildInboundPublish(allocator, "origin", seqno, "t", "dup-race"),
+    } });
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = s2,
+        .rpc = try buildInboundPublish(allocator, "origin", seqno, "t", "dup-race"),
+    } });
+
+    var waited: u64 = 0;
+    while (waited < 3000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_a.record, "t", "dup-race") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try sync(router, io);
+    io_time.ms(50).sleep(io) catch {}; // grace: a duplicate forward would land here
+    // Both copies were validated (both were in flight before either was seen)...
+    try std.testing.expectEqual(@as(usize, 2), val.calls.load(.acquire));
+    // ...but the message was forwarded and delivered exactly once.
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "dup-race"));
+    try std.testing.expectEqual(@as(usize, 1), rec.calls);
+}
+
+test "async signature check: a bad signature is rejected off-fiber (P4) and NOT marked seen" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    // strict_sign + scoring + concurrency=1, NO app validator: the SIGNATURE
+    // check itself runs on the validation fiber (go's worker validate() order).
+    // An unsigned message under strict_sign fails verification off-fiber; the
+    // verdict charges the relayer P4. Crucially the id is NOT marked seen — a
+    // forged (from, seqno) must not censor the real message — so a second copy
+    // is re-verified and re-penalized rather than seen-suppressed.
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, &host_key, scoringConfig(), .{ .validation_concurrency = 1 });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy();
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+    try std.testing.expectEqual(@as(f64, 0), syncedScore(router, io, source));
+
+    // First unsigned copy: verified off-fiber, rejected, P4 (-1 = -(1 invalid)^2).
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x21", "t", "forged"),
+    } });
+    var waited: u64 = 0;
+    while (waited < 3000) : (waited += 5) {
+        if (syncedScore(router, io, source) < 0) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    const score_after_first = syncedScore(router, io, source);
+    try std.testing.expect(score_after_first < 0);
+
+    // The SAME message again (same from/seqno => same id): NOT seen-suppressed —
+    // it is re-verified and the score strictly worsens (a seen-marked id would
+    // have been dropped as a duplicate with no further penalty).
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x21", "t", "forged"),
+    } });
+    waited = 0;
+    while (waited < 3000) : (waited += 5) {
+        if (syncedScore(router, io, source) < score_after_first) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(syncedScore(router, io, source) < score_after_first);
+
+    // Nothing was ever delivered or forwarded.
+    try std.testing.expectEqual(@as(usize, 0), rec.calls);
+    try std.testing.expectEqual(@as(usize, 0), recordCountPublishes(io, &conn_a.record, "t", "forged"));
+}
+
+test "async signature check: a correctly signed message verifies off-fiber and is forwarded" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = RecordingHandler{ .allocator = allocator };
+    defer rec.deinit();
+    var host_key = try identity.KeyPair.generate(.ED25519);
+    defer host_key.deinit();
+
+    // The POSITIVE async-signature path: with concurrency>0 and no app
+    // validator, a properly signed message is verified on the validation fiber
+    // and its accept verdict delivers + forwards it — the router fiber itself
+    // never runs the Ed25519 verify.
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rec.handler(), 0, &host_key, null, .{ .validation_concurrency = 2 });
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+
+    const peer_a = testPeer(1);
+    const source = testPeer(3);
+    const conn_a = try connectFakePeer(io, allocator, router, peer_a);
+    defer destroyFakeConn(allocator, conn_a);
+    const conn_s = try connectFakePeer(io, allocator, router, source);
+    defer destroyFakeConn(allocator, conn_s);
+    defer router.destroy();
+
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_a, peer_a, "t"));
+
+    // A second identity is the message's ORIGIN publisher: sign exactly the
+    // fields the wire carries, with its own from/key bytes.
+    var origin_key = try identity.KeyPair.generate(.ED25519);
+    defer origin_key.deinit();
+    var origin_signer = try signing.Signer.init(allocator, &origin_key);
+    defer origin_signer.deinit();
+    const seqno = "\x00\x00\x00\x42";
+    const sig = try origin_signer.sign(origin_signer.fromBytes(), seqno, "t", "signed-data");
+    defer allocator.free(sig);
+
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = source,
+        .rpc = try buildInboundPublishSigned(allocator, origin_signer.fromBytes(), seqno, "t", "signed-data", sig, origin_signer.keyBytes()),
+    } });
+
+    var waited: u64 = 0;
+    while (waited < 3000) : (waited += 5) {
+        if (recordCountPublishes(io, &conn_a.record, "t", "signed-data") >= 1) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try sync(router, io);
+    try std.testing.expectEqual(@as(usize, 1), recordCountPublishes(io, &conn_a.record, "t", "signed-data"));
+    try std.testing.expectEqual(@as(usize, 1), rec.calls);
 }
 
 /// A validator that BLOCKS forever (until cancelled) on entry, to model an
