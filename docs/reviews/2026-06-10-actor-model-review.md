@@ -384,7 +384,7 @@ architecture — no rewrite):
 
 | # | Item | Size | Status |
 |---|---|---|---|
-| 0 | 50k-pps router microbench + 5k msgs/s gossipsub soak, per-stage counters | S | open |
+| 0 | gossipsub router + QUIC loopback micro-benchmarks, baselines on macOS+Linux | S | **done** (`docs/benchmarks/2026-06-10-p0-baseline.md`; per-stage router counters still open) |
 | 1 | C1 writer-teardown deadlock; C2 seqno seed; C3 connection-identity lifecycle | S (C2 is one line) | **done** (`ff993a9`, `b54027b`, `962a009` + ABA follow-up `9839fec`) |
 | 2 | P1 check-seen-before-verify; verify in validation workers; throttle-drop at cap | S–M | **done** (`68f159e`; promise fulfilment follows go's tracer carve-out — fulfilled on duplicate/throttle/post-signature verdicts, never on a signature reject) |
 | 3 | P2 sendmmsg + GSO in zio + flushScheduled | M | open |
