@@ -595,6 +595,13 @@ pub fn Router(comptime Transport: type) type {
             /// WHICH connection died (the handler compares it against the
             /// PeerState's bound connection and ignores a non-matching one) and
             /// must not be dereferenced: the connection may already be freed.
+            /// The Switch's unregister callback must be this command's ONLY
+            /// producer: it posts before the connection's memory is freed, so
+            /// the FIFO inbox processes the event before any later event can
+            /// name a recycled address. A producer that cannot order its post
+            /// before the free (e.g. a writer fiber) must NOT post this —
+            /// see `reap_dead_writers` / `onWriterDisconnect` for the ABA it
+            /// would reintroduce.
             peer_disconnected: struct { peer: PeerId, conn: ConnHandle },
             /// The /meshsub protocol version a peer negotiated, learned when it
             /// opens an inbound stream to us (the peer proposes its best version;
@@ -659,6 +666,16 @@ pub fn Router(comptime Transport: type) type {
             /// teardown). Posted by a validation fiber; only enabled when
             /// `validation_concurrency > 0`. See `ValidationContext`.
             validation_result: struct { ctx: *ValidationContext, verdict: ValidationResult },
+            /// Prompt-wake for the dead-writer reap (see `reapDeadWriters`).
+            /// Posted by a writer fiber after it sets its PeerState's
+            /// `writer_dead` flag. Deliberately carries NO payload — in
+            /// particular no connection handle: a writer-sourced event cannot be
+            /// ordered before its connection's free, so a carried pointer could
+            /// alias a recycled address and tear down a just-rebound live peer
+            /// (ABA). The flag lives on the PeerState itself, so the reap always
+            /// acts on current identity. Best-effort: dropped when the inbox is
+            /// full, the heartbeat's own reap pass is the lossless fallback.
+            reap_dead_writers,
         };
 
         /// An owned, self-contained snapshot of a received message, HELD from the
@@ -1763,6 +1780,7 @@ pub fn Router(comptime Transport: type) type {
                     .enqueue_for_test => |e| router.onEnqueueForTest(e.peer, e.frame, e.reply),
                     .sync => |s| s.reply.set(router.io),
                     .validation_result => |r| router.onValidationResult(r.ctx, r.verdict),
+                    .reap_dead_writers => router.reapDeadWriters(),
                     .heartbeat => router.onHeartbeat(),
                     .shutdown => return,
                 }
@@ -2097,21 +2115,17 @@ pub fn Router(comptime Transport: type) type {
             };
         }
 
-        /// Handle one heartbeat tick: advance the tick counter, expire stale
-        /// backoffs and per-peer IDONTWANT (`dont_send`) entries, then run mesh
-        /// maintenance (graft below D_low / prune above D_high for each subscribed
-        /// topic) and fanout maintenance (expire stale fanout topics, replenish
-        /// short ones), gossip emission (IHAVE), and the message-cache window shift.
-        fn onHeartbeat(router: *Self) void {
-            router.heartbeat_tick += 1;
-            const tick = router.heartbeat_tick;
-
-            // Reap peers whose writer fiber died (open exhaustion) but whose
-            // non-blocking disconnect post was dropped on a full inbox: the
-            // atomic `writer_dead` flag is the lossless fallback signal (see
-            // onWriterDisconnect). Teardown mutates the map, so restart the
-            // iteration after each removal — flagged peers are rare (k is
-            // almost always 0), so this stays one O(peers) scan per heartbeat.
+        /// Tear down every peer whose `writer_dead` flag is set — the writer
+        /// fiber gave up (open exhaustion) and signalled via the flag. Runs on
+        /// the router fiber, invoked by the writer's `reap_dead_writers` wake
+        /// and by every heartbeat (the lossless fallback when that wake was
+        /// dropped on a full inbox). The teardown passes the PeerState's OWN
+        /// bound connection, so identity always matches — unlike a
+        /// writer-carried handle, this cannot alias a recycled address (ABA).
+        /// Teardown mutates the map, so restart the iteration after each
+        /// removal — flagged peers are rare (k is almost always 0), so this
+        /// stays one O(peers) scan per call.
+        fn reapDeadWriters(router: *Self) void {
             reap: while (true) {
                 var it = router.peers.valueIterator();
                 while (it.next()) |state_ptr| {
@@ -2123,6 +2137,22 @@ pub fn Router(comptime Transport: type) type {
                 }
                 break;
             }
+        }
+
+        /// Handle one heartbeat tick: advance the tick counter, expire stale
+        /// backoffs and per-peer IDONTWANT (`dont_send`) entries, then run mesh
+        /// maintenance (graft below D_low / prune above D_high for each subscribed
+        /// topic) and fanout maintenance (expire stale fanout topics, replenish
+        /// short ones), gossip emission (IHAVE), and the message-cache window shift.
+        fn onHeartbeat(router: *Self) void {
+            router.heartbeat_tick += 1;
+            const tick = router.heartbeat_tick;
+
+            // Reap dead-writer peers first so the rest of the tick (mesh
+            // maintenance, gossip emission) never grafts toward or gossips at a
+            // peer whose writer is gone. Lossless fallback for a dropped
+            // `reap_dead_writers` wake.
+            router.reapDeadWriters();
 
             // Ensure direct peers are connected (go-libp2p `directConnect`): every
             // `direct_connect_ticks` heartbeats, (re)dial any direct peer that is
@@ -3877,23 +3907,31 @@ pub fn Router(comptime Transport: type) type {
         /// PeerWriter on_disconnect callback. The writer exhausted its open
         /// retries, so hand the peer back to the router. Runs on the WRITER
         /// fiber, so it must only signal — never free the state/sink (the
-        /// writer's trailing `sink.close` still fires after this returns), and
-        /// it MUST NOT block: the router cancel+awaits this fiber in
-        /// teardownPeer, so parking (uncancelably) on the router's own full
-        /// inbox would wedge the router forever — it would join a fiber that
-        /// waits for the router to drain the very queue it is parked on. The
-        /// atomic flag is the lossless signal (swept by the heartbeat); the
-        /// non-blocking post (`min = 0` never parks) is just a prompt wake for
-        /// the common, non-full case.
+        /// writer's trailing `sink.close` still fires after this returns) —
+        /// and the signal must satisfy TWO constraints:
+        ///
+        /// - It MUST NOT block: the router cancel+awaits this fiber in
+        ///   teardownPeer, so parking (uncancelably) on the router's own full
+        ///   inbox would wedge the router forever — it would join a fiber that
+        ///   waits for the router to drain the very queue it is parked on.
+        /// - It MUST NOT carry the connection handle (or any identity): a
+        ///   writer-sourced event cannot be ordered before the connection's
+        ///   free, so a carried pointer can alias a RECYCLED address — a stale
+        ///   `peer_disconnected{peer, old_ptr}` processed after the peer
+        ///   rebound to a new connection at the same address would pass the
+        ///   identity check and destroy the live peer (ABA). This also fires
+        ///   spuriously when teardownPeer cancels a writer parked in its
+        ///   reopen backoff, which is exactly when the old handle is dangling.
+        ///
+        /// So: set the atomic flag on the PeerState (the lossless signal, tied
+        /// to current identity by construction) and post a payload-free
+        /// `reap_dead_writers` wake, non-blocking (`min = 0` never parks; a
+        /// full inbox drops the wake and the heartbeat's reap pass covers it).
         fn onWriterDisconnect(ctx: ?*anyopaque) void {
             const state: *PeerState = @ptrCast(@alignCast(ctx.?));
             const router = state.router_for_disconnect;
             state.writer_dead.store(true, .release);
-            _ = router.inbox.putUncancelable(
-                router.io,
-                &.{.{ .peer_disconnected = .{ .peer = state.peer, .conn = state.conn } }},
-                0,
-            ) catch 0;
+            _ = router.inbox.putUncancelable(router.io, &.{.reap_dead_writers}, 0) catch 0;
         }
     };
 }
