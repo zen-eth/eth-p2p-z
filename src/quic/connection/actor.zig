@@ -1215,6 +1215,9 @@ pub const ConnectionActor = struct {
         const conn = self.conn orelse return 0;
         var added: usize = 0;
 
+        // The SINGULAR accessor is borrow-safe: quiche's `Connection::source_id`
+        // returns a ConnectionId borrowing the connection's own storage, so the
+        // out-pointer stays valid while `conn` lives.
         var source_id_ptr: [*c]const u8 = null;
         var source_id_len: usize = 0;
         quiche.quiche_conn_source_id(conn, &source_id_ptr, &source_id_len);
@@ -1222,15 +1225,17 @@ pub const ConnectionActor = struct {
             if (try self.registerCid(source_id_ptr[0..source_id_len])) added += 1;
         }
 
-        const iter = quiche.quiche_conn_source_ids(conn) orelse return added;
-        defer quiche.quiche_connection_id_iter_free(iter);
-
-        var cid_ptr: [*c]const u8 = null;
-        var cid_len: usize = 0;
-        while (quiche.quiche_connection_id_iter_next(iter, &cid_ptr, &cid_len)) {
-            if (cid_ptr == null or cid_len != local_cid_len) continue;
-            if (try self.registerCid(cid_ptr[0..cid_len])) added += 1;
-        }
+        // Deliberately NO `quiche_conn_source_ids` iterator here: quiche
+        // 0.28.0's `quiche_connection_id_iter_next` returns a pointer into a
+        // ConnectionId CLONE that is dropped before the call returns — a
+        // use-after-free. The freed 20-byte buffer's head gets overwritten by
+        // allocator freelist metadata, so every dial registered one stable
+        // GARBAGE cid; two live connections reading the same recycled slot
+        // collided in the shared route table and failed the dial
+        // (RouteRegistrationFailed, first surfaced by the 50-dial footprint
+        // bench). At setup time a connection has exactly ONE source id — the
+        // singular call above — and every later SCID is minted by
+        // refreshSourceCids from OUR buffer, so the iterator bought nothing.
         return added;
     }
 
@@ -1272,14 +1277,17 @@ pub const ConnectionActor = struct {
 
     fn drainRetiredSourceCids(self: *ConnectionActor) usize {
         const conn = self.conn orelse return 0;
-        var removed: usize = 0;
+        // Drain quiche's retired-SCID queue WITHOUT reading the out-pointer:
+        // `quiche_conn_retired_scid_next` (quiche 0.28.0) has the same
+        // use-after-free as the connection-id iterator — the ConnectionId it
+        // points into is dropped before the call returns. The retired cid
+        // stays in our registry (and the shared route table) until connection
+        // teardown unregisters everything: dead weight, not a hazard — the
+        // peer stopped using it, and quiche drops stray packets for it.
         var cid_ptr: [*c]const u8 = null;
         var cid_len: usize = 0;
-        while (quiche.quiche_conn_retired_scid_next(conn, &cid_ptr, &cid_len)) {
-            if (cid_ptr == null or cid_len != local_cid_len) continue;
-            if (self.unregisterCid(cid_ptr[0..cid_len])) removed += 1;
-        }
-        return removed;
+        while (quiche.quiche_conn_retired_scid_next(conn, &cid_ptr, &cid_len)) {}
+        return 0;
     }
 
     fn drainPathEvents(self: *ConnectionActor) usize {
