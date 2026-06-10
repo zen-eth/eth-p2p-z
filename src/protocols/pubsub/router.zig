@@ -760,6 +760,17 @@ pub fn Router(comptime Transport: type) type {
             /// post peer_disconnected. Set in the initializer below so it is
             /// valid before the writer fiber spawns.
             router_for_disconnect: *Self,
+            /// Set (release) by the writer fiber when it gives up (open
+            /// exhaustion) — the LOSSLESS disconnect signal. The writer's inbox
+            /// post is only a best-effort wake and is dropped when the inbox is
+            /// full, because the router JOINS the writer in teardownPeer: a
+            /// writer parked on the router's own full inbox would deadlock the
+            /// whole router (it would await a fiber that waits for the router
+            /// to drain the queue it is parked on). The heartbeat sweeps this
+            /// flag and tears down flagged peers, so a dropped post only delays
+            /// the teardown by up to one heartbeat. Atomic: written on the
+            /// writer fiber, read on the router fiber.
+            writer_dead: std.atomic.Value(bool) = .init(false),
         };
 
         /// Posts inbound RPCs to the router's single Command inbox by wrapping
@@ -1714,8 +1725,14 @@ pub fn Router(comptime Transport: type) type {
 
         fn mainLoop(router: *Self) void {
             // On any exit (shutdown, closed inbox, cancellation) tear down every
-            // peer and drain the inbox so nothing leaks.
+            // peer and drain the inbox so nothing leaks. Close the inbox FIRST:
+            // close wakes every producer parked on a full queue with
+            // error.Closed — including a writer's disconnect post — BEFORE
+            // teardownAllPeers joins those writer fibers. The reverse order
+            // would await a fiber parked on a queue that only this (now
+            // tearing-down) fiber drains. drainInbox's own close is idempotent.
             defer {
+                router.inbox.close(router.io);
                 router.teardownAllPeers();
                 router.drainInbox();
             }
@@ -2061,6 +2078,24 @@ pub fn Router(comptime Transport: type) type {
         fn onHeartbeat(router: *Self) void {
             router.heartbeat_tick += 1;
             const tick = router.heartbeat_tick;
+
+            // Reap peers whose writer fiber died (open exhaustion) but whose
+            // non-blocking disconnect post was dropped on a full inbox: the
+            // atomic `writer_dead` flag is the lossless fallback signal (see
+            // onWriterDisconnect). Teardown mutates the map, so restart the
+            // iteration after each removal — flagged peers are rare (k is
+            // almost always 0), so this stays one O(peers) scan per heartbeat.
+            reap: while (true) {
+                var it = router.peers.valueIterator();
+                while (it.next()) |state_ptr| {
+                    const state = state_ptr.*;
+                    if (state.writer_dead.load(.acquire)) {
+                        router.onPeerDisconnected(state.peer);
+                        continue :reap;
+                    }
+                }
+                break;
+            }
 
             // Ensure direct peers are connected (go-libp2p `directConnect`): every
             // `direct_connect_ticks` heartbeats, (re)dial any direct peer that is
@@ -3813,14 +3848,25 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// PeerWriter on_disconnect callback. The writer exhausted its open
-        /// retries, so hand the peer back to the router by posting
-        /// `peer_disconnected`. Runs on the writer fiber, so it must only post —
-        /// never free the state/sink (the writer's trailing `sink.close` still
-        /// fires after this returns).
+        /// retries, so hand the peer back to the router. Runs on the WRITER
+        /// fiber, so it must only signal — never free the state/sink (the
+        /// writer's trailing `sink.close` still fires after this returns), and
+        /// it MUST NOT block: the router cancel+awaits this fiber in
+        /// teardownPeer, so parking (uncancelably) on the router's own full
+        /// inbox would wedge the router forever — it would join a fiber that
+        /// waits for the router to drain the very queue it is parked on. The
+        /// atomic flag is the lossless signal (swept by the heartbeat); the
+        /// non-blocking post (`min = 0` never parks) is just a prompt wake for
+        /// the common, non-full case.
         fn onWriterDisconnect(ctx: ?*anyopaque) void {
             const state: *PeerState = @ptrCast(@alignCast(ctx.?));
             const router = state.router_for_disconnect;
-            router.inbox.putOneUncancelable(router.io, .{ .peer_disconnected = .{ .peer = state.peer } }) catch {};
+            state.writer_dead.store(true, .release);
+            _ = router.inbox.putUncancelable(
+                router.io,
+                &.{.{ .peer_disconnected = .{ .peer = state.peer } }},
+                0,
+            ) catch 0;
         }
     };
 }
@@ -4182,6 +4228,70 @@ test "router tears the peer down when the writer exhausts open retries" {
     // The give-up freed the popped frame and the router freed the sink/state; no
     // leak. The writer never opened a stream.
     try std.testing.expectEqual(@as(usize, 0), conn.record.streams_opened);
+}
+
+test "writer give-up with a FULL inbox neither parks the writer nor wedges teardown" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Deadlock regression: the writer's disconnect signal used to be a BLOCKING
+    // uncancelable inbox post. With the inbox full, the writer parked forever
+    // (uncancelable puts ignore cancel), and any teardown joining the writer —
+    // teardownPeer / teardownAllPeers, both on the router fiber, the inbox's
+    // only consumer — wedged the router permanently: it awaited a fiber that
+    // was waiting for the router to drain the very queue it was parked on.
+    // Post-fix the writer signals via the atomic `writer_dead` flag plus a
+    // non-blocking post, and the heartbeat reaps flagged peers.
+    //
+    // start() is never called: with no main loop draining, the test fiber
+    // stands in for the router fiber and the inbox stays deterministically FULL.
+    const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null, 0, null, null, .{});
+    const peer = try PeerId.random();
+    const conn = try makeFakeConn(allocator);
+    defer destroyFakeConn(allocator, conn);
+    defer {
+        // Orderly cleanup without a main loop: close the (full) inbox so
+        // destroy's own shutdown post returns Closed instead of parking; with
+        // main_future null, destroy then tears down directly and drains.
+        router.inbox.close(io);
+        router.destroy();
+    }
+
+    // Connect a peer directly on this fiber (it is "the router fiber" here);
+    // the writer fiber spawns with every stream open failing.
+    router.onPeerConnected(peer, conn, dummy_addr);
+    try std.testing.expectEqual(@as(usize, 1), router.peerCount());
+    const state = router.peers.get(peerKey(&peer)).?;
+
+    // Fill the inbox to capacity with inert commands (drainInbox frees nothing
+    // for .heartbeat), so the writer's disconnect post will find it full.
+    while (true) {
+        const n = try router.inbox.putUncancelable(io, &.{.heartbeat}, 0);
+        if (n == 0) break;
+    }
+
+    // Trigger the writer's lazy stream open by pushing a frame straight onto
+    // its queue (the inbox is full, so the enqueue_for_test path is unusable).
+    // Every open fails -> the writer exhausts its retries -> fires
+    // onWriterDisconnect against the FULL inbox. Pre-fix it parks here forever
+    // and the await below hangs the test; post-fix it flags writer_dead and
+    // exits.
+    try state.queue.push(io, .data, try testDataFrame(allocator));
+
+    var waited_ms: u64 = 0;
+    while (waited_ms < 5000) : (waited_ms += 5) {
+        if (state.writer_dead.load(.acquire)) break;
+        io_time.ms(5).sleep(io) catch {};
+    }
+    try std.testing.expect(state.writer_dead.load(.acquire));
+
+    // The heartbeat reap is the lossless fallback for the dropped post: it must
+    // tear the flagged peer down (joining the now-exited writer without
+    // wedging).
+    router.onHeartbeat();
+    try std.testing.expectEqual(@as(usize, 0), router.peerCount());
 }
 
 test "router frees an inbound RPC (peer tracked and peer absent)" {
