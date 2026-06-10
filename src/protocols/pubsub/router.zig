@@ -123,6 +123,20 @@ pub const RouterConfig = struct {
     /// originated message uses the mesh (if we subscribe) or a fanout set (if we
     /// do not), exactly as a relay would.
     flood_publish: bool = true,
+    /// Local-delivery decoupling (go's Subscription model). > 0 (the default):
+    /// accepted messages are COPIED into a bounded delivery queue drained by a
+    /// dedicated delivery fiber, which invokes `MessageHandler.on_message` OFF
+    /// the router fiber — a slow or blocking handler can then never stall mesh
+    /// maintenance or message processing, and a handler that (re)publishes is
+    /// safe: it blocks at worst the delivery fiber, whose inbox post the router
+    /// keeps draining (no self-deadlock cycle). A FULL queue drops the new
+    /// message for the local subscriber, exactly like go's bounded subscriber
+    /// channel (forwarding is unaffected; `delivery_drops` counts them).
+    /// 0 = the historic INLINE mode: zero-copy, on the router fiber — the
+    /// handler must be cheap and MUST NOT call publish/subscribe/unsubscribe
+    /// synchronously (those post blocking into the inbox only the router fiber
+    /// drains; a full inbox under flood deadlocks the router on itself).
+    delivery_queue_len: usize = 256,
     /// Size threshold (bytes of message data) at or above which accepting a NEW
     /// received message broadcasts an IDONTWANT for it to our v1.2 mesh peers on
     /// the topic — telling them "I already have this large message, don't send it
@@ -239,6 +253,14 @@ pub const MeshDegree = struct {
 /// while it executes.
 pub const MessageHandler = struct {
     ctx: *anyopaque,
+    /// Invoked once per locally-delivered message. Execution context depends on
+    /// `RouterConfig.delivery_queue_len`: by DEFAULT (> 0) it runs on the
+    /// router's single DELIVERY fiber — calls are serialized with each other
+    /// but run CONCURRENTLY with the router fiber, so the handler may safely
+    /// block or call publish/subscribe; in INLINE mode (0) it runs on the
+    /// router fiber itself and must be cheap and must not post router commands
+    /// (see the config field). The slices are valid only for the call; copy to
+    /// retain.
     on_message: *const fn (ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void,
 };
 
@@ -314,6 +336,20 @@ pub const MessageValidator = struct {
 /// one reference on a SHARED interned id (the same id in a peer's `dont_send` or
 /// `iwant_promises` is one allocation); the sweep `release`s an expired entry's
 /// reference and `deinit` releases them all — no per-id `free` here.
+/// One unit of work for the delivery fiber: either a delivered message
+/// (topic ++ from ++ data packed into one owned allocation, split by the
+/// recorded lengths) or a sync fence the fiber sets once every delivery queued
+/// before it has been invoked (this is what keeps `sync`'s "everything prior
+/// has fully happened" test contract intact in queued-delivery mode).
+const Delivery = union(enum) {
+    message: struct {
+        bytes: []u8,
+        topic_len: usize,
+        from_len: usize,
+    },
+    fence: *std.Io.Event,
+};
+
 const SeenCache = struct {
     /// The router-shared intern table. `add` interns (retains) an id; the sweep
     /// and `deinit` release. The id bytes are freed only when the LAST holder
@@ -1078,6 +1114,16 @@ pub fn Router(comptime Transport: type) type {
         /// drain guarantees no fiber is mid-post when the drain frees pending
         /// contexts. Empty (no resources) when `validation_concurrency == 0`.
         validation_group: std.Io.Group = .init,
+        /// Bounded local-delivery queue (see RouterConfig.delivery_queue_len).
+        /// Zero-length storage = inline mode (the queue is never used). The
+        /// router fiber is the only producer; the delivery fiber the only
+        /// consumer.
+        delivery_storage: []Delivery,
+        delivery_queue: std.Io.Queue(Delivery),
+        delivery_future: ?std.Io.Future(void) = null,
+        /// Messages dropped because the delivery queue was full (the local
+        /// subscriber lagged) or the copy failed. Router-fiber-only writes.
+        delivery_drops: u64 = 0,
         /// When true (go-libp2p default), a message the local node ORIGINATES is
         /// flooded to every topic subscriber above the publish threshold rather
         /// than only its mesh/fanout. Relayed messages are unaffected (always
@@ -1135,6 +1181,8 @@ pub fn Router(comptime Transport: type) type {
             errdefer allocator.free(inbox_storage);
             const control_storage = try allocator.alloc(Command, control_inbox_capacity);
             errdefer allocator.free(control_storage);
+            const delivery_storage = try allocator.alloc(Delivery, config.delivery_queue_len);
+            errdefer allocator.free(delivery_storage);
 
             // Resolve the policy: an explicit one is used as-is; a null one is
             // inferred from the key (strict_sign with a key, none without) to keep
@@ -1176,6 +1224,8 @@ pub fn Router(comptime Transport: type) type {
                 .inbox_storage = inbox_storage,
                 .inbox = std.Io.Queue(Command).init(inbox_storage),
                 .control_storage = control_storage,
+                .delivery_storage = delivery_storage,
+                .delivery_queue = std.Io.Queue(Delivery).init(delivery_storage),
                 .control_inbox = std.Io.Queue(Command).init(control_storage),
                 .peers = std.AutoHashMap(PeerKey, *PeerState).init(allocator),
                 .peer_versions = std.AutoHashMap(PeerKey, pubsub.Version).init(allocator),
@@ -1257,6 +1307,9 @@ pub fn Router(comptime Transport: type) type {
         /// `start`, so no connect can race this — making the `peers` read here safe
         /// from the caller fiber. Each dial is fire-and-forget.
         pub fn start(router: *Self) std.Io.ConcurrentError!void {
+            if (router.delivery_storage.len > 0) {
+                router.delivery_future = try std.Io.concurrent(router.io, deliveryLoop, .{router});
+            }
             router.main_future = try std.Io.concurrent(router.io, mainLoop, .{router});
             if (router.heartbeat_interval_ms > 0) {
                 router.heartbeat_future = try std.Io.concurrent(router.io, heartbeatLoop, .{router});
@@ -1274,6 +1327,50 @@ pub fn Router(comptime Transport: type) type {
                 io_time.ms(router.heartbeat_interval_ms).sleep(router.io) catch break;
                 router.control_inbox.putOneUncancelable(router.io, .heartbeat) catch break;
                 router.notifyControl();
+            }
+        }
+
+        /// Delivery fiber body: invoke the application handler for each queued
+        /// message, OFF the router fiber. Single consumer; calls are serialized.
+        /// Parks UNCANCELABLY on the queue — `destroy` closes the queue before
+        /// joining (close-then-join), so the park always wakes; the close also
+        /// flushes: `getUncancelable` keeps returning queued items until the
+        /// closed queue is empty, so nothing is stranded.
+        fn deliveryLoop(router: *Self) void {
+            var buf: [1]Delivery = undefined;
+            while (true) {
+                const n = router.delivery_queue.getUncancelable(router.io, &buf, 1) catch return;
+                if (n == 0) return;
+                router.runDelivery(buf[0]);
+            }
+        }
+
+        fn runDelivery(router: *Self, item: Delivery) void {
+            switch (item) {
+                .message => |m| {
+                    defer router.allocator.free(m.bytes);
+                    const h = router.message_handler orelse return;
+                    const topic = m.bytes[0..m.topic_len];
+                    const from = m.bytes[m.topic_len .. m.topic_len + m.from_len];
+                    const data = m.bytes[m.topic_len + m.from_len ..];
+                    h.on_message(h.ctx, topic, from, data);
+                },
+                .fence => |reply| reply.set(router.io),
+            }
+        }
+
+        /// Teardown backstop: free anything still queued if the delivery fiber
+        /// was never spawned (a created-but-never-started router) or already
+        /// gone. Fences are SET, not dropped, so no syncing fiber hangs.
+        fn drainDeliveries(router: *Self) void {
+            var buf: [1]Delivery = undefined;
+            while (true) {
+                const n = router.delivery_queue.getUncancelable(router.io, &buf, 0) catch return;
+                if (n == 0) return;
+                switch (buf[0]) {
+                    .message => |m| router.allocator.free(m.bytes),
+                    .fence => |reply| reply.set(router.io),
+                }
             }
         }
 
@@ -1335,6 +1432,18 @@ pub fn Router(comptime Transport: type) type {
             // (the inline default, or an async router that was never flooded).
             router.validation_group.cancel(router.io);
 
+            // Retire the delivery fiber AFTER the main loop and the validation
+            // group: only the (now-exited) router fiber produced deliveries, so
+            // closing the queue here is final. The fiber drains every queued
+            // item (freeing payloads, setting fences) and exits on Closed; the
+            // close-then-join order is what makes its uncancelable park safe.
+            router.delivery_queue.close(router.io);
+            if (router.delivery_future) |*future| {
+                future.await(router.io);
+                router.delivery_future = null;
+            }
+            router.drainDeliveries();
+
             router.peers.deinit();
             router.peer_versions.deinit();
             // Free any pre-connect subscription stashes no `peer_connected` drained
@@ -1373,6 +1482,7 @@ pub fn Router(comptime Transport: type) type {
             router.score_snapshot.deinit(router.allocator);
             router.allocator.free(router.inbox_storage);
             router.allocator.free(router.control_storage);
+            router.allocator.free(router.delivery_storage);
             router.allocator.destroy(router);
         }
 
@@ -1925,7 +2035,7 @@ pub fn Router(comptime Transport: type) type {
                 .unsubscribe => |u| router.onUnsubscribe(u.topic),
                 .publish => |p| router.onPublish(p.topic, p.data),
                 .enqueue_for_test => |e| router.onEnqueueForTest(e.peer, e.frame, e.reply),
-                .sync => |s| s.reply.set(router.io),
+                .sync => |s| router.fenceSync(s.reply),
                 .validation_result => |r| router.onValidationResult(r.ctx, r.verdict),
                 .reap_dead_writers => router.reapDeadWriters(),
                 .heartbeat => router.onHeartbeat(),
@@ -1940,6 +2050,20 @@ pub fn Router(comptime Transport: type) type {
         /// (`min = 0`): a FULL data inbox means the consumer is awake and will
         /// drain control at its next loop top, so dropping the marker is safe —
         /// the marker is ONLY a waker, never a carrier.
+        /// Resolve a `sync` barrier. In queued-delivery mode the reply is
+        /// ROUTED THROUGH the delivery queue as a fence, so "sync returned"
+        /// keeps meaning "every prior command AND every delivery it produced
+        /// has fully happened" — the contract the test suite is built on. The
+        /// put is cancelable: at teardown-cancel (or a closed queue) nothing
+        /// is pending for the syncing fiber to observe, so set directly.
+        fn fenceSync(router: *Self, reply: *std.Io.Event) void {
+            if (router.delivery_storage.len == 0) {
+                reply.set(router.io);
+                return;
+            }
+            router.delivery_queue.putOne(router.io, .{ .fence = reply }) catch reply.set(router.io);
+        }
+
         pub fn notifyControl(router: *Self) void {
             _ = router.inbox.putUncancelable(router.io, &.{.control_ready}, 0) catch 0;
         }
@@ -3702,7 +3826,31 @@ pub fn Router(comptime Transport: type) type {
         /// The slices are valid only for the call (the handler copies to retain).
         fn deliverLocal(router: *Self, topic: []const u8, from: []const u8, data: []const u8) void {
             if (!router.my_topics.contains(topic)) return;
-            if (router.message_handler) |h| h.on_message(h.ctx, topic, from, data);
+            const h = router.message_handler orelse return;
+            if (router.delivery_storage.len == 0) {
+                // Inline mode (opt-in): zero-copy, ON the router fiber. The
+                // handler must be cheap and must not post router commands (see
+                // RouterConfig.delivery_queue_len).
+                h.on_message(h.ctx, topic, from, data);
+                return;
+            }
+            // Queued mode: copy topic++from++data into one allocation and hand
+            // it to the delivery fiber. Non-blocking put — a full queue means
+            // the local subscriber lagged; drop the message for it (go's
+            // bounded subscriber-channel semantics; forwarding is unaffected).
+            const bytes = router.allocator.alloc(u8, topic.len + from.len + data.len) catch {
+                router.delivery_drops += 1;
+                return;
+            };
+            @memcpy(bytes[0..topic.len], topic);
+            @memcpy(bytes[topic.len .. topic.len + from.len], from);
+            @memcpy(bytes[topic.len + from.len ..], data);
+            const item = Delivery{ .message = .{ .bytes = bytes, .topic_len = topic.len, .from_len = from.len } };
+            const queued = router.delivery_queue.putUncancelable(router.io, &.{item}, 0) catch 0;
+            if (queued == 0) {
+                router.allocator.free(bytes);
+                router.delivery_drops += 1;
+            }
         }
 
         /// Broadcast an IDONTWANT(`id`) on the control lane to every member of
@@ -5571,9 +5719,10 @@ test "publish to a subscribed topic forwards over the mesh and delivers locally"
     try std.testing.expect(router.meshContains("t", peer_a));
 
     // Publish locally: A gets the forwarded frame and our handler fires. The local
-    // delivery (onMessage) runs synchronously on the router fiber inside onPublish,
-    // so a sync guarantees rec.* is written before the test reads it. The forwarded
-    // frame to A is flushed asynchronously by A's writer, so poll the record.
+    // delivery (onMessage) runs on the delivery fiber, but `sync` fences THROUGH
+    // the delivery queue, so it still guarantees rec.* is written before the test
+    // reads it. The forwarded frame to A is flushed asynchronously by A's writer,
+    // so poll the record.
     try router.inbox.putOne(io, .{ .publish = .{
         .topic = try allocator.dupe(u8, "t"),
         .data = try allocator.dupe(u8, "hello"),
@@ -5884,6 +6033,68 @@ test "a forwarded message's id is interned ONCE across mcache + seen; freed only
     router.seen.sweep(router.heartbeat_tick +| mesh_params.seen_ttl_ticks +| 1);
     try std.testing.expectEqual(@as(usize, 0), internCount(router));
     try std.testing.expectEqual(@as(usize, 0), internRefs(router, id.bytes));
+}
+
+test "queued delivery: a handler that re-publishes synchronously completes (H1)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The eth2-natural pattern H1 flagged as a self-deadlock: receive ->
+    // process -> (re)publish SYNCHRONOUSLY from the message handler. In
+    // queued-delivery mode (the default) the handler runs on the delivery
+    // fiber, so its blocking inbox post is drained by the running router
+    // fiber — no cycle. (In inline mode the same handler would post into the
+    // queue only its own fiber drains and deadlock exactly under flood.)
+    const Republisher = struct {
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        router: *FakeRouter,
+        delivered: std.atomic.Value(usize) = .init(0),
+        republished: std.atomic.Value(bool) = .init(false),
+
+        fn handler(self: *@This()) MessageHandler {
+            return .{ .ctx = self, .on_message = onMessage };
+        }
+
+        fn onMessage(ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void {
+            _ = from;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.delivered.fetchAdd(1, .acq_rel);
+            if (std.mem.eql(u8, data, "ping") and !self.republished.swap(true, .acq_rel)) {
+                const t = self.allocator.dupe(u8, topic) catch return;
+                const d = self.allocator.dupe(u8, "pong") catch {
+                    self.allocator.free(t);
+                    return;
+                };
+                self.router.inbox.putOne(self.io, .{ .publish = .{ .topic = t, .data = d } }) catch {
+                    self.allocator.free(t);
+                    self.allocator.free(d);
+                };
+            }
+        }
+    };
+
+    var rep = Republisher{ .allocator = allocator, .io = io, .router = undefined };
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, rep.handler(), 0, null, null, .{});
+    rep.router = router;
+    try router.start();
+    defer router.destroy();
+    try subscribeAndWait(io, allocator, router, "t");
+
+    try router.inbox.putOne(io, .{ .publish = .{
+        .topic = try allocator.dupe(u8, "t"),
+        .data = try allocator.dupe(u8, "ping"),
+    } });
+    // First sync: fence1 is queued after the ping delivery, and the handler
+    // posts its re-publish BEFORE the fence is reached, so when this returns
+    // the pong publish is already in the inbox ahead of the next sync.
+    try sync(router, io);
+    // Second sync: fences the pong's own delivery.
+    try sync(router, io);
+    try std.testing.expectEqual(@as(usize, 2), rep.delivered.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), router.delivery_drops);
 }
 
 // --- mesh: GRAFT / PRUNE / backoff / heartbeat fake tests ------------------

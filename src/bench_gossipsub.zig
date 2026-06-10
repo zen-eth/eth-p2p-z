@@ -337,10 +337,14 @@ fn runScenario(
     const transport = BenchTransport{ .counters = &counters };
 
     const local_peer = try PeerId.random();
+    // Inline local delivery: the bench handler is one atomic increment, and
+    // the bench's job is to measure the ROUTER pipeline — queued delivery
+    // (the production default) would fold delivery-fiber scheduling and
+    // full-queue local drops into the delivered-throughput metric.
     const cfg: router_mod.RouterConfig = if (sc.host_key == null)
-        .{ .signature_policy = .anonymous, .validation_concurrency = sc.validation_concurrency }
+        .{ .signature_policy = .anonymous, .validation_concurrency = sc.validation_concurrency, .delivery_queue_len = 0 }
     else
-        .{ .validation_concurrency = sc.validation_concurrency };
+        .{ .validation_concurrency = sc.validation_concurrency, .delivery_queue_len = 0 };
     const score_cfg: ?router_mod.ScoreConfig = if (sc.scoring) benchScoringConfig() else null;
     const r = try BenchRouter.create(allocator, io, transport, local_peer, deliveries.handler(), 0, sc.host_key, score_cfg, cfg);
     var destroyed = false;
@@ -464,7 +468,7 @@ fn runHeartbeatScenario(counting: *CountingAllocator, io: std.Io) !void {
     var deliveries = DeliveryCounter{};
     const transport = BenchTransport{ .counters = &counters };
     const local_peer = try PeerId.random();
-    const r = try BenchRouter.create(allocator, io, transport, local_peer, deliveries.handler(), 0, null, null, .{ .signature_policy = .anonymous });
+    const r = try BenchRouter.create(allocator, io, transport, local_peer, deliveries.handler(), 0, null, null, .{ .signature_policy = .anonymous, .delivery_queue_len = 0 });
     defer r.destroy();
     try r.start();
     {
@@ -519,7 +523,7 @@ fn runGossipEmitScenario(counting: *CountingAllocator, io: std.Io) !void {
     var deliveries = DeliveryCounter{};
     const transport = BenchTransport{ .counters = &counters };
     const local_peer = try PeerId.random();
-    const r = try BenchRouter.create(allocator, io, transport, local_peer, deliveries.handler(), 0, null, null, .{ .signature_policy = .anonymous });
+    const r = try BenchRouter.create(allocator, io, transport, local_peer, deliveries.handler(), 0, null, null, .{ .signature_policy = .anonymous, .delivery_queue_len = 0 });
     defer r.destroy();
     try r.start();
     {
