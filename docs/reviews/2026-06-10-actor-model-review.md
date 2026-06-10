@@ -385,8 +385,8 @@ architecture — no rewrite):
 | # | Item | Size | Status |
 |---|---|---|---|
 | 0 | 50k-pps router microbench + 5k msgs/s gossipsub soak, per-stage counters | S | open |
-| 1 | C1 writer-teardown deadlock; C2 seqno seed; C3 connection-identity lifecycle | S (C2 is one line) | open |
-| 2 | P1 check-seen-before-verify; verify in validation workers; throttle-drop at cap | S–M | open |
+| 1 | C1 writer-teardown deadlock; C2 seqno seed; C3 connection-identity lifecycle | S (C2 is one line) | **done** (`ff993a9`, `b54027b`, `962a009` + ABA follow-up `9839fec`) |
+| 2 | P1 check-seen-before-verify; verify in validation workers; throttle-drop at cap | S–M | **done** (`68f159e`; promise fulfilment follows go's tracer carve-out — fulfilled on duplicate/throttle/post-signature verdicts, never on a signature reject) |
 | 3 | P2 sendmmsg + GSO in zio + flushScheduled | M | open |
 | 4 | P3 persistent recv fiber + sharded CID map + slab ring | M | open |
 | 5 | P4 expiry wheel + global promise map; P6 shared IHAVE encode + control coalescing | S–M | open |
