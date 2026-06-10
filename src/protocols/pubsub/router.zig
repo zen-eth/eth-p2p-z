@@ -890,8 +890,12 @@ pub fn Router(comptime Transport: type) type {
         /// heartbeat (`shift`).
         message_cache: mcache.MessageCache,
         /// Monotonic sequence number for messages WE originate; encoded big-endian
-        /// into Message.seqno so (from, seqno) is a unique message id.
-        seqno: u64 = 0,
+        /// into Message.seqno so (from, seqno) is a unique message id. Seeded at
+        /// create with wall-clock nanoseconds (`initialSeqno`), NOT 0: peers
+        /// remember message ids for the seen TTL, so a counter restarting at 0
+        /// would make every publish after a process restart reuse an already-seen
+        /// id and be silently dropped network-wide until the TTL expires.
+        seqno: u64,
         /// Our own peer id, used as Message.from on publish (under strict_sign /
         /// none; under anonymous publish omits `from` entirely).
         local_peer: PeerId,
@@ -1066,6 +1070,7 @@ pub fn Router(comptime Transport: type) type {
                 },
                 .score = score_engine,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
+                .seqno = initialSeqno(io),
             };
 
             // `seen` and `message_cache` share the router's intern table (now
@@ -1089,6 +1094,19 @@ pub fn Router(comptime Transport: type) type {
                 };
             }
             return router;
+        }
+
+        /// Seed for the publish seqno: wall-clock nanoseconds since the Unix
+        /// epoch (go-libp2p parity). Under strict_sign/none the message-id is
+        /// `from ++ seqno` and peers hold ids for the seen TTL, so a counter
+        /// restarting at 0 would self-censor every publish for up to the TTL
+        /// after a process restart. Wall time is unique AND increasing across
+        /// restarts (a random seed would only be unique). Falls back to 0 only
+        /// if the platform reports a pre-epoch wall clock.
+        fn initialSeqno(io: std.Io) u64 {
+            const wall_ns: i96 = std.Io.Clock.real.now(io).toNanoseconds();
+            if (wall_ns <= 0) return 0;
+            return @intCast(@min(wall_ns, @as(i96, std.math.maxInt(u64))));
         }
 
         /// Spawn the main fiber (and, when the heartbeat interval is non-zero, the
@@ -6390,16 +6408,21 @@ test "inbound IWANT: a cached id is served as the full publish; an unknown id is
     defer destroyFakeConn(allocator, conn_p);
     defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
-    // Our local publish uses (local_peer, seqno 0) as its id.
+    // Our local publish uses (local_peer, <the wall-clock-seeded initial seqno>)
+    // as its id. The counter is seeded at create and only the router fiber
+    // advances it, so reading it after the sync barrier (one publish processed)
+    // gives initial = current - 1.
     try router.inbox.putOne(io, .{ .publish = .{
         .topic = try allocator.dupe(u8, "t"),
         .data = try allocator.dupe(u8, "served-data"),
     } });
     const from = local_test_peer.bytes[0..local_test_peer.len];
-    var id = try rpc.messageId(allocator, from, "\x00\x00\x00\x00\x00\x00\x00\x00");
-    defer id.deinit(allocator);
     // Sync so the local publish is fully processed (cached), then read the cache.
     try sync(router, io);
+    var seqno_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seqno_buf, router.seqno - 1, .big);
+    var id = try rpc.messageId(allocator, from, &seqno_buf);
+    defer id.deinit(allocator);
     try std.testing.expect(router.message_cache.get(id.bytes) != null);
     var waited: u64 = 0;
 
@@ -6606,15 +6629,19 @@ test "gossip retransmission: same id served at most gossip_retransmission times 
     defer destroyFakeConn(allocator, conn_p);
     defer router.destroy(); // joins writers before records free; see destroyFakeConn
 
-    // Cache a message (local publish) so its id is serveable by IWANT.
+    // Cache a message (local publish) so its id is serveable by IWANT. The id
+    // uses the wall-clock-seeded seqno: read it back after the sync barrier
+    // (one publish processed → initial = current - 1).
     try router.inbox.putOne(io, .{ .publish = .{
         .topic = try allocator.dupe(u8, "t"),
         .data = try allocator.dupe(u8, "served-data"),
     } });
     const from = local_test_peer.bytes[0..local_test_peer.len];
-    var id = try rpc.messageId(allocator, from, "\x00\x00\x00\x00\x00\x00\x00\x00");
-    defer id.deinit(allocator);
     try sync(router, io);
+    var seqno_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seqno_buf, router.seqno - 1, .big);
+    var id = try rpc.messageId(allocator, from, &seqno_buf);
+    defer id.deinit(allocator);
     try std.testing.expect(router.message_cache.get(id.bytes) != null);
 
     // P IWANTs the same id 4 times (gossip_retransmission is 3). Each IWANT is a
@@ -7282,6 +7309,31 @@ fn recordHasAnonymousPublish(io: std.Io, record: *FakeRecord, topic: []const u8,
     return false;
 }
 
+test "seqno is seeded with wall-clock time, not 0 (restart must not reuse seen ids)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A "restarted" node is just a second router created later: its seed must
+    // be strictly ahead of the first's so no (from, seqno) id is ever reused
+    // while peers still hold the old ids in their seen caches. A counter that
+    // restarts at 0 fails exactly this.
+    const a = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    const seed_a = a.seqno;
+    a.destroy();
+    try std.testing.expect(seed_a != 0);
+
+    // Wall clocks tick in ns; even back-to-back creates are >0ns apart, but
+    // sleep a moment to make the strict ordering robust on coarse clocks.
+    io_time.ms(2).sleep(io) catch {};
+
+    const b = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    const seed_b = b.seqno;
+    b.destroy();
+    try std.testing.expect(seed_b > seed_a);
+}
+
 test "anonymous publish omits identity fields and uses a content-based id" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
@@ -7290,6 +7342,9 @@ test "anonymous publish omits identity fields and uses a content-based id" {
 
     // Anonymous policy, no host key. local_test_peer is ignored on the wire.
     const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{ .signature_policy = .anonymous });
+    // The create-time (wall-clock-seeded) counter value; read before start()
+    // spawns the router fiber, so the read cannot race.
+    const seqno0 = router.seqno;
     try router.start();
 
     // A peer subscribed to "t" so the flood-publish has a target to forward to.
@@ -7318,8 +7373,9 @@ test "anonymous publish omits identity fields and uses a content-based id" {
     var id = try rpc.contentMessageId(allocator, "t", "anon");
     defer id.deinit(allocator);
     try std.testing.expect(router.message_cache.get(id.bytes) != null);
-    // The seqno counter was never advanced (anonymous publishes do not use one).
-    try std.testing.expectEqual(@as(u64, 0), router.seqno);
+    // The seqno counter was never advanced past its create-time seed (anonymous
+    // publishes do not use one).
+    try std.testing.expectEqual(seqno0, router.seqno);
 }
 
 test "anonymous: two publishes of the same (topic,data) dedup on the content id" {
