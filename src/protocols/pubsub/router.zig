@@ -17,8 +17,11 @@
 //! pruning out above D_high). A received message is forwarded only to the
 //! topic's mesh members (minus the sender); a message published to a topic we do
 //! NOT subscribe to goes to a transient `fanout` peer set instead. GRAFT/PRUNE
-//! drive mesh membership; IHAVE/IWANT/IDONTWANT (gossip + scoring) are later
-//! layers and stay parsed-but-ignored.
+//! drive mesh membership; the heartbeat also advertises cached message ids to
+//! a shuffled gossip fringe (IHAVE), serves and promises requested messages
+//! (IWANT, scored as broken promises when unmet), and v1.2 peers suppress
+//! duplicate sends with IDONTWANT — all fully implemented below, alongside
+//! v1.1 peer scoring and peer exchange.
 //!
 //! The Router is generic over a comptime `Transport` so its lifecycle logic can
 //! be unit-tested against an in-memory fake (no real QUIC), exactly how
@@ -745,6 +748,11 @@ pub fn Router(comptime Transport: type) type {
             heartbeat,
             /// Stop the router: tear down every peer, then exit the main fiber.
             shutdown,
+            /// Test-only commands live in the production enum deliberately: they
+            /// are inert without a poster (nothing in production builds one), and
+            /// comptime-splitting the union would churn every dispatch/drain
+            /// switch for zero runtime difference.
+            ///
             /// Test-only: enqueue a frame reference onto a tracked peer's outbound
             /// queue, on the router fiber (so the peer-map lookup is race-free).
             /// Used by router unit tests to make a peer's writer actually attempt
@@ -756,6 +764,19 @@ pub fn Router(comptime Transport: type) type {
                 peer: PeerId,
                 frame: *peer_io.OutboundFrame,
                 reply: *std.Io.Event,
+            },
+            /// Test-only: snapshot a peer's router-owned tracking state and a
+            /// topic's mesh size ON the router fiber. The `sync` barrier below is
+            /// not enough for LIVE integration tests — a live remote keeps
+            /// posting commands, so the router does not stay parked after the
+            /// barrier and an off-fiber read of the peer map races its
+            /// mutations; the probe does the read where every mutation runs.
+            /// `topic` is borrowed: the prober blocks on `reply`, so it outlives
+            /// the command.
+            probe_for_test: struct {
+                peer: PeerId,
+                topic: []const u8,
+                reply: *PeerProbe,
             },
             /// Test-only barrier: the handler does nothing but set `reply`. Because
             /// the inbox is FIFO and the router is single-consumer, when this reply
@@ -2003,6 +2024,36 @@ pub fn Router(comptime Transport: type) type {
             reply.waitUncancelable(router.io);
         }
 
+        /// Reply slot + result of `probeForTest` (see the `probe_for_test`
+        /// command). `version` is meaningful only when `tracked`.
+        pub const PeerProbe = struct {
+            event: std.Io.Event = .unset,
+            tracked: bool = false,
+            subscribed: bool = false,
+            version: pubsub.Version = .v1_1,
+            /// Whether the cert store holds a certified signed record for the
+            /// peer (what a PX offer for it would carry). Independent of
+            /// `tracked` — records outlive disconnects.
+            has_record: bool = false,
+            mesh_size: usize = 0,
+        };
+
+        /// Test-only: read `peer`'s tracking state (tracked / subscribed to
+        /// `topic` / negotiated version) and `topic`'s mesh size on the router
+        /// fiber, race-free against a LIVE router (see the command's doc for why
+        /// the `sync` barrier cannot give live tests this guarantee). A closed
+        /// inbox (teardown) yields the zero probe: not tracked, mesh 0.
+        pub fn probeForTest(router: *Self, peer: PeerId, topic: []const u8) PeerProbe {
+            var reply: PeerProbe = .{};
+            router.inbox.putOne(router.io, .{ .probe_for_test = .{
+                .peer = peer,
+                .topic = topic,
+                .reply = &reply,
+            } }) catch return reply;
+            reply.event.waitUncancelable(router.io);
+            return reply;
+        }
+
         // ----- main fiber --------------------------------------------------
 
         fn mainLoop(router: *Self) void {
@@ -2078,6 +2129,7 @@ pub fn Router(comptime Transport: type) type {
                 .unsubscribe => |u| router.onUnsubscribe(u.topic),
                 .publish => |p| router.onPublish(p.topic, p.data),
                 .enqueue_for_test => |e| router.onEnqueueForTest(e.peer, e.frame, e.reply),
+                .probe_for_test => |pr| router.onProbeForTest(pr.peer, pr.topic, pr.reply),
                 .sync => |s| router.fenceSync(s.reply),
                 .validation_result => |r| router.onValidationResult(r.ctx, r.verdict),
                 .reap_dead_writers => router.reapDeadWriters(),
@@ -2585,7 +2637,8 @@ pub fn Router(comptime Transport: type) type {
             router.maintainMeshes();
             router.maintainFanout();
 
-            // TEMP DEBUG: log mesh/subscription state per topic each heartbeat.
+            // GS_DEBUG diagnostic: per-topic peer/subscriber/mesh counts each
+            // heartbeat — the first thing to read when a live mesh misbehaves.
             if (router.gs_debug) {
                 var tit = router.my_topics.keyIterator();
                 while (tit.next()) |tk| {
@@ -4237,6 +4290,19 @@ pub fn Router(comptime Transport: type) type {
         /// running on the router fiber so the peer-map lookup never races the
         /// router's own mutations. Releases the reference if the peer is gone or
         /// the push fails. Always sets the reply event.
+        /// `probe_for_test` handler: every read below runs on the router fiber,
+        /// the sole writer of the peer map, the topic sets, and the meshes.
+        fn onProbeForTest(router: *Self, peer: PeerId, topic: []const u8, reply: *PeerProbe) void {
+            if (router.peers.get(peerKey(&peer))) |state| {
+                reply.tracked = true;
+                reply.subscribed = state.topics.contains(topic);
+                reply.version = state.protocol_version;
+            }
+            reply.has_record = router.getRecord(peer) != null;
+            reply.mesh_size = router.meshSize(topic);
+            reply.event.set(router.io);
+        }
+
         fn onEnqueueForTest(router: *Self, peer: PeerId, frame: *peer_io.OutboundFrame, reply: *std.Io.Event) void {
             if (router.peers.get(peerKey(&peer))) |state| {
                 state.queue.push(router.io, .data, frame) catch frame.release();
@@ -4376,8 +4442,9 @@ pub fn Router(comptime Transport: type) type {
                     e.frame.release();
                     e.reply.set(router.io);
                 },
-                // Wake a sync barrier in flight at shutdown so its awaiter
-                // does not hang.
+                // Wake a probe/sync in flight at shutdown so its awaiter does
+                // not hang (the probe reports the zero result: not tracked).
+                .probe_for_test => |pr| pr.reply.event.set(router.io),
                 .sync => |s| s.reply.set(router.io),
                 // An async validation that posted its result before the inbox
                 // closed but never got processed by the main loop: free its held

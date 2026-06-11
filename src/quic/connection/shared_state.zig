@@ -240,6 +240,15 @@ pub const SharedState = struct {
         self.waitset.notify(self.io, .{ .accepted_stream_pop = true });
     }
 
+    /// Wakes handle-side `acceptStream` waiters, which park on the waitset's
+    /// signal EPOCH — this notify's epoch bump is what unblocks them. The
+    /// named bit itself has no actor consumer, so a parked actor also wakes
+    /// once and no-ops; that is inherent to the shared signal (an epoch-only
+    /// notify would wake it just the same) and accepted: stream opens are
+    /// rare (one lane per peer per direction), and a dedicated accept signal
+    /// would require every close path to remember to bump it too — missing
+    /// one turns acceptStream into a permanent hang, a far worse trade than
+    /// a no-op actor tick per accepted stream.
     pub fn notifyAcceptedStreamPush(self: *SharedState) void {
         self.waitset.notify(self.io, .{ .accepted_stream_push = true });
     }

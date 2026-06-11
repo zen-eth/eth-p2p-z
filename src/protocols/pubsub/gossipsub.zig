@@ -883,17 +883,11 @@ test "two gossipsub nodes: subscribe propagates and a publish is delivered end t
 
     waited_ms = 0;
     while (waited_ms < 3000) : (waited_ms += 10) {
-        if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state| {
-            if (state.topics.contains("t")) break;
-        }
+        if (client_gs.router.probeForTest(server_peer, "t").subscribed) break;
         io_time.ms(10).sleep(io) catch {};
     }
     {
-        const tracked = if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state|
-            state.topics.contains("t")
-        else
-            false;
-        try std.testing.expect(tracked);
+        try std.testing.expect(client_gs.router.probeForTest(server_peer, "t").subscribed);
     }
 
     // A publishes on "t"; B's handler must receive ("t", A's id, "hello").
@@ -918,16 +912,17 @@ test "two gossipsub nodes: subscribe propagates and a publish is delivered end t
     // poll for it to settle.
     waited_ms = 0;
     while (waited_ms < 3000) : (waited_ms += 10) {
-        const c = if (client_gs.router.peers.get(peerKeyOf(server_peer))) |st| st.protocol_version == .v1_2 else false;
-        const s = if (server_gs.router.peers.get(peerKeyOf(client_peer))) |st| st.protocol_version == .v1_2 else false;
-        if (c and s) break;
+        const c = client_gs.router.probeForTest(server_peer, "t");
+        const s = server_gs.router.probeForTest(client_peer, "t");
+        if (c.tracked and s.tracked and c.version == .v1_2 and s.version == .v1_2) break;
         io_time.ms(10).sleep(io) catch {};
     }
     {
-        const client_state = client_gs.router.peers.get(peerKeyOf(server_peer)) orelse return error.MissingPeer;
-        const server_state = server_gs.router.peers.get(peerKeyOf(client_peer)) orelse return error.MissingPeer;
-        try std.testing.expectEqual(pubsub.Version.v1_2, client_state.protocol_version);
-        try std.testing.expectEqual(pubsub.Version.v1_2, server_state.protocol_version);
+        const client_probe = client_gs.router.probeForTest(server_peer, "t");
+        const server_probe = server_gs.router.probeForTest(client_peer, "t");
+        if (!client_probe.tracked or !server_probe.tracked) return error.MissingPeer;
+        try std.testing.expectEqual(pubsub.Version.v1_2, client_probe.version);
+        try std.testing.expectEqual(pubsub.Version.v1_2, server_probe.version);
     }
 
     // Tear down in the gossipsub-required order: close connections first (so no
@@ -1028,9 +1023,7 @@ test "two gossipsub nodes: keep-alive holds an idle connection past max_idle_tim
     try server_gs.subscribe("t");
     waited_ms = 0;
     while (waited_ms < 3000) : (waited_ms += 10) {
-        if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state| {
-            if (state.topics.contains("t")) break;
-        }
+        if (client_gs.router.probeForTest(server_peer, "t").subscribed) break;
         io_time.ms(10).sleep(io) catch {};
     }
 
@@ -1149,9 +1142,7 @@ test "two gossipsub nodes: keep-alive clamps to a peer's shorter negotiated idle
     try server_gs.subscribe("t");
     waited_ms = 0;
     while (waited_ms < 3000) : (waited_ms += 10) {
-        if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state| {
-            if (state.topics.contains("t")) break;
-        }
+        if (client_gs.router.probeForTest(server_peer, "t").subscribed) break;
         io_time.ms(10).sleep(io) catch {};
     }
 
@@ -1265,17 +1256,11 @@ test "two gossipsub nodes: a publish larger than the stream outbound queue is de
 
     waited_ms = 0;
     while (waited_ms < 3000) : (waited_ms += 10) {
-        if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state| {
-            if (state.topics.contains("t")) break;
-        }
+        if (client_gs.router.probeForTest(server_peer, "t").subscribed) break;
         io_time.ms(10).sleep(io) catch {};
     }
     {
-        const tracked = if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state|
-            state.topics.contains("t")
-        else
-            false;
-        try std.testing.expect(tracked);
+        try std.testing.expect(client_gs.router.probeForTest(server_peer, "t").subscribed);
     }
 
     // A payload twice the default per-stream outbound queue (48 KiB), so the
@@ -1398,17 +1383,11 @@ test "two gossipsub nodes: pub/sub survives a drop+reconnect of the connection" 
         // before A's publish, or the publish has no subscriber to flood to.
         waited_ms = 0;
         while (waited_ms < 3000) : (waited_ms += 10) {
-            if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state| {
-                if (state.topics.contains("t")) break;
-            }
+            if (client_gs.router.probeForTest(server_peer, "t").subscribed) break;
             io_time.ms(10).sleep(io) catch {};
         }
         {
-            const tracked = if (client_gs.router.peers.get(peerKeyOf(server_peer))) |state|
-                state.topics.contains("t")
-            else
-                false;
-            try std.testing.expect(tracked);
+            try std.testing.expect(client_gs.router.probeForTest(server_peer, "t").subscribed);
         }
 
         // A publishes; B's handler must receive it. Republish on a short interval
@@ -1456,36 +1435,28 @@ test "two gossipsub nodes: pub/sub survives a drop+reconnect of the connection" 
     client_gs_live = false;
 }
 
-/// The Router's PeerKey for a PeerId (zero-padded bytes). Mirrors router.zig's
-/// private `peerKey`, reproduced here so this test can index the router's peer
-/// map directly to assert the subscription propagated.
-fn peerKeyOf(peer: PeerId) [64]u8 {
-    var key: [64]u8 = [_]u8{0} ** 64;
-    @memcpy(key[0..peer.len], peer.bytes[0..peer.len]);
-    return key;
-}
-
-/// Whether `router` currently tracks `peer` as a connected peer. The router
-/// fiber mutates `peers`; this read races it, so callers poll until it settles
-/// (a transient false is fine — the poll loop retries).
+/// Whether `router` currently tracks `peer` as a connected peer, read on the
+/// router fiber via the probe command (an off-fiber `peers` read would race
+/// the router's mutations).
 fn routerHasPeer(router: *Router, peer: PeerId) bool {
-    return router.peers.contains(peerKeyOf(peer));
+    return router.probeForTest(peer, "").tracked;
 }
 
 /// Whether `router` holds a certified signed peer record for `peer` (the bytes
-/// a peer-exchange offer for `peer` would carry). Reads the cert-store field
-/// directly — keyed like `peers` (zero-padded) — so the live test can confirm
-/// identify populated the store without widening the router's method surface.
+/// a peer-exchange offer for `peer` would carry), read on the router fiber via
+/// the probe command.
 fn routerHasRecord(router: *Router, peer: PeerId) bool {
-    return router.cert_store.contains(peerKeyOf(peer));
+    return router.probeForTest(peer, "").has_record;
 }
 
 /// The number of peers in `router`'s mesh for `topic` (0 when no mesh exists).
 /// Reads the `mesh` field directly so the test can watch the centre go
 /// over-degree without a public accessor.
 fn routerMeshSize(router: *Router, topic: []const u8) usize {
-    const set = router.mesh.getPtr(topic) orelse return 0;
-    return set.count();
+    // Probe with the node's own id (never tracked as a peer of itself): only
+    // the mesh_size field matters here, and the probe runs on the router fiber
+    // so the read cannot race live mesh mutations.
+    return router.probeForTest(router.local_peer, topic).mesh_size;
 }
 
 /// A live gossipsub node for the peer-exchange end-to-end test: a real
