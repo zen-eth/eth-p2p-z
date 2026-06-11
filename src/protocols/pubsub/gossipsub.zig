@@ -544,6 +544,13 @@ pub const Gossipsub = struct {
         return self.router.peerCount();
     }
 
+    /// One consistent snapshot of the router's production counters (message
+    /// pipeline outcomes, drop/saturation counters, peer/topic/seen sizes).
+    /// Blocks for one control-inbox round trip — meant for periodic scrapes.
+    pub fn stats(self: *Gossipsub) Router.Stats {
+        return self.router.stats();
+    }
+
     /// Subscribe the local node to `topic`. Dups the topic into an owned payload
     /// and posts a `subscribe` command; the router announces the subscription to
     /// every peer and begins delivering matching messages to the handler. On a

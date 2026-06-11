@@ -778,6 +778,12 @@ pub fn Router(comptime Transport: type) type {
                 topic: []const u8,
                 reply: *PeerProbe,
             },
+            /// Production observability: snapshot the router's counters ON the
+            /// router fiber (they are router-confined; the command serializes
+            /// the read with every writer). Posted on the CONTROL inbox so a
+            /// scrape is served ahead of any data backlog — saturation is
+            /// exactly when the numbers matter.
+            stats: struct { reply: *StatsReply },
             /// Test-only barrier: the handler does nothing but set `reply`. Because
             /// the inbox is FIFO and the router is single-consumer, when this reply
             /// fires every command posted before it has been fully processed and the
@@ -954,7 +960,16 @@ pub fn Router(comptime Transport: type) type {
             router: *Self,
 
             pub fn post(self: *InboxPoster, io: std.Io, in: peer_io.InboundRpc) anyerror!void {
-                return self.router.inbox.putOne(io, .{ .inbound_rpc = in });
+                const cmd: Command = .{ .inbound_rpc = in };
+                // Fast path: non-blocking put (one queue lock, same as before).
+                // A full inbox is the saturation the review called silent —
+                // count it (atomic: every per-peer reader fiber posts here),
+                // then park in the blocking put as always (the backpressure
+                // semantics are unchanged; only the metric is new).
+                const queued = self.router.inbox.putUncancelable(io, &.{cmd}, 0) catch 0;
+                if (queued == 1) return;
+                _ = self.router.inbox_stalls.fetchAdd(1, .monotonic);
+                return self.router.inbox.putOne(io, cmd);
             }
         };
 
@@ -1156,6 +1171,21 @@ pub fn Router(comptime Transport: type) type {
         /// Outbound frames dropped because a peer's lane was full (slow peer)
         /// or its queue closed mid-push. Router-fiber-only writes.
         lane_drops: u64 = 0,
+        /// Message-pipeline counters (router-fiber-only writes; read via the
+        /// `stats` command, which serializes the snapshot with every writer).
+        /// `msgs_received` counts every inbound publish handed to the pipeline;
+        /// accepted/duplicate/throttled/rejected/ignored partition its
+        /// outcomes (rejected = signature rejects + app-validator rejects).
+        msgs_received: u64 = 0,
+        msgs_accepted: u64 = 0,
+        msgs_duplicate: u64 = 0,
+        msgs_throttled: u64 = 0,
+        msgs_rejected: u64 = 0,
+        msgs_ignored: u64 = 0,
+        /// Inbound-RPC posts that found the data inbox FULL and had to park
+        /// until the router drained it (the silent-saturation signal the
+        /// review flagged). Written by per-peer reader fibers — atomic.
+        inbox_stalls: std.atomic.Value(u64) = .init(0),
         /// When true (go-libp2p default), a message the local node ORIGINATES is
         /// flooded to every topic subscriber above the publish threshold rather
         /// than only its mesh/fanout. Relayed messages are unaffected (always
@@ -2054,6 +2084,43 @@ pub fn Router(comptime Transport: type) type {
             return reply;
         }
 
+        /// One consistent snapshot of the router's production counters (see
+        /// the `stats` command). Counts are cumulative since create.
+        pub const Stats = struct {
+            msgs_received: u64 = 0,
+            msgs_accepted: u64 = 0,
+            msgs_duplicate: u64 = 0,
+            msgs_throttled: u64 = 0,
+            msgs_rejected: u64 = 0,
+            msgs_ignored: u64 = 0,
+            delivery_drops: u64 = 0,
+            lane_drops: u64 = 0,
+            inbox_stalls: u64 = 0,
+            validations_in_flight: usize = 0,
+            peers: usize = 0,
+            topics: usize = 0,
+            seen_ids: usize = 0,
+        };
+
+        /// Reply slot for the `stats` command (stack-allocated by the caller).
+        pub const StatsReply = struct {
+            event: std.Io.Event = .unset,
+            snap: Stats = .{},
+        };
+
+        /// Snapshot the router's production counters, consistently, from any
+        /// fiber: posts a `stats` command on the control inbox and blocks for
+        /// the reply (one control round trip — meant for periodic scrapes, not
+        /// per-message reads). A closed inbox (teardown) yields the zero
+        /// snapshot.
+        pub fn stats(router: *Self) Stats {
+            var reply: StatsReply = .{};
+            router.control_inbox.putOne(router.io, .{ .stats = .{ .reply = &reply } }) catch return reply.snap;
+            router.notifyControl();
+            reply.event.waitUncancelable(router.io);
+            return reply.snap;
+        }
+
         // ----- main fiber --------------------------------------------------
 
         fn mainLoop(router: *Self) void {
@@ -2130,6 +2197,7 @@ pub fn Router(comptime Transport: type) type {
                 .publish => |p| router.onPublish(p.topic, p.data),
                 .enqueue_for_test => |e| router.onEnqueueForTest(e.peer, e.frame, e.reply),
                 .probe_for_test => |pr| router.onProbeForTest(pr.peer, pr.topic, pr.reply),
+                .stats => |st| router.onStats(st.reply),
                 .sync => |s| router.fenceSync(s.reply),
                 .validation_result => |r| router.onValidationResult(r.ctx, r.verdict),
                 .reap_dead_writers => router.reapDeadWriters(),
@@ -3541,6 +3609,7 @@ pub fn Router(comptime Transport: type) type {
             // before pushing to its validation workers; a gossipsub mesh delivers
             // each message up to D times, so for sub-IDONTWANT-threshold messages
             // this is the difference between 1 verify and ~D verifies per id).
+            router.msgs_received += 1;
             var id = router.computeMessageId(topic, from, seqno, data) catch return;
             defer id.deinit(router.allocator);
 
@@ -3558,6 +3627,7 @@ pub fn Router(comptime Transport: type) type {
             // verification.
 
             if (router.seen.contains(id.bytes, router.heartbeat_tick)) {
+                router.msgs_duplicate += 1;
                 if (router.score != null) router.fulfillPromise(id.bytes);
                 // A duplicate of an already-seen message. If the relaying peer is
                 // a current mesh member for this topic, credit it the P3
@@ -3590,6 +3660,7 @@ pub fn Router(comptime Transport: type) type {
                 router.validation_concurrency > 0)
             {
                 if (router.validations_in_flight >= router.validation_concurrency) {
+                    router.msgs_throttled += 1;
                     // The peer did deliver — a throttled drop still fulfils its
                     // IWANT promise (go: RejectValidationThrottled fulfils).
                     if (router.score != null) router.fulfillPromise(id.bytes);
@@ -3623,6 +3694,7 @@ pub fn Router(comptime Transport: type) type {
             // be able to censor the real message (go returns before markSeen).
             if (needs_signature_check) {
                 if (!signing.verifyMessage(router.allocator, from, seqno, topic, data, signature, key)) {
+                    router.msgs_rejected += 1;
                     // Deliberately NO fulfillPromise here: a garbage-signed
                     // message must not make good on an IHAVE promise (P7).
                     if (router.score) |sc| sc.rejectMessage(exclude, topic);
@@ -3658,10 +3730,14 @@ pub fn Router(comptime Transport: type) type {
                 switch (v.validate(v.ctx, topic, from, data)) {
                     .accept => {},
                     .reject => {
+                        router.msgs_rejected += 1;
                         if (router.score) |sc| sc.rejectMessage(exclude, topic);
                         return;
                     },
-                    .ignore => return,
+                    .ignore => {
+                        router.msgs_ignored += 1;
+                        return;
+                    },
                 }
             }
 
@@ -3688,6 +3764,7 @@ pub fn Router(comptime Transport: type) type {
             key: []const u8,
             id: []const u8,
         ) void {
+            router.msgs_accepted += 1;
             // P2/P3: the relaying peer delivered a NEW, accepted message — credit
             // its first-delivery (and, if it is a mesh member, mesh-delivery)
             // counters. Keyed on the SENDING peer, not the message's `from`.
@@ -3887,6 +3964,7 @@ pub fn Router(comptime Transport: type) type {
                 ctx.deinit(router.allocator);
             }
             if (verdict == .reject_signature) {
+                router.msgs_rejected += 1;
                 // Deliberately NO fulfillPromise: a garbage-signed message must
                 // not make good on an IHAVE promise — the promise expires and
                 // draws P7 (go's tracer carve-out for RejectInvalidSignature).
@@ -3898,6 +3976,7 @@ pub fn Router(comptime Transport: type) type {
             // duplicate — go fulfils on all four).
             if (router.score != null) router.fulfillPromise(ctx.id);
             if (router.seen.contains(ctx.id, router.heartbeat_tick)) {
+                router.msgs_duplicate += 1;
                 if (router.score) |sc| {
                     if (router.meshContains(ctx.topic, ctx.exclude)) sc.duplicateMessage(ctx.exclude, ctx.topic);
                 }
@@ -3906,8 +3985,11 @@ pub fn Router(comptime Transport: type) type {
             router.seen.add(ctx.id, router.heartbeat_tick);
             switch (verdict) {
                 .accept => router.applyAccept(ctx.exclude, ctx.from, ctx.seqno, ctx.topic, ctx.data, ctx.signature, ctx.key, ctx.id),
-                .reject_validator => if (router.score) |sc| sc.rejectMessage(ctx.exclude, ctx.topic),
-                .ignore => {},
+                .reject_validator => {
+                    router.msgs_rejected += 1;
+                    if (router.score) |sc| sc.rejectMessage(ctx.exclude, ctx.topic);
+                },
+                .ignore => router.msgs_ignored += 1,
                 .reject_signature => unreachable, // handled above, before the seen mark
             }
         }
@@ -4290,6 +4372,27 @@ pub fn Router(comptime Transport: type) type {
         /// running on the router fiber so the peer-map lookup never races the
         /// router's own mutations. Releases the reference if the peer is gone or
         /// the push fails. Always sets the reply event.
+        /// `stats` handler: every read runs on the router fiber, the sole
+        /// writer of all the non-atomic counters.
+        fn onStats(router: *Self, reply: *StatsReply) void {
+            reply.snap = .{
+                .msgs_received = router.msgs_received,
+                .msgs_accepted = router.msgs_accepted,
+                .msgs_duplicate = router.msgs_duplicate,
+                .msgs_throttled = router.msgs_throttled,
+                .msgs_rejected = router.msgs_rejected,
+                .msgs_ignored = router.msgs_ignored,
+                .delivery_drops = router.delivery_drops,
+                .lane_drops = router.lane_drops,
+                .inbox_stalls = router.inbox_stalls.load(.monotonic),
+                .validations_in_flight = router.validations_in_flight,
+                .peers = router.peers.count(),
+                .topics = router.my_topics.count(),
+                .seen_ids = router.seen.entries.count(),
+            };
+            reply.event.set(router.io);
+        }
+
         /// `probe_for_test` handler: every read below runs on the router fiber,
         /// the sole writer of the peer map, the topic sets, and the meshes.
         fn onProbeForTest(router: *Self, peer: PeerId, topic: []const u8, reply: *PeerProbe) void {
@@ -4445,6 +4548,7 @@ pub fn Router(comptime Transport: type) type {
                 // Wake a probe/sync in flight at shutdown so its awaiter does
                 // not hang (the probe reports the zero result: not tracked).
                 .probe_for_test => |pr| pr.reply.event.set(router.io),
+                .stats => |st| st.reply.event.set(router.io),
                 .sync => |s| s.reply.set(router.io),
                 // An async validation that posted its result before the inbox
                 // closed but never got processed by the main loop: free its held
@@ -5743,6 +5847,63 @@ test "seen-cache TTL: a duplicate is suppressed within the window, re-processed 
         io_time.ms(5).sleep(io) catch {};
     }
     try std.testing.expectEqual(@as(usize, 2), recordCountPublishes(io, &conn_y.record, "t", "ttl"));
+}
+
+test "stats: pipeline counters partition received messages" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const router = try FakeRouter.create(allocator, io, .{}, local_test_peer, null, 0, null, null, .{});
+    try router.start();
+
+    try subscribeAndWait(io, allocator, router, "t");
+    const peer_x = testPeer(1);
+    const peer_y = testPeer(2);
+    const conn_x = try connectFakePeer(io, allocator, router, peer_x);
+    defer destroyFakeConn(allocator, conn_x);
+    const conn_y = try connectFakePeer(io, allocator, router, peer_y);
+    defer destroyFakeConn(allocator, conn_y);
+    defer router.destroy();
+    try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_y, peer_y, "t"));
+
+    // A new message, then its duplicate: received counts both, the outcome
+    // split is exactly one accept + one duplicate, and the seen cache holds
+    // the one id.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_x,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x0a", "t", "stats"),
+    } });
+    try sync(router, io);
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_x,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x0a", "t", "stats"),
+    } });
+    try sync(router, io);
+
+    const snap = router.stats();
+    try std.testing.expectEqual(@as(u64, 2), snap.msgs_received);
+    try std.testing.expectEqual(@as(u64, 1), snap.msgs_accepted);
+    try std.testing.expectEqual(@as(u64, 1), snap.msgs_duplicate);
+    try std.testing.expectEqual(@as(u64, 0), snap.msgs_throttled);
+    try std.testing.expectEqual(@as(u64, 0), snap.msgs_rejected);
+    try std.testing.expectEqual(@as(u64, 0), snap.msgs_ignored);
+    try std.testing.expectEqual(@as(usize, 2), snap.peers);
+    try std.testing.expectEqual(@as(usize, 1), snap.topics);
+    try std.testing.expectEqual(@as(usize, 1), snap.seen_ids);
+
+    // Counters are cumulative: a second snapshot after one more duplicate
+    // moves only received + duplicate.
+    try router.inbox.putOne(io, .{ .inbound_rpc = .{
+        .peer = peer_x,
+        .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x0a", "t", "stats"),
+    } });
+    try sync(router, io);
+    const snap2 = router.stats();
+    try std.testing.expectEqual(@as(u64, 3), snap2.msgs_received);
+    try std.testing.expectEqual(@as(u64, 1), snap2.msgs_accepted);
+    try std.testing.expectEqual(@as(u64, 2), snap2.msgs_duplicate);
 }
 
 test "seen-cache keeps more ids than the old FIFO cap within the TTL window (no premature eviction)" {
