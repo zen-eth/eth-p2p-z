@@ -6,3 +6,7 @@ build-*/
 docgen_tmp/
 .DS_Store
 *.pem
+
+# Testground plan import: the staged repo-root manifest must stay (the plan
+# symlinks to the repo root) — see interop/gossipsub/testground/import.sh.
+/manifest.toml

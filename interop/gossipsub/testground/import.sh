@@ -4,8 +4,14 @@
 # docker:generic builds from the IMPORTED plan tree, and our Zig stage needs the
 # whole eth-p2p-z source — so we import the REPO ROOT and point the manifest
 # `path` at this Go-plan subdir. `testground plan import` requires the manifest
-# at the import root, so this script stages it there for the import, then removes
-# it again (the import has already packed a copy into $TESTGROUND_HOME/plans).
+# at the import root.
+#
+# The staged repo-root manifest.toml is PERMANENT, not cleanup-able:
+# `testground plan import --from` SYMLINKS $TESTGROUND_HOME/plans/<name> to the
+# --from directory (it does not copy), so every later build/run resolves the
+# manifest through the live repo root — deleting it breaks the plan with
+# "failed to access plan manifest". It is gitignored (/manifest.toml) so it
+# never shows up as repo noise.
 #
 # Prereqs: a running `testground daemon`, and `go mod tidy` already run here
 # (so go.sum exists). Usage: bash interop/gossipsub/testground/import.sh
@@ -17,27 +23,21 @@ NAME="gossipsub-quic"
 
 [ -f "$PLAN_DIR/go.sum" ] || { echo "FAIL: $PLAN_DIR/go.sum missing — run 'cd $PLAN_DIR && go mod tidy' first"; exit 1; }
 
-STAGED="$REPO_ROOT/manifest.toml"
-if [ -e "$STAGED" ]; then
-    echo "FAIL: $STAGED already exists; refusing to overwrite. Remove it and re-run." >&2
-    exit 1
-fi
-cp "$PLAN_DIR/manifest.toml" "$STAGED"
-cleanup() { rm -f "$STAGED"; }
-trap cleanup EXIT
+cp "$PLAN_DIR/manifest.toml" "$REPO_ROOT/manifest.toml"
 
 echo "==> importing repo root as plan '$NAME' (manifest path=interop/gossipsub/testground)"
 testground plan import --from "$REPO_ROOT" --name "$NAME"
 
-# Verify the full subtree landed (Zig source + Go plan) before the first build.
+# The plan is a symlink to the repo root; verify it resolves the tree the
+# docker:generic build will pack (Zig source + Go plan + the manifest).
 TGHOME="${TESTGROUND_HOME:-$HOME/testground}"
+[ -d "$TGHOME/plans" ] || TGHOME="$HOME/.config/testground"
 echo "==> verifying imported layout under $TGHOME/plans/$NAME"
-ls "$TGHOME/plans/$NAME/build.zig" >/dev/null 2>&1 \
-    && echo "    ok: build.zig present (Zig source imported)" \
-    || echo "    WARN: build.zig not found at expected path — check $TGHOME/plans/$NAME"
-ls "$TGHOME/plans/$NAME/interop/gossipsub/testground/main.go" >/dev/null 2>&1 \
-    && echo "    ok: main.go present (Go plan imported)" \
-    || echo "    WARN: main.go not found at expected path"
+for f in manifest.toml build.zig interop/gossipsub/testground/main.go; do
+    ls "$TGHOME/plans/$NAME/$f" >/dev/null 2>&1 \
+        && echo "    ok: $f present" \
+        || echo "    WARN: $f not found — check $TGHOME/plans/$NAME"
+done
 
 echo "==> imported. Next:"
 echo "    testground build single --plan $NAME --builder docker:generic --wait"
