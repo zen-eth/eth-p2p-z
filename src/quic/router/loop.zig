@@ -140,6 +140,7 @@ pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAd
     }
     const caps = try socket_control.configureUdpSocket(&socket, .{
         .enable_udp_gro = ep.options.endpoint.enable_udp_gro,
+        .enable_udp_gso = ep.options.endpoint.enable_udp_gso,
         .enable_pktinfo = ep.options.endpoint.enable_pktinfo,
         .enable_orig_dst = ep.options.endpoint.enable_orig_dst,
         .enable_rx_timestamps = ep.options.endpoint.enable_rx_timestamps,

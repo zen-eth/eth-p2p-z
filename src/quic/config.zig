@@ -158,6 +158,13 @@ pub const EndpointOptions = struct {
     recv_slab_slot_bytes: usize = 65_535,
     handshake_timeout_ns: u64 = default_handshake_timeout_ns,
     enable_udp_gro: bool = true,
+    /// UDP generic segmentation offload on the send path (Linux >= 4.18,
+    /// probed at bind): a flush burst's equal-sized packets to one peer go
+    /// out as ONE sendmsg with a UDP_SEGMENT cmsg. Falls back to per-packet
+    /// sends where unsupported (macOS, old kernels, Shadow) or on the first
+    /// live GSO send failure (some drivers accept the probe and fail real
+    /// segmented sends).
+    enable_udp_gso: bool = true,
     /// Opt-in because packet-info rewrites quiche's local path address on
     /// wildcard sockets; transparent-proxy users can enable it together with
     /// source-address send control.

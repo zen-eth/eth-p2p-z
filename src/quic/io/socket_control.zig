@@ -8,6 +8,7 @@ pub const control_buffer_align = @alignOf(linux.cmsghdr);
 
 const cmsg_header_len = cmsgAlign(@sizeOf(linux.cmsghdr));
 const cmsg_space_udp_gro = cmsgSpace(@sizeOf(u16));
+const cmsg_space_udp_segment = cmsgSpace(@sizeOf(u16));
 const cmsg_space_ip_pktinfo = cmsgSpace(@sizeOf(std.posix.in_pktinfo));
 const cmsg_space_ip6_pktinfo = cmsgSpace(@sizeOf(std.posix.in6_pktinfo));
 const cmsg_space_sockaddr = cmsgSpace(@sizeOf(std.posix.sockaddr.storage));
@@ -20,10 +21,12 @@ pub const recv_control_buffer_len: usize =
     2 * cmsg_space_sockaddr +
     cmsg_space_timespec;
 
-pub const send_control_buffer_len: usize = @max(cmsg_space_ip_pktinfo, cmsg_space_ip6_pktinfo);
+pub const send_control_buffer_len: usize =
+    @max(cmsg_space_ip_pktinfo, cmsg_space_ip6_pktinfo) + cmsg_space_udp_segment;
 
 pub const Options = struct {
     enable_udp_gro: bool = true,
+    enable_udp_gso: bool = true,
     enable_pktinfo: bool = false,
     enable_orig_dst: bool = false,
     enable_rx_timestamps: bool = true,
@@ -38,6 +41,9 @@ pub const Options = struct {
 
 pub const Capabilities = struct {
     udp_gro: bool = false,
+    /// Kernel supports UDP_SEGMENT (GSO, Linux >= 4.18): one sendmsg can carry
+    /// a packed run of equal-sized datagrams that the kernel segments late.
+    udp_gso: bool = false,
     // Packet-info socket options are negotiated per address family; dual-stack
     // sockets can support source control for one family and reject the other.
     pktinfo_v4: bool = false,
@@ -91,6 +97,10 @@ pub const ParsedControl = struct {
 pub const OutgoingMeta = struct {
     caps: Capabilities = .{},
     from: ?std.Io.net.IpAddress = null,
+    /// When set (and the socket has `udp_gso`), the message's payload is a
+    /// packed run of datagrams of this size (the last may be shorter) and a
+    /// UDP_SEGMENT cmsg tells the kernel to segment it on the way out.
+    gso_segment_len: ?u16 = null,
 };
 
 pub const ParseIncomingControlError = error{
@@ -112,6 +122,12 @@ pub fn configureUdpSocket(socket: *const std.Io.net.Socket, options: Options) Co
 
     if (options.enable_udp_gro) {
         caps.udp_gro = trySetSockOpt(fd, std.posix.IPPROTO.UDP, linux.UDP.GRO, c_int, one);
+    }
+    if (options.enable_udp_gso) {
+        // Probe only: UDP_SEGMENT=0 keeps socket-wide segmentation off while
+        // proving kernel support (ENOPROTOOPT on < 4.18 leaves the cap false).
+        // Actual segment sizes ride per-send cmsgs (see encodeOutgoingControl).
+        caps.udp_gso = trySetSockOpt(fd, std.posix.IPPROTO.UDP, linux.UDP.SEGMENT, c_int, 0);
     }
     if (options.enable_pktinfo) {
         caps.pktinfo_v4 = trySetSockOpt(fd, linux.SOL.IP, linux.IP.PKTINFO, c_int, one);
@@ -233,6 +249,12 @@ pub fn encodeOutgoingControl(buffer: []u8, meta: OutgoingMeta) []const u8 {
             }
         },
     };
+
+    if (meta.gso_segment_len) |seg_len| {
+        if (meta.caps.udp_gso) {
+            std.debug.assert(appendCmsg(buffer, &offset, std.posix.IPPROTO.UDP, linux.UDP.SEGMENT, std.mem.asBytes(&seg_len)));
+        }
+    }
 
     return buffer[0..offset];
 }
@@ -579,4 +601,27 @@ test "encodeOutgoingControl respects packet info capability family" {
     }).len);
     try std.testing.expect(sourceControlEnabled(.{ .pktinfo_v4 = true }, v4_source));
     try std.testing.expect(!sourceControlEnabled(.{ .pktinfo_v4 = true }, v6_source));
+}
+
+test "encodeOutgoingControl appends a UDP_SEGMENT cmsg when GSO is usable" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var control: [send_control_buffer_len]u8 align(control_buffer_align) = undefined;
+    const out = encodeOutgoingControl(&control, .{
+        .caps = .{ .udp_gso = true },
+        .gso_segment_len = 1350,
+    });
+
+    var expected: [send_control_buffer_len]u8 align(control_buffer_align) = undefined;
+    var offset: usize = 0;
+    const seg: u16 = 1350;
+    try std.testing.expect(appendCmsg(&expected, &offset, std.posix.IPPROTO.UDP, linux.UDP.SEGMENT, std.mem.asBytes(&seg)));
+    try std.testing.expectEqualSlices(u8, expected[0..offset], out);
+
+    // Without the capability the segment hint is dropped (plain send).
+    const none = encodeOutgoingControl(&control, .{
+        .caps = .{},
+        .gso_segment_len = 1350,
+    });
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }

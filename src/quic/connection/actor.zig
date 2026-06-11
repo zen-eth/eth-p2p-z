@@ -103,12 +103,61 @@ fn applyOutgoingControl(
     message: *std.Io.net.OutgoingMessage,
     control_buffer: []u8,
     source_caps: socket_control.Capabilities,
-    selected_path: ?WriteState.Path,
+    from_addr: ?std.Io.net.IpAddress,
+    gso_segment_len: ?u16,
 ) void {
     message.control = socket_control.encodeOutgoingControl(control_buffer, .{
         .caps = source_caps,
-        .from = if (selected_path) |path| path.from else null,
+        .from = from_addr,
+        .gso_segment_len = gso_segment_len,
     });
+}
+
+/// Kernel caps for one UDP_SEGMENT send: at most 64 segments
+/// (UDP_MAX_SEGMENTS), and the whole superpacket must still fit one UDP
+/// datagram — udp_sendmsg rejects payloads over 0xFFFF outright (reachable
+/// here: a full 32-packet batch of max_send_udp_payload_size=2048 packets is
+/// exactly 65536 bytes, one over).
+const max_gso_segments: usize = 64;
+const max_gso_bytes: usize = 65535;
+
+/// One greedy GSO group: starting at `start`, how many consecutive collected
+/// packets can ride a single UDP_SEGMENT send. The kernel's rules: one
+/// destination; every segment carries the FIRST packet's length except the
+/// last, which may be shorter (so a shorter packet joins as the group's FINAL
+/// segment and closes it); at most `max_gso_segments` per send and at most
+/// `max_gso_bytes` in total. One OUR rule: a group shares a single control
+/// buffer, so all members must carry the same pktinfo source address (a
+/// multipath batch never coalesces across paths). Because the flush loop
+/// writes packets back-to-back into one flat buffer, a group admitted by
+/// these rules is already packed on the segment grid the kernel expects.
+/// Pure — unit-tested below.
+fn gsoGroupLen(
+    lens: []const usize,
+    dests: []const std.Io.net.IpAddress,
+    froms: []const ?std.Io.net.IpAddress,
+    start: usize,
+) usize {
+    const seg_len = lens[start];
+    var total: usize = seg_len;
+    var n: usize = 1;
+    while (start + n < lens.len and n < max_gso_segments) {
+        const next = start + n;
+        if (!dests[next].eql(&dests[start])) break;
+        if (!optionalFromEql(froms[next], froms[start])) break;
+        if (lens[next] > seg_len) break;
+        if (total + lens[next] > max_gso_bytes) break;
+        total += lens[next];
+        n += 1;
+        if (lens[next] < seg_len) break;
+    }
+    return n;
+}
+
+fn optionalFromEql(a: ?std.Io.net.IpAddress, b: ?std.Io.net.IpAddress) bool {
+    const av = a orelse return b == null;
+    const bv = b orelse return false;
+    return av.eql(&bv);
 }
 
 // ---------------------------------------------------------------------------
@@ -809,10 +858,22 @@ pub const ConnectionActor = struct {
 
         var packets_released: usize = 0;
         // Per-batch scratch, declared once at function scope: each iteration fully
-        // overwrites these (indexed by batch_len, which resets per iteration), so a
-        // single declaration is clearer than re-scoping ~64 KiB inside the loop and
-        // guarantees one stack slot in Debug.
-        var payloads: [max_outbound_batch_size][max_flush_packet_len]u8 = undefined;
+        // overwrites these (indexed from 0 each batch), so a single declaration is
+        // clearer than re-scoping ~66 KiB inside the loop and guarantees one stack
+        // slot in Debug. Packets are written back-to-back into ONE flat buffer so
+        // a GSO group's segments are already packed on the segment grid
+        // UDP_SEGMENT expects (every group member except the last has the group's
+        // segment length — see gsoGroupLen).
+        var payload_buf: [max_outbound_batch_size * max_flush_packet_len]u8 = undefined;
+        var offsets: [max_outbound_batch_size]usize = undefined;
+        var lens: [max_outbound_batch_size]usize = undefined;
+        var dests: [max_outbound_batch_size]std.Io.net.IpAddress = undefined;
+        // Each packet's pktinfo SOURCE address, captured at collection time
+        // while `self.write.selected_path` still describes THAT packet (the
+        // drain loop nulls it on DONE, reset() wipes it, and multipath can
+        // switch it mid-batch — encoding from it after the loop stamped every
+        // packet with a stale or null source).
+        var froms: [max_outbound_batch_size]?std.Io.net.IpAddress = undefined;
         var destinations: [max_outbound_batch_size]std.Io.net.IpAddress = undefined;
         var messages: [max_outbound_batch_size]std.Io.net.OutgoingMessage = undefined;
         var controls: [max_outbound_batch_size][socket_control.send_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
@@ -821,7 +882,8 @@ pub const ConnectionActor = struct {
                 @min(@max(transport.outbound_batch_size, @as(usize, 1)), max_outbound_batch_size),
                 max_packets - packets_released,
             );
-            var batch_len: usize = 0;
+            var pkt_count: usize = 0;
+            var write_off: usize = 0;
             var quiche_done = false;
             var paced_pending = false;
 
@@ -831,27 +893,20 @@ pub const ConnectionActor = struct {
                     self.write.next_release_time_ns = null;
                 }
 
-                destinations[batch_len] = self.write.destination orelse return error.AddressInvalid;
-                @memcpy(payloads[batch_len][0..self.write.bytes_written], self.write.written());
-                messages[batch_len] = .{
-                    .address = &destinations[batch_len],
-                    .data_ptr = payloads[batch_len][0..].ptr,
-                    .data_len = self.write.bytes_written,
-                };
-                applyOutgoingControl(
-                    &messages[batch_len],
-                    controls[batch_len][0..],
-                    transport.socket.caps,
-                    self.write.selected_path,
-                );
-                batch_len += 1;
+                dests[pkt_count] = self.write.destination orelse return error.AddressInvalid;
+                froms[pkt_count] = if (self.write.selected_path) |path| path.from else null;
+                offsets[pkt_count] = write_off;
+                lens[pkt_count] = self.write.bytes_written;
+                @memcpy(payload_buf[write_off..][0..self.write.bytes_written], self.write.written());
+                write_off += self.write.bytes_written;
+                pkt_count += 1;
                 packets_released += 1;
                 self.write.reset();
             }
 
-            while (batch_len < batch_cap and packets_released < max_packets) {
+            while (pkt_count < batch_cap and packets_released < max_packets) {
                 var send_info: quiche.quiche_send_info = undefined;
-                const sent = try self.quicheConnSendOnSelectedPath(conn, transport, payloads[batch_len][0..].ptr, max_flush_packet_len, &send_info);
+                const sent = try self.quicheConnSendOnSelectedPath(conn, transport, payload_buf[write_off..].ptr, max_flush_packet_len, &send_info);
                 if (sent == quiche.QUICHE_ERR_DONE) {
                     self.write.selected_path = null;
                     if (self.write.pending_paths != null) continue;
@@ -864,36 +919,123 @@ pub const ConnectionActor = struct {
                 const destination = address.fromSockaddrStorage(@ptrCast(@alignCast(&send_info.to))) catch return error.AddressInvalid;
                 if (sendInfoReleaseNs(&send_info)) |release_at_ns| {
                     if (!releaseTimeDue(transport.io, release_at_ns)) {
-                        self.storePendingWrite(payloads[batch_len][0..len], destination, release_at_ns);
+                        self.storePendingWrite(payload_buf[write_off..][0..len], destination, release_at_ns);
                         paced_pending = true;
                         break;
                     }
                 }
 
-                destinations[batch_len] = destination;
-                messages[batch_len] = .{
-                    .address = &destinations[batch_len],
-                    .data_ptr = payloads[batch_len][0..].ptr,
-                    .data_len = len,
-                };
-                applyOutgoingControl(
-                    &messages[batch_len],
-                    controls[batch_len][0..],
-                    transport.socket.caps,
-                    self.write.selected_path,
-                );
-                batch_len += 1;
+                dests[pkt_count] = destination;
+                froms[pkt_count] = if (self.write.selected_path) |path| path.from else null;
+                offsets[pkt_count] = write_off;
+                lens[pkt_count] = len;
+                write_off += len;
+                pkt_count += 1;
                 packets_released += 1;
             }
 
-            if (batch_len > 0) {
-                transport.socket.sendMany(transport.io, messages[0..batch_len], .{}) catch |err| {
+            if (pkt_count > 0) {
+                // Coalesce: one OutgoingMessage per GSO group. A group of one is
+                // a plain packet send (no UDP_SEGMENT cmsg), byte-identical to
+                // the pre-GSO path — and the only shape on macOS/Shadow/old
+                // kernels, where the bind-time probe leaves the cap false.
+                // Pacing is untouched: the batch already holds only packets that
+                // were DUE at collection time (a not-yet-due packet became the
+                // pending write and broke the drain), so coalescing changes how
+                // the burst is handed to the kernel, not when.
+                const gso_usable = transport.socket.gsoUsable();
+                var msg_count: usize = 0;
+                var gso_groups: u64 = 0;
+                var gso_segments: u64 = 0;
+                var i: usize = 0;
+                while (i < pkt_count) {
+                    const n = if (gso_usable) gsoGroupLen(lens[0..pkt_count], dests[0..pkt_count], froms[0..pkt_count], i) else 1;
+                    destinations[msg_count] = dests[i];
+                    messages[msg_count] = .{
+                        .address = &destinations[msg_count],
+                        .data_ptr = payload_buf[offsets[i]..].ptr,
+                        .data_len = (offsets[i + n - 1] + lens[i + n - 1]) - offsets[i],
+                    };
+                    applyOutgoingControl(
+                        &messages[msg_count],
+                        controls[msg_count][0..],
+                        transport.socket.caps,
+                        froms[i],
+                        if (n > 1) @intCast(lens[i]) else null,
+                    );
+                    if (n > 1) {
+                        gso_groups += 1;
+                        gso_segments += @intCast(n);
+                    }
+                    msg_count += 1;
+                    i += n;
+                }
+
+                var sent_via_gso = gso_groups > 0;
+                transport.socket.sendMany(transport.io, messages[0..msg_count], .{}) catch |err| gso_retry: {
+                    // Cancellation and plainly-transient network errors say
+                    // nothing about UDP_SEGMENT support — they propagate
+                    // exactly like the pre-GSO path did (Canceled must unwind
+                    // teardown; a routing blip must not permanently degrade
+                    // the whole socket). Anything else on a batch that carried
+                    // GSO groups is treated as the known driver class that
+                    // accepts the probe yet fails real segmented sends (quinn
+                    // met these in the wild): disable GSO for the socket,
+                    // resend this batch as plain packets — a duplicated
+                    // datagram is legal (QUIC dedups at the packet layer);
+                    // tearing the connection down for a send-path capability
+                    // mismatch is not.
+                    const capability_suspect = switch (err) {
+                        error.Canceled,
+                        error.NetworkDown,
+                        error.NetworkUnreachable,
+                        error.HostUnreachable,
+                        error.ConnectionRefused,
+                        error.SystemResources,
+                        => false,
+                        else => true,
+                    };
+                    if (gso_groups > 0 and capability_suspect) {
+                        transport.socket.disableGso();
+                        std.log.warn(
+                            "UDP GSO disabled for this socket: segmented send failed ({s}); resending the batch per-packet",
+                            .{@errorName(err)},
+                        );
+                        var pi: usize = 0;
+                        while (pi < pkt_count) : (pi += 1) {
+                            destinations[pi] = dests[pi];
+                            messages[pi] = .{
+                                .address = &destinations[pi],
+                                .data_ptr = payload_buf[offsets[pi]..].ptr,
+                                .data_len = lens[pi],
+                            };
+                            applyOutgoingControl(
+                                &messages[pi],
+                                controls[pi][0..],
+                                transport.socket.caps,
+                                froms[pi],
+                                null,
+                            );
+                        }
+                        transport.socket.sendMany(transport.io, messages[0..pkt_count], .{}) catch |retry_err| {
+                            self.stats_snapshot.write_errors += 1;
+                            return retry_err;
+                        };
+                        sent_via_gso = false;
+                        break :gso_retry;
+                    }
                     self.stats_snapshot.write_errors += 1;
                     return err;
                 };
+                // GSO accounting only after the segmented send actually
+                // succeeded — the downgrade path delivered plain packets.
+                if (sent_via_gso) {
+                    self.stats_snapshot.write_gso_groups += gso_groups;
+                    self.stats_snapshot.write_gso_segments += gso_segments;
+                }
                 self.stats_snapshot.write_batches += 1;
-                self.stats_snapshot.write_packets += @intCast(batch_len);
-                for (messages[0..batch_len]) |message| self.stats_snapshot.write_bytes += message.data_len;
+                self.stats_snapshot.write_packets += @intCast(pkt_count);
+                self.stats_snapshot.write_bytes += write_off;
                 // A flushed packet resets the idle timer on both ends, so push the
                 // next keep-alive out by a full period — a busy connection never
                 // sends a redundant PING; an idle one fires after `period` of silence.
@@ -903,7 +1045,7 @@ pub const ConnectionActor = struct {
             }
 
             if (quiche_done or paced_pending) return false;
-            if (batch_len == 0) return false;
+            if (pkt_count == 0) return false;
         }
 
         return true;
@@ -2115,14 +2257,86 @@ test "applyOutgoingControl respects source-control capabilities" {
     };
     var control: [socket_control.send_control_buffer_len]u8 align(socket_control.control_buffer_align) = undefined;
 
-    applyOutgoingControl(&message, control[0..], .{ .pktinfo_v4 = true }, .{
-        .from = .{ .ip4 = .loopback(9000) },
-        .to = destination,
-    });
+    applyOutgoingControl(&message, control[0..], .{ .pktinfo_v4 = true }, .{ .ip4 = .loopback(9000) }, null);
 
     if (builtin.os.tag == .linux) {
         try std.testing.expect(message.control.len > 0);
     } else {
         try std.testing.expectEqual(@as(usize, 0), message.control.len);
     }
+}
+
+test "gsoGroupLen: equal-sized packets to one destination form one group" {
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    const lens = [_]usize{ 1350, 1350, 1350, 1350 };
+    const dests = [_]std.Io.net.IpAddress{ a, a, a, a };
+    const froms = [_]?std.Io.net.IpAddress{ null, null, null, null };
+    try std.testing.expectEqual(@as(usize, 4), gsoGroupLen(&lens, &dests, &froms, 0));
+}
+
+test "gsoGroupLen: a shorter packet joins as the final segment and closes the group" {
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    const lens = [_]usize{ 1350, 1350, 900, 1350 };
+    const dests = [_]std.Io.net.IpAddress{ a, a, a, a };
+    const froms = [_]?std.Io.net.IpAddress{ null, null, null, null };
+    try std.testing.expectEqual(@as(usize, 3), gsoGroupLen(&lens, &dests, &froms, 0));
+    // The next group starts fresh at the packet after the short tail.
+    try std.testing.expectEqual(@as(usize, 1), gsoGroupLen(&lens, &dests, &froms, 3));
+}
+
+test "gsoGroupLen: a larger packet cannot join — it starts its own group" {
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    const lens = [_]usize{ 100, 1350, 1350 };
+    const dests = [_]std.Io.net.IpAddress{ a, a, a };
+    const froms = [_]?std.Io.net.IpAddress{ null, null, null };
+    try std.testing.expectEqual(@as(usize, 1), gsoGroupLen(&lens, &dests, &froms, 0));
+    try std.testing.expectEqual(@as(usize, 2), gsoGroupLen(&lens, &dests, &froms, 1));
+}
+
+test "gsoGroupLen: a destination change closes the group" {
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    const b = std.Io.net.IpAddress{ .ip4 = .loopback(2) };
+    const lens = [_]usize{ 1350, 1350, 1350 };
+    const dests = [_]std.Io.net.IpAddress{ a, a, b };
+    const froms = [_]?std.Io.net.IpAddress{ null, null, null };
+    try std.testing.expectEqual(@as(usize, 2), gsoGroupLen(&lens, &dests, &froms, 0));
+}
+
+test "gsoGroupLen: a source-path change closes the group (one control buffer per group)" {
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    const src = std.Io.net.IpAddress{ .ip4 = .loopback(7) };
+    const lens = [_]usize{ 1350, 1350, 1350 };
+    const dests = [_]std.Io.net.IpAddress{ a, a, a };
+    const froms = [_]?std.Io.net.IpAddress{ src, src, null };
+    try std.testing.expectEqual(@as(usize, 2), gsoGroupLen(&lens, &dests, &froms, 0));
+}
+
+test "gsoGroupLen: caps at the kernel segment limit" {
+    // 1000 B packets: 64 x 1000 = 64000 fits the byte cap, so the segment cap
+    // is the binding constraint here.
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    var lens: [max_gso_segments + 3]usize = undefined;
+    var dests: [max_gso_segments + 3]std.Io.net.IpAddress = undefined;
+    var froms: [max_gso_segments + 3]?std.Io.net.IpAddress = undefined;
+    for (&lens, &dests, &froms) |*l, *d, *f| {
+        l.* = 1000;
+        d.* = a;
+        f.* = null;
+    }
+    try std.testing.expectEqual(max_gso_segments, gsoGroupLen(&lens, &dests, &froms, 0));
+}
+
+test "gsoGroupLen: caps total bytes at one UDP datagram (65535)" {
+    // 32 packets x 2048 B = 65536 B — one byte over udp_sendmsg's limit; the
+    // group must close at 31 segments (63488 + 2048 would exceed 65535).
+    const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
+    var lens: [32]usize = undefined;
+    var dests: [32]std.Io.net.IpAddress = undefined;
+    var froms: [32]?std.Io.net.IpAddress = undefined;
+    for (&lens, &dests, &froms) |*l, *d, *f| {
+        l.* = 2048;
+        d.* = a;
+        f.* = null;
+    }
+    try std.testing.expectEqual(@as(usize, 31), gsoGroupLen(&lens, &dests, &froms, 0));
 }

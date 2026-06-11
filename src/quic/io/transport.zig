@@ -11,6 +11,10 @@ pub const SharedUdpSocket = struct {
     io: std.Io,
     socket: std.Io.net.Socket,
     caps: socket_control.Capabilities,
+    /// Set on the first live UDP_SEGMENT send failure (drivers exist that
+    /// accept the setsockopt probe and fail real segmented sends): every
+    /// connection on this socket falls back to per-packet sends from then on.
+    gso_broken: std.atomic.Value(bool) = .init(false),
     rc: AtomicRc = .{},
 
     pub fn init(
@@ -65,6 +69,16 @@ pub const SharedUdpSocket = struct {
 
     pub fn sendMany(shared: *const SharedUdpSocket, io: std.Io, messages: []std.Io.net.OutgoingMessage, flags: std.Io.net.SendFlags) std.Io.net.Socket.SendError!void {
         return shared.socket.sendMany(io, messages, flags);
+    }
+
+    /// Whether send paths may coalesce a burst into UDP_SEGMENT (GSO) sends:
+    /// the bind-time kernel probe passed and no live send has failed since.
+    pub fn gsoUsable(shared: *const SharedUdpSocket) bool {
+        return shared.caps.udp_gso and !shared.gso_broken.load(.monotonic);
+    }
+
+    pub fn disableGso(shared: *SharedUdpSocket) void {
+        shared.gso_broken.store(true, .monotonic);
     }
 };
 
