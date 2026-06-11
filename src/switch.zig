@@ -116,7 +116,7 @@ pub const Switch = struct {
     pub const OpenProtocolStreamError = error{
         ConnectionClosed,
         SelectedProtocolMismatch,
-    } || quic.Connection.OpenStreamError || protocols.multistream.Error;
+    } || quic.Connection.OpenStreamError || protocols.multistream.Error || std.Io.ConcurrentError;
     pub const StartInboundDispatchError = error{ ConnectionClosed, AlreadyDispatching } || std.Io.Cancelable || std.Io.ConcurrentError;
     pub const CloseError = error{ConnectionClosed} || quic.Connection.CloseError;
 
@@ -746,41 +746,75 @@ const SwitchConnectionActor = struct {
         }
     }
 
-    fn openProtocolStream(
-        actor: *SwitchConnectionActor,
-        protocol_id: protocols.ProtocolId,
+    /// Open + initiator-negotiate, OFF the actor's command fiber. Runs on a
+    /// `handler_group` fiber so a slow responder (network RTTs, up to the
+    /// negotiation timeout) never queues this connection's other commands
+    /// (close, stats, dispatch) behind it. The fiber touches the connection
+    /// handle but never `actor.conn`/`actor.closing` (actor-fiber-confined
+    /// fields): the handle pointer is resolved by the command fiber at spawn
+    /// and stays valid for the fiber's whole life — handler_group is cancelled
+    /// and joined before `cleanup` deinits the handle, and the `close` command
+    /// only `conn.close`s — whose teardown chain closes every per-stream queue,
+    /// unparking a negotiation blocked in a stream read (the handle itself is
+    /// deinited only at cleanup).
+    ///
+    /// Completes `reply` on EVERY path — cancellation included (the stream ops
+    /// surface Canceled as a value here, so the fiber never unwinds past the
+    /// completion) — because the caller is parked uncancelably on it.
+    fn outboundNegotiationMulti(
+        io: std.Io,
+        conn: *quic.Connection,
+        protocol_ids: []const protocols.ProtocolId,
         opts: Switch.OpenProtocolStreamOptions,
-    ) Switch.OpenProtocolStreamError!*quic.Stream {
-        // Single-protocol open: propose just `protocol_id` and treat a selection
-        // other than it as a mismatch (the responder echoing a candidate it was
-        // not offered). With a one-element list `negotiate` can only return that
-        // id, so the mismatch check is a belt-and-suspenders guard.
-        const result = try actor.openProtocolStreamMulti(&.{protocol_id}, opts);
-        if (!std.mem.eql(u8, result.selected, protocol_id)) {
-            closeStreamForCleanup(actor.io, result.stream);
-            result.stream.deinit();
-            return error.SelectedProtocolMismatch;
-        }
-        return result.stream;
+        reply: *OpenProtocolStreamMultiReply,
+    ) void {
+        reply.complete(io, openAndNegotiate(io, conn, protocol_ids, opts));
     }
 
-    fn openProtocolStreamMulti(
-        actor: *SwitchConnectionActor,
+    /// Single-protocol variant of `outboundNegotiationMulti`: propose just
+    /// `protocol_id` and treat a selection other than it as a mismatch (the
+    /// responder echoing a candidate it was not offered). With a one-element
+    /// list `negotiate` can only return that id, so the mismatch check is a
+    /// belt-and-suspenders guard.
+    fn outboundNegotiationSingle(
+        io: std.Io,
+        conn: *quic.Connection,
+        protocol_id: protocols.ProtocolId,
+        opts: Switch.OpenProtocolStreamOptions,
+        reply: *OpenProtocolStreamReply,
+    ) void {
+        const result = openAndNegotiate(io, conn, &.{protocol_id}, opts);
+        const selected = result catch |err| {
+            reply.complete(io, err);
+            return;
+        };
+        if (!std.mem.eql(u8, selected.selected, protocol_id)) {
+            closeStreamForCleanup(io, selected.stream);
+            selected.stream.deinit();
+            reply.complete(io, error.SelectedProtocolMismatch);
+            return;
+        }
+        reply.complete(io, selected.stream);
+    }
+
+    fn openAndNegotiate(
+        io: std.Io,
+        conn: *quic.Connection,
         protocol_ids: []const protocols.ProtocolId,
         opts: Switch.OpenProtocolStreamOptions,
     ) Switch.OpenProtocolStreamError!Switch.SelectedStream {
-        const conn = actor.liveConnection() orelse return error.ConnectionClosed;
-        const stream = try conn.openStream(actor.io);
+        const stream = try conn.openStream(io);
         var stream_live = true;
         errdefer if (stream_live) {
-            closeStreamForCleanup(actor.io, stream);
+            closeStreamForCleanup(io, stream);
             stream.deinit();
         };
 
         // The initiator proposes each id in `protocol_ids` (preference order)
         // until the responder accepts one; `selected` aliases that element, so it
-        // stays valid as long as the caller's slice does.
-        const selected = try protocols.multistream.negotiate(actor.io, stream, protocol_ids, .{
+        // stays valid as long as the caller's slice does (the caller blocks on
+        // the reply for the negotiation's whole life, so it does).
+        const selected = try protocols.multistream.negotiate(io, stream, protocol_ids, .{
             .role = .initiator,
             .timeout = opts.negotiation_timeout,
         });
@@ -879,21 +913,39 @@ fn actorMain(actor: *SwitchConnectionActor) std.Io.Cancelable!void {
             error.Canceled => return error.Canceled,
         };
         switch (command) {
+            // Outbound negotiation runs on a handler_group fiber, NOT here: it
+            // blocks on network RTTs (up to the negotiation timeout), and doing
+            // that inline queued every other command for this connection —
+            // close, stats, inbound dispatch — behind one slow peer. The
+            // command fiber only resolves the live connection and spawns; the
+            // fiber completes the reply on every path. handler_group is exactly
+            // the right lifetime bucket: the `close` command cancels it after
+            // closing the connection (a close ABORTS in-flight negotiations by
+            // design), and `cleanup` joins it before the handle is deinited.
             .open_protocol_stream => |cmd| {
-                const result = actor.openProtocolStream(cmd.protocol_id, cmd.opts) catch |err| {
-                    cmd.reply.complete(actor.io, err);
-                    if (err == error.Canceled) return error.Canceled;
+                const conn = actor.liveConnection() orelse {
+                    cmd.reply.complete(actor.io, error.ConnectionClosed);
                     continue;
                 };
-                cmd.reply.complete(actor.io, result);
+                // Spawn's only error is ConcurrencyUnavailable (no Canceled —
+                // the spawn is not a cancel point); complete the caller and
+                // keep serving commands.
+                actor.handler_group.concurrent(
+                    actor.io,
+                    SwitchConnectionActor.outboundNegotiationSingle,
+                    .{ actor.io, conn, cmd.protocol_id, cmd.opts, cmd.reply },
+                ) catch |err| cmd.reply.complete(actor.io, err);
             },
             .open_protocol_stream_multi => |cmd| {
-                const result = actor.openProtocolStreamMulti(cmd.protocol_ids, cmd.opts) catch |err| {
-                    cmd.reply.complete(actor.io, err);
-                    if (err == error.Canceled) return error.Canceled;
+                const conn = actor.liveConnection() orelse {
+                    cmd.reply.complete(actor.io, error.ConnectionClosed);
                     continue;
                 };
-                cmd.reply.complete(actor.io, result);
+                actor.handler_group.concurrent(
+                    actor.io,
+                    SwitchConnectionActor.outboundNegotiationMulti,
+                    .{ actor.io, conn, cmd.protocol_ids, cmd.opts, cmd.reply },
+                ) catch |err| cmd.reply.complete(actor.io, err);
             },
             .dispatch_inbound_stream => |cmd| {
                 actor.dispatchInboundStream(cmd.opts) catch |err| {
@@ -1450,6 +1502,87 @@ test "openProtocolStreamMulti negotiates the best protocol the peer supports" {
     client_conn_live = false;
     server_conn.deinit();
     server_conn_live = false;
+}
+
+test "a stalled outbound negotiation does not block the connection's command lane" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    defer client_conn.deinit();
+    const server_conn = try server.accept();
+    defer server_conn.deinit();
+
+    // The server registers no protocol and never dispatches inbound streams,
+    // so the client's multistream proposal gets no response: the initiator's
+    // negotiate parks in its response read until the (long) timeout below.
+    const OpenCtx = struct {
+        conn: *SwitchConnection,
+        io: std.Io,
+        err: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            const stream = ctx.conn.openProtocolStream("/stall/1.0.0", .{
+                .negotiation_timeout = .{ .duration = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake } },
+            }) catch |err| {
+                ctx.err = err;
+                return;
+            };
+            // Unexpected success (the test will fail on `err == null` below);
+            // clean the stream up so the failure does not also leak.
+            closeStreamForCleanup(ctx.io, stream);
+            stream.deinit();
+        }
+    };
+    var open_ctx = OpenCtx{ .conn = client_conn, .io = io };
+    const open_thread = try std.Thread.spawn(.{}, OpenCtx.run, .{&open_ctx});
+
+    // Give the open command time to reach the actor and park in negotiation,
+    // then demand the command lane: stats() posts a command on the same inbox.
+    // Serialized behind the parked negotiation it would take ~5 s; served
+    // concurrently it takes a command round trip. The 2 s bound is ~10^3 x the
+    // expected round trip and 2.5 x under the stall, so it cannot flake in
+    // either direction.
+    io_time.ms(200).sleep(io) catch {};
+    const stats_start_ns = io_time.monotonicNs(io);
+    _ = client_conn.stats();
+    const elapsed_ns = io_time.monotonicNs(io) - stats_start_ns;
+
+    open_thread.join();
+    try std.testing.expect(open_ctx.err != null);
+    try std.testing.expect(elapsed_ns < 2 * std.time.ns_per_s);
 }
 
 test "switch fires peer connect and disconnect events on both ends" {
