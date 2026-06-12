@@ -29,11 +29,10 @@ pub const Lane = enum { subscribe, control, data };
 /// allocator: the allocator that owns bytes/id/self, used by the final release.
 pub const OutboundFrame = struct {
     bytes: []u8,
-    /// Id of the message a data frame carries (for IDONTWANT matching); null
-    /// for control/subscribe frames. A PRIVATE copy, never the interned id: a
-    /// frame's last ref usually drops on a writer fiber, and releasing an
-    /// interned id there would unlink it from the unsynchronized,
-    /// router-fiber-owned intern table off-fiber.
+    /// null except on data frames (for IDONTWANT matching). A PRIVATE copy,
+    /// never the interned id: a frame's last ref usually drops on a writer
+    /// fiber, and releasing an interned id there would unlink it from the
+    /// unsynchronized, router-fiber-owned intern table off-fiber.
     message_id: ?[]u8,
     rc: AtomicRc,
     allocator: std.mem.Allocator,
@@ -401,10 +400,9 @@ pub fn PeerWriter(comptime Sink: type) type {
                     }
                 }
                 self.sink.writeFrame(io, frame.bytes) catch {
-                    // Stream died or write timed out (stalled peer). Lose only
-                    // this frame, close, and re-open next iteration — but after
-                    // max_write_failures in a row the peer is hopeless, so hand
-                    // it back to the router instead of cycling forever.
+                    // Stream died or write timed out (stalled peer): lose only
+                    // this frame, re-open next iteration; give up after
+                    // max_write_failures in a row.
                     self.sink.close(io);
                     self.have_stream = false;
                     frame.release();

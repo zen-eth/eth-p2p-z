@@ -44,8 +44,7 @@ const Stream = quic.Stream;
 /// On open it proposes the full `/meshsub` version list (1.2.0, 1.1.0, 1.0.0)
 /// and uses whichever the peer accepts, recording the negotiated protocol id in
 /// `selected` so the router can learn our outbound version for the peer.
-/// Per-chunk write deadline for the outbound gossip stream, matching the
-/// switch's multistream negotiation timeout.
+/// Matches the switch's multistream negotiation timeout.
 const write_timeout: std.Io.Timeout = .{
     .duration = .{ .raw = .fromNanoseconds(10 * std.time.ns_per_s), .clock = .awake },
 };
@@ -72,11 +71,10 @@ pub const StreamSink = struct {
     }
 
     /// Write one framed RPC to the current stream. Errors propagate so the
-    /// writer can tear the stream down and re-open. Each write is bounded by
-    /// `write_timeout` so a stalled-but-alive peer (flow-control frozen, not
-    /// reading) can't park the writer fiber forever with its lane backlog
-    /// pinned. The timeout is per write, so a slow-but-progressing peer never
-    /// trips it; repeated timeouts become a disconnect via the give-up counter.
+    /// writer can tear the stream down and re-open. Bounded per write so a
+    /// stalled-but-alive peer (flow-control frozen, not reading) can't park the
+    /// writer fiber forever; a slow-but-progressing peer never trips it, and
+    /// repeated timeouts become a disconnect via the give-up counter.
     pub fn writeFrame(self: *StreamSink, io: std.Io, bytes: []const u8) !void {
         try self.current.?.writeAll(io, bytes, .{ .timeout = write_timeout });
     }
@@ -97,12 +95,9 @@ pub const StreamSink = struct {
 /// errors so the reader loop exits.
 pub const StreamSource = struct {
     stream: *Stream,
-    /// Buffered reader over the stream, initialized lazily on the first read
-    /// (when an `io` is in hand). Keeps a frame's over-read for the next frame,
-    /// and reads the length varint from the buffer instead of one locked stream
-    /// read per byte. Must not move after the first read (the reader's vtable
-    /// resolves through its own address) — it lives as a stack local in the
-    /// inbound handler fiber.
+    /// Initialized lazily on the first read (when an `io` is in hand). Must not
+    /// move after that: the reader's vtable resolves through its own address,
+    /// and it lives as a stack local in the inbound handler fiber.
     reader: ?Stream.Reader = null,
     buffer: [read_buffer_len]u8 = undefined,
 
@@ -542,8 +537,7 @@ pub const Gossipsub = struct {
         return self.router.peerCount();
     }
 
-    /// Consistent snapshot of the router's counters (message-pipeline outcomes,
-    /// drop/saturation counts, peer/topic/seen sizes). Blocks for one
+    /// Consistent snapshot of the router's counters. Blocks for one
     /// control-inbox round trip; meant for periodic scrapes.
     pub fn stats(self: *Gossipsub) Router.Stats {
         return self.router.stats();
@@ -1440,24 +1434,17 @@ test "two gossipsub nodes: pub/sub survives a drop+reconnect of the connection" 
     client_gs_live = false;
 }
 
-/// Whether `router` currently tracks `peer` as a connected peer. Probes on the
-/// router fiber; an off-fiber `peers` read would race the router's mutations.
 fn routerHasPeer(router: *Router, peer: PeerId) bool {
     return router.probeForTest(peer, "").tracked;
 }
 
-/// Whether `router` holds a certified signed peer record for `peer` (the bytes
-/// a peer-exchange offer would carry). Probes on the router fiber.
 fn routerHasRecord(router: *Router, peer: PeerId) bool {
     return router.probeForTest(peer, "").has_record;
 }
 
-/// The number of peers in `router`'s mesh for `topic` (0 when no mesh exists).
-/// Reads the `mesh` field directly so the test can watch the centre go
-/// over-degree without a public accessor.
+/// Probes with the node's own id (never a peer of itself), so only `mesh_size`
+/// of the returned probe is meaningful.
 fn routerMeshSize(router: *Router, topic: []const u8) usize {
-    // Probe with the node's own id (never a peer of itself); only mesh_size
-    // matters. Runs on the router fiber, so it can't race mesh mutations.
     return router.probeForTest(router.local_peer, topic).mesh_size;
 }
 

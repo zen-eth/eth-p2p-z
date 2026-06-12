@@ -375,9 +375,8 @@ pub const StreamReader = struct {
         if (data_capacity == 0) {
             // writableVector queues caller slices ahead of the reader's own
             // buffer, so zero caller capacity means the read landed in
-            // `interface.buffer`: account for it by advancing `end` and return
-            // 0 (bytes delivered to `data`). Returning `n` makes the fill loop
-            // re-read and drop these bytes.
+            // `interface.buffer`: advance `end` and return 0 bytes-to-`data`.
+            // Returning `n` makes the fill loop re-read and drop these bytes.
             io_r.end += n;
             return 0;
         }
@@ -408,7 +407,6 @@ test "StreamReader: a refill into the reader's own buffer surfaces the bytes" {
     const stream = try create(allocator, state);
     defer stream.deinit();
 
-    // Actor side: three bytes arrive, then FIN.
     try std.testing.expect(state.inbound_queue.?.tryPutAll(io, "abc"));
     state.closeInbound();
 

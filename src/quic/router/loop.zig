@@ -114,10 +114,9 @@ pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAd
     var bind_addr = addr;
     // `ip6_only` stays UNSET: std.Io.Threaded inverts it (true -> dual-stack)
     // but zio is literal (true -> v6-only), so any value is wrong on one
-    // backend. We want dual-stack (IPv4 peers arrive v4-mapped), which is the
-    // OS default for AF_INET6 on Linux/macOS. V6ONLY is only changeable before
-    // bind and the socket is already bound, so we verify the default after bind
-    // rather than set it.
+    // backend. We want dual-stack (IPv4 peers arrive v4-mapped), the OS default
+    // for AF_INET6. V6ONLY is only settable before bind, so we verify the
+    // default after bind rather than set it.
     const bind_options: std.Io.net.IpAddress.BindOptions = .{
         .mode = .dgram,
     };

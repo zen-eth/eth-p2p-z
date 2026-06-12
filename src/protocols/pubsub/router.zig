@@ -955,9 +955,6 @@ pub fn Router(comptime Transport: type) type {
 
             pub fn post(self: *InboxPoster, io: std.Io, in: peer_io.InboundRpc) anyerror!void {
                 const cmd: Command = .{ .inbound_rpc = in };
-                // Try a non-blocking put first; on a full inbox, count the stall
-                // (atomic: many reader fibers post here) then park in the blocking
-                // put as before. Backpressure is unchanged — only the metric is new.
                 const queued = self.router.inbox.putUncancelable(io, &.{cmd}, 0) catch 0;
                 if (queued == 1) return;
                 _ = self.router.inbox_stalls.fetchAdd(1, .monotonic);
@@ -1867,8 +1864,6 @@ pub fn Router(comptime Transport: type) type {
                 if (router.peerScore(peer) < 0) continue;
                 out.append(router.allocator, peer) catch break;
             }
-            // Shuffle all eligible candidates, then keep `n`: a uniform sample
-            // rather than peer-map order an attacker could pace connections to steer.
             router.prng.random().shuffle(PeerId, out.items);
             if (out.items.len > n) out.shrinkRetainingCapacity(n);
             return out.items.len;
@@ -1901,8 +1896,6 @@ pub fn Router(comptime Transport: type) type {
                     const sc = if (router.score_snapshot.get(key_ptr.*)) |s| s else 0;
                     scored.append(router.allocator, .{ .key = key_ptr.*, .score = sc }) catch break;
                 }
-                // Shuffle before sorting so equal scores (the common case) break
-                // ties randomly instead of in map order, as go does.
                 router.prng.random().shuffle(Scored, scored.items);
                 std.mem.sort(Scored, scored.items, {}, struct {
                     fn lessThan(_: void, a: Scored, b: Scored) bool {
@@ -1922,8 +1915,6 @@ pub fn Router(comptime Transport: type) type {
             while (it.next()) |key_ptr| {
                 out.append(router.allocator, key_ptr.*) catch break;
             }
-            // Scoring off: every member is an equal candidate — shuffle, then
-            // keep `n`, so the victims are uniform rather than mesh-set order.
             router.prng.random().shuffle(PeerKey, out.items);
             if (out.items.len > n) out.shrinkRetainingCapacity(n);
             return out.items.len;
@@ -1973,8 +1964,6 @@ pub fn Router(comptime Transport: type) type {
         /// membership is a uniform sample of the topic's peers.
         fn fanoutReplenish(router: *Self, topic: []const u8, set: *PeerSet) void {
             if (set.count() >= mesh_params.d) return;
-            // Gather every eligible candidate not already in the set, shuffle,
-            // then top up to `d` — a uniform sample, not the peer-map prefix.
             var candidates: std.ArrayListUnmanaged(PeerId) = .empty;
             defer candidates.deinit(router.allocator);
             var it = router.peers.iterator();
@@ -2085,7 +2074,6 @@ pub fn Router(comptime Transport: type) type {
             seen_ids: usize = 0,
         };
 
-        /// Reply slot for the `stats` command (stack-allocated by the caller).
         pub const StatsReply = struct {
             event: std.Io.Event = .unset,
             snap: Stats = .{},
@@ -2687,8 +2675,6 @@ pub fn Router(comptime Transport: type) type {
             router.maintainMeshes();
             router.maintainFanout();
 
-            // GS_DEBUG diagnostic: per-topic peer/subscriber/mesh counts each
-            // heartbeat — the first thing to read when a live mesh misbehaves.
             if (router.gs_debug) {
                 var tit = router.my_topics.keyIterator();
                 while (tit.next()) |tk| {
@@ -4981,7 +4967,6 @@ test "router tears the peer down after consecutive write failures (stalled peer)
     for (0..4) |_| try router.enqueueDataForTest(peer, try testDataFrame(allocator));
 
     try std.testing.expect(waitFor(io, peerCountIsZero, router));
-    // Nothing was ever successfully written.
     try std.testing.expectEqual(@as(usize, 0), conn.record.written.items.len);
 }
 
@@ -5845,9 +5830,6 @@ test "stats: pipeline counters partition received messages" {
     defer router.destroy();
     try std.testing.expectEqual(GraftOutcome.accepted, try graftAndWait(io, allocator, router, conn_y, peer_y, "t"));
 
-    // A new message, then its duplicate: received counts both, the outcome
-    // split is exactly one accept + one duplicate, and the seen cache holds
-    // the one id.
     try router.inbox.putOne(io, .{ .inbound_rpc = .{
         .peer = peer_x,
         .rpc = try buildInboundPublish(allocator, "origin", "\x00\x00\x00\x0a", "t", "stats"),

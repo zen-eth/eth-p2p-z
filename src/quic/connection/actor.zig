@@ -1015,8 +1015,6 @@ pub const ConnectionActor = struct {
                     self.stats_snapshot.write_errors += 1;
                     return err;
                 };
-                // Count GSO only when the segmented send succeeded; the
-                // downgrade path delivered plain packets.
                 if (sent_via_gso) {
                     self.stats_snapshot.write_gso_groups += gso_groups;
                     self.stats_snapshot.write_gso_segments += gso_segments;
@@ -2268,7 +2266,6 @@ test "gsoGroupLen: a shorter packet joins as the final segment and closes the gr
     const dests = [_]std.Io.net.IpAddress{ a, a, a, a };
     const froms = [_]?std.Io.net.IpAddress{ null, null, null, null };
     try std.testing.expectEqual(@as(usize, 3), gsoGroupLen(&lens, &dests, &froms, 0));
-    // The next group starts fresh at the packet after the short tail.
     try std.testing.expectEqual(@as(usize, 1), gsoGroupLen(&lens, &dests, &froms, 3));
 }
 

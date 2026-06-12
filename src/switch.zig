@@ -767,9 +767,8 @@ const SwitchConnectionActor = struct {
         reply.complete(io, openAndNegotiate(io, conn, protocol_ids, opts));
     }
 
-    /// Single-protocol variant of `outboundNegotiationMulti`: propose just
-    /// `protocol_id` and reject a selection other than it. A one-element list
-    /// can only return that id, so the mismatch check is just a guard.
+    /// A one-element list can only return that id, so the mismatch check is just
+    /// a guard against the responder echoing a candidate it was not offered.
     fn outboundNegotiationSingle(
         io: std.Io,
         conn: *quic.Connection,
@@ -907,13 +906,6 @@ fn actorMain(actor: *SwitchConnectionActor) std.Io.Cancelable!void {
             error.Canceled => return error.Canceled,
         };
         switch (command) {
-            // Outbound negotiation runs on a handler_group fiber, not here: it
-            // blocks on network RTTs, and inline that queues every other command
-            // for this connection (close, stats, dispatch) behind one slow peer.
-            // This fiber just resolves the live connection and spawns. Lifetime:
-            // `close` cancels handler_group after closing the connection (close
-            // aborts in-flight negotiations), and `cleanup` joins it before the
-            // handle is deinited.
             .open_protocol_stream => |cmd| {
                 const conn = actor.liveConnection() orelse {
                     cmd.reply.complete(actor.io, error.ConnectionClosed);
@@ -1549,7 +1541,7 @@ test "a stalled outbound negotiation does not block the connection's command lan
                 ctx.err = err;
                 return;
             };
-            // Unexpected success (test fails on `err == null` below); clean up so it doesn't also leak.
+            // Unexpected: the test asserts failure below; clean up the stream anyway.
             closeStreamForCleanup(ctx.io, stream);
             stream.deinit();
         }

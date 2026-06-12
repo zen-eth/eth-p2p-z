@@ -191,7 +191,7 @@ pub const ConnectionStats = struct {
     write_batches: u64 = 0,
     write_packets: u64 = 0,
     /// GSO sends that coalesced >= 2 packets into one UDP_SEGMENT, and the
-    /// packets they carried (write_packets counts all packets regardless).
+    /// packets they carried; write_packets still counts these (not a subset).
     write_gso_groups: u64 = 0,
     write_gso_segments: u64 = 0,
     write_bytes: u64 = 0,

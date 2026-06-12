@@ -41,8 +41,7 @@ pub const Options = struct {
 
 pub const Capabilities = struct {
     udp_gro: bool = false,
-    /// Kernel supports UDP_SEGMENT (GSO, Linux >= 4.18): one sendmsg carries a
-    /// packed run of equal-sized datagrams that the kernel segments on egress.
+    /// Kernel supports UDP_SEGMENT (GSO, Linux >= 4.18).
     udp_gso: bool = false,
     // Packet-info socket options are negotiated per address family; dual-stack
     // sockets can support source control for one family and reject the other.
@@ -96,8 +95,7 @@ pub const OutgoingMeta = struct {
     caps: Capabilities = .{},
     from: ?std.Io.net.IpAddress = null,
     /// When set (and the socket has `udp_gso`), the payload is a packed run of
-    /// datagrams of this size (the last may be shorter); a UDP_SEGMENT cmsg
-    /// tells the kernel to segment it on egress.
+    /// datagrams of this size (the last may be shorter), segmented on egress.
     gso_segment_len: ?u16 = null,
 };
 
@@ -616,7 +614,6 @@ test "encodeOutgoingControl appends a UDP_SEGMENT cmsg when GSO is usable" {
     try std.testing.expect(appendCmsg(&expected, &offset, std.posix.IPPROTO.UDP, linux.UDP.SEGMENT, std.mem.asBytes(&seg)));
     try std.testing.expectEqualSlices(u8, expected[0..offset], out);
 
-    // Without the capability the segment hint is dropped (plain send).
     const none = encodeOutgoingControl(&control, .{
         .caps = .{},
         .gso_segment_len = 1350,

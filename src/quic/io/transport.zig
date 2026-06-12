@@ -71,8 +71,6 @@ pub const SharedUdpSocket = struct {
         return shared.socket.sendMany(io, messages, flags);
     }
 
-    /// True if GSO (UDP_SEGMENT) is safe to use: probe passed and no live send
-    /// has failed since.
     pub fn gsoUsable(shared: *const SharedUdpSocket) bool {
         return shared.caps.udp_gso and !shared.gso_broken.load(.monotonic);
     }

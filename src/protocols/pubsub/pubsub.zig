@@ -134,8 +134,7 @@ pub const ReadRpcBufferedError = error{ EndOfStream, ReadFailed, VarintTooLong, 
 /// Like `readRpc` but over a persistent buffered `std.Io.Reader`: one stream
 /// read per buffer refill instead of one mutex-guarded `readAll` per varint
 /// byte. Over-read bytes stay buffered for the next frame, so the reader must
-/// outlive the stream (one per inbound handler). Large bodies stream straight
-/// into the owned allocation once the buffer drains — no extra copy.
+/// outlive the stream (one per inbound handler).
 pub fn readRpcBuffered(allocator: std.mem.Allocator, r: *std.Io.Reader) ReadRpcBufferedError!OwnedRpc {
     const len = try readUvarintBuffered(r);
     if (len > max_rpc_message_len) return error.MessageTooLarge;
