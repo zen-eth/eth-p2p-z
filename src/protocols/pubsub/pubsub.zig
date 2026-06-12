@@ -131,13 +131,11 @@ pub fn readRpc(allocator: std.mem.Allocator, io: std.Io, stream: *Stream) ReadRp
 
 pub const ReadRpcBufferedError = error{ EndOfStream, ReadFailed, VarintTooLong, MessageTooLarge } || gremlin.Error;
 
-/// Like `readRpc` but through a PERSISTENT buffered `std.Io.Reader` over the
-/// stream: the length varint comes from the buffer (one stream round trip per
-/// REFILL instead of one mutex-guarded `readAll` per varint BYTE), and any
-/// over-read bytes stay buffered for the next frame — which is why the reader
-/// must live as long as the stream (one per inbound handler, see
-/// gossipsub.StreamSource). Large bodies stream straight into the owned
-/// allocation once the buffer drains, so big messages pay no extra copy.
+/// Like `readRpc` but over a persistent buffered `std.Io.Reader`: one stream
+/// read per buffer refill instead of one mutex-guarded `readAll` per varint
+/// byte. Over-read bytes stay buffered for the next frame, so the reader must
+/// outlive the stream (one per inbound handler). Large bodies stream straight
+/// into the owned allocation once the buffer drains — no extra copy.
 pub fn readRpcBuffered(allocator: std.mem.Allocator, r: *std.Io.Reader) ReadRpcBufferedError!OwnedRpc {
     const len = try readUvarintBuffered(r);
     if (len > max_rpc_message_len) return error.MessageTooLarge;

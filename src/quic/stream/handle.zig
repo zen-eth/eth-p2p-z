@@ -373,12 +373,11 @@ pub const StreamReader = struct {
             },
         };
         if (data_capacity == 0) {
-            // writableVector queues the caller's `data` slices ahead of the
-            // reader's own buffer, so zero caller capacity means the read
-            // landed in `interface.buffer`: those bytes are accounted for by
-            // advancing `end`, and the return value (bytes delivered to
-            // `data`) must be 0 — returning `n` here makes the fill loop
-            // re-read and silently drop this read's bytes.
+            // writableVector queues caller slices ahead of the reader's own
+            // buffer, so zero caller capacity means the read landed in
+            // `interface.buffer`: account for it by advancing `end` and return
+            // 0 (bytes delivered to `data`). Returning `n` makes the fill loop
+            // re-read and drop these bytes.
             io_r.end += n;
             return 0;
         }
@@ -413,11 +412,10 @@ test "StreamReader: a refill into the reader's own buffer surfaces the bytes" {
     try std.testing.expect(state.inbound_queue.?.tryPutAll(io, "abc"));
     state.closeInbound();
 
-    // takeByte refills through StreamReader.readVec with no caller slices, so
-    // the underlying read lands in the reader's internal buffer. Each byte
-    // must come out in order, then EndOfStream — a refill that forgets to
-    // advance `end` silently discards the bytes it just read and reports a
-    // premature end of stream instead.
+    // takeByte refills through readVec with no caller slices, so the read
+    // lands in the reader's internal buffer. Bytes must come out in order then
+    // EndOfStream; a refill that forgets to advance `end` discards them and
+    // reports a premature EOS.
     var buffer: [16]u8 = undefined;
     var r = stream.reader(io, &buffer);
     try std.testing.expectEqual(@as(u8, 'a'), try r.interface.takeByte());

@@ -746,21 +746,17 @@ const SwitchConnectionActor = struct {
         }
     }
 
-    /// Open + initiator-negotiate, OFF the actor's command fiber. Runs on a
-    /// `handler_group` fiber so a slow responder (network RTTs, up to the
-    /// negotiation timeout) never queues this connection's other commands
-    /// (close, stats, dispatch) behind it. The fiber touches the connection
-    /// handle but never `actor.conn`/`actor.closing` (actor-fiber-confined
-    /// fields): the handle pointer is resolved by the command fiber at spawn
-    /// and stays valid for the fiber's whole life — handler_group is cancelled
-    /// and joined before `cleanup` deinits the handle, and the `close` command
-    /// only `conn.close`s — whose teardown chain closes every per-stream queue,
-    /// unparking a negotiation blocked in a stream read (the handle itself is
-    /// deinited only at cleanup).
+    /// Open + initiator-negotiate on a `handler_group` fiber, off the actor's
+    /// command fiber, so a slow responder doesn't queue this connection's other
+    /// commands (close, stats, dispatch) behind it. Touches only the `conn`
+    /// handle (resolved at spawn), never `actor.conn`/`actor.closing`: the
+    /// handle stays valid because handler_group is cancelled+joined before
+    /// `cleanup` deinits it, and `close` only `conn.close`s — its teardown
+    /// closes every per-stream queue, unparking a negotiation blocked in a read.
     ///
-    /// Completes `reply` on EVERY path — cancellation included (the stream ops
-    /// surface Canceled as a value here, so the fiber never unwinds past the
-    /// completion) — because the caller is parked uncancelably on it.
+    /// Completes `reply` on every path including cancellation (stream ops
+    /// surface Canceled as a value, never unwinding past completion), because
+    /// the caller is parked uncancelably on it.
     fn outboundNegotiationMulti(
         io: std.Io,
         conn: *quic.Connection,
@@ -772,10 +768,8 @@ const SwitchConnectionActor = struct {
     }
 
     /// Single-protocol variant of `outboundNegotiationMulti`: propose just
-    /// `protocol_id` and treat a selection other than it as a mismatch (the
-    /// responder echoing a candidate it was not offered). With a one-element
-    /// list `negotiate` can only return that id, so the mismatch check is a
-    /// belt-and-suspenders guard.
+    /// `protocol_id` and reject a selection other than it. A one-element list
+    /// can only return that id, so the mismatch check is just a guard.
     fn outboundNegotiationSingle(
         io: std.Io,
         conn: *quic.Connection,
@@ -812,8 +806,8 @@ const SwitchConnectionActor = struct {
 
         // The initiator proposes each id in `protocol_ids` (preference order)
         // until the responder accepts one; `selected` aliases that element, so it
-        // stays valid as long as the caller's slice does (the caller blocks on
-        // the reply for the negotiation's whole life, so it does).
+        // stays valid as long as the caller's slice does — and it does, since the
+        // caller blocks on the reply for the whole negotiation.
         const selected = try protocols.multistream.negotiate(io, stream, protocol_ids, .{
             .role = .initiator,
             .timeout = opts.negotiation_timeout,
@@ -913,23 +907,19 @@ fn actorMain(actor: *SwitchConnectionActor) std.Io.Cancelable!void {
             error.Canceled => return error.Canceled,
         };
         switch (command) {
-            // Outbound negotiation runs on a handler_group fiber, NOT here: it
-            // blocks on network RTTs (up to the negotiation timeout), and doing
-            // that inline queued every other command for this connection —
-            // close, stats, inbound dispatch — behind one slow peer. The
-            // command fiber only resolves the live connection and spawns; the
-            // fiber completes the reply on every path. handler_group is exactly
-            // the right lifetime bucket: the `close` command cancels it after
-            // closing the connection (a close ABORTS in-flight negotiations by
-            // design), and `cleanup` joins it before the handle is deinited.
+            // Outbound negotiation runs on a handler_group fiber, not here: it
+            // blocks on network RTTs, and inline that queues every other command
+            // for this connection (close, stats, dispatch) behind one slow peer.
+            // This fiber just resolves the live connection and spawns. Lifetime:
+            // `close` cancels handler_group after closing the connection (close
+            // aborts in-flight negotiations), and `cleanup` joins it before the
+            // handle is deinited.
             .open_protocol_stream => |cmd| {
                 const conn = actor.liveConnection() orelse {
                     cmd.reply.complete(actor.io, error.ConnectionClosed);
                     continue;
                 };
-                // Spawn's only error is ConcurrencyUnavailable (no Canceled —
-                // the spawn is not a cancel point); complete the caller and
-                // keep serving commands.
+                // Spawn can only fail with ConcurrencyUnavailable, never Canceled; complete the caller and continue.
                 actor.handler_group.concurrent(
                     actor.io,
                     SwitchConnectionActor.outboundNegotiationSingle,
@@ -1545,9 +1535,8 @@ test "a stalled outbound negotiation does not block the connection's command lan
     const server_conn = try server.accept();
     defer server_conn.deinit();
 
-    // The server registers no protocol and never dispatches inbound streams,
-    // so the client's multistream proposal gets no response: the initiator's
-    // negotiate parks in its response read until the (long) timeout below.
+    // The server never dispatches inbound streams, so the client's proposal
+    // gets no response and negotiate parks in its read until the timeout below.
     const OpenCtx = struct {
         conn: *SwitchConnection,
         io: std.Io,
@@ -1560,8 +1549,7 @@ test "a stalled outbound negotiation does not block the connection's command lan
                 ctx.err = err;
                 return;
             };
-            // Unexpected success (the test will fail on `err == null` below);
-            // clean the stream up so the failure does not also leak.
+            // Unexpected success (test fails on `err == null` below); clean up so it doesn't also leak.
             closeStreamForCleanup(ctx.io, stream);
             stream.deinit();
         }
@@ -1569,12 +1557,10 @@ test "a stalled outbound negotiation does not block the connection's command lan
     var open_ctx = OpenCtx{ .conn = client_conn, .io = io };
     const open_thread = try std.Thread.spawn(.{}, OpenCtx.run, .{&open_ctx});
 
-    // Give the open command time to reach the actor and park in negotiation,
-    // then demand the command lane: stats() posts a command on the same inbox.
-    // Serialized behind the parked negotiation it would take ~5 s; served
-    // concurrently it takes a command round trip. The 2 s bound is ~10^3 x the
-    // expected round trip and 2.5 x under the stall, so it cannot flake in
-    // either direction.
+    // Let the open command park in negotiation, then hit the same inbox with
+    // stats(). Serialized behind the parked negotiation it takes ~5 s; served
+    // concurrently, one command round trip. The 2 s bound sits well above the
+    // round trip and well under the stall, so it can't flake either way.
     io_time.ms(200).sleep(io) catch {};
     const stats_start_ns = io_time.monotonicNs(io);
     _ = client_conn.stats();

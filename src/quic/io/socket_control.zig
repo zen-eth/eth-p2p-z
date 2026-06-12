@@ -41,8 +41,8 @@ pub const Options = struct {
 
 pub const Capabilities = struct {
     udp_gro: bool = false,
-    /// Kernel supports UDP_SEGMENT (GSO, Linux >= 4.18): one sendmsg can carry
-    /// a packed run of equal-sized datagrams that the kernel segments late.
+    /// Kernel supports UDP_SEGMENT (GSO, Linux >= 4.18): one sendmsg carries a
+    /// packed run of equal-sized datagrams that the kernel segments on egress.
     udp_gso: bool = false,
     // Packet-info socket options are negotiated per address family; dual-stack
     // sockets can support source control for one family and reject the other.
@@ -56,16 +56,14 @@ pub const Capabilities = struct {
 
 pub const ConfigureError = std.posix.SetSockOptError;
 
-/// IPV6_V6ONLY's optname (`std.posix.IPV6` is `void` on macOS, so the numeric
-/// values live here): 26 on Linux, 27 on the BSDs/macOS.
+/// IPV6_V6ONLY optname, hardcoded because `std.posix.IPV6` is `void` on macOS:
+/// 26 on Linux, 27 on the BSDs/macOS.
 const ipv6_v6only_optname: u32 = if (builtin.os.tag == .linux) 26 else 27;
 
-/// Whether an AF_INET6 UDP socket accepts IPv4-mapped traffic
-/// (IPV6_V6ONLY == 0). Read-only and therefore safe AFTER bind — the option
-/// itself can only be changed before bind, which is why the bind path relies
-/// on the OS default (dual-stack on both Linux and macOS) and verifies it
-/// here instead of setting anything. Returns null when the platform cannot
-/// report the option.
+/// Whether an AF_INET6 UDP socket accepts IPv4-mapped traffic (IPV6_V6ONLY ==
+/// 0). Read-only, so safe after bind; the option can only be set before bind,
+/// so the bind path relies on the OS default (dual-stack on Linux and macOS)
+/// and just verifies it here. Returns null if the platform can't report it.
 pub fn dualStackEnabled(socket: *const std.Io.net.Socket) ?bool {
     var value: c_int = -1;
     var len: std.posix.socklen_t = @sizeOf(c_int);
@@ -97,9 +95,9 @@ pub const ParsedControl = struct {
 pub const OutgoingMeta = struct {
     caps: Capabilities = .{},
     from: ?std.Io.net.IpAddress = null,
-    /// When set (and the socket has `udp_gso`), the message's payload is a
-    /// packed run of datagrams of this size (the last may be shorter) and a
-    /// UDP_SEGMENT cmsg tells the kernel to segment it on the way out.
+    /// When set (and the socket has `udp_gso`), the payload is a packed run of
+    /// datagrams of this size (the last may be shorter); a UDP_SEGMENT cmsg
+    /// tells the kernel to segment it on egress.
     gso_segment_len: ?u16 = null,
 };
 
@@ -124,9 +122,9 @@ pub fn configureUdpSocket(socket: *const std.Io.net.Socket, options: Options) Co
         caps.udp_gro = trySetSockOpt(fd, std.posix.IPPROTO.UDP, linux.UDP.GRO, c_int, one);
     }
     if (options.enable_udp_gso) {
-        // Probe only: UDP_SEGMENT=0 keeps socket-wide segmentation off while
-        // proving kernel support (ENOPROTOOPT on < 4.18 leaves the cap false).
-        // Actual segment sizes ride per-send cmsgs (see encodeOutgoingControl).
+        // Probe only: UDP_SEGMENT=0 proves kernel support without enabling
+        // socket-wide segmentation (ENOPROTOOPT on < 4.18 leaves the cap
+        // false). Real segment sizes ride per-send cmsgs.
         caps.udp_gso = trySetSockOpt(fd, std.posix.IPPROTO.UDP, linux.UDP.SEGMENT, c_int, 0);
     }
     if (options.enable_pktinfo) {

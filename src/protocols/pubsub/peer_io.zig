@@ -29,12 +29,11 @@ pub const Lane = enum { subscribe, control, data };
 /// allocator: the allocator that owns bytes/id/self, used by the final release.
 pub const OutboundFrame = struct {
     bytes: []u8,
-    /// The id of the message a data frame carries (for IDONTWANT matching);
-    /// null for control/subscribe frames. Owned by the frame — a PRIVATE copy,
-    /// never a reference into the router's intern table: an interned id's
-    /// LAST release unlinks it from the unsynchronized, router-fiber-owned
-    /// intern hash table, and a frame's last reference is usually dropped on
-    /// a writer fiber (the refcount itself is atomic; the table is not).
+    /// Id of the message a data frame carries (for IDONTWANT matching); null
+    /// for control/subscribe frames. A PRIVATE copy, never the interned id: a
+    /// frame's last ref usually drops on a writer fiber, and releasing an
+    /// interned id there would unlink it from the unsynchronized,
+    /// router-fiber-owned intern table off-fiber.
     message_id: ?[]u8,
     rc: AtomicRc,
     allocator: std.mem.Allocator,
@@ -86,10 +85,8 @@ pub const Options = struct {
     /// Max un-popped frames the data lane will hold; further pushes fail.
     data_cap: usize = 1024,
     /// Max un-popped frames the subscribe lane will hold; further pushes fail.
-    /// Subscriptions are rare (one frame per local topic change, plus the
-    /// full-set announce to a new peer), so this cap only ever binds when the
-    /// writer is wedged on a stalled peer — where an unbounded lane would
-    /// otherwise grow without limit (every other lane is capped).
+    /// Subscriptions are rare, so this only binds when the writer is wedged on
+    /// a stalled peer — but every lane must be capped so none grows unbounded.
     subscribe_cap: usize = 256,
 };
 
@@ -362,12 +359,11 @@ pub fn PeerWriter(comptime Sink: type) type {
         sink: *Sink,
         /// Open attempts before giving up on the peer (each followed by backoff).
         max_open_retries: usize = 5,
-        /// Consecutive failed frame writes (each followed by a stream re-open)
-        /// before giving up on the peer. A STALLED-but-alive peer fails every
-        /// write at the sink's write timeout; without this bound the writer
-        /// would cycle write-timeout -> reopen forever, draining one dropped
-        /// frame per timeout while the peer pins its queue caps. Resets on any
-        /// successful write.
+        /// Consecutive write failures (each followed by a stream re-open) before
+        /// giving up on the peer. A stalled-but-alive peer fails every write at
+        /// the write timeout; without this bound the writer cycles
+        /// write-timeout -> reopen forever, dropping one frame per timeout while
+        /// the peer pins its queue caps. Resets on any successful write.
         max_write_failures: usize = 3,
         /// Sleep between open attempts, in milliseconds.
         reopen_backoff_ms: u64 = 50,
@@ -405,12 +401,10 @@ pub fn PeerWriter(comptime Sink: type) type {
                     }
                 }
                 self.sink.writeFrame(io, frame.bytes) catch {
-                    // The stream died or the write timed out (a stalled peer).
-                    // Lose only this in-flight frame, close the stream, and
-                    // re-open lazily next iteration — unless this keeps
-                    // happening: after max_write_failures consecutive failures
-                    // the peer is hopeless (stalled or flapping), so give it
-                    // back to the router instead of cycling forever.
+                    // Stream died or write timed out (stalled peer). Lose only
+                    // this frame, close, and re-open next iteration — but after
+                    // max_write_failures in a row the peer is hopeless, so hand
+                    // it back to the router instead of cycling forever.
                     self.sink.close(io);
                     self.have_stream = false;
                     frame.release();

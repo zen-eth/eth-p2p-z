@@ -44,9 +44,8 @@ const Stream = quic.Stream;
 /// On open it proposes the full `/meshsub` version list (1.2.0, 1.1.0, 1.0.0)
 /// and uses whichever the peer accepts, recording the negotiated protocol id in
 /// `selected` so the router can learn our outbound version for the peer.
-/// Per-chunk write deadline for the outbound gossip stream — matches the
-/// switch's multistream negotiation timeout, so every network-facing wait in
-/// the writer's loop is bounded by the same order of patience.
+/// Per-chunk write deadline for the outbound gossip stream, matching the
+/// switch's multistream negotiation timeout.
 const write_timeout: std.Io.Timeout = .{
     .duration = .{ .raw = .fromNanoseconds(10 * std.time.ns_per_s), .clock = .awake },
 };
@@ -73,12 +72,11 @@ pub const StreamSink = struct {
     }
 
     /// Write one framed RPC to the current stream. Errors propagate so the
-    /// writer can tear the stream down and re-open. Each chunk write is bounded
-    /// by `write_timeout`: a STALLED-but-alive peer (flow-control frozen, not
-    /// reading) otherwise parks the writer fiber forever with the peer's whole
-    /// lane backlog pinned. A slow-but-progressing peer never trips it (the
-    /// timeout is per write call, refreshed on progress); repeated timeouts are
-    /// converted into a disconnect by the writer's give-up counter.
+    /// writer can tear the stream down and re-open. Each write is bounded by
+    /// `write_timeout` so a stalled-but-alive peer (flow-control frozen, not
+    /// reading) can't park the writer fiber forever with its lane backlog
+    /// pinned. The timeout is per write, so a slow-but-progressing peer never
+    /// trips it; repeated timeouts become a disconnect via the give-up counter.
     pub fn writeFrame(self: *StreamSink, io: std.Io, bytes: []const u8) !void {
         try self.current.?.writeAll(io, bytes, .{ .timeout = write_timeout });
     }
@@ -99,12 +97,12 @@ pub const StreamSink = struct {
 /// errors so the reader loop exits.
 pub const StreamSource = struct {
     stream: *Stream,
-    /// Persistent buffered reader over the stream (initialized lazily on the
-    /// first read, when an `io` is in hand). One frame's over-read stays
-    /// buffered for the next, and the length varint costs buffered byte-takes
-    /// instead of one locked stream read PER BYTE. The source must not move
-    /// after the first read (the reader's vtable resolves through its own
-    /// address) — it lives as a stack local in the inbound handler fiber.
+    /// Buffered reader over the stream, initialized lazily on the first read
+    /// (when an `io` is in hand). Keeps a frame's over-read for the next frame,
+    /// and reads the length varint from the buffer instead of one locked stream
+    /// read per byte. Must not move after the first read (the reader's vtable
+    /// resolves through its own address) — it lives as a stack local in the
+    /// inbound handler fiber.
     reader: ?Stream.Reader = null,
     buffer: [read_buffer_len]u8 = undefined,
 
@@ -544,9 +542,9 @@ pub const Gossipsub = struct {
         return self.router.peerCount();
     }
 
-    /// One consistent snapshot of the router's production counters (message
-    /// pipeline outcomes, drop/saturation counters, peer/topic/seen sizes).
-    /// Blocks for one control-inbox round trip — meant for periodic scrapes.
+    /// Consistent snapshot of the router's counters (message-pipeline outcomes,
+    /// drop/saturation counts, peer/topic/seen sizes). Blocks for one
+    /// control-inbox round trip; meant for periodic scrapes.
     pub fn stats(self: *Gossipsub) Router.Stats {
         return self.router.stats();
     }
@@ -1442,16 +1440,14 @@ test "two gossipsub nodes: pub/sub survives a drop+reconnect of the connection" 
     client_gs_live = false;
 }
 
-/// Whether `router` currently tracks `peer` as a connected peer, read on the
-/// router fiber via the probe command (an off-fiber `peers` read would race
-/// the router's mutations).
+/// Whether `router` currently tracks `peer` as a connected peer. Probes on the
+/// router fiber; an off-fiber `peers` read would race the router's mutations.
 fn routerHasPeer(router: *Router, peer: PeerId) bool {
     return router.probeForTest(peer, "").tracked;
 }
 
 /// Whether `router` holds a certified signed peer record for `peer` (the bytes
-/// a peer-exchange offer for `peer` would carry), read on the router fiber via
-/// the probe command.
+/// a peer-exchange offer would carry). Probes on the router fiber.
 fn routerHasRecord(router: *Router, peer: PeerId) bool {
     return router.probeForTest(peer, "").has_record;
 }
@@ -1460,9 +1456,8 @@ fn routerHasRecord(router: *Router, peer: PeerId) bool {
 /// Reads the `mesh` field directly so the test can watch the centre go
 /// over-degree without a public accessor.
 fn routerMeshSize(router: *Router, topic: []const u8) usize {
-    // Probe with the node's own id (never tracked as a peer of itself): only
-    // the mesh_size field matters here, and the probe runs on the router fiber
-    // so the read cannot race live mesh mutations.
+    // Probe with the node's own id (never a peer of itself); only mesh_size
+    // matters. Runs on the router fiber, so it can't race mesh mutations.
     return router.probeForTest(router.local_peer, topic).mesh_size;
 }
 

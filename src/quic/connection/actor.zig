@@ -113,25 +113,20 @@ fn applyOutgoingControl(
     });
 }
 
-/// Kernel caps for one UDP_SEGMENT send: at most 64 segments
-/// (UDP_MAX_SEGMENTS), and the whole superpacket must still fit one UDP
-/// datagram — udp_sendmsg rejects payloads over 0xFFFF outright (reachable
-/// here: a full 32-packet batch of max_send_udp_payload_size=2048 packets is
-/// exactly 65536 bytes, one over).
+/// Kernel caps for one UDP_SEGMENT send: 64 segments (UDP_MAX_SEGMENTS), and
+/// the whole superpacket must fit one UDP datagram (udp_sendmsg rejects
+/// payloads over 65535).
 const max_gso_segments: usize = 64;
 const max_gso_bytes: usize = 65535;
 
-/// One greedy GSO group: starting at `start`, how many consecutive collected
-/// packets can ride a single UDP_SEGMENT send. The kernel's rules: one
-/// destination; every segment carries the FIRST packet's length except the
-/// last, which may be shorter (so a shorter packet joins as the group's FINAL
-/// segment and closes it); at most `max_gso_segments` per send and at most
-/// `max_gso_bytes` in total. One OUR rule: a group shares a single control
-/// buffer, so all members must carry the same pktinfo source address (a
-/// multipath batch never coalesces across paths). Because the flush loop
-/// writes packets back-to-back into one flat buffer, a group admitted by
-/// these rules is already packed on the segment grid the kernel expects.
-/// Pure — unit-tested below.
+/// How many consecutive collected packets from `start` can ride one
+/// UDP_SEGMENT send. Kernel rules: same destination; every segment has the
+/// first packet's length except the last, which may be shorter (a shorter
+/// packet joins as the final segment and closes the group); at most
+/// `max_gso_segments` and `max_gso_bytes`. Our rule: a group shares one control
+/// buffer, so all members need the same pktinfo source (never coalesce across
+/// multipath paths). The flush loop packs packets back-to-back into one flat
+/// buffer, so an admitted group already sits on the segment grid.
 fn gsoGroupLen(
     lens: []const usize,
     dests: []const std.Io.net.IpAddress,
@@ -857,22 +852,19 @@ pub const ConnectionActor = struct {
         if (max_packets == 0) return true;
 
         var packets_released: usize = 0;
-        // Per-batch scratch, declared once at function scope: each iteration fully
-        // overwrites these (indexed from 0 each batch), so a single declaration is
-        // clearer than re-scoping ~66 KiB inside the loop and guarantees one stack
-        // slot in Debug. Packets are written back-to-back into ONE flat buffer so
-        // a GSO group's segments are already packed on the segment grid
-        // UDP_SEGMENT expects (every group member except the last has the group's
-        // segment length — see gsoGroupLen).
+        // Per-batch scratch, declared once at function scope: each iteration
+        // overwrites these, so one declaration beats re-scoping ~66 KiB inside
+        // the loop and guarantees one Debug stack slot. Packets go back-to-back
+        // into ONE flat buffer so a GSO group's segments already sit on the
+        // segment grid UDP_SEGMENT expects (see gsoGroupLen).
         var payload_buf: [max_outbound_batch_size * max_flush_packet_len]u8 = undefined;
         var offsets: [max_outbound_batch_size]usize = undefined;
         var lens: [max_outbound_batch_size]usize = undefined;
         var dests: [max_outbound_batch_size]std.Io.net.IpAddress = undefined;
-        // Each packet's pktinfo SOURCE address, captured at collection time
-        // while `self.write.selected_path` still describes THAT packet (the
-        // drain loop nulls it on DONE, reset() wipes it, and multipath can
-        // switch it mid-batch — encoding from it after the loop stamped every
-        // packet with a stale or null source).
+        // Each packet's pktinfo source, captured now while
+        // `self.write.selected_path` still describes THAT packet — the drain
+        // loop nulls it on DONE, reset() wipes it, and multipath can switch it
+        // mid-batch, so reading it after the loop gives a stale or null source.
         var froms: [max_outbound_batch_size]?std.Io.net.IpAddress = undefined;
         var destinations: [max_outbound_batch_size]std.Io.net.IpAddress = undefined;
         var messages: [max_outbound_batch_size]std.Io.net.OutgoingMessage = undefined;
@@ -937,12 +929,11 @@ pub const ConnectionActor = struct {
             if (pkt_count > 0) {
                 // Coalesce: one OutgoingMessage per GSO group. A group of one is
                 // a plain packet send (no UDP_SEGMENT cmsg), byte-identical to
-                // the pre-GSO path — and the only shape on macOS/Shadow/old
-                // kernels, where the bind-time probe leaves the cap false.
-                // Pacing is untouched: the batch already holds only packets that
-                // were DUE at collection time (a not-yet-due packet became the
-                // pending write and broke the drain), so coalescing changes how
-                // the burst is handed to the kernel, not when.
+                // the pre-GSO path — and the only shape where the bind-time
+                // probe left the cap false (macOS/Shadow/old kernels). Pacing is
+                // untouched: the batch already holds only packets due at
+                // collection time, so coalescing changes how the burst reaches
+                // the kernel, not when.
                 const gso_usable = transport.socket.gsoUsable();
                 var msg_count: usize = 0;
                 var gso_groups: u64 = 0;
@@ -973,18 +964,15 @@ pub const ConnectionActor = struct {
 
                 var sent_via_gso = gso_groups > 0;
                 transport.socket.sendMany(transport.io, messages[0..msg_count], .{}) catch |err| gso_retry: {
-                    // Cancellation and plainly-transient network errors say
-                    // nothing about UDP_SEGMENT support — they propagate
-                    // exactly like the pre-GSO path did (Canceled must unwind
-                    // teardown; a routing blip must not permanently degrade
-                    // the whole socket). Anything else on a batch that carried
-                    // GSO groups is treated as the known driver class that
-                    // accepts the probe yet fails real segmented sends (quinn
-                    // met these in the wild): disable GSO for the socket,
-                    // resend this batch as plain packets — a duplicated
-                    // datagram is legal (QUIC dedups at the packet layer);
-                    // tearing the connection down for a send-path capability
-                    // mismatch is not.
+                    // Cancellation and transient network errors say nothing
+                    // about UDP_SEGMENT support, so propagate them as before
+                    // (Canceled must unwind teardown; a routing blip must not
+                    // permanently degrade the socket). Any other error on a
+                    // GSO batch means a driver that accepts the probe but fails
+                    // real segmented sends: disable GSO and resend the batch as
+                    // plain packets. A duplicated datagram is legal (QUIC dedups
+                    // at the packet layer); tearing down the connection for a
+                    // send-path capability mismatch is not.
                     const capability_suspect = switch (err) {
                         error.Canceled,
                         error.NetworkDown,
@@ -1027,8 +1015,8 @@ pub const ConnectionActor = struct {
                     self.stats_snapshot.write_errors += 1;
                     return err;
                 };
-                // GSO accounting only after the segmented send actually
-                // succeeded — the downgrade path delivered plain packets.
+                // Count GSO only when the segmented send succeeded; the
+                // downgrade path delivered plain packets.
                 if (sent_via_gso) {
                     self.stats_snapshot.write_gso_groups += gso_groups;
                     self.stats_snapshot.write_gso_segments += gso_segments;
@@ -2312,8 +2300,7 @@ test "gsoGroupLen: a source-path change closes the group (one control buffer per
 }
 
 test "gsoGroupLen: caps at the kernel segment limit" {
-    // 1000 B packets: 64 x 1000 = 64000 fits the byte cap, so the segment cap
-    // is the binding constraint here.
+    // 64 x 1000 = 64000 fits the byte cap, so the segment cap binds here.
     const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
     var lens: [max_gso_segments + 3]usize = undefined;
     var dests: [max_gso_segments + 3]std.Io.net.IpAddress = undefined;
@@ -2327,8 +2314,7 @@ test "gsoGroupLen: caps at the kernel segment limit" {
 }
 
 test "gsoGroupLen: caps total bytes at one UDP datagram (65535)" {
-    // 32 packets x 2048 B = 65536 B — one byte over udp_sendmsg's limit; the
-    // group must close at 31 segments (63488 + 2048 would exceed 65535).
+    // 32 x 2048 = 65536, one byte over the limit, so the group closes at 31.
     const a = std.Io.net.IpAddress{ .ip4 = .loopback(1) };
     var lens: [32]usize = undefined;
     var dests: [32]std.Io.net.IpAddress = undefined;

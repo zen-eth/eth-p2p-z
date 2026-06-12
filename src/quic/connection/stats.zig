@@ -190,9 +190,8 @@ pub const ConnectionStats = struct {
     handshake_duration_ns: u64 = 0,
     write_batches: u64 = 0,
     write_packets: u64 = 0,
-    /// Messages that coalesced >= 2 packets into one UDP_SEGMENT (GSO) send,
-    /// and the packets that rode them (write_packets counts every packet
-    /// regardless of how it was sent).
+    /// GSO sends that coalesced >= 2 packets into one UDP_SEGMENT, and the
+    /// packets they carried (write_packets counts all packets regardless).
     write_gso_groups: u64 = 0,
     write_gso_segments: u64 = 0,
     write_bytes: u64 = 0,

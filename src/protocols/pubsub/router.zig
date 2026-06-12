@@ -17,11 +17,10 @@
 //! pruning out above D_high). A received message is forwarded only to the
 //! topic's mesh members (minus the sender); a message published to a topic we do
 //! NOT subscribe to goes to a transient `fanout` peer set instead. GRAFT/PRUNE
-//! drive mesh membership; the heartbeat also advertises cached message ids to
-//! a shuffled gossip fringe (IHAVE), serves and promises requested messages
-//! (IWANT, scored as broken promises when unmet), and v1.2 peers suppress
-//! duplicate sends with IDONTWANT — all fully implemented below, alongside
-//! v1.1 peer scoring and peer exchange.
+//! drive mesh membership; the heartbeat advertises cached ids to a gossip
+//! fringe (IHAVE), serves/promises requested messages (IWANT, an unmet promise
+//! scores as broken), and v1.2 peers suppress duplicate sends with IDONTWANT.
+//! v1.1 peer scoring and peer exchange also live below.
 //!
 //! The Router is generic over a comptime `Transport` so its lifecycle logic can
 //! be unit-tested against an in-memory fake (no real QUIC), exactly how
@@ -748,10 +747,9 @@ pub fn Router(comptime Transport: type) type {
             heartbeat,
             /// Stop the router: tear down every peer, then exit the main fiber.
             shutdown,
-            /// Test-only commands live in the production enum deliberately: they
-            /// are inert without a poster (nothing in production builds one), and
-            /// comptime-splitting the union would churn every dispatch/drain
-            /// switch for zero runtime difference.
+            /// Test-only commands stay in the production enum: they are inert
+            /// without a poster (production builds none), and splitting the union
+            /// at comptime would churn every dispatch/drain switch for nothing.
             ///
             /// Test-only: enqueue a frame reference onto a tracked peer's outbound
             /// queue, on the router fiber (so the peer-map lookup is race-free).
@@ -765,24 +763,20 @@ pub fn Router(comptime Transport: type) type {
                 frame: *peer_io.OutboundFrame,
                 reply: *std.Io.Event,
             },
-            /// Test-only: snapshot a peer's router-owned tracking state and a
-            /// topic's mesh size ON the router fiber. The `sync` barrier below is
-            /// not enough for LIVE integration tests — a live remote keeps
-            /// posting commands, so the router does not stay parked after the
-            /// barrier and an off-fiber read of the peer map races its
-            /// mutations; the probe does the read where every mutation runs.
-            /// `topic` is borrowed: the prober blocks on `reply`, so it outlives
-            /// the command.
+            /// Test-only: read a peer's tracking state + a topic's mesh size ON
+            /// the router fiber. Live tests can't use the `sync` barrier — a live
+            /// remote keeps the router busy, so an off-fiber peer-map read races
+            /// its mutations. `topic` is borrowed: the prober blocks on `reply`,
+            /// so it outlives the command.
             probe_for_test: struct {
                 peer: PeerId,
                 topic: []const u8,
                 reply: *PeerProbe,
             },
-            /// Production observability: snapshot the router's counters ON the
-            /// router fiber (they are router-confined; the command serializes
-            /// the read with every writer). Posted on the CONTROL inbox so a
-            /// scrape is served ahead of any data backlog — saturation is
-            /// exactly when the numbers matter.
+            /// Snapshot the router's (router-confined) counters ON the router
+            /// fiber, serialized with every writer. On the CONTROL inbox so a
+            /// scrape is served ahead of any data backlog — saturation is when
+            /// the numbers matter most.
             stats: struct { reply: *StatsReply },
             /// Test-only barrier: the handler does nothing but set `reply`. Because
             /// the inbox is FIFO and the router is single-consumer, when this reply
@@ -961,11 +955,9 @@ pub fn Router(comptime Transport: type) type {
 
             pub fn post(self: *InboxPoster, io: std.Io, in: peer_io.InboundRpc) anyerror!void {
                 const cmd: Command = .{ .inbound_rpc = in };
-                // Fast path: non-blocking put (one queue lock, same as before).
-                // A full inbox is the saturation the review called silent —
-                // count it (atomic: every per-peer reader fiber posts here),
-                // then park in the blocking put as always (the backpressure
-                // semantics are unchanged; only the metric is new).
+                // Try a non-blocking put first; on a full inbox, count the stall
+                // (atomic: many reader fibers post here) then park in the blocking
+                // put as before. Backpressure is unchanged — only the metric is new.
                 const queued = self.router.inbox.putUncancelable(io, &.{cmd}, 0) catch 0;
                 if (queued == 1) return;
                 _ = self.router.inbox_stalls.fetchAdd(1, .monotonic);
@@ -1098,13 +1090,11 @@ pub fn Router(comptime Transport: type) type {
         /// would make every publish after a process restart reuse an already-seen
         /// id and be silently dropped network-wide until the TTL expires.
         seqno: u64,
-        /// PRNG behind every peer-selection shuffle (graft candidates, prune
-        /// victims, gossip targets, PX offers, fanout replenishment): each
-        /// selection gathers ALL eligible candidates, shuffles, then truncates,
-        /// so selection cannot be steered by whoever controls peer-map insertion
-        /// order (an eclipse-attack lever; go-libp2p shuffles every candidate
-        /// list for the same reason). Seeded from OS entropy at create. Only
-        /// ever touched on the router fiber.
+        /// PRNG behind every peer-selection shuffle (graft, prune, gossip, PX,
+        /// fanout): each selection gathers ALL eligible candidates, shuffles,
+        /// then truncates, so peer-map insertion order can't steer it (an
+        /// eclipse lever; go shuffles candidates for the same reason). Seeded
+        /// from OS entropy at create. Router-fiber-only.
         prng: std.Random.DefaultPrng,
         /// Our own peer id, used as Message.from on publish (under strict_sign /
         /// none; under anonymous publish omits `from` entirely).
@@ -1183,8 +1173,7 @@ pub fn Router(comptime Transport: type) type {
         msgs_rejected: u64 = 0,
         msgs_ignored: u64 = 0,
         /// Inbound-RPC posts that found the data inbox FULL and had to park
-        /// until the router drained it (the silent-saturation signal the
-        /// review flagged). Written by per-peer reader fibers — atomic.
+        /// until the router drained it. Written by per-peer reader fibers — atomic.
         inbox_stalls: std.atomic.Value(u64) = .init(0),
         /// When true (go-libp2p default), a message the local node ORIGINATES is
         /// flooded to every topic subscriber above the publish threshold rather
@@ -1360,9 +1349,8 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// OS-entropy seed for the selection PRNG. arc4random_buf is in libc
-        /// on macOS and glibc >= 2.36 Linux (the interop images build natively
-        /// on bookworm = 2.36; this build links libc) and cannot fail — the
-        /// same pattern PeerId.random uses.
+        /// (macOS; glibc >= 2.36 Linux) and cannot fail — same pattern as
+        /// PeerId.random.
         fn selectionSeed() u64 {
             var seed: u64 = undefined;
             std.c.arc4random_buf(std.mem.asBytes(&seed), @sizeOf(u64));
@@ -1879,9 +1867,8 @@ pub fn Router(comptime Transport: type) type {
                 if (router.peerScore(peer) < 0) continue;
                 out.append(router.allocator, peer) catch break;
             }
-            // ALL eligible candidates were gathered; shuffle, then keep `n`, so
-            // mesh membership is drawn uniformly rather than in peer-map
-            // insertion order (which an attacker can pace connections to steer).
+            // Shuffle all eligible candidates, then keep `n`: a uniform sample
+            // rather than peer-map order an attacker could pace connections to steer.
             router.prng.random().shuffle(PeerId, out.items);
             if (out.items.len > n) out.shrinkRetainingCapacity(n);
             return out.items.len;
@@ -1895,9 +1882,9 @@ pub fn Router(comptime Transport: type) type {
         /// mesh members are sorted by score (descending) and the bottom `n` are
         /// dropped, so the heartbeat retains the highest-scoring ~D peers (a
         /// simplified form of go-libp2p's score-aware prune; the finer D_out
-        /// outbound-quota retention is a future refinement; ties within equal
-        /// scores break randomly via a pre-sort shuffle). With scoring disabled
-        /// the victims are a uniform shuffled sample of the mesh.
+        /// outbound-quota retention is a future refinement; equal scores break
+        /// ties randomly via a pre-sort shuffle). With scoring disabled the
+        /// victims are a uniform shuffled sample of the mesh.
         fn selectPruneVictims(router: *Self, topic: []const u8, n: usize, out: *std.ArrayListUnmanaged(PeerKey)) usize {
             if (n == 0) return 0;
             const set = router.mesh.getPtr(topic) orelse return 0;
@@ -1914,10 +1901,8 @@ pub fn Router(comptime Transport: type) type {
                     const sc = if (router.score_snapshot.get(key_ptr.*)) |s| s else 0;
                     scored.append(router.allocator, .{ .key = key_ptr.*, .score = sc }) catch break;
                 }
-                // Shuffle BEFORE sorting so equal scores (the common case when
-                // most peers behave) break ties randomly instead of in map
-                // order — go shuffles its peer list ahead of the score sort for
-                // exactly this reason.
+                // Shuffle before sorting so equal scores (the common case) break
+                // ties randomly instead of in map order, as go does.
                 router.prng.random().shuffle(Scored, scored.items);
                 std.mem.sort(Scored, scored.items, {}, struct {
                     fn lessThan(_: void, a: Scored, b: Scored) bool {
@@ -1989,9 +1974,7 @@ pub fn Router(comptime Transport: type) type {
         fn fanoutReplenish(router: *Self, topic: []const u8, set: *PeerSet) void {
             if (set.count() >= mesh_params.d) return;
             // Gather every eligible candidate not already in the set, shuffle,
-            // then top up to `d`: fanout membership is a uniform sample of the
-            // topic's peers, not the peer-map prefix (go picks fanout peers
-            // randomly for the same reason).
+            // then top up to `d` — a uniform sample, not the peer-map prefix.
             var candidates: std.ArrayListUnmanaged(PeerId) = .empty;
             defer candidates.deinit(router.allocator);
             var it = router.peers.iterator();
@@ -2070,9 +2053,9 @@ pub fn Router(comptime Transport: type) type {
 
         /// Test-only: read `peer`'s tracking state (tracked / subscribed to
         /// `topic` / negotiated version) and `topic`'s mesh size on the router
-        /// fiber, race-free against a LIVE router (see the command's doc for why
-        /// the `sync` barrier cannot give live tests this guarantee). A closed
-        /// inbox (teardown) yields the zero probe: not tracked, mesh 0.
+        /// fiber, race-free against a LIVE router (the `sync` barrier can't give
+        /// live tests this). A closed inbox (teardown) yields the zero probe:
+        /// not tracked, mesh 0.
         pub fn probeForTest(router: *Self, peer: PeerId, topic: []const u8) PeerProbe {
             var reply: PeerProbe = .{};
             router.inbox.putOne(router.io, .{ .probe_for_test = .{
@@ -2434,10 +2417,9 @@ pub fn Router(comptime Transport: type) type {
             frame.retain();
             state.queue.push(router.io, lane, frame) catch {
                 frame.release();
-                // Full lane or closed queue: the frame is dropped for THIS peer
-                // only (go's bounded-outbound-queue semantics). Router-fiber-only
-                // counter; the slow peer itself is reaped by the writer's
-                // give-up paths, this just makes the drops observable.
+                // Full lane or closed queue: drop the frame for THIS peer only
+                // (go's bounded-outbound-queue semantics). The slow peer is reaped
+                // by the writer's give-up paths; this just counts the drops.
                 router.lane_drops += 1;
             };
         }
@@ -3462,10 +3444,9 @@ pub fn Router(comptime Transport: type) type {
         /// which is why `out` is freed there.
         fn selectPxPeers(router: *Self, topic: []const u8, pruned: PeerId, out: *std.ArrayListUnmanaged(?rpc_pb.PeerInfo)) void {
             const set = router.mesh.getPtr(topic) orelse return;
-            // Gather every eligible mesh member first, shuffle, then offer the
-            // first `prune_peers`: the PX offer is a uniform sample of the mesh,
-            // not its set-iteration prefix (a pruned peer eclipse-probing us
-            // would otherwise see a stable, steerable offer set).
+            // Gather every eligible member, shuffle, then offer the first
+            // `prune_peers`: a stable set-iteration prefix would let a pruned
+            // peer eclipse-probing us see a steerable offer set.
             var candidates: std.ArrayListUnmanaged(*PeerState) = .empty;
             defer candidates.deinit(router.allocator);
             var it = set.keyIterator();
@@ -4087,14 +4068,10 @@ pub fn Router(comptime Transport: type) type {
             key: ?[]const u8,
             id: []const u8,
         ) void {
-            // The data frame carries one PRIVATE copy of the message id (for a
-            // later IDONTWANT purge). `id` is interned, and an interned id's
-            // LAST release unlinks it from the unsynchronized, router-fiber-
-            // owned intern table — but a frame's last reference is usually
-            // dropped on a writer fiber (the refcount is atomic; the table is
-            // not), so a frame must never hold an interned reference. The one
-            // small dupe per accepted message is the price of that confinement.
-            // Freed on any pre-frame failure.
+            // The frame owns a private copy of the id (for later IDONTWANT
+            // purging), not the interned one: a frame's last ref usually drops on
+            // a writer fiber, where releasing an interned id would unlink it from
+            // the router-fiber-owned intern table off-fiber. Freed on pre-frame failure.
             const id_copy = router.allocator.dupe(u8, id) catch return;
             // The cached/forwarded frame carries whatever signature/key the
             // message was published or relayed with (null under the none policy),

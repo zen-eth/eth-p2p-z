@@ -112,14 +112,12 @@ pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAd
     if (ep.socket_slot.* != null) return error.AlreadyBound;
     const io = ep.io;
     var bind_addr = addr;
-    // `ip6_only` stays UNSET: the std and zio backends apply that flag with
-    // OPPOSITE meanings (std.Io.Threaded inverts it — true sets IPV6_V6ONLY=0,
-    // dual-stack — while zio is literal: true sets IPV6_V6ONLY=1, v6-only), so
-    // any value picks the wrong behavior on one of them. We want dual-stack on
-    // IPv6 binds (IPv4 peers arrive as v4-mapped addresses), which is the OS
-    // default for an AF_INET6 socket on both Linux and macOS; V6ONLY can only
-    // be CHANGED before bind (the socket is already bound when we get it), so
-    // the default is verified right after bind instead of set.
+    // `ip6_only` stays UNSET: std.Io.Threaded inverts it (true -> dual-stack)
+    // but zio is literal (true -> v6-only), so any value is wrong on one
+    // backend. We want dual-stack (IPv4 peers arrive v4-mapped), which is the
+    // OS default for AF_INET6 on Linux/macOS. V6ONLY is only changeable before
+    // bind and the socket is already bound, so we verify the default after bind
+    // rather than set it.
     const bind_options: std.Io.net.IpAddress.BindOptions = .{
         .mode = .dgram,
     };
@@ -127,10 +125,9 @@ pub fn bind(ep: Context, addr: std.Io.net.IpAddress) ListenError!std.Io.net.IpAd
     var socket_owned = true;
     errdefer if (socket_owned) socket.close(io);
     if (bind_addr == .ip6) {
-        // A v6-only wildcard listener silently drops every IPv4 peer — an
-        // operational outage, not a preference. Only a non-default kernel
-        // policy (e.g. net.ipv6.bindv6only=1) gets here, and the listener
-        // still serves IPv6, so warn loudly rather than fail the bind.
+        // A v6-only listener silently drops all IPv4 peers. Only a non-default
+        // kernel policy (e.g. net.ipv6.bindv6only=1) reaches here; IPv6 still
+        // works, so warn rather than fail the bind.
         if (socket_control.dualStackEnabled(&socket)) |dual_stack| {
             if (!dual_stack) std.log.warn(
                 "ipv6 listener is v6-only (IPV6_V6ONLY=1, non-default kernel policy): IPv4 peers cannot reach it",
