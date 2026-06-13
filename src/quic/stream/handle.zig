@@ -65,11 +65,20 @@ const Impl = struct {
         self.state = null;
         self.unlockHandle();
         if (state) |st| {
-            // Best-effort drop notification: if not already closed, ask the
-            // actor to abrupt-close (RESET_STREAM(0)). Fire-and-forget.
+            // Best-effort drop notification, fire-and-forget. If the write side
+            // was gracefully finished (closeWrite/close already queued our FIN),
+            // tear down via the graceful close_stream path so the buffered data +
+            // FIN still flush — an abrupt drop_stream (RESET_STREAM) would discard
+            // them. Otherwise the app abandoned an open write side, so RESET it
+            // (quinn/quic-go: dropping an unfinished stream resets it).
             if (!st.isClosed()) {
+                const write_finished = st.isWriteShutdown();
                 st.markClosedLocal();
-                postFireAndForget(st, .{ .drop_stream = st.stream_id }, st.io);
+                if (write_finished) {
+                    postFireAndForget(st, .{ .close_stream = .{ .stream_id = st.stream_id } }, st.io);
+                } else {
+                    postFireAndForget(st, .{ .drop_stream = st.stream_id }, st.io);
+                }
             }
             st.release();
         }

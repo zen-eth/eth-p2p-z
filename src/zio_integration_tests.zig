@@ -317,3 +317,134 @@ test "endpoint loopback: ipv6 unspecified listener accepts an ipv4 dial on exact
         }
     }.root);
 }
+
+// ---------------------------------------------------------------------------
+// Graceful half-close: a peer must observe EOF after the writer half-closes
+// (closeWrite -> FIN) and then tears the stream down — the pattern the standard
+// libp2p /perf/1.0.0 relies on (responder writes its reply, half-closes, and
+// returns; the Switch then closes+deinits the stream). quinn/quic-go guarantee
+// the buffered data + FIN are delivered even after the handle is closed; this
+// pins the same guarantee for our stream layer.
+
+const HalfCloseMode = enum {
+    // Switch inbound-handler teardown: graceful bidi close() then deinit().
+    close_then_deinit,
+    // Half-close the write side (FIN) then drop the handle.
+    close_write_then_deinit,
+};
+
+const HalfCloseServerCtx = struct {
+    conn: *quic.Connection,
+    io: std.Io,
+    mode: HalfCloseMode,
+    err: ?anyerror = null,
+
+    fn run(ctx: *HalfCloseServerCtx) void {
+        const io = ctx.io;
+        const inbound = ctx.conn.acceptStream(io, .{ .timeout = receiveTimeout(5 * std.time.ns_per_s) }) catch |err| {
+            ctx.err = err;
+            return;
+        };
+        // Drain the client's upload to EOF (needs the client's FIN). Reading
+        // the peer's FIN must NOT shut our own write side down — that is the
+        // half-close invariant this test pins.
+        var dbuf: [256]u8 = undefined;
+        while (true) {
+            _ = inbound.read(io, &dbuf, .{}) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    ctx.err = err;
+                    inbound.deinit();
+                    return;
+                },
+            };
+        }
+        // Write the reply, then half-close + tear the stream down — the
+        // standard /perf/1.0.0 responder pattern. The buffered reply + FIN
+        // must reach the peer even though the handle is dropped immediately.
+        inbound.writeAll(io, "pong", .{}) catch |err| {
+            ctx.err = err;
+            inbound.deinit();
+            return;
+        };
+        switch (ctx.mode) {
+            .close_then_deinit => inbound.close(io) catch {},
+            .close_write_then_deinit => inbound.closeWrite(io) catch {},
+        }
+        inbound.deinit();
+    }
+};
+
+fn halfCloseEofRoot(io: std.Io, mode: HalfCloseMode) !void {
+    const allocator = testing.allocator;
+
+    var fixture = try TwoEndpoints.init(
+        allocator,
+        io,
+        .{ .endpoint = .{ .connection_accept_queue_len = 1 } },
+        .{},
+    );
+    defer fixture.deinit();
+
+    const server_addr = try fixture.bindServerLoopback();
+    _ = try fixture.bindClientLoopback();
+
+    var server_pk = try fixture.server_host.publicKey(allocator);
+    defer if (server_pk.data) |data| allocator.free(data);
+
+    var accept_ctx = AcceptCtx{ .endpoint = fixture.server };
+    var accept_future = try std.Io.concurrent(io, AcceptCtx.run, .{&accept_ctx});
+
+    const client_conn = try fixture.client.dial(server_addr, .{
+        .timeout = receiveTimeout(default_handshake_timeout_ns),
+        .expected_peer_key = &server_pk,
+    });
+    defer client_conn.deinit();
+
+    accept_future.await(io);
+    if (accept_ctx.err) |err| return err;
+    const server_conn = accept_ctx.conn orelse return error.TestExpectedConn;
+    defer server_conn.deinit();
+
+    var server_ctx = HalfCloseServerCtx{ .conn = server_conn, .io = io, .mode = mode };
+    var server_future = try std.Io.concurrent(io, HalfCloseServerCtx.run, .{&server_ctx});
+
+    const outbound = try client_conn.openStream(io);
+    defer outbound.deinit();
+
+    try outbound.writeAll(io, "upload-payload", .{});
+    try outbound.closeWrite(io);
+
+    // Read the reply to EOF. A per-read timeout turns a lost FIN into a
+    // Timeout error (test failure) instead of a hang.
+    var received: usize = 0;
+    var rbuf: [256]u8 = undefined;
+    while (true) {
+        const n = outbound.read(io, &rbuf, .{ .timeout = receiveTimeout(3 * std.time.ns_per_s) }) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err, // Timeout/ResetByPeer here == the reply or FIN was lost.
+        };
+        received += n;
+    }
+
+    server_future.await(io);
+    if (server_ctx.err) |err| return err;
+
+    try testing.expectEqual(@as(usize, 4), received); // "pong"
+}
+
+test "loopback half-close: peer observes EOF after responder close + deinit on exact(2)" {
+    try runRoot(2, struct {
+        fn root(io: std.Io) !void {
+            try halfCloseEofRoot(io, .close_then_deinit);
+        }
+    }.root);
+}
+
+test "loopback half-close: peer observes EOF after responder closeWrite + deinit on exact(2)" {
+    try runRoot(2, struct {
+        fn root(io: std.Io) !void {
+            try halfCloseEofRoot(io, .close_write_then_deinit);
+        }
+    }.root);
+}

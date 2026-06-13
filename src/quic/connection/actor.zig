@@ -1972,8 +1972,17 @@ pub const ConnectionActor = struct {
         return work_remains;
     }
 
+    /// Reap a stream only when BOTH directions are done. `quiche_conn_stream_finished`
+    /// is read-side only — it goes true the moment the peer's FIN is read, while our
+    /// write side may still be open. Collecting then would `markFinishedByActor`
+    /// (set write_shutdown) and break the request/response (half-close) pattern where
+    /// we read the peer's FIN, then write our reply. So also require our FIN handed to
+    /// quiche (`record.fin_sent`); that also defers reaping until a flow-controlled FIN
+    /// has actually gone out, so the buffered data + FIN are never discarded.
     fn collectFinishedStream(self: *ConnectionActor, conn: *quiche.quiche_conn, stream_id: u64) void {
         if (!quiche.quiche_conn_stream_finished(conn, stream_id)) return;
+        const record = self.streams.get(stream_id) orelse return;
+        if (!record.fin_sent) return;
         if (self.removeStream(stream_id, false)) {
             self.stats_snapshot.streams_collected_after_fin += 1;
         }
