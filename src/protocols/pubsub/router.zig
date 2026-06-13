@@ -4770,10 +4770,9 @@ fn destroyFakeConn(allocator: std.mem.Allocator, conn: *FakeTransport.FakeConn) 
 
 const FakeRouter = Router(FakeTransport);
 
-/// Build a deterministic, distinct test PeerId. `PeerId.random()` is seeded with
-/// a fixed constant (so it returns the same id every call); `testPeer(seed)`
-/// stamps `seed` into the digest so each value is unique, which the mesh
-/// forwarding tests need to track several peers at once.
+/// A distinct test PeerId per `seed`: a random digest with `seed` stamped into
+/// byte[2], so different seeds never collide — which is all the mesh forwarding
+/// tests need to track several peers at once.
 fn testPeer(seed: u8) PeerId {
     var id = PeerId.random() catch unreachable;
     id.bytes[2] = seed;
