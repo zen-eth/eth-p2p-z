@@ -11,16 +11,16 @@
 # peer connects to a peer it never dialed:
 #
 #   Direction 1 (go EMITS PX, zig CONSUMES + dials):
-#     A go bootstrap A with PX on and a tiny mesh degree (D_high=2, D=1) is dialed
-#     by three zig leaves. A's mesh reaches 3 > D_high, so the heartbeat prunes two
-#     leaves down to D=1, each prune carrying PX offers (the surviving leaves'
+#     A go bootstrap A with PX on and a tiny mesh degree (D_high=3, D=2) is dialed
+#     by four zig leaves. A's mesh reaches 4 > D_high, so the heartbeat prunes two
+#     leaves down to D=2, each prune carrying PX offers (the surviving leaves'
 #     signed records, which A learned via identify). Each pruned zig leaf verifies
 #     a record, decodes its BINARY multiaddr, and dials the offered zig leaf. The
 #     zig leaf logs `PX-CONNECT` once its gossipsub peer count grows past the one
 #     upstream peer it dialed itself — proof of a connection to a PX-offered peer.
 #
 #   Direction 2 (zig EMITS PX, go CONSUMES + dials):
-#     A zig bootstrap A (px=on, tiny degree) is dialed by three go leaves. A prunes
+#     A zig bootstrap A (px=on, tiny degree) is dialed by four go leaves. A prunes
 #     two go leaves with PX, offering the surviving leaves' signed records (which A
 #     learned via identify, as the dialer's identify client). Each pruned go leaf
 #     parses the record and dials the offered go leaf. Asserted from the go leaf
@@ -84,9 +84,9 @@ run_direction1() {
     addr_file="$(mktmp)"; boot_log="$(mktmp)"
     : > "$addr_file"
 
-    echo "==> [boot] go px=on d_high=2 d=1 d_low=1 port=$boot_port"
+    echo "==> [boot] go px=on d_high=3 d=2 d_low=1 port=$boot_port"
     GOLOG_LOG_LEVEL="pubsub=debug" "$GO_BIN" \
-        role=listen mode=sub px=on d_high=2 d=1 d_low=1 \
+        role=listen mode=sub px=on d_high=3 d=2 d_low=1 \
         "port=$boot_port" "topic=$TOPIC" "addr_file=$addr_file" "duration_ms=$DURATION_MS" \
         > "$boot_log" 2>&1 &
     local boot_pid=$!
@@ -101,11 +101,11 @@ run_direction1() {
     fi
     echo "    bootstrap: $boot_addr"
 
-    # Three zig leaves: each LISTENS (so a PX-offered leaf is dialable) and dials
+    # Four zig leaves: each LISTENS (so a PX-offered leaf is dialable) and dials
     # the bootstrap. px=on so each CONSUMES the records the bootstrap offers.
     local leaf_logs=()
     local i
-    for i in 1 2 3; do
+    for i in 1 2 3 4; do
         local log; log="$(mktmp)"; leaf_logs+=("$log")
         "$ZIG_BIN" role=listen mode=sub px=on \
             "port=$((BASE_PORT + i))" "peers=$boot_addr" \
@@ -114,11 +114,22 @@ run_direction1() {
         track_pid "$!"
     done
 
-    # The bootstrap must over-degree-prune (its mesh of 3 > D_high=2 shrinks to D=1).
-    if poll_until_grep "HEARTBEAT: Remove mesh link" "$boot_log" "$PX_POLL_MS"; then
-        echo "    go bootstrap over-degree-pruned a leaf (PX path)"
+    # The bootstrap must over-degree-prune (its mesh of 4 > D_high=3 shrinks to D=2)
+    # and the prune must CARRY PX, i.e. emit a signed peer record. We detect that
+    # directly by the `signedPeerRecord` field in the sent PRUNE control RPC, which
+    # is the actual PX emit. (Earlier this grepped go's "HEARTBEAT: Remove mesh link"
+    # debug line, but that string is internal to go-libp2p and changed across the
+    # v0.38->v0.46 bump; the over-degree prune now also fires at GRAFT time, not only
+    # at the heartbeat. `signedPeerRecord` is the protocol-level, version-stable proof.)
+    # NB: D must be >= 2 here. go-libp2p v0.16 (v0.46) added a GossipSubParams check
+    # `Dout < Dlo && Dout < D/2` (gossipsub.go); integer D/2 == 0 at D == 1 needs
+    # Dout < 0 (impossible), so D=1 is rejected outright. v0.38.1 (pubsub v0.13) had
+    # no such check and accepted D=1. D=2/D_high=3 keeps D < D_high (non-degenerate)
+    # and still over-degrees (4 leaves > D_high=3), so PX fires, pruning two leaves.
+    if poll_until_grep "signedPeerRecord" "$boot_log" "$PX_POLL_MS"; then
+        echo "    go bootstrap over-degree-pruned a leaf and emitted PX records"
     else
-        echo "FAIL: go bootstrap never over-degree-pruned (no PX emit)" >&2
+        echo "FAIL: go bootstrap never emitted a PX record (no signedPeerRecord)" >&2
         cat "$boot_log" >&2
         return 1
     fi
@@ -131,7 +142,7 @@ run_direction1() {
         fi
     done
 
-    echo "    zig leaves that dialed a PX-offered peer: $px_hits / 3"
+    echo "    zig leaves that dialed a PX-offered peer: $px_hits / 4"
     if [ "$px_hits" -ge 1 ]; then
         echo "    Direction 1 evidence (a zig leaf's PX-CONNECT line):"
         grep -h "PX-CONNECT" "${leaf_logs[@]}" | head -1 | sed 's/^/      /'
@@ -139,7 +150,7 @@ run_direction1() {
         return 0
     fi
     echo "FAIL: no zig leaf connected to a go-offered PX peer" >&2
-    echo "--- go bootstrap PX log ---" >&2; grep -E "Remove mesh|prune" "$boot_log" >&2
+    echo "--- go bootstrap PX log ---" >&2; grep -E "signedPeerRecord|prune" "$boot_log" >&2
     return 1
 }
 
@@ -157,9 +168,9 @@ run_direction2() {
     addr_file="$(mktmp)"; boot_log="$(mktmp)"
     : > "$addr_file"
 
-    echo "==> [boot] zig px=on d_high=2 d=1 d_low=1 port=$boot_port"
+    echo "==> [boot] zig px=on d_high=3 d=2 d_low=1 port=$boot_port"
     "$ZIG_BIN" \
-        role=listen mode=sub px=on d_high=2 d=1 d_low=1 \
+        role=listen mode=sub px=on d_high=3 d=2 d_low=1 \
         "port=$boot_port" "topic=$TOPIC" "addr_file=$addr_file" "duration_ms=$DURATION_MS" \
         > "$boot_log" 2>&1 &
     local boot_pid=$!
@@ -180,7 +191,7 @@ run_direction2() {
     # leaf CONSUMES the PX offers and dials the offered peer.
     local leaf_logs=()
     local i
-    for i in 1 2 3; do
+    for i in 1 2 3 4; do
         local log; log="$(mktmp)"; leaf_logs+=("$log")
         GOLOG_LOG_LEVEL="pubsub=debug" "$GO_BIN" \
             role=dial mode=sub px=on \
@@ -190,22 +201,24 @@ run_direction2() {
     done
 
     # The zig bootstrap must over-degree-prune; the go leaves must then act on the
-    # PX offer. go logs `connecting to <peer>` (gossipsub px consume) right after a
+    # PX offer. go logs `connecting to peer` (gossipsub px consume) right after a
     # `PRUNE: Remove mesh link`, naming a peer that is NOT the bootstrap.
     local px_hits=0
     for log in "${leaf_logs[@]}"; do
-        # go's PX consume logs "connecting to <peerID>" (pubsub px_connect). It only
-        # fires for peers offered via PX (a record-driven dial), so its presence is
-        # the cross-impl PX evidence.
-        if poll_until_grep "connecting to 12D3" "$log" "$PX_POLL_MS"; then
+        # go's PX consume logs `msg="connecting to peer" peer=<id>` (pubsub px_connect,
+        # gossipsub.go). It only fires for peers offered via PX (a record-driven dial),
+        # so its presence is the cross-impl PX evidence. NB: v0.46 logs "connecting to
+        # peer" with the id in a separate peer= field; pre-v0.46 inlined it ("connecting
+        # to 12D3...") — match the field-less prefix so both formats are detected.
+        if poll_until_grep "connecting to peer" "$log" "$PX_POLL_MS"; then
             px_hits=$((px_hits + 1))
         fi
     done
 
-    echo "    go leaves that dialed a PX-offered peer: $px_hits / 3"
+    echo "    go leaves that dialed a PX-offered peer: $px_hits / 4"
     if [ "$px_hits" -ge 1 ]; then
         echo "    Direction 2 evidence (a go leaf acting on a zig PX offer):"
-        grep -hE "PRUNE: Remove mesh link|connecting to 12D3" "${leaf_logs[@]}" | head -2 | sed 's/^/      /'
+        grep -hE "PRUNE: Remove mesh link|connecting to peer" "${leaf_logs[@]}" | head -2 | sed 's/^/      /'
         echo "PASS: zig-emitted PX records were verified + dialed by a go consumer"
         return 0
     fi
