@@ -1306,7 +1306,7 @@ pub fn Router(comptime Transport: type) type {
                 .score = score_engine,
                 .heartbeat_interval_ms = heartbeat_interval_ms,
                 .seqno = initialSeqno(io),
-                .prng = std.Random.DefaultPrng.init(selectionSeed()),
+                .prng = std.Random.DefaultPrng.init(selectionSeed(io)),
             };
 
             // `seen` and `message_cache` share the router's intern table (now
@@ -1345,12 +1345,11 @@ pub fn Router(comptime Transport: type) type {
             return @intCast(@min(wall_ns, @as(i96, std.math.maxInt(u64))));
         }
 
-        /// OS-entropy seed for the selection PRNG. arc4random_buf is in libc
-        /// (macOS; glibc >= 2.36 Linux) and cannot fail — same pattern as
-        /// PeerId.random.
-        fn selectionSeed() u64 {
+        /// OS-entropy seed for the selection PRNG, via the Io backend (the 0.16
+        /// entry point for entropy; cross-platform, unlike a bare libc call).
+        fn selectionSeed(io: std.Io) u64 {
             var seed: u64 = undefined;
-            std.c.arc4random_buf(std.mem.asBytes(&seed), @sizeOf(u64));
+            io.random(std.mem.asBytes(&seed));
             return seed;
         }
 
