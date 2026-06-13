@@ -151,6 +151,29 @@ pub fn build(b: *std.Build) void {
     const gossipsub_interop_step = b.step("gossipsub-interop", "Run the gossipsub interop binary");
     gossipsub_interop_step.dependOn(&gossipsub_interop_run_cmd.step);
 
+    const perf_interop_module = b.createModule(.{
+        .root_source_file = b.path("interop/perf/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addImports(perf_interop_module, deps);
+    perf_interop_module.addImport("zig-libp2p", root_module);
+    perf_interop_module.addImport("zio", zio_dep.module("zio"));
+
+    const perf_interop_exe = b.addExecutable(.{
+        .name = "libp2p-perf-interop",
+        .root_module = perf_interop_module,
+    });
+    b.installArtifact(perf_interop_exe);
+
+    const perf_interop_run_cmd = b.addRunArtifact(perf_interop_exe);
+    perf_interop_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        perf_interop_run_cmd.addArgs(args);
+    }
+    const perf_interop_step = b.step("perf-interop", "Run the perf interop binary");
+    perf_interop_step.dependOn(&perf_interop_run_cmd.step);
+
     // P0 micro-benchmarks. Rooted in src/ so they can reach internals (the
     // Router generic, the endpoint test fixture) by relative import; run them
     // with -Doptimize=ReleaseFast for meaningful numbers.
