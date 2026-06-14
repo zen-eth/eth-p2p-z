@@ -5,11 +5,24 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const log_level_opt = b.option([]const u8, "log-level", "Set std.log level (debug, info, warn, err)");
-    const zio_backend = b.option(
+    const zio_backend_opt = b.option(
         []const u8,
         "zio-backend",
         "Override zio event loop backend (io_uring, epoll, kqueue, iocp, poll)",
     );
+    // Default to epoll on Linux. zio's own default is io_uring, but io_uring has a
+    // QUIC-handshake latency regression on this stack: the event loop over-sleeps
+    // during latency-bound request/response, giving ~4x slower handshakes than epoll
+    // (~9ms vs ~2.2ms on a loopback bench; bulk throughput is unaffected) — and
+    // io_uring is also blocked by the default container seccomp. On epoll this stack
+    // already beats go/rust on both handshake and throughput. Pass
+    // -Dzio-backend=io_uring to opt back into io_uring (e.g. bulk-throughput-only).
+    const zio_backend: ?[]const u8 = if (zio_backend_opt) |b_|
+        b_
+    else if (target.result.os.tag == .linux)
+        "epoll"
+    else
+        null;
     const build_options = b.addOptions();
     build_options.addOption(?[]const u8, "log_level", log_level_opt);
 
