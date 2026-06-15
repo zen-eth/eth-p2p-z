@@ -605,6 +605,9 @@ pub const YamuxSession = struct {
     // --- Frame dispatch ---
 
     fn dispatchFrame(self: *YamuxSession, frame: YamuxFrame, payload: []const u8) !void {
+        std.log.info("[dbg-ymx] dispatch type={d} flags=0x{x} sid={d} len={d} payload_len={d} is_client={} known_sid={}", .{
+            frame.frame_type, frame.flags, frame.stream_id, frame.length, payload.len, self.is_client, self.streams.get(frame.stream_id) != null,
+        });
         switch (frame.frame_type) {
             TYPE_DATA => try self.handleData(frame, payload),
             TYPE_WINDOW_UPDATE => self.handleWindowUpdate(frame),
@@ -615,9 +618,6 @@ pub const YamuxSession = struct {
     }
 
     fn handleData(self: *YamuxSession, frame: YamuxFrame, payload: []const u8) !void {
-        std.log.info("[dbg-ymx] handleData type={d} flags=0x{x} sid={d} len={d} payload_len={d} is_client={} known_sid={}", .{
-            frame.frame_type, frame.flags, frame.stream_id, frame.length, payload.len, self.is_client, self.streams.get(frame.stream_id) != null,
-        });
         // New stream opened by peer: SYN flag set AND we haven't seen this ID before
         if (frame.flags & FLAG_SYN != 0 and self.streams.get(frame.stream_id) == null) {
             const stream = try YamuxStream.init(self.allocator, frame.stream_id, self, .syn_recv);
