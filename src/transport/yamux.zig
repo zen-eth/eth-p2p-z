@@ -615,11 +615,15 @@ pub const YamuxSession = struct {
     }
 
     fn handleData(self: *YamuxSession, frame: YamuxFrame, payload: []const u8) !void {
+        std.log.info("[dbg-ymx] handleData type={d} flags=0x{x} sid={d} len={d} payload_len={d} is_client={} known_sid={}", .{
+            frame.frame_type, frame.flags, frame.stream_id, frame.length, payload.len, self.is_client, self.streams.get(frame.stream_id) != null,
+        });
         // New stream opened by peer: SYN flag set AND we haven't seen this ID before
         if (frame.flags & FLAG_SYN != 0 and self.streams.get(frame.stream_id) == null) {
             const stream = try YamuxStream.init(self.allocator, frame.stream_id, self, .syn_recv);
             try self.streams.put(frame.stream_id, stream);
             // Respond with SYN+ACK
+            std.log.info("[dbg-ymx] sending SYN|ACK response sid={d} is_client={}", .{ frame.stream_id, self.is_client });
             self.sendFrame(.{ .frame_type = TYPE_DATA, .flags = FLAG_SYN | FLAG_ACK, .stream_id = frame.stream_id, .length = 0 });
             stream.state = .established;
 
