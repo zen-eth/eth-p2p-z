@@ -5,6 +5,9 @@ pub const identity = @import("identity.zig");
 pub const security = @import("security.zig");
 pub const quic = @import("quic.zig");
 pub const protocols = @import("protocols.zig");
+/// The identify protocol, surfaced at the root path (it lives under
+/// `protocols/identify.zig`).
+pub const identify = @import("protocols/identify.zig");
 pub const protobuf = @import("protobuf.zig");
 pub const peer_record = @import("peer_record.zig");
 pub const secp_context = @import("secp_context.zig");
@@ -26,6 +29,9 @@ pub const Stream = quic.Stream;
 pub const Switch = swarm.Switch;
 pub const SwitchConnection = swarm.SwitchConnection;
 pub const ManagedConnection = swarm.ManagedConnection;
+/// The libp2p peer id type, surfaced at the root for converting to/from raw
+/// peer-id bytes (e.g. for the Switch peer-query API).
+pub const PeerId = @import("peer_id").PeerId;
 
 pub const PubSubMessage = protobuf.rpc.Message;
 

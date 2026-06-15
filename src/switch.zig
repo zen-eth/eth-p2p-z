@@ -42,6 +42,16 @@ pub const Switch = struct {
     services: std.StringHashMap(protocols.AnyProtocolService),
     services_lock: std.Io.Mutex = .init,
     registry_frozen: bool = false,
+    /// When true (default), every managed connection — dialed OR accepted —
+    /// automatically starts serving inbound streams. libp2p connections are
+    /// bidirectional: the dialer must serve the peer's inbound streams too
+    /// (otherwise the peer's stream-opens negotiation-timeout and it scores us
+    /// down / disconnects). Matches go-libp2p and rust-libp2p, which always serve
+    /// inbound on every connection. Set false BEFORE dialing/listening for
+    /// pure-outbound connections, or to drive `startInboundDispatcher` yourself
+    /// with custom DispatchOptions. NOTE: auto-dispatch freezes the protocol
+    /// registry on the first connection, so register all services first.
+    auto_inbound_dispatch: bool = true,
     connections: std.ArrayList(*SwitchConnection) = .empty,
     connections_lock: std.Io.Mutex = .init,
     /// Available slots in the aggregate handler cap, shared by every connection's
@@ -265,6 +275,36 @@ pub const Switch = struct {
         return PeerId.fromPublicKey(allocator, &pub_key);
     }
 
+    /// Snapshot the peer ids of all currently-managed connections. Caller owns
+    /// the returned slice (free with `allocator.free`). Lets a caller enumerate
+    /// connected peers without a separate registry — the connection list IS the
+    /// registry.
+    pub fn snapshotPeerIds(sw: *Switch, allocator: std.mem.Allocator) std.mem.Allocator.Error![]PeerId {
+        sw.connections_lock.lockUncancelable(sw.io);
+        defer sw.connections_lock.unlock(sw.io);
+        const out = try allocator.alloc(PeerId, sw.connections.items.len);
+        for (sw.connections.items, 0..) |conn, i| out[i] = conn.peerId();
+        return out;
+    }
+
+    /// The first managed connection to `peer_id`, or null.
+    /// NOTE: the returned pointer is only valid while the connection stays
+    /// registered; callers use it promptly (single-executor model).
+    pub fn connectionForPeer(sw: *Switch, peer_id: PeerId) ?*SwitchConnection {
+        sw.connections_lock.lockUncancelable(sw.io);
+        defer sw.connections_lock.unlock(sw.io);
+        for (sw.connections.items) |conn| {
+            const have = conn.peerId();
+            if (std.mem.eql(u8, have.bytes[0..have.len], peer_id.bytes[0..peer_id.len])) return conn;
+        }
+        return null;
+    }
+
+    /// Whether `peer_id` currently has a managed connection.
+    pub fn isConnected(sw: *Switch, peer_id: PeerId) bool {
+        return sw.connectionForPeer(peer_id) != null;
+    }
+
     pub fn addProtocolService(sw: *Switch, id: protocols.ProtocolId, service: protocols.AnyProtocolService) AddProtocolServiceError!void {
         const owned_id = try sw.allocator.dupe(u8, id);
         var owned_id_live = true;
@@ -339,6 +379,20 @@ pub const Switch = struct {
         if (sw.peer_event_callback) |cb| {
             cb.on_connected(cb.ctx, managed.peerId(), managed, managed.remoteAddress());
         }
+
+        // Serve the peer's inbound streams by default (libp2p connections are
+        // bidirectional). Only when at least one protocol service is registered:
+        // starting the dispatcher with an empty registry makes it exit
+        // immediately ("no protocol handlers"), and consumers that register
+        // handlers after connecting (or drive dispatch manually) should be left
+        // alone — they freeze/start the registry themselves. Best-effort and
+        // idempotent with any later explicit startInboundDispatcher call. Opt out
+        // entirely via `sw.auto_inbound_dispatch`.
+        if (sw.auto_inbound_dispatch and sw.hasRegisteredServices()) {
+            managed.startInboundDispatch(.{}) catch |err| {
+                std.log.warn("switch: auto inbound-dispatch failed: {s}", .{@errorName(err)});
+            };
+        }
         return managed;
     }
 
@@ -381,6 +435,12 @@ pub const Switch = struct {
         var it = sw.services.iterator();
         while (it.next()) |entry| try ids.append(sw.allocator, entry.key_ptr.*);
         return ids.toOwnedSlice(sw.allocator);
+    }
+
+    fn hasRegisteredServices(sw: *Switch) bool {
+        sw.services_lock.lockUncancelable(sw.io);
+        defer sw.services_lock.unlock(sw.io);
+        return sw.services.count() > 0;
     }
 
     fn freezeProtocolRegistry(sw: *Switch) void {
@@ -853,7 +913,9 @@ const SwitchConnectionActor = struct {
 
     fn startInboundDispatch(actor: *SwitchConnectionActor, opts: Switch.DispatchOptions) Switch.StartInboundDispatchError!void {
         _ = actor.liveConnection() orelse return error.ConnectionClosed;
-        if (actor.dispatcher_running) return error.AlreadyDispatching;
+        // Idempotent: a second start (e.g. auto-dispatch in manageConnection plus
+        // an explicit startInboundDispatcher call) is a no-op, not an error.
+        if (actor.dispatcher_running) return;
         actor.sw.freezeProtocolRegistry();
         try actor.dispatcher_group.concurrent(actor.io, inboundDispatcher, .{ actor, opts });
         actor.dispatcher_running = true;
@@ -1176,6 +1238,12 @@ test "switch dispatches inbound streams to registered protocol handlers" {
     defer server.deinit();
     const client = try Switch.init(allocator, io, client_endpoint);
     defer client.deinit();
+    // This test drives inbound dispatch MANUALLY (both startInboundDispatch and
+    // the single-shot dispatchInboundStream primitive), so it opts out of the
+    // default auto inbound-dispatch — otherwise the auto continuous dispatcher
+    // races the manual single-stream accept on the same connection.
+    server.auto_inbound_dispatch = false;
+    client.auto_inbound_dispatch = false;
 
     const HandlerEvent = struct {
         len: usize = 0,

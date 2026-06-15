@@ -275,6 +275,17 @@ pub const protocol_id = pubsub.protocol_id;
 /// peer then negotiates the best common version) without importing pubsub.zig.
 pub const supported_protocols = pubsub.supported_protocols;
 
+/// The individual `/meshsub` version ids (newest to oldest). `protocol_id` above
+/// is the 1.1.0 id; these name the others so a consumer can register/advertise a
+/// specific version without importing pubsub.zig.
+pub const protocol_id_v1_2 = pubsub.protocol_id_v1_2;
+pub const protocol_id_v1_0 = pubsub.protocol_id_v1_0;
+
+/// Frame a pubsub RPC into its length-prefixed wire bytes
+/// (uvarint(len) || RPC.encode()). General gossipsub wire primitive; caller owns
+/// the returned slice.
+pub const frameRpc = pubsub.frameRpc;
+
 /// Per-stream inbound handler. The Switch's dispatcher creates one of these per
 /// inbound `/meshsub/1.1.0` stream (capturing the sender's peer id) and runs it
 /// on a handler fiber the Switch owns and cancels on connection teardown. The
