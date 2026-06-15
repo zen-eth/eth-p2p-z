@@ -610,7 +610,7 @@ pub const YamuxSession = struct {
         });
         switch (frame.frame_type) {
             TYPE_DATA => try self.handleData(frame, payload),
-            TYPE_WINDOW_UPDATE => self.handleWindowUpdate(frame),
+            TYPE_WINDOW_UPDATE => try self.handleWindowUpdate(frame),
             TYPE_PING => self.handlePing(frame),
             TYPE_GO_AWAY => self.handleGoAway(),
             else => {}, // Unknown frame type; ignore per spec
@@ -618,13 +618,17 @@ pub const YamuxSession = struct {
     }
 
     fn handleData(self: *YamuxSession, frame: YamuxFrame, payload: []const u8) !void {
-        // New stream opened by peer: SYN flag set AND we haven't seen this ID before
+        // New stream opened by peer: SYN flag set AND we haven't seen this ID before.
+        // Some peers (notably go-yamux) open streams via WindowUpdate+SYN instead, which
+        // is handled in `handleWindowUpdate`; we accept either form per the yamux spec.
         if (frame.flags & FLAG_SYN != 0 and self.streams.get(frame.stream_id) == null) {
             const stream = try YamuxStream.init(self.allocator, frame.stream_id, self, .syn_recv);
             try self.streams.put(frame.stream_id, stream);
-            // Respond with SYN+ACK
-            std.log.info("[dbg-ymx] sending SYN|ACK response sid={d} is_client={}", .{ frame.stream_id, self.is_client });
-            self.sendFrame(.{ .frame_type = TYPE_DATA, .flags = FLAG_SYN | FLAG_ACK, .stream_id = frame.stream_id, .length = 0 });
+            // Spec: respond with an ACK-only frame (not SYN+ACK). go-yamux treats a
+            // SYN flag on a stream id the peer already owns as a protocol violation
+            // and resets the stream.
+            std.log.info("[dbg-ymx] sending ACK (data) sid={d} is_client={}", .{ frame.stream_id, self.is_client });
+            self.sendFrame(.{ .frame_type = TYPE_DATA, .flags = FLAG_ACK, .stream_id = frame.stream_id, .length = 0 });
             stream.state = .established;
 
             // Deliver any payload that piggybacked on the SYN
@@ -639,7 +643,7 @@ pub const YamuxSession = struct {
             return;
         }
 
-        // ACK for a stream we opened: SYN+ACK response
+        // ACK for a stream we opened.
         if (frame.flags & FLAG_ACK != 0) {
             if (self.streams.get(frame.stream_id)) |stream| {
                 if (stream.state == .syn_sent) stream.state = .established;
@@ -655,8 +659,50 @@ pub const YamuxSession = struct {
         // Unknown stream ID: ignore (peer may have reset it already)
     }
 
-    fn handleWindowUpdate(self: *YamuxSession, frame: YamuxFrame) void {
-        if (self.streams.get(frame.stream_id)) |stream| {
+    /// Handle a TYPE_WINDOW_UPDATE frame. The yamux spec allows WindowUpdate to
+    /// open streams (SYN flag), acknowledge stream opens (ACK), reset streams
+    /// (RST), and extend the sender's send window (length > 0). `hashicorp/yamux`
+    /// uses `WindowUpdate+SYN` as the canonical stream-open frame, so this path
+    /// is required for interop with go-libp2p (which embeds that library).
+    fn handleWindowUpdate(self: *YamuxSession, frame: YamuxFrame) !void {
+        // New stream opened by peer (WindowUpdate + SYN, unseen stream id).
+        if (frame.flags & FLAG_SYN != 0 and self.streams.get(frame.stream_id) == null) {
+            const stream = try YamuxStream.init(self.allocator, frame.stream_id, self, .syn_recv);
+            try self.streams.put(frame.stream_id, stream);
+            // `length` on the opening frame is an additional send-window credit
+            // beyond the implicit INITIAL_WINDOW. Apply it before ACKing.
+            if (frame.length > 0) stream.send_window +|= frame.length;
+            std.log.info("[dbg-ymx] sending ACK (window) sid={d} is_client={}", .{ frame.stream_id, self.is_client });
+            self.sendFrame(.{ .frame_type = TYPE_WINDOW_UPDATE, .flags = FLAG_ACK, .stream_id = frame.stream_id, .length = 0 });
+            stream.state = .established;
+            if (self.accept_waiters.items.len > 0) {
+                const waiter = self.accept_waiters.orderedRemove(0);
+                waiter.callback(waiter.ctx, stream);
+            } else {
+                try self.pending_accept.append(self.allocator, stream);
+            }
+            return;
+        }
+
+        // Beyond the new-stream case, all other WindowUpdate semantics target an
+        // existing stream. Unknown sids are silently ignored (peer may have
+        // already reset / we may have GC'd).
+        const stream = self.streams.get(frame.stream_id) orelse return;
+
+        // ACK in response to our SYN: complete the open handshake.
+        if (frame.flags & FLAG_ACK != 0 and stream.state == .syn_sent) {
+            stream.state = .established;
+        }
+
+        // FIN / RST: route through the stream's close handler with empty payload.
+        // `YamuxStream.onData` skips its receive-window bookkeeping when data.len == 0,
+        // so this reuses the existing FIN/RST state transitions without side effects.
+        if (frame.flags & (FLAG_FIN | FLAG_RST) != 0) {
+            try stream.onData(&.{}, frame.flags);
+        }
+
+        // Extend send window if the peer granted additional credits.
+        if (frame.length > 0) {
             stream.send_window +|= frame.length; // saturating add
             stream.drainPendingWrites();
         }
