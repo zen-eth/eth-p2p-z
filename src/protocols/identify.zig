@@ -170,6 +170,7 @@ pub const IdentifyProtocolHandler = struct {
         callback_ctx: ?*anyopaque,
         callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     ) !void {
+        std.log.info("[dbg-id] IdentifyProtocolHandler.onResponderStart fired (mss matched /ipfs/id/1.0.0)", .{});
         const handler = self.allocator.create(IdentifyResponder) catch |err| {
             callback(callback_ctx, err);
             stream.close(null, struct {
