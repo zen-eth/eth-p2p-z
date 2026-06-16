@@ -360,9 +360,10 @@ fn runListener(
     try redis.rpush(addr_key, published_addr, &scratch);
     std.log.info("listener published {s}", .{published_addr});
 
-    const conn = try switcher.accept();
-    defer conn.deinit();
-    try conn.startInboundDispatcher(.{});
+    // Serve all inbound connections in the background (the Switch owns the accept
+    // loop + connection lifetimes, torn down by `switcher.deinit`). This is the
+    // standard way a server serves inbound — no hand-rolled accept loop.
+    try switcher.serve(io);
 
     // Stay up until the dialer finishes; docker shuts the container down when
     // the dialer exits, so a generous sleep is just an upper bound.

@@ -262,6 +262,16 @@ pub fn main(init: std.process.Init) !void {
         protocols.streamHandlerService(protocols.ping.PingHandler, protocols.ping.PingHandler.run, &ping_handler),
     );
 
+    // Serve identify (`/ipfs/id/1.0.0`). The reference go/rust/python interop
+    // peers open an identify stream right after connecting; without a handler we
+    // answer `na` and they log a "protocol not supported" error (non-fatal, but
+    // noisy). A minimal handler responds with our protocol/agent version.
+    var identify_handler = protocols.identify.IdentifyHandler.init(allocator);
+    try switcher.addProtocolService(
+        protocols.identify.protocol_id,
+        protocols.streamHandlerService(protocols.identify.IdentifyHandler, protocols.identify.IdentifyHandler.run, &identify_handler),
+    );
+
     var redis = try RedisClient.connect(allocator, io, env.redis_host, env.redis_port);
     redis.initBuffers();
     defer redis.deinit();
@@ -325,9 +335,12 @@ fn runListener(
     try redis.rpush(listener_addr_key, published_addr, &scratch);
     std.log.info("listener published {s}", .{published_addr});
 
-    const conn = try switcher.accept();
-    defer conn.deinit();
-    try conn.startInboundDispatcher(.{});
+    // Serve every inbound connection in the background. py-libp2p opens a SECOND
+    // QUIC connection after a successful identify exchange; serving only the first
+    // would stall a ping stream opened on the later one (~10s stream-open timeout).
+    // `Switch.serve` owns the accept loop + connection lifetimes (torn down by
+    // `switcher.deinit`), so the binary needs no accept loop of its own.
+    try switcher.serve(io);
 
     try timeoutFromSeconds(env.timeout_seconds).sleep(io);
 }

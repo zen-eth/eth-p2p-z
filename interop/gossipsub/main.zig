@@ -640,6 +640,12 @@ fn runListener(
     finishAndExit(io, recorder, args);
 }
 
+// NOT `Switch.serve()`: besides accept + dispatch, this loop runs identify as a
+// CLIENT on each inbound peer (`exchangeIdentify`, certifying signed peer records
+// for PX). That needs per-connection access `serve()` does not expose, and it
+// can't move to the peer-event callback because gossipsub already owns it
+// (`Gossipsub` calls `setPeerEventCallback`). So a manual accept loop is the right
+// tool here — see `Switch.serve`'s doc for exactly this exception.
 const AcceptState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -648,9 +654,10 @@ const AcceptState = struct {
     conns: std.ArrayList(*libp2p.SwitchConnection) = .empty,
 
     /// Accept inbound connections in a loop, starting an inbound stream
-    /// dispatcher for each. Returns on accept failure or cancellation (the run
-    /// loop bounds the wait). A bootstrap node is dialed by every leaf, so it
-    /// must accept more than one connection for the mesh to span all peers.
+    /// dispatcher + running client-side identify for each. Returns on accept
+    /// failure or cancellation (the run loop bounds the wait). A bootstrap node is
+    /// dialed by every leaf, so it must accept more than one connection for the
+    /// mesh to span all peers.
     fn run(self: *AcceptState) void {
         while (true) {
             const conn = self.switcher.accept() catch |err| {
