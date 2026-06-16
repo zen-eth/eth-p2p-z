@@ -19,6 +19,7 @@ const tcp_mod = libp2p.transport.tcp;
 const yamux_mod = libp2p.transport.yamux;
 const tls_tcp_mod = libp2p.security.tls_tcp;
 const tls_sec_mod = libp2p.security.tls;
+const identify_mod = libp2p.protocols.identify;
 const p2p_conn = libp2p.conn;
 const proto_binding_mod = libp2p.multistream.proto_binding;
 const multistream_mod = libp2p.multistream.multistream;
@@ -613,6 +614,37 @@ pub fn main() !void {
     defer ps_handler.deinit();
     try sw.addProtocolHandler(gossipsub_mod.v1_id, ps_handler.any());
     try sw.addProtocolHandler(gossipsub_mod.v1_1_id, ps_handler.any());
+
+    // ------------------------------------------------------------------ //
+    // 12a. Register identify handler.
+    //
+    // go-libp2p opens /ipfs/id/1.0.0 on every new connection and gates
+    // `host.NewStream` (used by pubsub.handleNewPeer to open `/meshsub`) on
+    // `IdentifyWait` populating the peerstore. Without a working responder
+    // here, Zig's announced protocols never enter Go's peerstore, Go's
+    // gossipsub treats Zig as an unknown-protocol peer, and never opens
+    // its half of the semi-duplex `/meshsub` stream pair. Verified via the
+    // `[dbg-brg]` probe: every inbound substream from Go contained an
+    // `/ipfs/id/1.0.0` proposal and Go RST'd after Zig replied `na`.
+    const encoded_pubkey = try host_pub_key.encode(allocator);
+    defer allocator.free(encoded_pubkey);
+
+    const own_listen_addr = listen_ma_str;
+    const identify_listen_addrs = [_][]const u8{own_listen_addr};
+    const identify_supported_protocols = [_][]const u8{
+        gossipsub_mod.v1_id,
+        gossipsub_mod.v1_1_id,
+        identify_mod.protocol_id,
+    };
+    var identify_handler = identify_mod.IdentifyProtocolHandler.init(allocator, .{
+        .protocol_version = "libp2p/1.0.0",
+        .agent_version = "eth-p2p-z/0.0.1",
+        .public_key = encoded_pubkey,
+        .listen_addrs = &identify_listen_addrs,
+        .supported_protocols = &identify_supported_protocols,
+    });
+    defer identify_handler.deinit();
+    try sw.addProtocolHandler(identify_mod.protocol_id, identify_handler.any());
 
     // ------------------------------------------------------------------ //
     // 13. Init LISTENER enhancer + XevTransport + start listening
