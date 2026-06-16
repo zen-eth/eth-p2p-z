@@ -146,8 +146,6 @@ const RedisClient = struct {
     }
 };
 
-const listener_addr_key = "listenerAddr";
-
 const Env = struct {
     transport: []const u8,
     is_dialer: bool,
@@ -160,39 +158,43 @@ const Env = struct {
     redis_port: u16,
     timeout_seconds: u32,
     listen_port: u16,
+    test_key: []const u8,
 
     fn load(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) !Env {
-        const transport_owned = try getRequiredOwned(allocator, env_map, "transport");
+        const transport_owned = try getRequiredOwned(allocator, env_map, "TRANSPORT");
         errdefer allocator.free(transport_owned);
 
-        const is_dialer_raw = try getRequiredOwned(allocator, env_map, "is_dialer");
+        const is_dialer_raw = try getRequiredOwned(allocator, env_map, "IS_DIALER");
         defer allocator.free(is_dialer_raw);
         const is_dialer = try parseBool(is_dialer_raw);
 
-        const debug_owned = try getOptionalOwnedOrDefault(allocator, env_map, "debug", "false");
+        const debug_owned = try getOptionalOwnedOrDefault(allocator, env_map, "DEBUG", "false");
         defer allocator.free(debug_owned);
         const debug = try parseBool(debug_owned);
 
-        const bind_ip_owned = try getOptionalOwnedOrDefault(allocator, env_map, "ip", "0.0.0.0");
+        const bind_ip_owned = try getOptionalOwnedOrDefault(allocator, env_map, "LISTENER_IP", "0.0.0.0");
         errdefer allocator.free(bind_ip_owned);
 
         const default_publish = if (is_dialer) "dialer" else "listener";
-        const publish_host_owned = try getOptionalOwnedOrDefault(allocator, env_map, "publish_host", default_publish);
+        const publish_host_owned = try getOptionalOwnedOrDefault(allocator, env_map, "PUBLISH_HOST", default_publish);
         errdefer allocator.free(publish_host_owned);
 
-        const muxer_owned = try getOptionalOwned(allocator, env_map, "muxer");
+        const muxer_owned = try getOptionalOwned(allocator, env_map, "MUXER");
         errdefer if (muxer_owned) |value| allocator.free(value);
 
-        const security_owned = try getOptionalOwned(allocator, env_map, "security");
+        const security_owned = try getOptionalOwned(allocator, env_map, "SECURITY");
         errdefer if (security_owned) |value| allocator.free(value);
 
-        const redis_addr_owned = try getOptionalOwnedOrDefault(allocator, env_map, "redis_addr", "redis:6379");
+        const redis_addr_owned = try getOptionalOwnedOrDefault(allocator, env_map, "REDIS_ADDR", "redis:6379");
         defer allocator.free(redis_addr_owned);
         const parsed_redis = try parseHostPort(allocator, redis_addr_owned);
         errdefer allocator.free(parsed_redis.host);
 
-        const timeout_secs = try getOptionalUint(env_map, "test_timeout_seconds", 180);
-        const listen_port_value = try getOptionalUint(env_map, "listen_port", 4001);
+        const test_key_owned = try getOptionalOwnedOrDefault(allocator, env_map, "TEST_KEY", "transport");
+        errdefer allocator.free(test_key_owned);
+
+        const timeout_secs = try getOptionalUint(env_map, "TEST_TIMEOUT_SECONDS", 180);
+        const listen_port_value = try getOptionalUint(env_map, "LISTEN_PORT", 4001);
         if (listen_port_value > std.math.maxInt(u16)) return error.InvalidPort;
 
         return .{
@@ -207,7 +209,15 @@ const Env = struct {
             .redis_port = parsed_redis.port,
             .timeout_seconds = timeout_secs,
             .listen_port = @intCast(listen_port_value),
+            .test_key = test_key_owned,
         };
+    }
+
+    /// Redis key for the listener multiaddr, namespaced by TEST_KEY so parallel
+    /// tests sharing one redis instance don't collide (the modern scheme uses a
+    /// single shared redis rather than the legacy per-test proxy).
+    fn listenerAddrKey(self: *const Env, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}_listener_multiaddr", .{self.test_key});
     }
 
     fn deinit(self: *Env, allocator: std.mem.Allocator) void {
@@ -215,6 +225,7 @@ const Env = struct {
         allocator.free(self.bind_ip);
         allocator.free(self.publish_host);
         allocator.free(self.redis_host);
+        allocator.free(self.test_key);
         if (self.muxer) |value| allocator.free(value);
         if (self.security) |value| allocator.free(value);
     }
@@ -294,6 +305,9 @@ fn runListener(
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(allocator);
 
+    const listener_addr_key = try env.listenerAddrKey(allocator);
+    defer allocator.free(listener_addr_key);
+
     const listen_addr_text = try buildListenMultiaddr(allocator, env.bind_ip, env.listen_port);
     defer allocator.free(listen_addr_text);
     std.log.info("listener binding {s}", .{listen_addr_text});
@@ -327,6 +341,9 @@ fn runDialer(
 ) !void {
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(allocator);
+
+    const listener_addr_key = try env.listenerAddrKey(allocator);
+    defer allocator.free(listener_addr_key);
 
     std.log.info("waiting for listener address in Redis key {s}", .{listener_addr_key});
     const addr_bytes = try waitForListenerMultiaddr(redis, listener_addr_key, env.timeout_seconds, &scratch);
