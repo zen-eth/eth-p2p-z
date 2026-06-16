@@ -9,6 +9,7 @@ const identity = libp2p.identity;
 const keys = @import("peer_id").keys;
 const Allocator = std.mem.Allocator;
 const identify_pb = @import("../proto/identify.proto.zig");
+const uvarint = @import("multiformats").uvarint;
 
 /// Protocol identifier for libp2p identify.
 pub const protocol_id = "/ipfs/id/1.0.0";
@@ -338,30 +339,35 @@ const IdentifyResponder = struct {
     callback: *const fn (callback_ctx: ?*anyopaque, controller: anyerror!?*anyopaque) void,
     handler: *IdentifyProtocolHandler,
     message_sent: bool = false,
-    encoded_message: ?[]const u8 = null, // Stored until async write completes
+    encoded_message: ?[]const u8 = null,
 
     const Self = @This();
 
     fn onActivated(self: *Self, _: protocols.AnyStream) anyerror!void {
-        // Build identify message using shared builder
         var identify_msg = try self.handler.builder.build(self.allocator);
         errdefer self.handler.builder.freeMessage(self.allocator, &identify_msg);
 
         const encoded = try identify_msg.encode(self.allocator);
-        errdefer self.allocator.free(encoded);
+        defer self.allocator.free(encoded);
 
-        // Free message after encoding
         self.handler.builder.freeMessage(self.allocator, &identify_msg);
 
+        var prefix_buf: [uvarint.bufferSize(u64)]u8 = undefined;
+        const prefix = uvarint.encode(u64, @intCast(encoded.len), &prefix_buf);
+
+        const framed = try self.allocator.alloc(u8, prefix.len + encoded.len);
+        errdefer self.allocator.free(framed);
+        @memcpy(framed[0..prefix.len], prefix);
+        @memcpy(framed[prefix.len..], encoded);
+
         self.message_sent = true;
-        self.encoded_message = encoded; // Store until write completes
-        self.stream.write(encoded, self, writeCompleteCallback);
+        self.encoded_message = framed;
+        self.stream.write(framed, self, writeCompleteCallback);
     }
 
     fn writeCompleteCallback(ctx: ?*anyopaque, res: anyerror!usize) void {
         const self: *Self = @ptrCast(@alignCast(ctx.?));
 
-        // Free encoded message now that write is complete
         if (self.encoded_message) |msg| {
             self.allocator.free(msg);
             self.encoded_message = null;
@@ -372,7 +378,6 @@ const IdentifyResponder = struct {
             return;
         };
 
-        // Close stream after sending message
         self.stream.close(self, closeCallback);
     }
 
@@ -467,7 +472,10 @@ pub fn freeIdentifyResult(allocator: Allocator, result: IdentifyResult) void {
 /// All strings are cloned from the buffer, so the buffer can be freed after this returns.
 /// On error, no memory is leaked. On success, caller must call freeIdentifyResult.
 fn parseIdentifyResult(allocator: Allocator, buffer: []const u8) anyerror!IdentifyResult {
-    var reader = try identify_pb.IdentifyReader.init(buffer);
+    const decoded = try uvarint.decode(u64, buffer);
+    const expected_len: usize = @intCast(decoded.value);
+    if (decoded.remaining.len < expected_len) return error.UnexpectedEof;
+    var reader = try identify_pb.IdentifyReader.init(decoded.remaining[0..expected_len]);
 
     // Clone simple string fields
     const pv_raw = reader.getProtocolVersion();
