@@ -300,7 +300,15 @@ pub fn main(init: std.process.Init) !void {
 
     var host_key = try identity.KeyPair.generate(.ED25519);
     defer host_key.deinit();
-    const endpoint = try libp2p.QuicEndpoint.initWithIdentity(allocator, io, &host_key, .{});
+    // Perf benchmark: size the per-stream outbound buffer up to the 256KB QUIC
+    // stream send window (vs the 64KB/128KB library default) to minimize
+    // cross-fiber handoffs on the bulk single-stream transfer. Pacing left ON.
+    const endpoint = try libp2p.QuicEndpoint.initWithIdentity(allocator, io, &host_key, .{
+        .actor = .{
+            .stream_outbound_quantum_bytes = 128 * 1024,
+            .stream_outbound_queue_bytes = 256 * 1024,
+        },
+    });
     defer endpoint.deinit();
     const switcher = try libp2p.Switch.init(allocator, io, endpoint);
     defer switcher.deinit();

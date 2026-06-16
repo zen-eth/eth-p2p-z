@@ -124,9 +124,17 @@ pub const ActorOptions = struct {
     outbound_batch_size: usize = 32,
     control_queue_len: usize = 256,
     stream_inbound_queue_bytes: usize = 48 * 1024,
-    stream_outbound_queue_bytes: usize = 48 * 1024,
+    /// Per-stream outbound cross-fiber buffer (writer fiber -> connection actor).
+    /// `quantum` is the credit-grant chunk per drain; `queue` is the total the
+    /// writer may get ahead. Sized so a large `writeAll` isn't chopped into many
+    /// cross-fiber handoffs (the old 32KB/48KB chunked a 256KB write ~6x, costing
+    /// bulk-send throughput). Keep `quantum` ~= one UDP-GSO super-packet (64KB)
+    /// and `queue` a small multiple; do NOT exceed the per-stream QUIC send window
+    /// (`initial_max_stream_data_bidi_*` = 256KB) — buffering past it is wasted.
+    /// Memory cost is `queue_bytes` x concurrent outbound streams.
+    stream_outbound_queue_bytes: usize = 128 * 1024,
     stream_inbound_quantum_bytes: usize = 32 * 1024,
-    stream_outbound_quantum_bytes: usize = 32 * 1024,
+    stream_outbound_quantum_bytes: usize = 64 * 1024,
     stream_accept_queue_len: usize = 64,
     recv_datagram_slots: usize = 48,
     send_datagram_queue_len: usize = 48,
