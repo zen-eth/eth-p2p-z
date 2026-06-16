@@ -54,6 +54,9 @@ pub const Switch = struct {
     auto_inbound_dispatch: bool = true,
     connections: std.ArrayList(*SwitchConnection) = .empty,
     connections_lock: std.Io.Mutex = .init,
+    /// Background accept fiber spawned by `serve`; null until then. Owned by the
+    /// Switch: `deinit` wakes a parked accept via `closeListener` and joins it.
+    accept_future: ?std.Io.Future(void) = null,
     /// Available slots in the aggregate handler cap, shared by every connection's
     /// dispatcher. Claimed non-blockingly via `channel.tryDecrementToFloor`.
     handler_slots_total: std.atomic.Value(usize) = .init(default_max_inflight_handlers_total),
@@ -184,6 +187,16 @@ pub const Switch = struct {
     }
 
     pub fn deinit(sw: *Switch) void {
+        // Stop the background accept loop (if `serve` was used) BEFORE tearing down
+        // connections, so it can't accept/append concurrently. `closeListener`
+        // wakes a parked accept() with ListenerClosed; the fiber then exits and we
+        // join it. (Persistent-signal + await, not a bare cancel of a parked wait.)
+        if (sw.accept_future) |*future| {
+            sw.closeListener(sw.io);
+            future.await(sw.io);
+            sw.accept_future = null;
+        }
+
         while (true) {
             sw.connections_lock.lockUncancelable(sw.io);
             const conn = if (sw.connections.items.len > 0) sw.connections.pop().? else null;
@@ -244,6 +257,48 @@ pub const Switch = struct {
     pub fn accept(sw: *Switch) AcceptError!*SwitchConnection {
         const conn = try sw.endpoint.accept();
         return sw.manageConnection(conn);
+    }
+
+    /// THE standard way a server serves inbound connections. Spawns a Switch-owned
+    /// fiber that loops `accept()`, so every inbound connection is managed (tracked
+    /// in `connections`) and — with `auto_inbound_dispatch` — has its inbound stream
+    /// dispatcher started, WITHOUT the caller writing its own accept loop. Usage:
+    /// `listen()`, register all protocol handlers, then `serve()`. Register handlers
+    /// BEFORE the first connection arrives (the registry freezes on first connection).
+    ///
+    /// This is a background-fiber model (like go-libp2p's Host, which auto-serves)
+    /// rather than rust-libp2p's app-drives-the-poll-loop model — consistent with
+    /// the rest of eth-p2p-z, where the library owns its connection-actor and
+    /// dispatcher fibers. The fiber is Switch-owned and joined in `deinit`.
+    ///
+    /// Idempotent. Do NOT also drive `accept()` manually — both consume the same
+    /// accept queue. Reach for a manual `accept()` loop ONLY when you need
+    /// per-connection access that the dispatcher does not give you — e.g. running
+    /// identify as a CLIENT on each inbound peer when the peer-event callback is
+    /// already taken (see the gossipsub interop binary), or in tests. `deinit`
+    /// stops the loop (`closeListener` wakes the parked accept) and tears down the
+    /// accepted connections.
+    pub fn serve(sw: *Switch, io: std.Io) std.Io.ConcurrentError!void {
+        if (sw.accept_future != null) return;
+        sw.accept_future = try std.Io.concurrent(io, acceptLoop, .{sw});
+    }
+
+    fn acceptLoop(sw: *Switch) void {
+        while (true) {
+            // manageConnection (inside accept) tracks the connection in
+            // `connections` and starts its dispatcher via auto_inbound_dispatch,
+            // so there is nothing to do per connection here.
+            _ = sw.accept() catch |err| {
+                switch (err) {
+                    // Clean stops: ListenerClosed is the graceful shutdown signal
+                    // from `closeListener` (incl. the implicit one in `deinit`);
+                    // Canceled is a direct fiber cancel. Neither is a failure.
+                    error.ListenerClosed, error.Canceled => {},
+                    else => std.log.warn("switch accept loop terminated: {any}", .{err}),
+                }
+                return;
+            };
+        }
     }
 
     /// Graceful-shutdown helper: unblock a fiber parked in `accept`. After this,
@@ -1135,7 +1190,12 @@ fn runNegotiatedProtocolHandler(
 }
 
 fn closeStreamForCleanup(io: std.Io, stream: *quic.Stream) void {
-    stream.close(io) catch |err| std.log.debug("failed to close QUIC stream during cleanup: {}", .{err});
+    // FIN-only: finish our write side but do NOT STOP_SENDING(0) the read side.
+    // A handler may have server-pushed a response (e.g. identify) that the peer is
+    // still reading; an eager STOP_SENDING races that read on some stacks. This
+    // matches go-libp2p `CloseWrite` / rust-libp2p `Stream::poll_close`. The actor
+    // reaps the stream record once the peer also finishes.
+    stream.closeGraceful(io) catch |err| std.log.debug("failed to close QUIC stream during cleanup: {}", .{err});
 }
 
 /// libp2p-format multiaddr text for an IPv4/IPv6 UDP/quic-v1 endpoint.
@@ -1454,6 +1514,97 @@ test "switch dispatches inbound streams to registered protocol handlers" {
     client_conn_live = false;
     server_conn.deinit();
     server_conn_live = false;
+}
+
+test "serve accepts and dispatches every inbound connection without a manual accept loop" {
+    // `serve` spawns a Switch-owned background accept loop, so a server just
+    // listen()s, registers handlers, and serve()s — no per-app accept loop. Two
+    // independent clients dial the same server and the registered handler must run
+    // for BOTH connections. A one-shot accept() would serve only the first; this
+    // guards the multi-connection case (e.g. py-libp2p opens a second connection
+    // after a successful identify exchange).
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var c1_key = try identity.KeyPair.generate(.ED25519);
+    defer c1_key.deinit();
+    var c2_key = try identity.KeyPair.generate(.ED25519);
+    defer c2_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const c1_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &c1_key, .{});
+    defer c1_endpoint.deinit();
+    const c2_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &c2_key, .{});
+    defer c2_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const c1 = try Switch.init(allocator, io, c1_endpoint);
+    defer c1.deinit();
+    const c2 = try Switch.init(allocator, io, c2_endpoint);
+    defer c2.deinit();
+
+    // Echo one byte and record that the handler ran. Capacity 2 = one slot per
+    // expected connection.
+    const EchoHandler = struct {
+        queue: *std.Io.Queue(u8),
+        fn run(self: *@This(), handler_io: std.Io, stream: *quic.Stream) anyerror!void {
+            var buf: [1]u8 = undefined;
+            try stream.readAll(handler_io, &buf, .{});
+            try stream.writeAll(handler_io, &buf, .{});
+            try self.queue.putOne(handler_io, buf[0]);
+        }
+    };
+    var queue_buffer: [2]u8 = undefined;
+    var queue = std.Io.Queue(u8).init(&queue_buffer);
+    var handler = EchoHandler{ .queue = &queue };
+    try server.addProtocolService(
+        "/test/serve/1.0.0",
+        protocols.streamHandlerService(EchoHandler, EchoHandler.run, &handler),
+    );
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+
+    // The point of the test: start serving with NO manual accept() call anywhere.
+    try server.serve(io);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const c1_conn = try c1.dial(dial_addr, .{});
+    defer c1_conn.deinit();
+    const c2_conn = try c2.dial(dial_addr, .{});
+    defer c2_conn.deinit();
+
+    inline for (.{ .{ c1_conn, @as(u8, 0xA1) }, .{ c2_conn, @as(u8, 0xB2) } }) |pair| {
+        const conn = pair[0];
+        const byte = pair[1];
+        const stream = try conn.openProtocolStream("/test/serve/1.0.0", .{});
+        defer stream.deinit();
+        defer stream.close(io) catch {};
+        var out = [_]u8{byte};
+        try stream.writeAll(io, &out, .{});
+        var in: [1]u8 = undefined;
+        try stream.readAll(io, &in, .{});
+        try std.testing.expectEqual(byte, in[0]);
+    }
+
+    // The registered handler ran for BOTH connections, in either accept order.
+    const first = try queue.getOne(io);
+    const second = try queue.getOne(io);
+    try std.testing.expect((first == 0xA1 and second == 0xB2) or (first == 0xB2 and second == 0xA1));
 }
 
 test "openProtocolStreamMulti negotiates the best protocol the peer supports" {

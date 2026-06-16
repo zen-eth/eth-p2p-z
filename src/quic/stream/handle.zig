@@ -197,6 +197,30 @@ pub const Stream = opaque {
         reply.event.waitUncancelable(io);
     }
 
+    /// FIN-only graceful close for tearing down an inbound protocol-handler
+    /// stream. Finishes the write side (sending FIN + draining buffered bytes,
+    /// like `closeWrite`) and then marks the handle closed so `deinit` is a clean
+    /// free — but, unlike `close`, it does NOT send STOP_SENDING(0) on the read
+    /// side. STOP_SENDING on a stream whose peer may still be reading a
+    /// server-pushed response (e.g. identify) races that read on some stacks
+    /// (py-libp2p over QUIC reports "fail to read from multiselect communicator").
+    /// The connection actor reaps the record via its normal finished-stream sweep
+    /// once the peer also finishes (FIN was set here). Mirrors rust-libp2p
+    /// `Stream::poll_close` (finish send only) and go-libp2p `CloseWrite`.
+    pub fn closeGraceful(self: *Stream, io: std.Io) ShutdownWriteError!void {
+        const state = self.impl().liveRetained() orelse return;
+        defer state.release();
+        if (state.isClosed()) return;
+        if (!state.isWriteShutdown()) {
+            state.markWriteShutdownLocal();
+            var reply: VoidReply = .{};
+            if (postCommittedCommand(state, .{ .close_write_stream = .{ .stream_id = state.stream_id, .reply = &reply } }, io)) {
+                reply.event.waitUncancelable(io);
+            }
+        }
+        state.markClosedLocal();
+    }
+
     /// Abrupt bidirectional close. RESET_STREAM(code) on the write side,
     /// STOP_SENDING(code) on the read side. Pending outbound bytes are
     /// discarded.
