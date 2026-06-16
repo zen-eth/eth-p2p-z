@@ -238,7 +238,7 @@ const ParsedHostPort = struct {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const cpu_count = std.Thread.getCpuCount() catch 2;
+    const cpu_count = libp2p.effectiveCpuCount(allocator); // cgroup-CFS-quota-aware (see src/cpu_count.zig)
     const executor_count: u8 = @intCast(std.math.clamp(cpu_count, 2, 64));
     const runtime = try zio.Runtime.init(allocator, .{ .executors = .exact(executor_count) });
     defer runtime.deinit();

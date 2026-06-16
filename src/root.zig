@@ -35,8 +35,37 @@ pub const PeerId = @import("peer_id").PeerId;
 
 pub const PubSubMessage = protobuf.rpc.Message;
 
+/// cgroup-CFS-quota-aware logical CPU count (vendored from ChainSafe/lodestar-z):
+/// `min(cgroup quota, affinity)`, walking the full cgroup ancestor chain. Use
+/// instead of `std.Thread.getCpuCount` when sizing a thread/executor pool. Needs
+/// an `io` (it reads `/proc/self/{cgroup,mountinfo}` + the cgroup tree).
+pub const getNumCpus = @import("cpu_count.zig").getNumCpus;
+
+/// Convenience over `getNumCpus` for sizing the zio executor pool BEFORE the real
+/// runtime exists: spins a throwaway bootstrap io for the `/proc` reads, logs the
+/// affinity-vs-effective decision so containerized deployments surface any
+/// oversubscription, and falls back to the affinity count on any detection error.
+/// `std.Thread.getCpuCount` (sched_getaffinity) is blind to the cgroup CPU quota,
+/// so on `--cpus`/k8s-`limits.cpu` it over-reports and oversubscribes executors.
+pub fn effectiveCpuCount(gpa: std.mem.Allocator) usize {
+    const affinity = std.Thread.getCpuCount() catch 1;
+    var bootstrap = std.Io.Threaded.init(gpa, .{});
+    defer bootstrap.deinit();
+    const n = getNumCpus(gpa, bootstrap.io()) catch |err| {
+        std.log.info("[cpu] affinity={d} (cgroup cpu detection failed: {s}) -> using {d}", .{ affinity, @errorName(err), affinity });
+        return @max(@as(usize, 1), affinity);
+    };
+    if (n < affinity) {
+        std.log.info("[cpu] affinity={d} cgroup-cpu-quota -> using {d} (quota-limited; avoids oversubscription)", .{ affinity, n });
+    } else {
+        std.log.info("[cpu] affinity={d} cgroup-cpu={d} (no quota limit)", .{ affinity, n });
+    }
+    return n;
+}
+
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("cpu_count.zig");
     _ = @import("quic/config.zig");
     _ = @import("quic/endpoint/mod.zig");
     _ = @import("quic/io/socket_control.zig");
