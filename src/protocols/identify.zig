@@ -387,14 +387,11 @@ const IdentifyResponder = struct {
             self.fail(err);
             return;
         };
-
-        self.callback(self.callback_ctx, null);
         self.allocator.destroy(self);
     }
 
     fn onMessage(self: *Self, _: protocols.AnyStream, _: []const u8) anyerror!void {
         _ = self;
-        // Responder should not receive messages, but we'll ignore them
     }
 
     fn onClose(self: *Self, stream: protocols.AnyStream) anyerror!void {
@@ -402,7 +399,6 @@ const IdentifyResponder = struct {
         if (!self.message_sent) {
             self.fail(error.StreamClosedBeforeResponse);
         }
-        // Cleanup will happen in closeCallback
     }
 
     fn fail(self: *Self, err: anyerror) void {
