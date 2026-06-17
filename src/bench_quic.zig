@@ -4,8 +4,7 @@
 //! one stream: the client blasts a fixed byte volume, the server drains it.
 //! Reported per scenario: stream goodput (Gbit/s), the packet rate the
 //! endpoint router actually sustained (from the live endpoint stats), and the
-//! router's drop counters — the baseline the P2 (send batching/GSO) and P3
-//! (recv-path) work must move.
+//! router's drop counters.
 //!
 //! Two chunk sizes bound the shape: 64 KiB writes (bulk transfer, packets at
 //! max size) and 1200 B writes (small-message traffic, one packet per write at
@@ -362,8 +361,7 @@ pub fn main(init: std.process.Init) !void {
     // RUN THE BINARY DIRECTLY for valid numbers on macOS: under `zig build`
     // the child process sometimes lands in background QoS, whose timer
     // coalescing (~4 ms slack) lockstep-throttles the pacing timers ~30x
-    // (reproduce deliberately with `taskpolicy -c background`); see
-    // docs/benchmarks/2026-06-10-p0-baseline.md.
+    // (reproduce deliberately with `taskpolicy -c background`).
     if (std.c.getenv("BENCH_FOOTPRINT_ONLY") != null) {
         try runFootprint(&counting, io, 50);
         return;

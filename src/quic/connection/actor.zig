@@ -187,10 +187,8 @@ pub const ConnectionActor = struct {
     stream_outbound_quantum_bytes: usize = 0,
     /// Keep-alive period in ns (0 = disabled). When the connection has had no
     /// outbound packet for this long the actor sends an ack-eliciting PING so an
-    /// idle connection survives the negotiated idle timeout. Starts at the config
-    /// value, then on handshake completion is clamped down to
-    /// `peer_max_idle_timeout/2` if smaller (see `clampKeepAliveToPeerIdle`). See
-    /// `config.TransportOptions.keep_alive_period_ms`.
+    /// idle connection survives the negotiated idle timeout. On handshake
+    /// completion it is clamped down to `peer_max_idle_timeout/2` if smaller.
     keep_alive_period_ns: u64 = 0,
     /// Monotonic-ns deadline for the next keep-alive PING; reset to now+period on
     /// every flushed packet. 0 means "not yet armed" — it gets armed by the first
@@ -492,12 +490,10 @@ pub const ConnectionActor = struct {
     fn shutdownAndCleanup(self: *ConnectionActor) void {
         // Close the application-facing queues UNCONDITIONALLY: every exit of
         // the actor loop must wake uncancelably-parked posters, whatever path
-        // got us here. (This used to be gated on shutdown_requested/isClosed —
-        // correct only because the sole canceller sets the flag first; any new
-        // cancellation site would silently strand posters against queues that
-        // only the FINAL SharedState release closes, which a parked poster's
-        // own retain prevents — a deadlock. The closes are idempotent, so the
-        // gate bought nothing.)
+        // got us here. Gating on shutdown_requested/isClosed would strand
+        // posters against queues that only the final SharedState release closes
+        // — which a parked poster's own retain prevents (a deadlock). The closes
+        // are idempotent.
         self.closeApplicationQueues();
         if (self.conn) |conn| {
             if (self.transport) |transport| {
@@ -768,11 +764,11 @@ pub const ConnectionActor = struct {
 
     /// On handshake completion, clamp the keep-alive period to the peer-negotiated
     /// idle timeout: `min(configured, peer_max_idle_timeout/2)`, matching go-libp2p
-    /// (quic-go `min(KeepAlivePeriod, idleTimeout/2)`). Until now the period was the
-    /// local config value, which a peer advertising a SHORTER idle timeout could
-    /// outrace — the PING would fire after the negotiated idle had already closed
-    /// the connection. (`config.validateTransport` already guards the local pair;
-    /// this handles the remote half, which is only known after the handshake.)
+    /// (quic-go `min(KeepAlivePeriod, idleTimeout/2)`). A peer advertising a SHORTER
+    /// idle timeout could otherwise outrace the local-config period — the PING would
+    /// fire after the negotiated idle had already closed the connection.
+    /// (`config.validateTransport` guards the local pair; this handles the remote
+    /// half, which is only known after the handshake.)
     fn clampKeepAliveToPeerIdle(self: *ConnectionActor, conn: *quiche.quiche_conn, io: std.Io) void {
         if (self.keep_alive_period_ns == 0) return;
         var tp: quiche.quiche_transport_params = undefined;
@@ -1143,9 +1139,7 @@ pub const ConnectionActor = struct {
         // below calls handshake.close() -> done.set, waking a dialer parked in
         // waitHandshake; its failReason()/classifyHandshakeFailure must see
         // last_actor_error + close_reason=.actor_error or it reports an opaque
-        // error. (This publish previously sat behind `if (isHandshaking())` AFTER
-        // markClosed had already flipped the stage to .closed — it was dead code
-        // and never ran, so the fatal-error cause was silently dropped.)
+        // error. This must run before markClosed flips the stage to .closed.
         if (self.shared.handshake.isHandshaking()) self.publishStats();
         if (!self.shared.isClosed()) {
             if (self.conn) |conn| {
@@ -1289,9 +1283,8 @@ pub const ConnectionActor = struct {
         self.lifecycle.fail();
         // Publish BEFORE any wake. Both markClosed() (handshake.close -> done.set)
         // and handshake.fail() wake a dialer parked in waitHandshake, which reads
-        // conn.stats() immediately. markClosed() previously ran at the TOP of this
-        // function, so a multi-executor dialer could wake on its done.set (stage
-        // .closed) and read the snapshot before this publish. Publish first, then
+        // conn.stats() immediately; a multi-executor dialer could otherwise wake on
+        // done.set (stage .closed) and read a stale snapshot. Publish first, then
         // markClosed + fail (happens-before via the stats mutex + handshake event).
         self.publishStats();
         self.shared.markClosed();
@@ -1353,16 +1346,14 @@ pub const ConnectionActor = struct {
             if (try self.registerCid(source_id_ptr[0..source_id_len])) added += 1;
         }
 
-        // Deliberately NO `quiche_conn_source_ids` iterator here: quiche
-        // 0.28.0's `quiche_connection_id_iter_next` returns a pointer into a
-        // ConnectionId CLONE that is dropped before the call returns — a
-        // use-after-free. The freed 20-byte buffer's head gets overwritten by
-        // allocator freelist metadata, so every dial registered one stable
-        // GARBAGE cid; two live connections reading the same recycled slot
-        // collided in the shared route table and failed the dial
-        // (RouteRegistrationFailed, first surfaced by the 50-dial footprint
-        // bench). At setup time a connection has exactly ONE source id — the
-        // singular call above — and every later SCID is minted by
+        // Deliberately NO `quiche_conn_source_ids` iterator here:
+        // `quiche_connection_id_iter_next` returns a pointer into a ConnectionId
+        // CLONE that is dropped before the call returns — a use-after-free. The
+        // freed buffer gets overwritten by allocator freelist metadata, so every
+        // dial registered one stable GARBAGE cid; two live connections reading the
+        // same recycled slot collided in the shared route table and failed the dial
+        // (RouteRegistrationFailed). At setup time a connection has exactly ONE
+        // source id — the singular call above — and every later SCID is minted by
         // refreshSourceCids from OUR buffer, so the iterator bought nothing.
         return added;
     }
@@ -1406,12 +1397,12 @@ pub const ConnectionActor = struct {
     fn drainRetiredSourceCids(self: *ConnectionActor) usize {
         const conn = self.conn orelse return 0;
         // Drain quiche's retired-SCID queue WITHOUT reading the out-pointer:
-        // `quiche_conn_retired_scid_next` (quiche 0.28.0) has the same
-        // use-after-free as the connection-id iterator — the ConnectionId it
-        // points into is dropped before the call returns. The retired cid
-        // stays in our registry (and the shared route table) until connection
-        // teardown unregisters everything: dead weight, not a hazard — the
-        // peer stopped using it, and quiche drops stray packets for it.
+        // `quiche_conn_retired_scid_next` has the same use-after-free as the
+        // connection-id iterator — the ConnectionId it points into is dropped
+        // before the call returns. The retired cid stays in our registry (and the
+        // shared route table) until connection teardown unregisters everything:
+        // dead weight, not a hazard — the peer stopped using it, and quiche drops
+        // stray packets for it.
         var cid_ptr: [*c]const u8 = null;
         var cid_len: usize = 0;
         while (quiche.quiche_conn_retired_scid_next(conn, &cid_ptr, &cid_len)) {}
@@ -2067,8 +2058,7 @@ pub const ConnectionActor = struct {
 /// Hand a single inbound packet (or GRO super-packet) to quiche. Side
 /// effects beyond `quiche_conn_recv` — path event drain, source-CID
 /// refresh, readable-stream discovery, datagram delivery — are deferred to
-/// `postRecvBatch` (Cut 3) so they run once per actor tick instead of
-/// once per packet.
+/// `postRecvBatch` so they run once per actor tick instead of once per packet.
 pub fn recvRoutedPacket(conn: *quiche.quiche_conn, packet: *RoutedPacket) NetworkError!void {
     var peer_storage: address.PosixAddress = undefined;
     var local_storage: address.PosixAddress = undefined;

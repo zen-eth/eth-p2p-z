@@ -112,7 +112,7 @@ pub const Record = struct {
 
     /// Mark FIN as sent on the wire. Fires any deferred close_write reply
     /// so the caller's `closeWrite` returns once the FIN is in quiche's
-    /// hands (matches existing semantics).
+    /// hands.
     pub fn markFinSent(self: *Record, io: std.Io) void {
         self.fin_sent = true;
         self.fin_requested = false;

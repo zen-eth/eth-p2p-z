@@ -28,19 +28,17 @@ pub const CongestionControl = enum {
 };
 
 /// QUIC transport-parameter and quiche-config knobs that are visible to the
-/// peer (idle timeout, flow control, congestion control, etc.). Splitting
-/// these out from the local-only actor/endpoint settings keeps two distinct
-/// concerns separate: things the peer negotiates against us, vs. things only
-/// our own IO loop sees.
+/// peer (idle timeout, flow control, congestion control, etc.), kept separate
+/// from the local-only actor/endpoint settings: things the peer negotiates
+/// against us, vs. things only our own IO loop sees.
 pub const TransportOptions = struct {
     max_idle_timeout_ms: u64 = 30_000,
-    /// Keep-alive period in ms. When a connection has had no outbound packet for
-    /// this long, the actor sends an ack-eliciting PING
-    /// (`quiche_conn_send_ack_eliciting`) which resets BOTH peers' idle timers, so
-    /// an otherwise-idle connection survives `max_idle_timeout_ms`. This mirrors
-    /// go-libp2p/quic-go's KeepAlivePeriod (≈ idle/2): without it, a node that
-    /// publishes nothing for `max_idle_timeout_ms` (e.g. a gossipsub subscriber
-    /// waiting between bursts) silently loses every connection. Must be
+    /// Keep-alive period in ms. After this long with no outbound packet, the actor
+    /// sends an ack-eliciting PING (`quiche_conn_send_ack_eliciting`) which resets
+    /// BOTH peers' idle timers, so an otherwise-idle connection survives
+    /// `max_idle_timeout_ms` (e.g. a gossipsub subscriber waiting between bursts,
+    /// which would otherwise silently lose every connection). Mirrors
+    /// go-libp2p/quic-go's KeepAlivePeriod (≈ idle/2). Must be
     /// `< max_idle_timeout_ms`; 0 disables keep-alive.
     keep_alive_period_ms: u64 = 15_000,
     initial_max_data: u64 = 1024 * 1024,
@@ -99,10 +97,10 @@ pub const TransportOptions = struct {
     enable_early_data: bool = false,
     /// ACK delay exponent transport parameter. RFC 9000 default is 3.
     ack_delay_exponent: u64 = 3,
-    /// Optional stateless reset token. Server-only in effect: quiche reads this
-    /// from the config only for `is_server` connections (`let reset_token = if
-    /// is_server { ... } else { None }`), so on our dual-role endpoint's shared
-    /// config it is applied to accepted connections and ignored for outbound dials.
+    /// Optional stateless reset token. Server-only in effect: quiche reads it
+    /// from the config only for `is_server` connections, so on our dual-role
+    /// endpoint's shared config it applies to accepted connections and is
+    /// ignored for outbound dials.
     stateless_reset_token: ?[16]u8 = null,
     /// Quiche CUBIC idle restart behavior toggle exposed for parity.
     enable_cubic_idle_restart_fix: bool = false,
@@ -127,8 +125,7 @@ pub const ActorOptions = struct {
     /// Per-stream outbound cross-fiber buffer (writer fiber -> connection actor).
     /// `quantum` is the credit-grant chunk per drain; `queue` is the total the
     /// writer may get ahead. Sized so a large `writeAll` isn't chopped into many
-    /// cross-fiber handoffs (the old 32KB/48KB chunked a 256KB write ~6x, costing
-    /// bulk-send throughput). Keep `quantum` ~= one UDP-GSO super-packet (64KB)
+    /// cross-fiber handoffs. Keep `quantum` ~= one UDP-GSO super-packet (64KB)
     /// and `queue` a small multiple; do NOT exceed the per-stream QUIC send window
     /// (`initial_max_stream_data_bidi_*` = 256KB) — buffering past it is wasted.
     /// Memory cost is `queue_bytes` x concurrent outbound streams.
@@ -218,7 +215,7 @@ pub fn validateOptions(opts: Options) ConfigError!Options {
 fn validateTransport(opts: TransportOptions) ConfigError!void {
     if (opts.max_recv_udp_payload_size > packet_route.max_udp_payload_len) return error.InvalidOptions;
     if (opts.max_send_udp_payload_size > connection_actor.max_flush_packet_len) return error.InvalidOptions;
-    // >= min_udp_payload_size also subsumes the old non-zero requirement.
+    // >= min_udp_payload_size also subsumes the non-zero requirement.
     if (opts.max_recv_udp_payload_size < min_udp_payload_size) return error.InvalidOptions;
     if (opts.max_send_udp_payload_size < min_udp_payload_size) return error.InvalidOptions;
     if (opts.max_amplification_factor == 0) return error.InvalidOptions;

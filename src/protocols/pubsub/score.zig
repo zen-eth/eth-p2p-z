@@ -39,11 +39,10 @@
 //! per-counter factor in (0,1)); a counter that decays below `decay_to_zero` snaps
 //! to zero so it does not linger as float dust. All math is f64.
 //!
-//! NOTE on tuning: the default parameters below are a sane, self-consistent
-//! baseline that exercises every term, NOT production values. Real deployments
-//! (eth2's gossipsub, Filecoin, etc.) tune every weight, cap, threshold, and decay
-//! per-topic to their message rates and mesh sizes per the gossipsub v1.1 spec.
-//! Leaving every weight at zero disables scoring entirely (every peer scores 0).
+//! NOTE on tuning: the default parameters below are a self-consistent baseline
+//! that exercises every term, NOT production values — real deployments tune every
+//! weight, cap, threshold, and decay per-topic to their message rates and mesh
+//! sizes. Leaving every weight at zero disables scoring entirely (peers score 0).
 
 const std = @import("std");
 const PeerId = @import("peer_id").PeerId;
@@ -195,12 +194,11 @@ pub const PeerScoreThresholds = struct {
     opportunistic_graft_threshold: f64,
 };
 
-/// A documented baseline parameter set. These values are SELF-CONSISTENT and
-/// exercise every term, but they are NOT production-tuned — real apps (eth2,
-/// Filecoin) tune every field per-topic per the gossipsub v1.1 spec. Modest
-/// positive rewards for mesh time and first deliveries; the standard negative
-/// penalty weights; geometric decays near 0.95-0.997 (a counter retains most of
-/// its value across a heartbeat). Setting every weight to zero disables scoring.
+/// A baseline parameter set: self-consistent and exercises every term, but NOT
+/// production-tuned (real apps tune every field per-topic). Modest positive
+/// rewards for mesh time and first deliveries; the standard negative penalty
+/// weights; geometric decays near 0.95-0.997 (a counter retains most of its value
+/// across a heartbeat). Setting every weight to zero disables scoring.
 pub const default_params: ScoreParams = .{
     .app_specific_weight = 1.0,
     .ip_colocation_factor_weight = -5.0,
@@ -418,10 +416,9 @@ pub const PeerScore = struct {
     // ----- IP tracking (P6) -------------------------------------------------
 
     /// Record that `peer` uses `ip`: add it to the peer's IP list and bump the
-    /// global per-IP count. Duplicate IPs for one peer are NOT collapsed (go-libp2p
-    /// tracks the connection's address; one peer with two connections from the same
-    /// IP counts twice) — but that matches go's per-address bookkeeping. No-op for
-    /// an untracked peer. Best-effort on allocation failure.
+    /// global per-IP count. Duplicate IPs for one peer are NOT collapsed — go-libp2p
+    /// tracks per connection, so one peer with two connections from the same IP
+    /// counts twice. No-op for an untracked peer. Best-effort on allocation failure.
     pub fn addIP(self: *PeerScore, peer: PeerId, ip: std.Io.net.IpAddress) void {
         const stats = self.peers.getPtr(peerKey(&peer)) orelse return;
         const key = ipKey(ip);

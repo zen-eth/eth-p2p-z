@@ -5,8 +5,7 @@ pub const identity = @import("identity.zig");
 pub const security = @import("security.zig");
 pub const quic = @import("quic.zig");
 pub const protocols = @import("protocols.zig");
-/// The identify protocol, surfaced at the root path (it lives under
-/// `protocols/identify.zig`).
+/// The identify protocol, surfaced at the root path.
 pub const identify = @import("protocols/identify.zig");
 pub const protobuf = @import("protobuf.zig");
 pub const peer_record = @import("peer_record.zig");
@@ -35,7 +34,7 @@ pub const PeerId = @import("peer_id").PeerId;
 
 pub const PubSubMessage = protobuf.rpc.Message;
 
-/// cgroup-CFS-quota-aware logical CPU count (vendored from ChainSafe/lodestar-z):
+/// cgroup-CFS-quota-aware logical CPU count:
 /// `min(cgroup quota, affinity)`, walking the full cgroup ancestor chain. Use
 /// instead of `std.Thread.getCpuCount` when sizing a thread/executor pool. Needs
 /// an `io` (it reads `/proc/self/{cgroup,mountinfo}` + the cgroup tree).

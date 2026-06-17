@@ -1,20 +1,12 @@
-//! A small, generic, atomically reference-counted box, modeled on a standard
-//! atomic refcount (no weak references, no cycle handling — just shared
-//! ownership of one heap value).
+//! A small, generic, atomically reference-counted box: shared ownership of one
+//! heap value, no weak references and no cycle handling.
 //!
 //! `RefCount(T)` heap-allocates a wrapper holding a `T` and an atomic counter.
-//! `init` mints it with one reference; each holder calls `retain` to add a
-//! reference and `release` to drop one. The wrapper (and its `T`) is freed
-//! exactly once, on the reference's 1→0 transition. The counter is atomic so the
-//! box can be shared across fibers/threads — matching the `OutboundFrame`
-//! refcount in this codebase, whose ordering this primitive copies:
-//!   - `retain` bumps with `.monotonic`: a new holder only becomes reachable to
-//!     another thread through some synchronizing edge (a mutex/queue/signal), so
-//!     the bump itself needs no ordering.
-//!   - `release` decrements with `.release`; the holder that observes the 1→0
-//!     transition issues an `.acquire` fence before freeing, establishing
-//!     happens-before with every prior holder's writes so the memory is safely
-//!     reclaimed.
+//! `init` mints it with one reference; each holder `retain`s to add a reference
+//! and `release`s to drop one. The wrapper (and its `T`) is freed exactly once,
+//! on the 1→0 transition. The counter is atomic so the box can be shared across
+//! fibers/threads; for the ordering rationale see `AtomicRc` and the per-method
+//! docs.
 //!
 //! The inner `T.deinit` (if present) is dispatched at comptime: a `deinit` that
 //! takes an allocator is called as `value.deinit(allocator)`, one that takes only
@@ -24,32 +16,22 @@ const std = @import("std");
 
 /// Intrusive atomic refcount: embed as a field of an owning struct; the owner
 /// calls `retain`/`release` and performs its own at-zero cleanup + free. The
-/// counter mechanics (the atomic add/sub and the happens-before fencing) live
-/// here so every owner shares one audited implementation; the struct layout,
-/// allocation, pointer types, and call sites stay the owner's own.
+/// counter mechanics live here so every owner shares one audited implementation;
+/// the struct layout, allocation, pointer types, and call sites stay the owner's.
 ///
-/// Two ordering flavors are provided, matching the two patterns already in this
-/// codebase — pick ONE per owner and use it consistently:
+/// Two ordering flavors — pick ONE per owner and use it consistently:
 ///
-///   * `retain` / `release` — the lighter pattern (used by the pre-framed RPC
-///     frame on the pubsub path). `retain` bumps with `.monotonic`: a freshly
-///     retained box only becomes reachable to another thread through a
-///     synchronizing edge (queue/mutex/signal) that already carries the
-///     happens-before, so the bump itself needs no ordering. `release`
-///     decrements with `.release`; the holder that observes the 1→0 transition
-///     issues an `.acquire` fence before its cleanup, establishing
-///     happens-before with every prior holder's writes before reclamation.
+///   * `retain` / `release` — the lighter pattern: `.monotonic` bump, `.release`
+///     decrement + acquire fence on the 1→0 transition.
 ///
-///   * `retainChecked` / `releaseChecked` — the QUIC lifecycle pattern (shared
-///     connection/stream/endpoint/socket/channel state). Both directions use
-///     `.acq_rel` and assert the prior count was positive, catching a
-///     retain-after-free or an over-release in debug builds on these
-///     UAF-sensitive primitives. `.acq_rel` is strictly stronger than the
-///     lighter pattern's `.release` + acquire-fence, so the at-zero reader still
+///   * `retainChecked` / `releaseChecked` — both directions use `.acq_rel` and
+///     assert the prior count was positive, catching a retain-after-free or an
+///     over-release in debug builds on UAF-sensitive primitives. `.acq_rel` is
+///     strictly stronger than the lighter pattern, so the at-zero reader still
 ///     observes every prior holder's writes.
 ///
 /// Either way the count starts at 1 and `release*` returns `true` exactly once,
-/// on the 1→0 transition — that is the caller's signal to run cleanup and free.
+/// on the 1→0 transition — the caller's signal to run cleanup and free.
 pub const AtomicRc = struct {
     n: std.atomic.Value(usize) = .init(1),
 

@@ -213,8 +213,8 @@ pub const RouterConfig = struct {
     /// fiber. When this many validations are already in flight a further
     /// message is throttle-DROPPED exactly like go ("validation throttled:
     /// queue full; dropping") — neither marked seen (a later copy can still be
-    /// validated) nor penalized; the old inline-fallback let a validation flood
-    /// stall the router fiber, the very thing the offload exists to prevent.
+    /// validated) nor penalized; an inline fallback here would let a validation
+    /// flood stall the router fiber, the very thing the offload exists to prevent.
     /// No effect when there is nothing to offload (no signer AND no validator).
     /// See `MessageValidator`.
     validation_concurrency: usize = 0,
@@ -332,9 +332,9 @@ pub const MessageValidator = struct {
 /// default): a re-add of an id already present does NOT extend its expiry, so an
 /// id stays seen for the TTL measured from the FIRST time it was observed.
 ///
-/// Unlike the old count-bounded FIFO this has no hard count cap: it is bounded by
-/// TIME like go, and the per-heartbeat flood defenses (max_ihave / max_idontwant /
-/// scoring) bound the inflow of new ids within any TTL window. Each entry holds
+/// There is no hard count cap: it is bounded by TIME like go, and the
+/// per-heartbeat flood defenses (max_ihave / max_idontwant / scoring) bound the
+/// inflow of new ids within any TTL window. Each entry holds
 /// one reference on a SHARED interned id (the same id in a peer's `dont_send` or
 /// `iwant_promises` is one allocation); the sweep `release`s an expired entry's
 /// reference and `deinit` releases them all — no per-id `free` here.
@@ -369,10 +369,9 @@ const SeenCache = struct {
     /// The expiry wheel: `ttl_ticks + 1` per-tick buckets; an id added with
     /// expiry tick E lands in `buckets[E % buckets.len]`, and `sweep(T)` drains
     /// exactly `buckets[T % buckets.len]` — O(expired-this-tick), no map scans.
-    /// (The old shape iterated the WHOLE map per heartbeat and restarted the
-    /// iteration after every removal: O(n*k). At eth2 rates — ~180k retained
-    /// ids, ~1.5k expiring per tick — that was a measured multi-SECOND
-    /// router-fiber stall per heartbeat; the wheel makes it ~k list pops.)
+    /// A full-map scan per heartbeat is O(n*k); at eth2 rates (~180k retained
+    /// ids, ~1.5k expiring per tick) that is a multi-SECOND router-fiber stall,
+    /// where the wheel is ~k list pops.
     ///
     /// Bucket slots are NON-owning copies of the entry's `rc` pointer: the map
     /// entry holds the one reference, and nothing but the sweep ever removes a
@@ -2112,13 +2111,13 @@ pub fn Router(comptime Transport: type) type {
             // TWO inboxes, control before data: every iteration drains ALL
             // queued CONTROL commands (validation verdicts — which free the
             // bounded in-flight validation slots — peer lifecycle, the
-            // heartbeat, shutdown) before taking ONE data command. With a
-            // single FIFO inbox a data flood queued ahead of the verdicts that
-            // recycle validation slots, so a burst starved the async pipeline
-            // into throttle-dropping ~97% of itself (measured in
-            // bench-gossipsub); lifecycle events were likewise backpressured
-            // behind data. Control latency is now bounded by ONE data
-            // command's processing time. Wakeups need no extra primitive: a
+            // heartbeat, shutdown) before taking ONE data command. A single
+            // FIFO inbox lets a data flood queue ahead of the verdicts that
+            // recycle validation slots, starving the async pipeline into
+            // throttle-dropping nearly all of itself, and backpressures
+            // lifecycle events behind data. Two queues bound control latency by
+            // ONE data command's processing time. Wakeups need no extra
+            // primitive: a
             // control producer follows its post with a best-effort
             // `.control_ready` marker into the DATA queue (see notifyControl)
             // — if the data queue is full the consumer is necessarily awake
@@ -2744,13 +2743,12 @@ pub fn Router(comptime Transport: type) type {
             if (targets.items.len == 0) return;
 
             // Build the IHAVE frame ONCE and hand each target a refcounted
-            // reference: every target gets the identical id list today (the cap
-            // is a deterministic prefix), so the old per-peer sendIHave
-            // protobuf-encoded the same bytes once per target — at the eth2
-            // shape (5000 ids ≈ 170 KB per encode × ~16 targets per topic per
-            // heartbeat) that was megabytes of redundant encoding every second.
-            // If per-target shuffle SAMPLING of the over-cap id set is added
-            // for go-parity later, this sharing must give way for that case.
+            // reference: every target gets the identical id list (the cap is a
+            // deterministic prefix), so encoding it once instead of per-target
+            // saves megabytes of redundant encoding per heartbeat at eth2 shape
+            // (5000 ids ≈ 170 KB per encode × ~16 targets per topic). If
+            // per-target shuffle SAMPLING of the over-cap id set is added for
+            // go-parity later, this sharing must give way for that case.
             router.sendIHaveShared(topic, capped, targets.items);
         }
 
@@ -3616,11 +3614,11 @@ pub fn Router(comptime Transport: type) type {
             // command (see onValidationResult for why seen is marked there).
             //
             // At the in-flight cap the message is throttle-DROPPED, exactly like
-            // go ("message validation throttled: queue full; dropping"): the
-            // inline fallback we used to run here let a validation flood stall
-            // the router fiber — the very thing the offload exists to prevent.
-            // The drop neither marks seen (a later copy can still be validated)
-            // nor penalizes the sender (the message was never judged).
+            // go ("message validation throttled: queue full; dropping"): an
+            // inline fallback here would let a validation flood stall the router
+            // fiber — the very thing the offload exists to prevent. The drop
+            // neither marks seen (a later copy can still be validated) nor
+            // penalizes the sender (the message was never judged).
             const needs_signature_check = router.signer != null;
             if ((needs_signature_check or router.validator != null) and
                 router.validation_concurrency > 0)
@@ -10393,9 +10391,8 @@ test "async validation cap: over-cap messages are throttle-DROPPED (go parity) a
     // A slow ACCEPT validator with a cap of 1: the first message occupies the
     // single async slot (and sleeps); further messages posted while it is in
     // flight exceed the cap and are throttle-DROPPED, exactly like go
-    // ("validation throttled: queue full; dropping") — never validated inline
-    // (the old fallback let a validation flood stall the router fiber), never
-    // delivered, never forwarded. The drop does NOT mark the id seen, so a
+    // ("validation throttled: queue full; dropping") — never validated inline,
+    // never delivered, never forwarded. The drop does NOT mark the id seen, so a
     // later re-delivery of a dropped message validates normally.
     var val = AsyncValidator{ .io = io, .verdict = .accept, .sleep_ms = 200 };
 

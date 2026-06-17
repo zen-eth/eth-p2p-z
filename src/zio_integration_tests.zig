@@ -5,11 +5,10 @@
 //! with the server `accept()` running on a concurrent fiber (worker executor)
 //! rather than the OS thread the std.Io.Threaded unit tests are forced to use.
 //!
-//! This exercises the full multi-executor stack the upper-layer refactors touch
-//! — router fiber, per-connection actors, stream byte queues, TLS handshake,
-//! teardown — under genuine cross-executor scheduling (the path that starved
-//! under the historical .exact(1) bug). It is the regression net for the
-//! multi-executor refactor of the upper layers.
+//! This exercises the full multi-executor stack — router fiber, per-connection
+//! actors, stream byte queues, TLS handshake, teardown — under genuine
+//! cross-executor scheduling. It is the regression net for the multi-executor
+//! refactor of the upper layers.
 //!
 //! Pulls BoringSSL (via the quiche dep), so it is a separate, slower-compiling
 //! target from the Layer-0 zio-io-test. Run: `zig build zio-integ-test`.
@@ -134,19 +133,18 @@ test "endpoint loopback: handshake + stream echo on exact(4)" {
 //
 // Regression guard for a teardown deadlock: a Switch connection's inbound
 // dispatcher parks inside acceptStream (futexWait on the connection's accept
-// waitset) waiting for a stream that never arrives. Tearing the connection down
-// (SwitchConnection.deinit) used to rely on a cross-executor Group.cancel to
-// unblock that parked dispatcher before joining it. On a real multi-executor
-// runtime that cancel's wakeup could be lost, so the join blocked forever.
+// waitset) waiting for a stream that never arrives. A cross-executor cancel to
+// unblock it can lose its wakeup on a real multi-executor runtime, so the join
+// blocks forever.
 //
-// The fix drives the dispatcher to exit via a PERSISTENT signal — closing the
-// connection marks it closed and notifies the accept waitset (level-triggered),
-// so the parked acceptStream wakes via notify, observes isClosed(), and returns
-// ConnectionClosed; the dispatcher loop exits on its own and the join is then
-// trivial. This test loops the bring-up/teardown many times across 2 and 4
-// executors to surface the intermittent lost-wakeup race; a hang here is the
-// deadlock, and a clean completion (leak-checked by the testing allocator)
-// proves the persistent-signal teardown is reliable.
+// Teardown must instead drive the dispatcher to exit via a PERSISTENT signal:
+// closing the connection marks it closed and notifies the accept waitset
+// (level-triggered), so the parked acceptStream wakes via notify, observes
+// isClosed(), and returns ConnectionClosed; the dispatcher loop exits on its
+// own and the join is then trivial. This test loops bring-up/teardown across 2
+// and 4 executors to surface the intermittent lost-wakeup race; a hang here is
+// the deadlock, a clean (leak-checked) completion proves the persistent-signal
+// teardown is reliable.
 
 /// Minimal inbound handler so the server has a registered protocol (an empty
 /// registry makes the dispatcher exit immediately with NoRegisteredProtocols,
@@ -240,10 +238,9 @@ fn switchDispatcherTeardownLoop(io: std.Io, iterations: usize) !void {
     }
 }
 
-// 50 bring-up/teardown cycles per executor count. The race surfaced on the
-// FIRST iteration before the fix, so this is ample as a permanent regression
-// guard while keeping the default suite fast; it was validated at far higher
-// counts (hundreds of cycles, zero hangs) during the fix.
+// 50 bring-up/teardown cycles per executor count: the race surfaces on the
+// first iteration, so this is ample as a permanent guard while keeping the
+// default suite fast.
 const teardown_loop_iterations: usize = 50;
 
 test "switch connection teardown: parked dispatcher unblocks on exact(2)" {
@@ -269,10 +266,9 @@ test "switch connection teardown: parked dispatcher unblocks on exact(4)" {
 // applies the flag INVERTED (true -> IPV6_V6ONLY=0, dual-stack) while zio is
 // literal (true -> IPV6_V6ONLY=1, v6-only). The bind path therefore sets no
 // flag at all and relies on the OS default (dual-stack on Linux and macOS),
-// verifying it post-bind. This test pins the production-backend behavior the
+// verifying it post-bind. This pins the production-backend behavior the
 // std-backend twin in router/loop_tests.zig cannot see: a [::] listener must
-// accept an IPv4 dial. Before the fix, the zio bind requested v6-only and this
-// dial timed out.
+// accept an IPv4 dial.
 
 /// Bind the server on `[::]:0`, dial it over IPv4 loopback: the dual-stack
 /// listener must complete the handshake with the v4-mapped peer.

@@ -318,8 +318,8 @@ fn writeShared(state: *SharedState, io: std.Io, buf: []const u8, opts: WriteOpti
             return written;
         }
 
-        // Note: surface queue-full pressure through the connection's
-        // pending counter so the actor can fold it into stats.
+        // Surface queue-full pressure through the connection's pending
+        // counter so the actor can fold it into stats.
         _ = state.conn.outbound_stream_queue_full.fetchAdd(1, .acq_rel);
 
         if (opts.timeout != .none and io_time.timeoutExpired(io, deadline)) return error.Timeout;

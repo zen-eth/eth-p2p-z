@@ -22,14 +22,12 @@
 //!
 //! The id KEY is an INTERNED, reference-counted `*InternedId` shared through the
 //! router's `InternTable` — the SAME allocation that `seen` and the per-peer
-//! `dont_send`/`iwant_counts`/`iwant_promises` maps hold. An id present in both
-//! the cache and one of those maps is one heap copy; the cache interns on `put`
-//! (one reference per cached id) and releases on eviction (window shift past
-//! `history_length`) and on `deinit`, so the id bytes are freed only when the
-//! LAST holder across all maps releases. The cache stores no id copies of its own
-//! — `release` is the single free path, the table the single live-id index. The
-//! map/lookup keys still alias the id bytes (now the interned box's owned bytes),
-//! so `get`/`getGossipIDs`/dedup remain by content, unchanged.
+//! `dont_send`/`iwant_counts`/`iwant_promises` maps hold, so an id present in both
+//! the cache and one of those maps is one heap copy. The cache interns on `put`
+//! (one reference per cached id) and releases on eviction and on `deinit`, so the
+//! id bytes are freed only when the LAST holder across all maps releases. The
+//! map/lookup keys alias the interned box's owned bytes, so `get`/`getGossipIDs`/
+//! dedup remain by content.
 
 const std = @import("std");
 const peer_io = @import("peer_io.zig");
@@ -56,10 +54,9 @@ pub fn historyLengthForTest() u64 {
 }
 
 /// One cached message. Holds one reference on the SHARED interned id box `rc`
-/// (the id bytes are `rc.value.bytes`, owned by the box, freed only when the last
-/// holder across all maps releases), owns its `topic` byte copy, and holds
-/// exactly one reference on `frame`. The entry's eviction (or the cache's deinit)
-/// releases `rc`, frees the `topic` copy, and releases `frame` exactly once.
+/// (id bytes are `rc.value.bytes`, freed only when the last holder releases), owns
+/// its `topic` byte copy, and holds exactly one reference on `frame`. Eviction (or
+/// `deinit`) releases `rc`, frees the `topic` copy, and releases `frame` once.
 const Entry = struct {
     rc: *InternedId,
     topic: []u8,
@@ -69,20 +66,18 @@ const Entry = struct {
 pub const MessageCache = struct {
     allocator: std.mem.Allocator,
     /// The router-shared intern table. `put` interns (retains) an id; eviction and
-    /// `deinit` release. The id bytes are freed only when the LAST holder across
-    /// all maps releases (see `InternTable`). The pointer is stable: the cache is
-    /// Router-owned and the table is a field of the heap-allocated Router.
+    /// `deinit` release. The pointer is stable: the cache is Router-owned and the
+    /// table is a field of the heap-allocated Router.
     intern_table: *InternTable,
     /// Ring of windows, newest first: `windows[0]` is the current window every
     /// `put` lands in; `windows[history_length - 1]` is the oldest, dropped by
     /// the next `shift`.
     windows: [history_length]std.ArrayListUnmanaged(Entry),
     /// id → the stored frame, for O(1) `get` and duplicate detection. The keys
-    /// alias the owning entry's interned-id bytes (`rc.value.bytes`, freed by the
-    /// box on the last release), so the map never owns its keys. Eviction (`shift`)
-    /// removes the key BEFORE releasing `rc`; `deinit` frees the map storage
-    /// wholesale without touching keys. Frame pointers are stable, unlike pointers
-    /// into the resizable per-window entry lists.
+    /// alias the owning entry's interned-id bytes (`rc.value.bytes`), so the map
+    /// never owns its keys: eviction must remove the key BEFORE releasing `rc`,
+    /// since the release may free those bytes. The value is the stable frame
+    /// pointer (pointers into the resizable per-window entry lists would dangle).
     index: std.StringHashMapUnmanaged(*peer_io.OutboundFrame),
 
     pub fn init(allocator: std.mem.Allocator, intern_table: *InternTable) MessageCache {
@@ -107,40 +102,30 @@ pub const MessageCache = struct {
         self.* = undefined;
     }
 
-    /// Insert a message into the current (newest) window, interning `id` (the cache
-    /// then holds one reference on the SHARED id box), copying `topic`, and
-    /// retaining `frame` (the cache then holds one reference). Duplicate `id` is a
-    /// no-op: the message is NOT stored, interned, or retained twice, so it stays
-    /// in exactly one window. On allocation failure the message is simply not
-    /// cached (no id reference held, `frame` not retained), which only costs the
-    /// ability to later serve it via IWANT — safe, and the alternative (failing
-    /// the forward) is worse.
+    /// Insert a message into the current (newest) window, interning `id`, copying
+    /// `topic`, and retaining `frame` (one cache reference each). Duplicate `id` is
+    /// a no-op: NOT stored, interned, or retained twice, so it stays in exactly one
+    /// window. On allocation failure the message is simply not cached, which only
+    /// costs the ability to later serve it via IWANT — safer than failing the
+    /// forward.
     pub fn put(self: *MessageCache, id: []const u8, topic: []const u8, frame: *peer_io.OutboundFrame) !void {
         if (self.index.contains(id)) return;
 
-        // Intern the id (one shared allocation across the cache + the router maps);
-        // this holds one reference for the cache, released on evict/deinit. OOM
-        // here leaves the message uncached — safe (see above).
         const rc = self.intern_table.intern(id) orelse return error.OutOfMemory;
         errdefer rc.release();
 
         const topic_copy = try self.allocator.dupe(u8, topic);
         errdefer self.allocator.free(topic_copy);
 
-        // Index by the interned box's OWNED bytes BEFORE appending: the index key
-        // aliases `rc.value.bytes` (freed by the box on its last release, after
-        // the entry's eviction removes this key and releases `rc`), so on an
-        // index-insert failure we undo via the errdefers (release the id, free the
-        // topic) without ever having an orphaned window entry. The value is the
-        // stable frame pointer (never a pointer into the resizable window list).
+        // Key by the interned box's OWNED bytes (`rc.value.bytes`); on insert
+        // failure the errdefers unwind cleanly with no orphaned window entry.
         try self.index.put(self.allocator, rc.value.bytes, frame);
         errdefer _ = self.index.remove(rc.value.bytes);
 
         const window = &self.windows[0];
         try window.append(self.allocator, .{ .rc = rc, .topic = topic_copy, .frame = frame });
 
-        // All bookkeeping committed: the cache now holds the interned id reference,
-        // owns the topic copy, and takes its reference on the frame.
+        // All bookkeeping committed: take the frame reference last.
         frame.retain();
     }
 
@@ -177,9 +162,8 @@ pub const MessageCache = struct {
     /// removed BEFORE `freeEntry` releases `rc` (the key aliases the box's bytes,
     /// which the release may free).
     pub fn shift(self: *MessageCache) void {
-        // The oldest window is evicted. Release/free its entries and drop them
-        // from the index, then reuse its (emptied) storage as the new newest
-        // window so no allocation is needed to re-open one.
+        // Evict the oldest window's entries, then reuse its emptied storage as the
+        // new newest window so re-opening one needs no allocation.
         var oldest = self.windows[history_length - 1];
         for (oldest.items) |*entry| {
             _ = self.index.remove(entry.rc.value.bytes);

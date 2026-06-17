@@ -61,12 +61,11 @@ pub const Context = struct {
     accept_available: *std.atomic.Value(usize),
     /// Slot for the router's main socket-reader fiber. Owned by the
     /// endpoint handle. Filled on `bind`, cleared (after `await`) by
-    /// `closeListener`. We use a `Future` (not a `Group`) for the main
-    /// router loop because the surrounding endpoint memory is freed
-    /// shortly after `closeListener` returns; `Future.await` blocks until
-    /// the runtime has fully torn down the fiber, eliminating the race the
-    /// old `Group`-based scheme was vulnerable to. The loop is stopped via
-    /// the `stopping` flag (not cancellation — see that field).
+    /// `closeListener`. A `Future` (not a `Group`): the surrounding endpoint
+    /// memory is freed shortly after `closeListener` returns, and
+    /// `Future.await` blocks until the runtime has fully torn down the fiber.
+    /// The loop is stopped via the `stopping` flag (not cancellation — see
+    /// that field).
     router_future_slot: *?std.Io.Future(RouterLoopError!void),
     /// Group for short-lived "handshake waiter" tasks spawned when the router
     /// promotes an Initial packet to a Connection. Lives alongside the main
@@ -213,12 +212,10 @@ pub fn closeListener(ep: Context) void {
     // recv fiber out of its blocking `recvmsg` with a zero-length datagram sent
     // to the socket's own (loopback-substituted) address — the loop drops
     // empty datagrams and re-checks `stopping` at the top of every iteration.
-    // The flag is the truth, the datagram is just the waker: this is the same
-    // persistent-signal doctrine the old route-command-channel close
-    // implemented, without the per-packet Select that channel forced. If the
-    // wake send fails (practically impossible on loopback), fall back to the
-    // one-shot `cancel` as a backstop — the recv is a single cancellation
-    // point, and the loop maps `Canceled` back to a `stopping` re-check.
+    // The flag is the truth, the datagram is just the waker. If the wake send
+    // fails (practically impossible on loopback), fall back to the one-shot
+    // `cancel` as a backstop — the recv is a single cancellation point, and the
+    // loop maps `Canceled` back to a `stopping` re-check.
     ep.stopping.store(true, .release);
     if (ep.router_future_slot.*) |*future| {
         // TWO independent wakers, belt and suspenders: the loopback wake
@@ -277,10 +274,9 @@ fn routerSocketLoop(ep: Context) RouterLoopError!void {
     }
 
     // ONE persistent fiber owning the blocking recv — no per-datagram Select,
-    // no task spawns, no cancel/join. Route-table updates no longer pass
-    // through this loop at all (writers mutate the shared table directly), so
-    // the only wake this loop needs is a datagram: real traffic, or
-    // closeListener's zero-length loopback wake.
+    // no task spawns, no cancel/join. Route-table writers mutate the shared
+    // table directly (not via this loop), so the only wake this loop needs is a
+    // datagram: real traffic, or closeListener's zero-length loopback wake.
     var recv_slab = RecvSlab{ .pool = ep.slab_pool_slot.* };
     defer recv_slab.retire();
     while (true) {
@@ -451,8 +447,8 @@ fn receiveRouterPacket(ep: Context, rs: *RecvSlab, timeout: std.Io.Timeout) (err
     const socket = ep.socket_slot.* orelse return error.Canceled;
     const local_addr = socket.address();
     // Receive straight into the current slab's tail (the packet then becomes a
-    // zero-copy VIEW); when the pool is dry, degrade to a stack buffer + the
-    // old per-packet heap copy.
+    // zero-copy VIEW); when the pool is dry, degrade to a stack buffer + a
+    // per-packet heap copy.
     var fallback_buf: [packet_buf_len]u8 = undefined;
     const slab_tail = rs.tail();
     const buf: []u8 = if (slab_tail) |t| t[0..packet_buf_len] else fallback_buf[0..];
@@ -545,7 +541,7 @@ fn processRouterGroPacket(ep: Context, packet: *const RoutedPacket, segment_size
         };
         // A slab-backed super-datagram splits into sibling VIEWS of the same
         // bytes (one retain each, zero copies); the heap-copy fallback dupes
-        // per segment as before.
+        // per segment.
         var segment = if (packet.slab) |slab|
             (RoutedPacket.initView(slab, packet.data[offset..end], packet.from, packet.to, segment_meta) orelse {
                 ep.addStat("router_packet_drops", 1);

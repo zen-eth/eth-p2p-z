@@ -3,14 +3,12 @@
 //! WHY THIS FILE EXISTS: every other test in the tree runs on `std.Io.Threaded`
 //! and is single-threaded + sequential (trySend/tryRecv with no blocking
 //! handoff), so the cross-executor wake / backpressure / refcount contracts that
-//! make the model multi-executor-safe are NOT exercised anywhere. That gap is
-//! exactly what let zio v0.11's stubbed `batchAwaitConcurrent` reach interop.
+//! make the model multi-executor-safe are NOT exercised anywhere.
 //!
 //! These tests spin a REAL `zio.Runtime` with >=2 executors and put producers
-//! and consumers on different executors, so they pin the Invariant-Ledger
-//! contracts before the Layer-0 refactor
-//! touches channel.zig / waitset.zig. BoringSSL-free: imports only zio + the
-//! io primitives, so it compiles in seconds.
+//! and consumers on different executors, so they pin the cross-executor
+//! contracts of channel.zig / waitset.zig. BoringSSL-free: imports only zio +
+//! the io primitives, so it compiles in seconds.
 //!
 //! Run: `zig build zio-io-test` (optionally `-Dfilter=...`).
 
@@ -252,10 +250,10 @@ test "Bounded channel: refcount frees exactly once after concurrent retain/relea
 // ---------------------------------------------------------------------------
 // Regression: zio kqueue completion-lifecycle UAF. N fibers each blocked in a
 // receiveManyTimeout on their own socket, cancelled concurrently cross-executor.
-// On stock zio v0.12.0 this crashed 40/40 (poll() dereferenced a Completion freed
-// by a resumed fiber via a stale kevent udata). The epoll-style fix (lalinsky/zio
-// #443) keys pending completions by (ident,filter) in a loop-owned `poll_queue`
-// and stops storing raw Completion pointers in udata, so stale events can't deref.
+// The bug: poll() dereferenced a Completion freed by a resumed fiber via a stale
+// kevent udata. The fix keys pending completions by (ident,filter) in a
+// loop-owned `poll_queue` instead of storing raw Completion pointers in udata,
+// so stale events can't deref.
 // ---------------------------------------------------------------------------
 const io_time = @import("io/time.zig");
 const ReproFut = std.Io.Future((std.Io.Cancelable || std.Io.ConcurrentError)!void);

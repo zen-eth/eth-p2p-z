@@ -214,8 +214,7 @@ const Env = struct {
     }
 
     /// Redis key for the listener multiaddr, namespaced by TEST_KEY so parallel
-    /// tests sharing one redis instance don't collide (the modern scheme uses a
-    /// single shared redis rather than the legacy per-test proxy).
+    /// tests sharing one redis instance don't collide.
     fn listenerAddrKey(self: *const Env, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "{s}_listener_multiaddr", .{self.test_key});
     }
@@ -238,7 +237,7 @@ const ParsedHostPort = struct {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const cpu_count = libp2p.effectiveCpuCount(allocator); // cgroup-CFS-quota-aware (see src/cpu_count.zig)
+    const cpu_count = libp2p.effectiveCpuCount(allocator); // cgroup-CFS-quota-aware
     const executor_count: u8 = @intCast(std.math.clamp(cpu_count, 2, 64));
     const runtime = try zio.Runtime.init(allocator, .{ .executors = .exact(executor_count) });
     defer runtime.deinit();
@@ -376,7 +375,7 @@ fn runDialer(
 
     // Emit the result JSON via the std.Io file writer. stdout is a pipe under the
     // interop harness; the default positional writer falls back to streaming on a
-    // non-seekable fd (relies on zio's ESPIPE->Unseekable fix, lalinsky/zio#451).
+    // non-seekable fd (ESPIPE -> Unseekable).
     const stdout_file: std.Io.File = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
     var stdout_buf: [256]u8 = undefined;
     var stdout_writer = stdout_file.writer(io, &stdout_buf);

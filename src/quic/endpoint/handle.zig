@@ -21,8 +21,7 @@ pub const EndpointStats = endpoint_core.EndpointStats;
 /// `routerContext`: `&endpoint.socket`, `&endpoint.router_future`,
 /// `&endpoint.router_stopping`, `&endpoint.accept_available`, ...). It must
 /// therefore never be copied or moved — `opaque` makes "pointer-only, never by
-/// value" a compile-time guarantee. Switching to a struct-behind-pointer would
-/// require auditing those borrows by hand.
+/// value" a compile-time guarantee.
 pub const QuicEndpoint = opaque {
     pub const Options = config.Options;
     pub const InitError = config.ConfigError || error{RandomFailed} || std.mem.Allocator.Error;

@@ -7,9 +7,7 @@
 //! along the cgroup ancestor chain — the kernel enforces every level, but each
 //! level's quota file reports only its own limit.
 //!
-//! Vendored verbatim from ChainSafe/lodestar-z (src/cpu_count.zig). In this repo
-//! it is consumed via `root.effectiveCpuCount` to size the zio executor pool, so
-//! a CPU-quota-limited container (`docker --cpus` / k8s `limits.cpu`) does not
+//! Sizes the zio executor pool so a CPU-quota-limited container does not
 //! oversubscribe executor threads against its quota.
 
 const std = @import("std");

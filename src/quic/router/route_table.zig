@@ -6,14 +6,11 @@
 //!
 //! This is a plain mutex-protected map written DIRECTLY by its writers — the
 //! quinn model — not actor-owned state: CID routing is not quiche state, so it
-//! needs no single-writer ordering. Replacing the old design (a route-command
-//! channel drained by the recv loop, which forced the loop into a fresh
-//! two-arm Select — two fiber spawns plus a cancel/join — per datagram) with
-//! direct writes lets the recv loop be a single persistent fiber with zero
-//! per-packet task churn, and makes registration synchronous (no ack
-//! round-trip) while SHRINKING the new-CID race window: a CID is routable the
-//! instant `quiche_conn_new_scid` returns, before the NEW_CONNECTION_ID frame
-//! reaches the peer.
+//! needs no single-writer ordering. Direct writes let the recv loop be a single
+//! persistent fiber with zero per-packet task churn, make registration
+//! synchronous (no ack round-trip), and shrink the new-CID race window: a CID is
+//! routable the instant `quiche_conn_new_scid` returns, before the
+//! NEW_CONNECTION_ID frame reaches the peer.
 //!
 //! Locking: every operation takes the one mutex for a short, bounded critical
 //! section (map probe + channel enqueue at most). `deliver` enqueues UNDER the

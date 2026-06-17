@@ -613,8 +613,8 @@ test "the payload type constant is the libp2p peer-record codec 0x03 0x01" {
 test "consumes a real go-libp2p signed peer-record envelope (wire-compat)" {
     const allocator = testing.allocator;
 
-    // Fixture produced by go-libp2p v0.38.1 `record.Seal` over a PeerRecord with
-    // an Ed25519 key (fixed seed), seq=0x1122334455667788, and two quic-v1
+    // Fixture produced by go-libp2p `record.Seal` over a PeerRecord with an
+    // Ed25519 key (fixed seed), seq=0x1122334455667788, and two quic-v1
     // multiaddrs. Decoding it here proves our envelope/record/signing-input byte
     // layout matches the reference implementation exactly.
     const envelope = try hexDecode(allocator, "0a240801122079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664120203011a500a2600240801122079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad0496641088ef99abc5e88c91111a0d0a0b047f00000191020fa1cd031a0d0a0b04c0a8000a91022328cd032a40d85c6ac219c546773786025106fb199fa63b456e808af9cdbed155efd4dc1114cf7eb912a0b1cc2adfcb129f4fe54bdc47fb03987733be3107fed37c6495e30a");

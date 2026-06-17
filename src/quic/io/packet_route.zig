@@ -121,9 +121,8 @@ pub const RoutedPacket = struct {
 /// the tail can no longer hold a maximum datagram. A retired slab returns to
 /// the free list when its last view is released, so a slab is pinned only
 /// while connections still hold its packets in their bounded inboxes. When the
-/// pool is exhausted (every slab pinned) the recv path falls back to the
-/// per-packet heap copy, so backpressure degrades to the old behaviour instead
-/// of blocking the recv fiber.
+/// pool is exhausted (every slab pinned) the recv path falls back to a
+/// per-packet heap copy, so the recv fiber never blocks.
 ///
 /// Lifetime: the endpoint holds one pool reference (dropped in closeListener
 /// after the recv fiber exits); every live slab holds one. In-flight views can

@@ -1,4 +1,4 @@
-//! P0 gossipsub router micro-benchmark (`zig build bench-gossipsub`).
+//! Gossipsub router micro-benchmark (`zig build bench-gossipsub`).
 //!
 //! Measures the ROUTER hot path in-process — protobuf decode, signature
 //! verification (inline vs the async worker pipeline), seen-cache dedup, mesh
@@ -8,19 +8,18 @@
 //!   strict/inline     signed messages, verification ON the router fiber
 //!                     (validation_concurrency = 0)
 //!   strict/async      same load, verification on validation fibers
-//!                     (validation_concurrency = executor count) — the P1 lever
+//!                     (validation_concurrency = executor count)
 //!   strict/async dupx4 every id delivered 4x (relayed by 4 peers): duplicates
 //!                     must skip crypto via the seen check
 //!   anonymous         no signatures, content-derived ids (the eth2 StrictNoSign
 //!                     shape; app/BLS validation is out of scope here)
 //!   heartbeat         heartbeat latency with a loaded seen cache, and the
-//!                     expiry tick where every id ages out at once (the P4
-//!                     sweep cost)
+//!                     expiry tick where every id ages out at once
 //!
 //! Reported per scenario: delivered msgs/s, µs/msg, end-to-end wall time,
 //! deliveries vs offered (a shortfall under strict/async = validation throttle
 //! drops, go-parity behaviour), forwarded frames+bytes (discard-sink counters),
-//! and allocator op counts (allocs/frees per message — the P7 budget).
+//! and allocator op counts (allocs/frees per message).
 //!
 //! Run with -Doptimize=ReleaseFast for meaningful numbers. The runtime is zio
 //! (production parity: epoll/kqueue), executors = clamp(cpus, 2, 64).
@@ -42,7 +41,7 @@ const mesh_peers = 8;
 /// Messages per throughput scenario.
 const default_msgs: usize = 20_000;
 /// Payload size: the eth2 attestation ballpark (well under the 1 KiB IDONTWANT
-/// threshold, so duplicates get no IDONTWANT relief — the worst case P1 targets).
+/// threshold, so duplicates get no IDONTWANT relief — the worst case).
 const payload_len: usize = 256;
 /// Seen-cache load for the heartbeat scenario.
 const heartbeat_seen_load: usize = 100_000;
@@ -254,23 +253,21 @@ const Scenario = struct {
     /// barrier between batches, so verdict re-entries are never starved behind
     /// queued ingress — measures the pipeline's sustained validated capacity.
     /// Unpaced (open-loop) posts everything at memcpy speed and measures burst
-    /// behaviour. (The control-inbox split keeps verdicts ahead of queued
-    /// ingress; the remaining unpaced shortfall is the real
-    /// offered-vs-verification capacity gap.)
+    /// behaviour. The remaining unpaced shortfall is the real
+    /// offered-vs-verification capacity gap.
     paced: bool = false,
     /// Enable peer scoring: every accepted message then runs the per-message
-    /// promise fulfilment probe (today O(all peers): one iwant_promises map
-    /// probe per connected peer per message) plus the P2 first-delivery
-    /// bookkeeping — the cost the global-promise-map rework targets.
+    /// promise fulfilment probe (O(all peers): one iwant_promises map probe per
+    /// connected peer per message) plus first-delivery bookkeeping.
     scoring: bool = false,
-    /// Extra NON-mesh connected peers, to scale the O(peers) terms the way a
-    /// real node's peer set (mesh + gossip fringe) does.
+    /// Extra NON-mesh connected peers, to scale the O(peers) per-message terms
+    /// the way a real node's peer set (mesh + gossip fringe) does.
     extra_peers: usize = 0,
 };
 
-/// A neutral scoring config: live P2/P4/P7 terms, undecayed, thresholds out of
-/// the way — enough to turn the scoring engine (and its per-message probes) ON
-/// without any peer ever crossing a gate during the bench.
+/// A neutral scoring config: live terms, undecayed, thresholds out of the way
+/// — enough to turn the scoring engine (and its per-message probes) ON without
+/// any peer ever crossing a gate during the bench.
 fn benchScoringConfig() router_mod.ScoreConfig {
     return .{
         .params = .{
@@ -514,9 +511,8 @@ fn runHeartbeatScenario(counting: *CountingAllocator, io: std.Io) !void {
 /// Heartbeat gossip-emission cost: a full IHAVE window (max_ihave_length ids
 /// in the current mcache gossip slot) advertised to the gossip fringe — 64
 /// non-mesh peers that announced the topic. Measures the per-tick cost of
-/// emitGossip: today the IDENTICAL IHAVE RPC is protobuf-encoded and
-/// frame-allocated once PER TARGET PEER (P6); the frames/bytes/alloc counters
-/// attribute it.
+/// emitGossip: the IDENTICAL IHAVE RPC is protobuf-encoded and frame-allocated
+/// once PER TARGET PEER; the frames/bytes/alloc counters attribute it.
 fn runGossipEmitScenario(counting: *CountingAllocator, io: std.Io) !void {
     const allocator = counting.allocator();
     var counters = SinkCounters{};
@@ -612,8 +608,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "strict/async dupx4 paced", .host_key = &host_key, .validation_concurrency = executor_count, .dup_factor = 4, .msgs = default_msgs, .paced = true },
         .{ .name = "anonymous/inline", .host_key = null, .validation_concurrency = 0, .dup_factor = 1, .msgs = default_msgs },
         // Scoring pair: same paced-async pipeline, scoring ON, 8 vs 64 connected
-        // peers — isolates the per-message O(peers) scoring/promise cost that
-        // the global-promise-map rework targets.
+        // peers — isolates the per-message O(peers) scoring/promise cost.
         .{ .name = "strict/async score p8", .host_key = &host_key, .validation_concurrency = executor_count, .dup_factor = 1, .msgs = default_msgs, .paced = true, .scoring = true },
         .{ .name = "strict/async score p64", .host_key = &host_key, .validation_concurrency = executor_count, .dup_factor = 1, .msgs = default_msgs, .paced = true, .scoring = true, .extra_peers = 56 },
     };

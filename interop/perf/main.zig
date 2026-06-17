@@ -6,8 +6,7 @@
 //! latency over QUIC and prints the results as YAML on stdout; all logs go to
 //! stderr. Coordination is via the shared Redis server the framework provides.
 //!
-//! Env vars are unified-testing's (UPPERCASE, `TEST_KEY`-namespaced redis key),
-//! NOT the old test-plans lowercase convention.
+//! Env vars are unified-testing's (UPPERCASE, `TEST_KEY`-namespaced redis key).
 
 pub const std_options = @import("zig-libp2p").std_options;
 
@@ -19,16 +18,15 @@ const protocols = libp2p.protocols;
 const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 const Stream = libp2p.quic.Stream;
 
-/// Perf protocol id. Standard half-close request/response, wire-compatible with
-/// the libp2p `unified-testing` reference codec: the dialer writes a 16-byte
-/// header (upload_len ++ download_len, big-endian), streams `upload_len` bytes,
-/// then HALF-CLOSES its write side (FIN). The listener reads the header, drains
-/// the upload to EOF, writes `download_len` bytes, and returns — the Switch then
+/// Perf protocol id. Half-close request/response, wire-compatible with the
+/// libp2p `unified-testing` reference codec: the dialer writes a 16-byte header
+/// (upload_len ++ download_len, big-endian), streams `upload_len` bytes, then
+/// HALF-CLOSES its write side (FIN). The listener reads the header, drains the
+/// upload to EOF, writes `download_len` bytes, and returns — the Switch then
 /// closes the stream (FIN). The dialer reads the response to EOF, so timing
 /// captures end-to-end delivery in BOTH directions (for the upload-only case the
-/// listener's FIN is the "fully received" signal). Relies on graceful half-close
-/// (read-EOF must not shut the peer's write side); see the half-close fix +
-/// reproducer in src/zio_integration_tests.zig.
+/// listener's FIN is the "fully received" signal). Relies on graceful half-close:
+/// read-EOF must not shut the peer's write side.
 const perf_protocol_id = "/perf/1.0.0";
 
 /// Transfer chunk for upload/download loops.
@@ -287,7 +285,7 @@ const ParsedHostPort = struct { host: []u8, port: u16 };
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const cpu_count = libp2p.effectiveCpuCount(allocator); // cgroup-CFS-quota-aware (see src/cpu_count.zig)
+    const cpu_count = libp2p.effectiveCpuCount(allocator); // cgroup-CFS-quota-aware
     const executor_count: u8 = @intCast(std.math.clamp(cpu_count, 2, 64));
     const runtime = try zio.Runtime.init(allocator, .{ .executors = .exact(executor_count) });
     defer runtime.deinit();

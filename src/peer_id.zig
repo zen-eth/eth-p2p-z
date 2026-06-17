@@ -134,9 +134,8 @@ pub const PeerId = struct {
         out[0] = 0x00;
         out[1] = 32;
         // Fill the 32-byte identity-hash portion with real OS entropy so each
-        // call returns a DISTINCT peer id. The previous fixed PRNG seed made
-        // every call return the same id. arc4random_buf is in libc on macOS and
-        // glibc Linux (this build links libc), and cannot fail.
+        // call returns a DISTINCT peer id. arc4random_buf is in libc on macOS
+        // and glibc Linux (this build links libc), and cannot fail.
         std.c.arc4random_buf(out[2..34].ptr, 32);
         return .{ .bytes = out, .len = 34 };
     }
