@@ -242,7 +242,10 @@ test "frameRpc length prefix matches payload length" {
     while (i < framed.len) : (i += 1) {
         prefix_len |= (@as(usize, framed[i] & 0x7f) << @intCast(shift));
         shift += 7;
-        if ((framed[i] & 0x80) == 0) { i += 1; break; }
+        if ((framed[i] & 0x80) == 0) {
+            i += 1;
+            break;
+        }
     }
     const payload_slice = framed[i..];
     try std.testing.expectEqual(prefix_len, payload_slice.len);

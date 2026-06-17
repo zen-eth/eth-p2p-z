@@ -262,7 +262,6 @@ test "switch connection teardown: parked dispatcher unblocks on exact(4)" {
     }.root);
 }
 
-
 // ---------------------------------------------------------------------------
 // Dual-stack listener on the production (zio) backend.
 //
