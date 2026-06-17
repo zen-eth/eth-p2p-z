@@ -30,6 +30,8 @@ pub const PubSubPeerInitiator = semiduplex.PubSubPeerInitiator;
 pub const PubSubPeerResponder = semiduplex.PubSubPeerResponder;
 pub const PubSubPeerProtocolHandler = semiduplex.PubSubPeerProtocolHandler;
 pub const mcache = @import("mcache.zig");
+pub const peer_score_mod = @import("peer_score.zig");
+pub const PeerScore = peer_score_mod.PeerScore;
 
 pub const v1_id: ProtocolId = "/meshsub/1.0.0";
 pub const v1_1_id: ProtocolId = "/meshsub/1.1.0";
@@ -344,6 +346,22 @@ pub const Event = union(enum) {
 ///
 const heartbeat_seed_salt: u64 = 0x9e3779b97f4a7c15;
 
+/// Writes the address-family-appropriate IP literal (no port) of `addr` into
+/// `buf` and returns the slice. Returns null for unsupported families.
+fn ipStringFromAddress(buf: []u8, addr: std.net.Address) ?[]u8 {
+    return switch (addr.any.family) {
+        std.posix.AF.INET => blk: {
+            const bytes: [4]u8 = @bitCast(addr.in.sa.addr);
+            break :blk std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch null;
+        },
+        std.posix.AF.INET6 => blk: {
+            const b = addr.in6.sa.addr;
+            break :blk std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{ b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15] }) catch null;
+        },
+        else => null,
+    };
+}
+
 fn heartbeatSeed(now_ms: i64, ticks: u64) u64 {
     const now_bits: u64 = @bitCast(now_ms);
     return now_bits ^ (ticks ^ heartbeat_seed_salt);
@@ -412,6 +430,10 @@ pub const Gossipsub = struct {
     /// Used to prevent peers from re-grafting too quickly after being pruned
     backoff: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(PeerId, i64)) = .empty,
 
+    /// Optional GossipSub v1.1 peer scoring. Owned by the caller and attached
+    /// via `setPeerScore` after `init`; null disables scoring entirely.
+    peer_score: ?*PeerScore = null,
+
     pub const Options = struct {
         seen_ttl_s: u32 = 120,
         max_messages_per_rpc: ?usize = null,
@@ -432,6 +454,9 @@ pub const Gossipsub = struct {
         D_lo: usize = 4,
         D_hi: usize = 12,
         D_lazy: usize = 6,
+        /// Of the peers kept on mesh-overflow prune, this many are retained
+        /// by score (best first); the rest of the kept set is randomized.
+        D_score: usize = 4,
         heartbeat_interval_ms: u64 = 1_000,
         fanout_ttl_ms: i64 = 60_000,
         gossip_factor: f32 = 0.25,
@@ -495,6 +520,10 @@ pub const Gossipsub = struct {
             stream_initiator.on_close_ctx = close_ctx;
             stream_initiator.on_close = StreamCloseCtx.onStreamClose;
 
+            if (self.pubsub.peer_score) |ps| ps.addPeer(peer_id) catch |err| {
+                std.log.warn("peer_score addPeer failed for {}: {}", .{ peer_id, err });
+            };
+
             self.pubsub.sendExistingSubscriptionsToPeer(peer_id) catch |err| {
                 std.log.warn("failed to send existing subscriptions to peer {}: {}", .{ peer_id, err });
             };
@@ -514,6 +543,7 @@ pub const Gossipsub = struct {
             defer self.pubsub.allocator.destroy(self);
 
             _ = self.pubsub.peers.remove(self.peer);
+            if (self.pubsub.peer_score) |ps| ps.removePeer(self.peer);
             self.callback(self.callback_ctx, {});
         }
     };
@@ -568,6 +598,31 @@ pub const Gossipsub = struct {
         };
 
         self.startHeartbeatTimer();
+    }
+
+    pub fn setPeerScore(self: *Self, ps: ?*PeerScore) void {
+        self.peer_score = ps;
+    }
+
+    /// Returns the peer's score, or 0.0 when scoring is disabled.
+    fn peerScore(self: *const Self, peer_id: PeerId) f64 {
+        const ps = self.peer_score orelse return 0;
+        return ps.score(peer_id);
+    }
+
+    /// In-place filter: keeps only peers whose score is >= `min_score`.
+    /// Returns a slice into `peers` shrunk to the surviving prefix.
+    /// No-op when scoring is disabled.
+    fn filterPeersByMinScore(self: *const Self, peers: []PeerId, min_score: f64) []PeerId {
+        const ps = self.peer_score orelse return peers;
+        var write: usize = 0;
+        for (peers) |p| {
+            if (ps.score(p) >= min_score) {
+                peers[write] = p;
+                write += 1;
+            }
+        }
+        return peers[0..write];
     }
 
     pub fn deinit(self: *Self) void {
@@ -743,25 +798,11 @@ pub const Gossipsub = struct {
     }
 
     pub fn acceptFrom(self: *Self, peer_id: PeerId) bool {
-        // TODO: Implement peer acceptance logic
-        _ = self;
-        _ = peer_id;
-        return true;
+        const ps = self.peer_score orelse return true;
+        return ps.score(peer_id) >= ps.thresholds.graylist_threshold;
     }
 
     pub fn handleRPC(self: *Self, arena: Allocator, rpc_message: *const pubsub.RPC) !void {
-        const raw_src = rpc_message.rpc_reader.sourceBytes();
-        const raw_len = raw_src.len;
-        {
-            var hex_buf: [128]u8 = undefined;
-            const peek = @min(raw_len, 32);
-            var idx: usize = 0;
-            for (raw_src[0..peek]) |b| {
-                _ = std.fmt.bufPrint(hex_buf[idx..], "{x:0>2}", .{b}) catch break;
-                idx += 2;
-            }
-            std.log.info("[dbg-gs] handleRPC raw head[0..{d}]={s} from={}", .{ peek, hex_buf[0..idx], rpc_message.from });
-        }
         if (!self.acceptFrom(rpc_message.from)) {
             std.log.warn("Rejected RPC message from peer: {}", .{rpc_message.from});
             return;
@@ -773,7 +814,6 @@ pub const Gossipsub = struct {
 
         var subscriptions = std.ArrayList(Subscription).empty;
 
-        var sub_count: usize = 0;
         while (reader.subscriptionsNext()) |sub| {
             const topic_id = sub.getTopicid();
             const subscribe_msg = sub.getSubscribe();
@@ -781,7 +821,6 @@ pub const Gossipsub = struct {
             try self.handleSubscription(&rpc_message.from, topic_id, subscribe_msg);
 
             try subscriptions.append(arena, .{ .topic = topic_id, .subscribe = subscribe_msg });
-            sub_count += 1;
         }
 
         self.event_emitter.emit(.{ .subscription_changed = .{
@@ -794,7 +833,6 @@ pub const Gossipsub = struct {
         while (reader.publishNext()) |msg| {
             try publish_msgs.append(arena, msg);
         }
-        std.log.info("[dbg-gs] handleRPC from={} raw_rpc_bytes={d} subs={d} publishes={d}", .{ rpc_message.from, raw_len, sub_count, publish_msgs.items.len });
 
         if (self.opts.max_messages_per_rpc) |max| if (publish_msgs.items.len > max) {
             std.log.warn("Received {} messages, exceeding limit of {}", .{ publish_msgs.items.len, max });
@@ -852,6 +890,15 @@ pub const Gossipsub = struct {
             callback(callback_ctx, err);
             return;
         };
+
+        if (self.peer_score) |ps| {
+            var ip_buf: [64]u8 = undefined;
+            if (ipStringFromAddress(&ip_buf, addr_and_peer_id.address)) |ip| {
+                ps.addIp(addr_and_peer_id.peer_id.?, ip) catch |err| {
+                    std.log.warn("peer_score addIp failed for {}: {}", .{ addr_and_peer_id.peer_id.?, err });
+                };
+            }
+        }
 
         if (self.peers.getEntry(addr_and_peer_id.peer_id.?)) |entry| {
             if (entry.value_ptr.initiator == null) {
@@ -949,6 +996,10 @@ pub const Gossipsub = struct {
         };
         responder.on_close_ctx = close_ctx;
         responder.on_close = StreamCloseCtx.onStreamClose;
+
+        if (self.peer_score) |ps| ps.addPeer(peer_id) catch |err| {
+            std.log.warn("peer_score addPeer failed for {}: {}", .{ peer_id, err });
+        };
     }
 
     pub fn publish(self: *Self, topic: []const u8, data: []const u8, callback_ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, res: anyerror![]PeerId) void) void {
@@ -1252,13 +1303,16 @@ pub const Gossipsub = struct {
             .fanout = 0,
         };
 
+        const publish_threshold: f64 = if (self.peer_score) |ps| ps.thresholds.publish_threshold else 0;
+
         if (self.topics.getPtr(topic)) |peers_map| {
             if (self.opts.flood_publish) {
                 var it = peers_map.iterator();
                 while (it.next()) |entry| {
-                    // TODO: support direct peers and peer scoring
+                    const peer_id = entry.key_ptr.*;
+                    if (self.peer_score != null and self.peerScore(peer_id) < publish_threshold) continue;
                     to_send_count.flood += 1;
-                    try selected_peers.append(arena, entry.key_ptr.*);
+                    try selected_peers.append(arena, peer_id);
                 }
             } else {
                 // TODO: support direct peers and floodsub peers
@@ -1275,15 +1329,18 @@ pub const Gossipsub = struct {
                         };
                         var more_peers = try self.getRandomGossipPeers(topic, self.opts.D - mesh_peers.count(), &filter_ctx, FilterCtx.filter);
                         defer more_peers.deinit(self.allocator);
-                        try selected_peers.appendSlice(arena, more_peers.items);
-                        to_send_count.fanout += more_peers.items.len;
+                        const kept = self.filterPeersByMinScore(more_peers.items, publish_threshold);
+                        try selected_peers.appendSlice(arena, kept);
+                        to_send_count.fanout += kept.len;
                     }
                 } else {
                     if (self.fanout.getPtr(topic)) |fanout_peers| {
                         var it = fanout_peers.iterator();
                         while (it.next()) |entry| {
+                            const peer_id = entry.key_ptr.*;
+                            if (self.peer_score != null and self.peerScore(peer_id) < publish_threshold) continue;
                             to_send_count.fanout += 1;
-                            try selected_peers.append(arena, entry.key_ptr.*);
+                            try selected_peers.append(arena, peer_id);
                         }
                     } else {
                         var more_peers = try self.getRandomGossipPeers(topic, self.opts.D, null, struct {
@@ -1292,10 +1349,11 @@ pub const Gossipsub = struct {
                             }
                         }.filter);
                         defer more_peers.deinit(self.allocator);
-                        if (more_peers.items.len > 0) {
+                        const kept_new_fanout = self.filterPeersByMinScore(more_peers.items, publish_threshold);
+                        if (kept_new_fanout.len > 0) {
                             var new_fanout: std.AutoHashMapUnmanaged(PeerId, void) = .empty;
                             errdefer new_fanout.deinit(self.allocator);
-                            for (more_peers.items) |p| {
+                            for (kept_new_fanout) |p| {
                                 try new_fanout.put(self.allocator, p, {});
                                 try selected_peers.append(arena, p);
                                 to_send_count.fanout += 1;
@@ -1422,6 +1480,7 @@ pub const Gossipsub = struct {
         if (!semi_duplex.active_close) {
             if (semi_duplex.initiator == null and semi_duplex.responder == null) {
                 _ = self.peers.remove(peer_id);
+                if (self.peer_score) |ps| ps.removePeer(peer_id);
             } else {
                 semi_duplex.close(null, struct {
                     fn callback(_: ?*anyopaque, _: anyerror!*Semiduplex) void {}
@@ -1559,9 +1618,14 @@ pub const Gossipsub = struct {
 
         if (rpc_msg.control) |ctrl| {
             if (ctrl.graft) |graft| {
+                const now_ms = std.time.milliTimestamp();
                 for (graft) |g_opt| {
                     const g = g_opt orelse continue;
                     const topic_id = g.topic_i_d orelse continue;
+
+                    if (self.peer_score) |ps| ps.graft(to.*, topic_id, now_ms) catch |err| {
+                        std.log.warn("peer_score graft failed for {} {s}: {}", .{ to.*, topic_id, err });
+                    };
 
                     self.event_emitter.emit(.{ .gossipsub_graft = .{
                         .peer = to.*,
@@ -1574,6 +1638,10 @@ pub const Gossipsub = struct {
                 for (prune) |p_opt| {
                     const p = p_opt orelse continue;
                     const topic_id = p.topic_i_d orelse continue;
+
+                    if (self.peer_score) |ps| ps.prune(to.*, topic_id) catch |err| {
+                        std.log.warn("peer_score prune failed for {} {s}: {}", .{ to.*, topic_id, err });
+                    };
 
                     self.event_emitter.emit(.{ .gossipsub_prune = .{
                         .peer = to.*,
@@ -1864,14 +1932,10 @@ pub const Gossipsub = struct {
     }
 
     fn handleMessage(self: *Self, arena: Allocator, from: *const PeerId, publish_msg: *const rpc.MessageReader) !void {
-        const _data = publish_msg.getData();
-        const id_u64 = if (_data.len >= 8) std.mem.readInt(u64, _data[0..8], .big) else 0;
-        std.log.info("[dbg-gs] handleMessage from={} data_len={d} msg_id_be_u64={d} from_len={d} seqno_len={d} sig_len={d}", .{ from.*, _data.len, id_u64, publish_msg.getFrom().len, publish_msg.getSeqno().len, publish_msg.getSignature().len });
         const validation_result = try self.validateReceivedMessage(arena, publish_msg, from.*);
 
         switch (validation_result) {
             .valid => |valid_msg| {
-                std.log.info("[dbg-gs] handleMessage VALID topic={s} subscribed={}", .{ valid_msg.message.topic, self.subscriptions.contains(valid_msg.message.topic) });
                 // TODO: Change the mcache to store `rpc.MessageReader` to avoid copying data again.
                 // Store the original publish_msg from network, not the transformed one.
                 const rpc_msg = rpc.Message{
@@ -1883,6 +1947,10 @@ pub const Gossipsub = struct {
                     .key = publish_msg._key,
                 };
                 try self.mcache.putWithId(valid_msg.message_id, &rpc_msg);
+
+                if (self.peer_score) |ps| ps.markFirstMessageDelivery(from.*, valid_msg.message.topic) catch |err| {
+                    std.log.warn("peer_score deliver failed for {} {s}: {}", .{ from.*, valid_msg.message.topic, err });
+                };
 
                 if (self.subscriptions.contains(valid_msg.message.topic)) {
                     const is_from_self = from.*.eql(&self.peer_id);
@@ -1898,10 +1966,18 @@ pub const Gossipsub = struct {
                 try self.forwardMessage(arena, valid_msg.message_id, &rpc_msg, from.*, null);
             },
             .invalid => |invalid_msg| {
-                std.log.warn("[dbg-gs] handleMessage INVALID from={}: {}", .{ from.*, invalid_msg.err });
+                std.log.warn("Invalid message from peer {}: {}", .{ from.*, invalid_msg.err });
+                if (self.peer_score) |ps| {
+                    const topic = publish_msg.getTopic();
+                    if (topic.len > 0) ps.markInvalidMessageDelivery(from.*, topic) catch {};
+                }
             },
             .duplicate => |dup_msg| {
-                std.log.info("[dbg-gs] handleMessage DUPLICATE from={} msg_id_len={d}", .{ from.*, dup_msg.message_id.len });
+                std.log.debug("Duplicate message received from peer {}: ID {any}", .{ from.*, dup_msg.message_id });
+                if (self.peer_score) |ps| {
+                    const topic = publish_msg.getTopic();
+                    if (topic.len > 0) ps.markDuplicateMessageDelivery(from.*, topic) catch {};
+                }
             },
         }
     }
@@ -1966,6 +2042,13 @@ pub const Gossipsub = struct {
     }
 
     fn handleIWant(self: *Self, arena: Allocator, from: *const PeerId, iwant: []rpc.ControlIWantReader) ![]*rpc.Message {
+        if (self.peer_score) |ps| {
+            if (ps.score(from.*) < ps.thresholds.gossip_threshold) {
+                std.log.debug("Ignoring IWANT from peer {} below gossip_threshold", .{from.*});
+                return &.{};
+            }
+        }
+
         var ihave: std.StringHashMapUnmanaged(*rpc.Message) = .empty;
 
         var iwant_by_topic: std.StringHashMapUnmanaged(usize) = .empty;
@@ -2007,6 +2090,13 @@ pub const Gossipsub = struct {
     }
 
     fn handleIHave(self: *Self, arena: Allocator, from: *const PeerId, ihave: []rpc.ControlIHaveReader) ![]const rpc.ControlIWant {
+        if (self.peer_score) |ps| {
+            if (ps.score(from.*) < ps.thresholds.gossip_threshold) {
+                std.log.debug("Ignoring IHAVE from peer {} below gossip_threshold", .{from.*});
+                return &.{};
+            }
+        }
+
         const peer_have = (self.peer_have.get(from.*) orelse 0) + 1;
         try self.peer_have.put(self.allocator, from.*, peer_have);
         if (peer_have > self.opts.max_ihave_messages) {
@@ -2093,8 +2183,7 @@ pub const Gossipsub = struct {
                     std.log.warn("failed to extend backoff for peer {} on topic {s}: {}", .{ from.*, topic, err });
                 };
 
-                // TODO: Apply P7 behavioral penalty once peer scoring is implemented
-                // "the pruning peer may apply a behavioural penalty for the action"
+                if (self.peer_score) |ps| ps.addPenalty(from.*, 1);
                 continue;
             }
 
@@ -2108,6 +2197,9 @@ pub const Gossipsub = struct {
                 try prune.put(arena, topic, {});
             } else {
                 try peers.put(self.allocator, from.*, {});
+                if (self.peer_score) |ps| ps.graft(from.*, topic, now_ms) catch |err| {
+                    std.log.warn("peer_score graft failed for {} {s}: {}", .{ from.*, topic, err });
+                };
             }
 
             self.event_emitter.emit(.{ .gossipsub_graft = .{
@@ -2140,7 +2232,11 @@ pub const Gossipsub = struct {
             if (topic.len == 0) continue;
 
             var peer_set = self.mesh.getPtr(topic) orelse continue;
-            _ = peer_set.remove(from.*);
+            if (peer_set.remove(from.*)) {
+                if (self.peer_score) |ps| ps.prune(from.*, topic) catch |err| {
+                    std.log.warn("peer_score prune failed for {} {s}: {}", .{ from.*, topic, err });
+                };
+            }
 
             // GossipSub v1.1: Store backoff period
             if (self.opts.gossipsub_v1_1) {
@@ -2270,6 +2366,10 @@ pub const Gossipsub = struct {
 
     fn enqueueGossip(self: *Self, peer: PeerId, topic: []const u8, message_ids: [][]const u8) !void {
         if (message_ids.len == 0) return;
+
+        if (self.peer_score) |ps| {
+            if (ps.score(peer) < ps.thresholds.gossip_threshold) return;
+        }
 
         const limit = @min(message_ids.len, self.opts.max_ihave_len);
         if (limit == 0) return;
@@ -2673,6 +2773,8 @@ pub const Gossipsub = struct {
         const now_ms = std.time.milliTimestamp();
         self.heartbeat_ticks += 1;
 
+        if (self.peer_score) |ps| ps.refreshScores(now_ms);
+
         self.peer_have.deinit(self.allocator);
         self.peer_have = std.AutoHashMapUnmanaged(PeerId, usize).empty;
         self.iasked.deinit(self.allocator);
@@ -2712,6 +2814,22 @@ pub const Gossipsub = struct {
                 _ = peers.remove(peer_id);
             }
 
+            if (self.peer_score) |ps| {
+                var below: std.ArrayList(PeerId) = .empty;
+                defer below.deinit(arena_allocator);
+                var pit = peers.keyIterator();
+                while (pit.next()) |peer_id_ptr| {
+                    if (ps.score(peer_id_ptr.*) < 0) {
+                        below.append(arena_allocator, peer_id_ptr.*) catch {};
+                    }
+                }
+                for (below.items) |peer_id| {
+                    if (peers.remove(peer_id)) {
+                        self.queuePruneTopic(arena_allocator, &toprune, peer_id, topic);
+                    }
+                }
+            }
+
             if (peers.count() < self.opts.D_lo) {
                 const deficit = if (self.opts.D > peers.count()) self.opts.D - peers.count() else 0;
                 if (deficit > 0) {
@@ -2722,7 +2840,8 @@ pub const Gossipsub = struct {
                     };
                     defer new_peers.deinit(self.allocator);
 
-                    for (new_peers.items) |peer_id| {
+                    const candidates = self.filterPeersByMinScore(new_peers.items, 0);
+                    for (candidates) |peer_id| {
                         if (peers.contains(peer_id)) continue;
 
                         // GossipSub v1.1: Don't graft peers that are in backoff
@@ -2748,7 +2867,23 @@ pub const Gossipsub = struct {
                     peer_list.append(arena_allocator, peer_id_ptr.*) catch {};
                 }
 
-                random.shuffle(PeerId, peer_list.items);
+                if (self.peer_score) |_| {
+                    const Ctx = struct { gs: *Self };
+                    const cmp = struct {
+                        fn lt(ctx: Ctx, a: PeerId, b: PeerId) bool {
+                            return ctx.gs.peerScore(a) > ctx.gs.peerScore(b);
+                        }
+                    }.lt;
+                    std.sort.pdq(PeerId, peer_list.items, Ctx{ .gs = self }, cmp);
+
+                    const d_score = @min(self.opts.D_score, peer_list.items.len);
+                    if (peer_list.items.len > d_score) {
+                        random.shuffle(PeerId, peer_list.items[d_score..]);
+                    }
+                } else {
+                    random.shuffle(PeerId, peer_list.items);
+                }
+
                 const target = self.opts.D;
                 var idx: usize = target;
                 while (idx < peer_list.items.len) : (idx += 1) {
@@ -5205,6 +5340,193 @@ test "pubsub three-node propagation" {
     try std.testing.expect(message_c_data != null);
     try std.testing.expect(std.mem.eql(u8, message_c_data.?, payload));
 }
+
+test "stage B: peer_score receives first-delivery credit when message arrives" {
+    const allocator = std.testing.allocator;
+
+    var ps = PeerScore.init(allocator, .{}, .{});
+    defer ps.deinit();
+
+    const topic = "score-stage-b";
+    try ps.setTopicParams(topic, .{
+        .topic_weight = 1.0,
+        .time_in_mesh_weight = 0,
+        .first_message_deliveries_weight = 1.0,
+        .first_message_deliveries_decay = 0.99,
+        .first_message_deliveries_cap = 1000.0,
+        .mesh_message_deliveries_weight = 0,
+        .mesh_failure_penalty_weight = 0,
+        .invalid_message_deliveries_weight = 0,
+        .invalid_message_deliveries_decay = 0.3,
+    });
+
+    var node_a: TestGossipsubNode = undefined;
+    try node_a.init(allocator, 12090, .{});
+    defer {
+        node_a.router.setPeerScore(null);
+        node_a.deinit();
+    }
+
+    var node_b: TestGossipsubNode = undefined;
+    try node_b.init(allocator, 12091, .{});
+    defer node_b.deinit();
+
+    node_a.router.setPeerScore(&ps);
+
+    try addPeerSync(&node_a.router, node_b.dial_addr);
+    try addPeerSync(&node_b.router, node_a.dial_addr);
+
+    const wait_ns = 5 * std.time.ns_per_s;
+    try waitForUsableStream(&node_a.router, node_b.transport.local_peer_id, wait_ns);
+    try waitForUsableStream(&node_b.router, node_a.transport.local_peer_id, wait_ns);
+
+    try subscribeSync(&node_a.router, topic);
+    try subscribeSync(&node_b.router, topic);
+
+    try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, wait_ns);
+    try waitForTopicPeer(&node_b.router, topic, node_a.transport.local_peer_id, wait_ns);
+    try waitForMeshTopic(&node_a.router, topic, wait_ns);
+    try waitForMeshTopic(&node_b.router, topic, wait_ns);
+
+    const payload = "scored-msg";
+    const recipients = try publishSync(&node_b.router, topic, payload, allocator);
+    defer allocator.free(recipients);
+
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        if (ps.score(node_b.transport.local_peer_id) > 0) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(ps.score(node_b.transport.local_peer_id) > 0);
+}
+
+test "stage D: ipStringFromAddress formats IPv4" {
+    var buf: [64]u8 = undefined;
+    const addr = std.net.Address.initIp4(.{ 192, 168, 1, 100 }, 8080);
+    const s = ipStringFromAddress(&buf, addr).?;
+    try std.testing.expectEqualStrings("192.168.1.100", s);
+}
+
+test "stage D: ipStringFromAddress formats IPv6" {
+    var buf: [64]u8 = undefined;
+    const addr_bytes: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    const addr = std.net.Address.initIp6(addr_bytes, 8080, 0, 0);
+    const s = ipStringFromAddress(&buf, addr).?;
+    try std.testing.expectEqualStrings("2001:0db8:0000:0000:0000:0000:0000:0001", s);
+}
+
+test "stage D: doAddPeer registers peer IP on attached PeerScore" {
+    const allocator = std.testing.allocator;
+
+    var ps = PeerScore.init(allocator, .{}, .{});
+    defer ps.deinit();
+
+    var node_a: TestGossipsubNode = undefined;
+    try node_a.init(allocator, 12200, .{});
+    defer {
+        node_a.router.setPeerScore(null);
+        node_a.deinit();
+    }
+
+    var node_b: TestGossipsubNode = undefined;
+    try node_b.init(allocator, 12201, .{});
+    defer node_b.deinit();
+
+    node_a.router.setPeerScore(&ps);
+
+    try addPeerSync(&node_a.router, node_b.dial_addr);
+
+    try std.testing.expectEqual(@as(usize, 1), ps.peerCountAtIp("127.0.0.1"));
+}
+
+test "stage C: heartbeat prunes mesh peer with negative score" {
+    const allocator = std.testing.allocator;
+
+    var ps = PeerScore.init(allocator, .{ .app_specific_weight = 1.0 }, .{});
+    defer ps.deinit();
+
+    const topic = "score-prune";
+    try ps.setTopicParams(topic, .{});
+
+    var node_a: TestGossipsubNode = undefined;
+    try node_a.init(allocator, 12100, .{});
+    defer {
+        node_a.router.setPeerScore(null);
+        node_a.deinit();
+    }
+
+    var node_b: TestGossipsubNode = undefined;
+    try node_b.init(allocator, 12101, .{});
+    defer node_b.deinit();
+
+    try addPeerSync(&node_a.router, node_b.dial_addr);
+    try addPeerSync(&node_b.router, node_a.dial_addr);
+
+    const wait_ns = 5 * std.time.ns_per_s;
+    try waitForUsableStream(&node_a.router, node_b.transport.local_peer_id, wait_ns);
+    try waitForUsableStream(&node_b.router, node_a.transport.local_peer_id, wait_ns);
+
+    try subscribeSync(&node_a.router, topic);
+    try subscribeSync(&node_b.router, topic);
+    try waitForTopicPeer(&node_a.router, topic, node_b.transport.local_peer_id, wait_ns);
+
+    // Wait specifically for B to land in A's mesh for the topic — the
+    // shared `waitForMeshTopic` only checks the topic key exists.
+    var waited: u64 = 0;
+    const step: u64 = 10 * std.time.ns_per_ms;
+    while (waited < wait_ns) : (waited += step) {
+        const m = node_a.router.mesh.getPtr(topic);
+        if (m != null and m.?.contains(node_b.transport.local_peer_id)) break;
+        std.Thread.sleep(step);
+    }
+    try std.testing.expect(node_a.router.mesh.getPtr(topic).?.contains(node_b.transport.local_peer_id));
+
+    node_a.router.setPeerScore(&ps);
+    try ps.addPeer(node_b.transport.local_peer_id);
+    _ = ps.setApplicationScore(node_b.transport.local_peer_id, -100.0);
+    try std.testing.expect(ps.score(node_b.transport.local_peer_id) < 0);
+
+    node_a.router.doHeartbeat();
+
+    try std.testing.expect(!node_a.router.mesh.getPtr(topic).?.contains(node_b.transport.local_peer_id));
+}
+
+test "stage C: acceptFrom rejects peer below graylist_threshold" {
+    const allocator = std.testing.allocator;
+
+    var ps = PeerScore.init(allocator, .{ .app_specific_weight = 1.0 }, .{ .graylist_threshold = -10.0 });
+    defer ps.deinit();
+
+    var node: TestGossipsubNode = undefined;
+    try node.init(allocator, 12110, .{});
+    defer {
+        node.router.setPeerScore(null);
+        node.deinit();
+    }
+
+    node.router.setPeerScore(&ps);
+
+    const peer_a = try TestPeer.make(1);
+    const peer_b = try TestPeer.make(2);
+
+    try ps.addPeer(peer_a);
+    try ps.addPeer(peer_b);
+    _ = ps.setApplicationScore(peer_b, -100.0);
+
+    try std.testing.expect(node.router.acceptFrom(peer_a));
+    try std.testing.expect(!node.router.acceptFrom(peer_b));
+}
+
+const TestPeer = struct {
+    fn make(seed: u64) !PeerId {
+        var key_bytes: [32]u8 = undefined;
+        std.mem.writeInt(u64, key_bytes[0..8], seed, .little);
+        @memset(key_bytes[8..], 0);
+        var pub_key = keys.PublicKey{ .type = .ED25519, .data = &key_bytes };
+        return try PeerId.fromPublicKey(std.testing.allocator, &pub_key);
+    }
+};
 
 test "gossipsub prune backoff: addBackoff and inBackoff" {
     const allocator = std.testing.allocator;

@@ -227,7 +227,6 @@ const ListenerEnhancer = struct {
 
     fn enhanceConnImpl(instance: *anyopaque, conn: p2p_conn.AnyConn) anyerror!void {
         const self: *ListenerEnhancer = @ptrCast(@alignCast(instance));
-        std.log.info("[dbg-lst] ListenerEnhancer.enhanceConn fired (new inbound TCP)", .{});
         self.tls_bindings_buf = .{self.tls_binding};
 
         const upgrade_ctx = conn.getPipeline().allocator.create(ListenerUpgradeCtx) catch
@@ -251,10 +250,9 @@ const ListenerUpgradeCtx = struct {
 
     fn tlsCallback(instance: ?*anyopaque, res: anyerror!?*anyopaque) void {
         const self: *ListenerUpgradeCtx = @ptrCast(@alignCast(instance.?));
-        std.log.info("[dbg-lst] Inbound tlsCallback fired", .{});
 
         const result = res catch |err| {
-            std.log.warn("[dbg-lst] Inbound TLS failed: {}", .{err});
+            std.log.warn("Inbound TLS failed: {}", .{err});
             self.conn.getPipeline().allocator.destroy(self);
             return;
         };
@@ -262,7 +260,6 @@ const ListenerUpgradeCtx = struct {
         const sec_ptr: *p2p_conn.SecuritySession = @ptrCast(@alignCast(result.?));
         self.conn.setSecuritySession(sec_ptr.*);
         self.conn.getPipeline().allocator.destroy(sec_ptr);
-        std.log.info("[dbg-lst] Inbound TLS ok; starting muxer multistream", .{});
 
         self.yamux_bindings_buf = .{self.enhancer.yamux_binding};
         var ms: multistream_mod.Multistream = undefined;
@@ -283,17 +280,15 @@ const ListenerUpgradeCtx = struct {
     fn muxerCallback(instance: ?*anyopaque, res: anyerror!?*anyopaque) void {
         const self: *ListenerUpgradeCtx = @ptrCast(@alignCast(instance.?));
         defer self.conn.getPipeline().allocator.destroy(self);
-        std.log.info("[dbg-lst] Inbound muxerCallback fired", .{});
 
         const enh = self.enhancer;
 
         const result = res catch |err| {
-            std.log.warn("[dbg-lst] Inbound muxer negotiation failed: {}", .{err});
+            std.log.warn("Inbound muxer negotiation failed: {}", .{err});
             return;
         };
 
         const yamux: *yamux_mod.YamuxSession = @ptrCast(@alignCast(result.?));
-        std.log.info("[dbg-lst] Inbound muxer ok; remote_peer={?}", .{yamux.remote_peer_id});
 
         // Register the inbound yamux session under the peer's listening multiaddr
         // — the same key the dialer side uses — so Switch.newStream can reuse it
@@ -621,11 +616,9 @@ pub fn main() !void {
     // go-libp2p opens /ipfs/id/1.0.0 on every new connection and gates
     // `host.NewStream` (used by pubsub.handleNewPeer to open `/meshsub`) on
     // `IdentifyWait` populating the peerstore. Without a working responder
-    // here, Zig's announced protocols never enter Go's peerstore, Go's
+    // here, Zig's announced protocols never reach Go's peerstore, Go's
     // gossipsub treats Zig as an unknown-protocol peer, and never opens
-    // its half of the semi-duplex `/meshsub` stream pair. Verified via the
-    // `[dbg-brg]` probe: every inbound substream from Go contained an
-    // `/ipfs/id/1.0.0` proposal and Go RST'd after Zig replied `na`.
+    // its half of the semi-duplex `/meshsub` stream pair.
     const encoded_pubkey = try host_pub_key.encode(allocator);
     defer allocator.free(encoded_pubkey);
 
@@ -670,11 +663,9 @@ pub fn main() !void {
     // listener — every inbound connection gets a fresh channel.
     const AcceptCtx = struct {
         fn callback(_: ?*anyopaque, res: anyerror!p2p_conn.AnyConn) void {
-            if (res) |_| {
-                std.log.info("[dbg-lst] TCP accept ok", .{});
-            } else |err| {
-                std.log.warn("[dbg-lst] TCP accept failed: {}", .{err});
-            }
+            _ = res catch |err| {
+                std.log.warn("TCP accept failed: {}", .{err});
+            };
             // TlsTcpEnhancer handles the rest asynchronously.
         }
     };

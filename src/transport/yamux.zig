@@ -605,9 +605,6 @@ pub const YamuxSession = struct {
     // --- Frame dispatch ---
 
     fn dispatchFrame(self: *YamuxSession, frame: YamuxFrame, payload: []const u8) !void {
-        std.log.info("[dbg-ymx] dispatch type={d} flags=0x{x} sid={d} len={d} payload_len={d} is_client={} known_sid={}", .{
-            frame.frame_type, frame.flags, frame.stream_id, frame.length, payload.len, self.is_client, self.streams.get(frame.stream_id) != null,
-        });
         switch (frame.frame_type) {
             TYPE_DATA => try self.handleData(frame, payload),
             TYPE_WINDOW_UPDATE => try self.handleWindowUpdate(frame),
@@ -627,7 +624,6 @@ pub const YamuxSession = struct {
             // Spec: respond with an ACK-only frame (not SYN+ACK). go-yamux treats a
             // SYN flag on a stream id the peer already owns as a protocol violation
             // and resets the stream.
-            std.log.info("[dbg-ymx] sending ACK (data) sid={d} is_client={}", .{ frame.stream_id, self.is_client });
             self.sendFrame(.{ .frame_type = TYPE_DATA, .flags = FLAG_ACK, .stream_id = frame.stream_id, .length = 0 });
             stream.state = .established;
 
@@ -672,7 +668,6 @@ pub const YamuxSession = struct {
             // `length` on the opening frame is an additional send-window credit
             // beyond the implicit INITIAL_WINDOW. Apply it before ACKing.
             if (frame.length > 0) stream.send_window +|= frame.length;
-            std.log.info("[dbg-ymx] sending ACK (window) sid={d} is_client={}", .{ frame.stream_id, self.is_client });
             self.sendFrame(.{ .frame_type = TYPE_WINDOW_UPDATE, .flags = FLAG_ACK, .stream_id = frame.stream_id, .length = 0 });
             stream.state = .established;
             if (self.accept_waiters.items.len > 0) {

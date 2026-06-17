@@ -727,18 +727,6 @@ pub const Switch = struct {
 
         fn onDataImpl(instance: *anyopaque, data: []const u8) anyerror!void {
             const self: *TcpStreamBridge = @ptrCast(@alignCast(instance));
-            // Probe: log first ~80 bytes as ASCII (printable subset) so we can
-            // see what multistream-select / protocol bytes the peer sent.
-            {
-                var ascii_buf: [80]u8 = undefined;
-                const n = @min(data.len, ascii_buf.len);
-                for (data[0..n], 0..) |b, i| {
-                    ascii_buf[i] = if (b >= 32 and b < 127) b else '.';
-                }
-                std.log.info("[dbg-brg] onData bytes={d} has_handler={} ascii=\"{s}\"", .{
-                    data.len, self.stream.getProtoMsgHandler() != null, ascii_buf[0..n],
-                });
-            }
             if (self.stream.getProtoMsgHandler()) |h| {
                 var handler = h;
                 try handler.onMessage(self.stream, data);

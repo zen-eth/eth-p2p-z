@@ -1,4 +1,5 @@
 pub const gossipsub = @import("./routers/gossipsub.zig");
+pub const peer_score = @import("./routers/peer_score.zig");
 const std = @import("std");
 const libp2p = @import("../../root.zig");
 const rpc = libp2p.protobuf.rpc;
