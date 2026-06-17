@@ -38,6 +38,12 @@ jobs:
           curl https://nim-lang.org/choosenim/init.sh -sSf | sh -s -- -y
           echo "$HOME/.nimble/bin" >> $GITHUB_PATH
 
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
       - name: Set up Zig 0.15.2
         run: |
           curl -fL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz \
@@ -81,13 +87,33 @@ jobs:
           ./setup install
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
+      - name: Build all implementation binaries
+        working-directory: test-plans/gossipsub-interop
+        run: make binaries
+
       - name: Run gossipsub interop tests (Zig)
         working-directory: test-plans/gossipsub-interop
         run: make test-zig
 
       - name: Run gossipsub interop tests (Zig + Go)
         working-directory: test-plans/gossipsub-interop
-        run: make binaries && make test-zig-go
+        run: make test-zig-go
+
+      - name: Run gossipsub interop tests (Zig + Rust)
+        working-directory: test-plans/gossipsub-interop
+        run: make test-zig-rust
+
+      - name: Run gossipsub interop tests (Zig + Nim)
+        working-directory: test-plans/gossipsub-interop
+        run: make test-zig-nim
+
+      - name: Run gossipsub interop tests (Zig + JVM)
+        working-directory: test-plans/gossipsub-interop
+        run: make test-zig-jvm
+
+      - name: Run gossipsub interop tests (Zig + Go + Rust + JVM + Nim)
+        working-directory: test-plans/gossipsub-interop
+        run: make test-zig-all
 
       - name: Upload Shadow output
         if: always()
