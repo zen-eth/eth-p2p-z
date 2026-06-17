@@ -1,22 +1,19 @@
 //! libp2p pubsub message signing + verification (the StrictSign policy).
 //!
-//! To sign a `Message` the publisher: clears `signature`/`key`, marshals the
-//! message to protobuf, prepends the ASCII prefix `libp2p-pubsub:`, and signs
-//! that byte string with its host private key. The signature goes in
-//! `Message.signature`; the publisher's marshaled libp2p `PublicKey` protobuf
-//! goes in `Message.key`. `Message.from` is the publisher's marshaled peer-id
-//! bytes (libp2p can omit `key` when the pubkey is recoverable from `from` for
-//! Ed25519 identity peer-ids, but always including it is spec-valid and simpler,
-//! so we always do).
+//! Sign: clear `signature`/`key`, marshal to protobuf, prepend ASCII
+//! `libp2p-pubsub:`, sign with the host private key. The signature, the
+//! marshaled libp2p `PublicKey` protobuf, and the marshaled peer-id go in
+//! `Message.signature`/`.key`/`.from`. Verify reverses it: get the pubkey,
+//! confirm `from` is its derived peer-id, reconstruct the exact signing input,
+//! and check the signature; any mismatch rejects.
 //!
-//! To verify, the receiver parses `key` (or recovers the pubkey from `from`),
-//! confirms `from` is the peer-id derived from that pubkey, then reconstructs the
-//! exact signing input (message with `signature`/`key` cleared, prefix
-//! prepended) and checks the signature against the pubkey. Any mismatch rejects.
+//! Wire-parity anchor: go-libp2p OMITS `Message.key` when the pubkey is
+//! recoverable from `from` (Ed25519 identity-multihash peer-ids) and includes
+//! it otherwise. We always include it on send (spec-valid, simpler) but accept
+//! its absence on receive.
 //!
 //! This is the ONLY place that knows the signing byte layout; it reuses the
-//! identity / peer-id / TLS crypto primitives (Ed25519 sign + verify, libp2p
-//! PublicKey marshaling, peer-id derivation) rather than hand-rolling crypto.
+//! identity / peer-id / TLS crypto primitives rather than hand-rolling crypto.
 
 const std = @import("std");
 const gremlin = @import("gremlin");
@@ -36,11 +33,9 @@ pub const SigningInputError = gremlin.Error || Allocator.Error;
 /// These are the raw ASCII bytes of "libp2p-pubsub:" (14 bytes, no terminator).
 pub const signing_prefix = "libp2p-pubsub:";
 
-/// Builds the exact signing input for a message: `signing_prefix` followed by
-/// the protobuf marshaling of the message WITH `signature`/`key` absent. The
-/// caller owns the returned slice. The proto encoder omits null fields, so
-/// passing a Message whose `signature`/`key` are null reproduces the bytes
-/// go-libp2p hashes over.
+/// Builds the exact signing input: `signing_prefix` followed by the protobuf
+/// marshaling of the message WITH `signature`/`key` absent (the encoder omits
+/// null fields). Caller owns the returned slice.
 pub fn signingInput(
     allocator: Allocator,
     from: []const u8,
@@ -65,13 +60,11 @@ pub fn signingInput(
     return out;
 }
 
-/// If `from` is an identity-multihash peer-id (`0x00 <len> <pubkey-proto>` — the
-/// form libp2p uses for small keys like Ed25519), return the marshaled libp2p
-/// PublicKey protobuf embedded in it. Otherwise (e.g. a sha256-hashed peer-id,
-/// `0x12 0x20 <digest>`) the pubkey is NOT recoverable from `from`, so return
-/// null — such a message must carry `key` to be verifiable. This mirrors
-/// go-libp2p, which OMITS `Message.key` when the pubkey is recoverable from
-/// `from` (identity-multihash peer-ids) and includes it otherwise.
+/// If `from` is an identity-multihash peer-id (`0x00 <len> <pubkey-proto>`,
+/// the form used for small keys like Ed25519), return the embedded marshaled
+/// libp2p PublicKey protobuf. Otherwise (e.g. a sha256-hashed peer-id,
+/// `0x12 0x20 <digest>`) the pubkey is NOT recoverable, so return null — such a
+/// message must carry `key` to be verifiable.
 fn recoverKeyFromPeerId(from: []const u8) ?[]const u8 {
     // Identity multihash: code 0x00, then a varint length, then the digest which
     // (for an inlined key) IS the marshaled PublicKey proto. The lengths libp2p
@@ -87,10 +80,9 @@ fn recoverKeyFromPeerId(from: []const u8) ?[]const u8 {
 ///     field, or recovered from `from` when `key` is absent),
 ///   - the peer-id derived from that pubkey equals `from`,
 ///   - and the signature checks out over `signing_prefix ++ marshal(msg)`.
-/// Any parse/derivation/crypto failure returns false (reject) rather than an
-/// error, so a malformed message is simply dropped. An empty signature (an
-/// unsigned message) returns false. An empty `key` is only acceptable when the
-/// pubkey is recoverable from `from` (the libp2p Ed25519 identity-peer-id case).
+/// Fail-closed: any parse/derivation/crypto failure returns false (reject), so a
+/// malformed or unsigned (empty-signature) message is simply dropped. An empty
+/// `key` is acceptable only when the pubkey is recoverable from `from`.
 pub fn verifyMessage(
     allocator: Allocator,
     from: []const u8,
@@ -103,7 +95,7 @@ pub fn verifyMessage(
     if (signature.len == 0 or from.len == 0) return false;
 
     // The PublicKey protobuf comes from `key` if present, else is recovered from
-    // an identity-multihash `from` (go omits `key` for Ed25519 peer-ids).
+    // an identity-multihash `from`.
     const key_proto: []const u8 = if (key.len > 0) key else (recoverKeyFromPeerId(from) orelse return false);
 
     // Parse the libp2p PublicKey protobuf.
@@ -126,12 +118,10 @@ pub fn verifyMessage(
     return tls.verifyHostSignature(&pubkey, input, signature) catch false;
 }
 
-/// Holds a publisher's key plus the once-computed values needed to stamp every
-/// outbound message: the marshaled libp2p PublicKey protobuf (goes in
-/// `Message.key`) and the publisher's peer-id (its bytes go in `Message.from`).
-/// Caching these makes per-publish signing cheap (no pubkey re-marshal). The
-/// `key` is borrowed (the host KeyPair, which must outlive the Signer); the
-/// cached pubkey bytes are owned and freed on `deinit`.
+/// Holds a publisher's key plus the once-computed `Message.key`/`.from` bytes,
+/// so per-publish signing avoids re-marshaling the pubkey. `key` is borrowed
+/// (the host KeyPair must outlive the Signer); the cached pubkey bytes are owned
+/// and freed on `deinit`.
 pub const Signer = struct {
     allocator: Allocator,
     key: *const identity.KeyPair,
@@ -245,8 +235,7 @@ test "sign then verify round trips; tampering rejects" {
     try std.testing.expect(!verifyMessage(allocator, from, seqno, topic, data, "", signer.keyBytes()));
 
     // Empty `key` still verifies for an Ed25519 identity-multihash peer-id: the
-    // pubkey is recovered from `from` (this is what go-libp2p sends — it omits
-    // `key` when it is recoverable from the peer-id).
+    // pubkey is recovered from `from`.
     try std.testing.expect(verifyMessage(allocator, from, seqno, topic, data, sig, ""));
     // ...but with a tampered signature, recovery does not save it.
     try std.testing.expect(!verifyMessage(allocator, from, seqno, topic, data, bad_sig, ""));

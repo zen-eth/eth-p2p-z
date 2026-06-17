@@ -19,11 +19,9 @@ pub const RoutedPacket = struct {
     rx_mono_ns: ?u64 = null,
     rx_system_ns: ?u64 = null,
     gro_segment_size: ?u16 = null,
-    /// When non-null, `data` is a VIEW into this slab's buffer and `deinit`
-    /// releases the held slab reference instead of freeing; the recv path
-    /// creates packets this way (zero per-packet allocation/copy, and GRO
-    /// segments become sibling views into one slab). Null = `data` is an
-    /// owned heap copy (the pool-exhausted fallback and non-recv callers).
+    /// Non-null: `data` is a VIEW into this slab and `deinit` releases the held
+    /// slab reference (zero-copy recv path; GRO segments are sibling views).
+    /// Null: `data` is an owned heap copy (pool-exhausted fallback, non-recv).
     slab: ?*SlabPool.Slab = null,
     data: []u8,
 
@@ -114,27 +112,21 @@ pub const RoutedPacket = struct {
     }
 };
 
-/// A refcounted pool of large receive buffers ("slabs") for the endpoint's
-/// recv fiber. The fiber bump-fills the current slab — each received datagram
-/// becomes a zero-copy `RoutedPacket` VIEW into it (GRO segments become
-/// sibling views of the same bytes) — and retires the slab to a fresh one when
-/// the tail can no longer hold a maximum datagram. A retired slab returns to
-/// the free list when its last view is released, so a slab is pinned only
-/// while connections still hold its packets in their bounded inboxes. When the
-/// pool is exhausted (every slab pinned) the recv path falls back to a
-/// per-packet heap copy, so the recv fiber never blocks.
+/// A refcounted pool of large receive buffers ("slabs"). The recv fiber
+/// bump-fills the current slab — each datagram becomes a zero-copy
+/// `RoutedPacket` VIEW into it — and retires it once the tail can't hold a
+/// maximum datagram. A slab stays pinned while connections hold its views in
+/// their bounded inboxes, returning to the free list on the last release; when
+/// every slab is pinned the recv path heap-copies so the fiber never blocks.
 ///
 /// Lifetime: the endpoint holds one pool reference (dropped in closeListener
-/// after the recv fiber exits); every live slab holds one. In-flight views can
-/// therefore outlive the listener: the last released view frees its slab,
-/// and the last slab frees the pool.
+/// after the recv fiber exits), every live slab holds one, so in-flight views
+/// outlive the listener — the last view frees its slab, the last slab the pool.
 pub const SlabPool = struct {
     allocator: std.mem.Allocator,
     /// One spin lock guards free/live_slabs/closing. `Slab.release` runs on
-    /// whatever fiber drops the last view (a connection actor, a channel
-    /// drop hook) and carries no `io` handle for an `std.Io.Mutex`; the
-    /// critical sections are a list push/pop and a counter, so a spin lock is
-    /// the pragmatic single-lock answer for every pool operation.
+    /// whatever fiber drops the last view, with no `io` handle for an
+    /// `std.Io.Mutex`; critical sections are just a list op + counter.
     spin: std.atomic.Value(bool) = .init(false),
     free: std.ArrayList(*Slab) = .empty,
     /// Slabs ever created and not yet destroyed (free + checked out).
@@ -217,12 +209,9 @@ pub const SlabPool = struct {
     }
 
     fn recycle(pool: *SlabPool, slab: *Slab) void {
-        // The pool reference is dropped only AFTER the spin lock is released:
-        // a 1->0 observer that destroyed the pool while still inside the lock
-        // could free it under another fiber spinning in lock() — any such
-        // fiber still holds its own (not yet dropped) slab reference, so
-        // deferring the drop past the unlock makes the last decrementer
-        // provably the last toucher.
+        // Drop the pool reference only AFTER unlocking: destroying the pool
+        // inside the lock could free it under a fiber spinning in lock().
+        // Deferring past unlock makes the last decrementer the last toucher.
         var drop_ref = false;
         {
             pool.lock();

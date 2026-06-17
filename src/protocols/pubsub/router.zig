@@ -1,33 +1,21 @@
 //! The gossipsub Router actor: a single fiber that owns ALL per-peer state
-//! lock-free (the go-libp2p processLoop model). Every event — a peer connecting
-//! or disconnecting, an inbound RPC arriving, a shutdown request — reaches the
-//! router as a `Command` on its one inbox queue. Producers (the Switch's
-//! peer-event callback, the per-stream inbound handlers) only POST commands;
-//! they never touch router state, so the single fiber serialises all mutation
-//! with no locks.
+//! lock-free (go-libp2p's processLoop model). Every event reaches the router as
+//! a `Command` on its inbox; producers only POST, so the single fiber serialises
+//! all mutation with no locks.
 //!
-//! This layer handles per-peer I/O lifecycle plus gossipsub mesh pub/sub: on
-//! connect it opens a per-peer outbound stream (lazily, via a writer fiber
-//! draining an OutboundQueue) and starts reading the peer's inbound stream; on
-//! disconnect it tears that down cleanly. On top of that it implements the
-//! gossipsub mesh — the local node subscribes to topics and publishes messages;
-//! inbound subscriptions are tracked per peer; subscribing to a topic JOINs its
-//! mesh (graft peers) and unsubscribing LEAVEs it (prune them); the heartbeat
-//! keeps each mesh sized around the target degree D (grafting in below D_low,
-//! pruning out above D_high). A received message is forwarded only to the
-//! topic's mesh members (minus the sender); a message published to a topic we do
-//! NOT subscribe to goes to a transient `fanout` peer set instead. GRAFT/PRUNE
-//! drive mesh membership; the heartbeat advertises cached ids to a gossip
-//! fringe (IHAVE), serves/promises requested messages (IWANT, an unmet promise
-//! scores as broken), and v1.2 peers suppress duplicate sends with IDONTWANT.
+//! It handles per-peer I/O lifecycle (connect opens an outbound writer fiber and
+//! reads the inbound stream; disconnect tears that down) plus the gossipsub mesh:
+//! subscribing JOINs a topic's mesh (graft) and unsubscribing LEAVEs it (prune);
+//! the heartbeat keeps each mesh near target degree D (graft below D_low, prune
+//! above D_high). A received message forwards only to the topic's mesh (minus the
+//! sender); publishing to an unsubscribed topic uses a transient `fanout` set.
+//! The heartbeat advertises cached ids (IHAVE), serves/promises requests (IWANT,
+//! an unmet promise scores as broken), and v1.2 peers suppress dups (IDONTWANT).
 //! v1.1 peer scoring and peer exchange also live below.
 //!
-//! The Router is generic over a comptime `Transport` so its lifecycle logic can
-//! be unit-tested against an in-memory fake (no real QUIC), exactly how
-//! go-libp2p-pubsub and rust-libp2p test their gossipsub cores. The real
-//! Switch/QUIC binding (`SwitchTransport`, the concrete stream sink/source, the
-//! inbound service) lives in gossipsub.zig; this file knows nothing about
-//! `*Switch`/`*SwitchConnection`/`*quic.Stream`.
+//! Generic over a comptime `Transport` so the lifecycle logic unit-tests against
+//! an in-memory fake. The real Switch/QUIC binding lives in gossipsub.zig; this
+//! file knows nothing about `*Switch`/`*SwitchConnection`/`*quic.Stream`.
 
 const std = @import("std");
 const pubsub = @import("pubsub.zig");
@@ -48,23 +36,18 @@ const peer_record = @import("../../peer_record.zig");
 const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 const PeerId = @import("peer_id").PeerId;
 
-/// The libp2p pubsub message-signature policy. Picks how a published message is
-/// stamped, whether an inbound message is verified, and how its message-id is
-/// derived:
-///   - `strict_sign`: every published message carries `from`+`seqno`+`signature`
-///     +`key` and every inbound published message is verified (an invalid or
-///     unsigned one is dropped). The message-id is `from`++`seqno`. Requires a
-///     host key. This is go-libp2p's default and what cross-impl interop uses.
-///   - `none`: a published message carries `from`+`seqno` but no signature, and
-///     inbound messages are not verified. The message-id is `from`++`seqno`. A
-///     local convenience (used when no host key is configured); NOT a privacy
-///     mode — the peer-id still rides on the wire as `from`.
-///   - `anonymous` (libp2p StrictNoSign): a published message carries ONLY
-///     `topic`+`data` — no `from`/`seqno`/`signature`/`key`, so the publisher's
-///     peer-id never appears on the wire. Inbound messages are not verified.
-///     Because there is no `from`/`seqno` to key on, the message-id MUST be
-///     content-derived (see `message_id_fn` / the default `sha256(topic++data)`);
-///     every node in a topic must agree on the same id function. Requires NO key.
+/// The libp2p pubsub message-signature policy: how a published message is
+/// stamped, whether inbound messages are verified, and how the message-id is
+/// derived. `strict_sign` is go-libp2p's default and what cross-impl interop uses.
+///   - `strict_sign`: carries `from`+`seqno`+`signature`+`key`; inbound is
+///     verified (invalid/unsigned dropped). Id = `from`++`seqno`. Requires a key.
+///   - `none`: carries `from`+`seqno`, no signature; inbound not verified. Id =
+///     `from`++`seqno`. Local convenience (no key configured); NOT a privacy mode
+///     — the peer-id still rides on the wire as `from`.
+///   - `anonymous` (StrictNoSign): carries ONLY `topic`+`data`, so the publisher's
+///     peer-id never reaches the wire; inbound not verified. With no `from`/`seqno`
+///     to key on, the id MUST be content-derived (`message_id_fn` / the default
+///     `sha256(topic++data)`); every node in a topic must agree on it. No key.
 pub const SignaturePolicy = enum { strict_sign, none, anonymous };
 
 /// A custom message-id function. Given a message's fields (any of which may be
@@ -90,14 +73,11 @@ pub const MessageIdConfig = struct {
     func: *const MessageIdFn,
 };
 
-/// Optional peer-scoring configuration handed to `Router.create` /
-/// `Gossipsub.init`. When provided, the router builds a `PeerScore` engine,
-/// fires scoring events on every relevant transition, and gates its
-/// mesh/gossip/graylist decisions on the score. When null, scoring is entirely
-/// off: no engine, no events, no gates — the router behaves exactly as it did
-/// before scoring existed (matching go-libp2p, where scoring is app-configured
-/// and disabled by default). `score_mod.default_params` /
-/// `score_mod.default_thresholds` are a ready-made baseline a caller can pass.
+/// Optional peer-scoring configuration. When provided, the router builds a
+/// `PeerScore` engine, fires scoring events on every transition, and gates its
+/// mesh/gossip/graylist decisions on the score. Null = scoring entirely off: no
+/// engine, no events, no gates (go-libp2p also disables scoring by default).
+/// `score_mod.default_params` / `default_thresholds` are a ready-made baseline.
 pub const ScoreConfig = struct {
     params: score_mod.ScoreParams,
     thresholds: score_mod.PeerScoreThresholds,
@@ -115,122 +95,88 @@ pub const DirectPeer = struct {
 };
 
 /// Behaviour knobs handed to `Router.create` / `Gossipsub.init`. Defaults match
-/// go-libp2p so an empty `.{}` reproduces go's out-of-the-box gossipsub.
+/// go-libp2p so an empty `.{}` reproduces its out-of-the-box gossipsub.
 pub const RouterConfig = struct {
-    /// Flood-publish (go-libp2p default ON): a message the local node ORIGINATES
-    /// is sent to EVERY peer subscribed to its topic (above the publish
-    /// threshold when scoring is on), not just the topic's mesh/fanout — which
-    /// maximises propagation of locally-originated messages. RELAYED (received)
-    /// messages are never flooded; they go only to the mesh. With this off, an
-    /// originated message uses the mesh (if we subscribe) or a fanout set (if we
-    /// do not), exactly as a relay would.
+    /// Flood-publish (default ON): a message the local node ORIGINATES goes to
+    /// EVERY topic subscriber (above the publish threshold when scoring is on),
+    /// not just the mesh/fanout, maximising propagation. RELAYED messages never
+    /// flood — they go only to the mesh. Off, an originated message uses the mesh
+    /// (if we subscribe) or a fanout set, exactly as a relay would.
     flood_publish: bool = true,
     /// Local-delivery decoupling (go's Subscription model). > 0 (the default):
     /// accepted messages are COPIED into a bounded delivery queue drained by a
-    /// dedicated delivery fiber, which invokes `MessageHandler.on_message` OFF
-    /// the router fiber — a slow or blocking handler can then never stall mesh
-    /// maintenance or message processing, and a handler that (re)publishes is
-    /// safe: it blocks at worst the delivery fiber, whose inbox post the router
-    /// keeps draining (no self-deadlock cycle). A FULL queue drops the new
-    /// message for the local subscriber, exactly like go's bounded subscriber
-    /// channel (forwarding is unaffected; `delivery_drops` counts them).
-    /// 0 = the historic INLINE mode: zero-copy, on the router fiber — the
-    /// handler must be cheap and MUST NOT call publish/subscribe/unsubscribe
-    /// synchronously (those post blocking into the inbox only the router fiber
-    /// drains; a full inbox under flood deadlocks the router on itself).
+    /// dedicated fiber that calls `MessageHandler.on_message` OFF the router fiber,
+    /// so a slow/blocking handler cannot stall the router and a (re)publishing
+    /// handler is safe (no self-deadlock cycle). A FULL queue drops the message for
+    /// the local subscriber (forwarding is unaffected; `delivery_drops` counts it).
+    /// 0 = INLINE mode: zero-copy, on the router fiber — the handler must be cheap
+    /// and MUST NOT call publish/subscribe/unsubscribe synchronously (those block
+    /// on the inbox only the router fiber drains; a full inbox would self-deadlock).
     delivery_queue_len: usize = 256,
-    /// Size threshold (bytes of message data) at or above which accepting a NEW
-    /// received message broadcasts an IDONTWANT for it to our v1.2 mesh peers on
-    /// the topic — telling them "I already have this large message, don't send it
-    /// to me", which saves bandwidth on big messages (go-libp2p
-    /// `IDontWantMessageThreshold`, default 1 KiB).
+    /// Data-size threshold (bytes) at or above which accepting a NEW received
+    /// message broadcasts an IDONTWANT to our v1.2 mesh peers on the topic,
+    /// saving bandwidth on big messages (go `IDontWantMessageThreshold`, 1 KiB).
     idontwant_message_threshold: usize = 1024,
-    /// The signature policy. Leave null to infer it from the host key (the
-    /// backward-compatible default): a key present means `strict_sign`, a key
-    /// absent means `none`. Set it explicitly to select a policy regardless —
-    /// notably `anonymous` (which requires NO host key). The resolved policy is
-    /// validated against the host key in `Router.create`: `strict_sign` requires a
-    /// key; `none`/`anonymous` require the key to be absent.
+    /// The signature policy. Null infers it from the host key (key → `strict_sign`,
+    /// no key → `none`); set it explicitly to force a policy, notably `anonymous`.
+    /// `create` validates it against the key (`strict_sign` requires one;
+    /// `none`/`anonymous` require its absence).
     signature_policy: ?SignaturePolicy = null,
-    /// Optional override for how a message-id is computed. When set it is used for
-    /// every publish and every inbound message, replacing the policy's built-in
-    /// derivation (`from`++`seqno` for strict_sign/none, `sha256(topic++data)` for
-    /// anonymous). All nodes in a topic must use the SAME function. The default
-    /// (null) leaves the policy's built-in derivation in place.
+    /// Optional override for message-id derivation, used for every publish and
+    /// inbound message in place of the policy's built-in (`from`++`seqno` for
+    /// strict_sign/none, `sha256(topic++data)` for anonymous). All nodes in a
+    /// topic must use the SAME function. Null keeps the built-in derivation.
     message_id_fn: ?MessageIdConfig = null,
-    /// Direct (explicit) peers: peers with an out-of-band peering agreement
-    /// (go-libp2p `WithDirectPeers`). A connected direct peer is treated as
-    /// trusted and OUTSIDE the mesh: every valid message on a topic it subscribes
-    /// to is forwarded to it unconditionally (alongside the mesh, deduped), it is
-    /// NEVER grafted/pruned into a mesh (a GRAFT from it is refused with a PRUNE
-    /// back, signalling a non-reciprocal config), and it bypasses the score gates
-    /// (graylist, the GRAFT negative-score reject, and the publish threshold). The
-    /// peering should be reciprocal — both ends configure each other as direct.
-    /// Each entry carries the peer id AND a multiaddr string to dial it at. The
-    /// slice is BORROWED for the `create` call only: `create` copies each id and
-    /// address into Router-owned storage, so the caller may free the slice
-    /// afterward. An empty slice means no direct peers (the default).
+    /// Direct (explicit) peers: out-of-band peering (go-libp2p `WithDirectPeers`).
+    /// A connected direct peer is trusted and OUTSIDE the mesh: every valid message
+    /// on a topic it subscribes to is forwarded to it unconditionally (deduped with
+    /// the mesh), it is NEVER grafted/pruned (a GRAFT from it draws a PRUNE back),
+    /// and it bypasses the score gates (graylist, GRAFT negative-score reject,
+    /// publish threshold). The peering should be reciprocal. The slice is BORROWED
+    /// for `create` only (it copies each id+address); empty = none (the default).
     ///
-    /// The router keeps each direct peer connected itself (go-libp2p's
-    /// `DirectConnectTicks`): it dials every configured direct peer once at start,
-    /// then every `MeshParams.direct_connect_ticks` heartbeats re-dials any that
-    /// are NOT currently connected. A dial is fire-and-forget — success surfaces
-    /// later as the normal connect event; a failure is logged and retried next tick.
+    /// The router keeps each direct peer connected itself (`DirectConnectTicks`):
+    /// dial all once at start, then every `direct_connect_ticks` heartbeats re-dial
+    /// any not currently connected. Dials are fire-and-forget (success surfaces as
+    /// the normal connect event; failure is retried next tick).
     direct_peers: []const DirectPeer = &.{},
-    /// Peer exchange (PX) on PRUNE (go-libp2p `WithPeerExchange`, default OFF —
-    /// opt-in). When ON, a PRUNE we send on a doPX-eligible path (an over-degree
-    /// heartbeat prune) carries a sample of OTHER peers in the topic as signed
-    /// peer records, so the pruned peer has alternatives to graft toward — and an
-    /// inbound PRUNE that carries such records, from a peer whose score clears the
-    /// accept-PX threshold, makes us dial the suggested peers. Disabled is exactly
-    /// the historic behaviour: PRUNEs carry no PX peers and inbound PX is ignored.
-    /// PX is NOT emitted on a LEAVE (unsubscribe), a GRAFT-reject, or a
-    /// negative-score prune (go suppresses PX on those paths to avoid leaking the
-    /// mesh to a peer we are cutting off for cause).
+    /// Peer exchange (PX) on PRUNE (go-libp2p `WithPeerExchange`, default OFF).
+    /// On: a PRUNE on a doPX-eligible path (an over-degree heartbeat prune) carries
+    /// a sample of OTHER topic peers as signed records so the pruned peer has graft
+    /// alternatives, and an inbound PRUNE carrying such records from a peer above
+    /// the accept-PX threshold makes us dial the suggested peers. Off: PRUNEs carry
+    /// no PX and inbound PX is ignored. PX is NOT emitted on a LEAVE, a GRAFT-reject,
+    /// or a negative-score prune — never leak the mesh to a peer we cut off for cause.
     peer_exchange_enabled: bool = false,
-    /// Optional application topic-message validator (go-libp2p-pubsub
-    /// `RegisterTopicValidator` / rust-libp2p `report_message_validation_result`).
-    /// When set, a received published message — once it passes the signature check
-    /// and is found new — is handed to it; the verdict gates delivery + forwarding
-    /// and, on `reject`, charges the relaying peer the P4 penalty. Null (the
-    /// default) accepts every message: behaviour is exactly as it was before the
-    /// validator existed. See `MessageValidator` / `ValidationResult`.
+    /// Optional application topic-message validator (go `RegisterTopicValidator` /
+    /// rust `report_message_validation_result`). When set, a new received message
+    /// that passes the signature check is handed to it; the verdict gates delivery
+    /// + forwarding and, on `reject`, charges the relaying peer the P4 penalty.
+    /// Null (the default) accepts every message. See `MessageValidator`.
     validator: ?MessageValidator = null,
     /// How many message validations may run OFF the router fiber at once
-    /// (go-libp2p-pubsub's validation-worker model, bounded by its
-    /// `validateThrottle` semaphore). Zero (the default) runs everything INLINE
-    /// on the single router fiber — the historic, backward-compatible
-    /// behaviour, fine for a cheap validator and light message rates. A value
-    /// > 0 enables the ASYNC pipeline for BOTH the StrictSign SIGNATURE check
-    /// and the app `validator` (go's worker validate() runs exactly these two,
-    /// in this order; its processLoop never touches crypto): a received message
-    /// that passes the seen check is snapshotted and handed to a validation
-    /// fiber (spawned in a router-owned group, up to this many in flight), and
-    /// the combined outcome is posted back as a command which applies ALL
-    /// effects — the seen mark, scoring, delivery, and forwarding. Under
-    /// strict_sign this is the throughput lever: inline Ed25519 (~60-100µs per
-    /// message) otherwise serializes every peer's traffic on the one router
-    /// fiber. When this many validations are already in flight a further
-    /// message is throttle-DROPPED exactly like go ("validation throttled:
-    /// queue full; dropping") — neither marked seen (a later copy can still be
-    /// validated) nor penalized; an inline fallback here would let a validation
-    /// flood stall the router fiber, the very thing the offload exists to prevent.
-    /// No effect when there is nothing to offload (no signer AND no validator).
-    /// See `MessageValidator`.
+    /// (go-libp2p's validation-worker model, its `validateThrottle` semaphore).
+    /// Zero (the default) runs everything INLINE on the router fiber. A value > 0
+    /// enables the ASYNC pipeline for BOTH the StrictSign SIGNATURE check and the
+    /// app `validator`, in that order (go's worker validate() order): a message
+    /// past the seen check is snapshotted, handed to a validation fiber (up to this
+    /// many in flight), and the outcome posted back to apply ALL effects (seen
+    /// mark, scoring, delivery, forwarding). The throughput lever under strict_sign,
+    /// where inline Ed25519 would serialize every peer's traffic on one fiber.
+    /// At the cap a further message is throttle-DROPPED (go: "validation throttled")
+    /// — neither marked seen (a later copy can still validate) nor penalized; an
+    /// inline fallback would let a flood stall the fiber, what the offload prevents.
+    /// Inert when there is nothing to offload (no signer AND no validator).
     validation_concurrency: usize = 0,
-    /// Optional override of the per-topic mesh DEGREE targets (`d`, `d_low`,
-    /// `d_high`) the heartbeat's mesh maintenance uses to decide when to graft
-    /// more peers in (mesh below `d_low`, top up to `d`) and when to prune excess
-    /// out (mesh above `d_high`, shrink to `d`). Null (the default) keeps the
-    /// go-libp2p baseline (`d` 6, `d_low` 5, `d_high` 12), so behaviour is exactly
-    /// as before this knob existed. It exists so a SMALL topology can be driven
-    /// over-degree on purpose — e.g. a three-node star where the centre meshes
-    /// with two leaves can be pushed past `d_high = 1` so the heartbeat prunes one
-    /// (the peer-exchange path). Only the maintenance degree decision reads it; the
-    /// inbound-GRAFT path is unaffected (it never rejects on size, by design — the
-    /// heartbeat is what shrinks an over-full mesh). The three values must be
-    /// consistent (`d_low <= d <= d_high`); inconsistent values are not validated
-    /// here (a misconfiguration only mis-sizes this node's own mesh).
+    /// Optional override of the per-topic mesh DEGREE targets (`d`/`d_low`/`d_high`)
+    /// the heartbeat's mesh maintenance uses (graft below `d_low` toward `d`, prune
+    /// above `d_high` toward `d`). Null (the default) keeps the go-libp2p baseline
+    /// (6/5/12). It exists so a SMALL topology can be driven over-degree on purpose
+    /// to exercise the heartbeat-prune / peer-exchange path. Only the maintenance
+    /// degree decision reads it; the inbound-GRAFT path never rejects on size (the
+    /// heartbeat shrinks an over-full mesh). The three values must satisfy
+    /// `d_low <= d <= d_high`; inconsistent values are not validated here (a
+    /// misconfiguration only mis-sizes this node's own mesh).
     mesh_degree: ?MeshDegree = null,
 };
 
@@ -255,89 +201,64 @@ pub const MeshDegree = struct {
 /// while it executes.
 pub const MessageHandler = struct {
     ctx: *anyopaque,
-    /// Invoked once per locally-delivered message. Execution context depends on
-    /// `RouterConfig.delivery_queue_len`: by DEFAULT (> 0) it runs on the
-    /// router's single DELIVERY fiber — calls are serialized with each other
-    /// but run CONCURRENTLY with the router fiber, so the handler may safely
-    /// block or call publish/subscribe; in INLINE mode (0) it runs on the
-    /// router fiber itself and must be cheap and must not post router commands
-    /// (see the config field). The slices are valid only for the call; copy to
-    /// retain.
+    /// Invoked once per locally-delivered message. By DEFAULT (delivery_queue_len
+    /// > 0) it runs serialized on the DELIVERY fiber, concurrently with the router
+    /// fiber, so it may block or call publish/subscribe; in INLINE mode (0) it runs
+    /// on the router fiber and must be cheap and must not post router commands. The
+    /// slices are valid only for the call; copy to retain.
     on_message: *const fn (ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void,
 };
 
-/// The application's verdict on a received message, mirroring go-libp2p-pubsub's
-/// `ValidationResult` (Accept/Reject/Ignore) and rust-libp2p's `MessageAcceptance`
-/// (the two implementations agree exactly on each verdict's effect):
-///   - `accept`: the message is valid — deliver it locally (if we subscribe) and
-///     forward it over the mesh (the default, accept-all behaviour).
-///   - `reject`: the message is application-invalid — do NOT deliver or forward,
-///     and PENALIZE the relaying peer with the squared invalid-message-delivery
-///     penalty (P4), exactly as a failed signature check does. Use this only for
-///     a message that is genuinely malformed/invalid, since it costs the sender
-///     score.
-///   - `ignore`: drop the message (no deliver, no forward) but do NOT penalize the
-///     relaying peer — the sender did nothing wrong; we simply choose not to
-///     propagate it (e.g. a stale-but-well-formed message).
-/// In all three cases the message ends up marked seen, so a later duplicate is
-/// suppressed without re-validating (go marks seen right after the signature
-/// check, before invoking user validators). One async-path nuance, shared with
-/// go: copies of one id that arrive while its validation is still IN FLIGHT
-/// (before the verdict marks it seen) are validated too — the verdicts converge
-/// on the router fiber, where every copy after the first is handled as a
-/// duplicate. A validator must therefore tolerate being invoked more than once
-/// for the same message under duplicate-heavy arrival.
+/// The application's verdict on a received message (go `ValidationResult` /
+/// rust `MessageAcceptance`, which agree on each verdict's effect):
+///   - `accept`: valid — deliver locally (if we subscribe) and forward over the mesh.
+///   - `reject`: application-invalid — do NOT deliver/forward, and PENALIZE the
+///     relaying peer with the squared invalid-delivery penalty (P4), like a failed
+///     signature check. Use only for a genuinely invalid message: it costs score.
+///   - `ignore`: drop (no deliver, no forward) but do NOT penalize — the sender
+///     did nothing wrong (e.g. a stale-but-well-formed message).
+/// All three end up marked seen, so a later duplicate is suppressed without
+/// re-validating. Async nuance (shared with go): copies of one id arriving while
+/// its validation is still IN FLIGHT are validated too (verdicts converge on the
+/// router fiber, all but the first handled as duplicates), so a validator must
+/// tolerate being invoked more than once for the same message.
 pub const ValidationResult = enum { accept, reject, ignore };
 
-/// An optional, application-supplied topic message validator, matching the
-/// validate-then-forward gate of go-libp2p-pubsub (`RegisterTopicValidator`) and
-/// rust-libp2p (`report_message_validation_result`). When set on `RouterConfig`,
-/// every received published message — found to be new (not a seen duplicate) and
-/// past the StrictSign signature check — is handed to `validate`, whose verdict
-/// gates delivery + forwarding (see `ValidationResult`). When null, every message
-/// is accepted (the historic accept-all behaviour, unchanged).
+/// An optional, application-supplied topic message validator. When set on
+/// `RouterConfig`, every new (non-duplicate), signature-checked received message
+/// is handed to `validate`, whose verdict gates delivery + forwarding (see
+/// `ValidationResult`). Null = accept-all.
 ///
-/// A SINGLE validator covers all topics: an application that wants per-topic logic
-/// dispatches on `topic` inside its own `validate` (mirroring how an app registers
-/// a function and switches on the topic — we do not maintain a per-topic registry).
+/// A SINGLE validator covers all topics: per-topic logic dispatches on `topic`
+/// inside `validate` (there is no per-topic registry).
 ///
-/// By default (`RouterConfig.validation_concurrency == 0`) this is called INLINE on
-/// the single router fiber, like `MessageHandler.on_message`, so it must be cheap:
-/// it stalls every other peer's events while it runs (matching go's `validateInline`
-/// path). An app with an EXPENSIVE validator should instead set
-/// `RouterConfig.validation_concurrency > 0` to run it ASYNCHRONOUSLY on a validation
-/// fiber off the router fiber (go-libp2p's validator-worker model), so other peers'
-/// events are not blocked; the verdict is then applied back on the router fiber. The
-/// `topic`/`from`/`data` slices are valid only for the call; a validator that needs
-/// to retain them must copy (the async path hands it copies that live only for the
-/// call, exactly like the inline path).
+/// By default (`validation_concurrency == 0`) it runs INLINE on the router fiber,
+/// so it must be cheap (it stalls every other peer's events). With
+/// `validation_concurrency > 0` it runs ASYNCHRONOUSLY on a validation fiber and
+/// the verdict is applied back on the router fiber — so it must then be
+/// thread-safe. The `topic`/`from`/`data` slices are valid only for the call;
+/// copy to retain.
 pub const MessageValidator = struct {
     ctx: *anyopaque,
     validate: *const fn (ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) ValidationResult,
 };
 
-// The interned message-id machinery — `MsgId`, `InternedId` (= `RefCount(MsgId)`),
-// the `InternTable` index, and the `IdEntry` map-value helper — lives in
-// `intern.zig` and is imported above. It is shared by this file's per-id maps
-// (`seen`, each peer's `dont_send`/`iwant_counts`/`iwant_promises`) AND the
-// message cache, so a single id present in several of them is ONE allocation;
-// `RefCount.release` is the single free path and the table the single live-id
-// index.
+// The interned message-id machinery (`MsgId`, `InternedId` = `RefCount(MsgId)`,
+// `InternTable`, `IdEntry`) lives in `intern.zig`. It is shared by this file's
+// per-id maps (`seen`, each peer's `dont_send`/`iwant_counts`/`iwant_promises`)
+// AND the message cache, so an id in several of them is ONE allocation;
+// `RefCount.release` is the single free path, the table the single live-id index.
 
-/// A TIME-bounded set of owned message-id byte copies, used to suppress
-/// duplicate/looping messages — the go-libp2p-pubsub seen-cache model. Each id
-/// maps to an EXPIRY heartbeat tick (the tick it was first added plus the TTL);
-/// the id reads as "seen" until that tick passes, then a per-heartbeat sweep
-/// drops it. First-seen semantics (go's `Strategy_FirstSeen`, the pubsub
-/// default): a re-add of an id already present does NOT extend its expiry, so an
-/// id stays seen for the TTL measured from the FIRST time it was observed.
+/// A TIME-bounded set of message ids, suppressing duplicate/looping messages
+/// (go-libp2p's seen-cache, first-seen strategy `Strategy_FirstSeen`). Each id
+/// maps to an EXPIRY heartbeat tick (first-added tick + TTL); it reads "seen"
+/// until then, when a per-heartbeat sweep drops it. First-seen: a re-add does NOT
+/// extend the expiry, so the TTL is measured from the FIRST observation.
 ///
-/// There is no hard count cap: it is bounded by TIME like go, and the
-/// per-heartbeat flood defenses (max_ihave / max_idontwant / scoring) bound the
-/// inflow of new ids within any TTL window. Each entry holds
-/// one reference on a SHARED interned id (the same id in a peer's `dont_send` or
-/// `iwant_promises` is one allocation); the sweep `release`s an expired entry's
-/// reference and `deinit` releases them all — no per-id `free` here.
+/// No hard count cap — bounded by TIME, and the per-heartbeat flood defenses
+/// (max_ihave / max_idontwant / scoring) bound new-id inflow within a TTL window.
+/// Each entry holds one reference on a SHARED interned id; the sweep releases an
+/// expired entry's reference and `deinit` releases them all (no per-id `free`).
 /// One unit of work for the delivery fiber: either a delivered message
 /// (topic ++ from ++ data packed into one owned allocation, split by the
 /// recorded lengths) or a sync fence the fiber sets once every delivery queued
@@ -366,21 +287,16 @@ const SeenCache = struct {
     /// `ttl_ticks`). "Seen" while `expiry` is still in the future; the sweep
     /// removes (and releases) it once `expiry <= now`.
     entries: std.StringHashMapUnmanaged(IdEntry(u64)) = .empty,
-    /// The expiry wheel: `ttl_ticks + 1` per-tick buckets; an id added with
-    /// expiry tick E lands in `buckets[E % buckets.len]`, and `sweep(T)` drains
-    /// exactly `buckets[T % buckets.len]` — O(expired-this-tick), no map scans.
-    /// A full-map scan per heartbeat is O(n*k); at eth2 rates (~180k retained
-    /// ids, ~1.5k expiring per tick) that is a multi-SECOND router-fiber stall,
-    /// where the wheel is ~k list pops.
+    /// The expiry wheel: `ttl_ticks + 1` per-tick buckets; an id expiring at tick E
+    /// lands in `buckets[E % buckets.len]` and `sweep(T)` drains `buckets[T %
+    /// buckets.len]` — O(expired-this-tick), no map scans (a full-map scan per
+    /// heartbeat would be a multi-second stall at eth2 rates).
     ///
-    /// Bucket slots are NON-owning copies of the entry's `rc` pointer: the map
-    /// entry holds the one reference, and nothing but the sweep ever removes a
-    /// live entry, so a bucket slot stays valid exactly until its own drain.
-    /// Generation safety: with `ttl + 1` buckets, a bucket index is drained
-    /// (at its expiry tick E) strictly before any id that would reuse the same
-    /// index can be added (the earliest such add is at tick E+1), so
-    /// generations never mix; an id re-added after its sweep simply starts a
-    /// new life in a new bucket.
+    /// Bucket slots are NON-owning aliases of the entry's `rc`: the map holds the
+    /// one reference, and only the sweep removes a live entry, so a slot stays valid
+    /// until its drain. Generation safety: with `ttl + 1` buckets, a bucket index is
+    /// drained (at expiry tick E) strictly before any id reusing that index can be
+    /// added (earliest such add is E+1), so generations never mix.
     buckets: []Bucket,
     /// The last tick `sweep` ran for; the next sweep drains every bucket in
     /// (last_swept, now] so the PUBLIC contract stays "remove everything
@@ -415,12 +331,9 @@ const SeenCache = struct {
         return entry.payload > now_tick;
     }
 
-    /// Remember `id` until `now_tick + ttl_ticks`, interning it (one shared
-    /// allocation across all maps). First-seen: if the id is already present its
-    /// expiry is LEFT UNCHANGED (a re-add does not extend it), matching go's
-    /// default `Strategy_FirstSeen`. On OOM the id is simply not remembered (dedup
-    /// degrades to forwarding a possible duplicate — safe, and the only
-    /// alternative is to drop the message, which is worse).
+    /// Remember `id` until `now_tick + ttl_ticks`, interning it. First-seen: a
+    /// re-add of a present id leaves its expiry UNCHANGED. On OOM the id is simply
+    /// not remembered (dedup degrades to forwarding a possible duplicate — safe).
     fn add(self: *SeenCache, id: []const u8, now_tick: u64) void {
         if (self.entries.contains(id)) return;
         const rc = self.intern_table.intern(id) orelse return;
@@ -467,10 +380,8 @@ const SeenCache = struct {
             _ = self.entries.remove(rc.value.bytes);
             rc.release();
         }
-        // Retains capacity: each bucket pins its historical per-tick expiry
-        // peak (8 bytes/slot) for the cache's lifetime — the same non-shrinking
-        // trade the id map itself makes, in exchange for allocation-free
-        // steady-state churn.
+        // Retains capacity: each bucket pins its historical per-tick expiry peak
+        // for the cache's lifetime, in exchange for allocation-free steady churn.
         bucket.clearRetainingCapacity();
     }
 };
@@ -500,10 +411,9 @@ fn peerKey(peer: *const PeerId) PeerKey {
     return key;
 }
 
-/// The mesh sizing parameters (go-libp2p defaults). The mesh for a topic is the
-/// set of peers we exchange full messages with directly; the heartbeat keeps its
-/// size between `d_low` and `d_high` around the target degree `d`. (Scoring-aware
-/// degrees and the gossip-only fanout degree arrive with later layers.)
+/// The mesh sizing parameters (go-libp2p defaults). A topic's mesh is the peers
+/// we exchange full messages with directly; the heartbeat keeps its size between
+/// `d_low` and `d_high` around the target degree `d`.
 const MeshParams = struct {
     /// Target mesh degree per topic.
     d: usize = 6,
@@ -521,32 +431,25 @@ const MeshParams = struct {
     /// How long (in heartbeat ticks; one tick is one second) a PRUNE keeps us
     /// from re-grafting the pruned peer for that topic.
     prune_backoff_ticks: u64 = 60,
-    /// Shorter backoff (in heartbeat ticks) used when the PRUNE is because we are
-    /// LEAVING the topic (unsubscribe), not pruning for mesh maintenance. Both the
-    /// wire backoff in the emitted PRUNE and our own local backoff for the departing
-    /// peer use this value, so a node that unsubscribes then quickly resubscribes
-    /// can re-mesh sooner. (go-libp2p-pubsub `GossipSubUnsubscribeBackoff`, 10s.)
+    /// Shorter backoff (heartbeat ticks) used when LEAVING a topic (unsubscribe)
+    /// rather than pruning for maintenance — applied to both the wire PRUNE and our
+    /// local backoff, so an unsubscribe-then-resubscribe can re-mesh sooner.
+    /// (go `GossipSubUnsubscribeBackoff`, 10s.)
     unsubscribe_backoff_ticks: u64 = 10,
     /// How long (in heartbeat ticks) a fanout topic survives without a publish.
     /// Once `heartbeat_tick - fanout_last_pub[topic]` exceeds this the fanout
     /// peer set is dropped (we stopped publishing to a topic we don't subscribe).
     fanout_ttl_ticks: u64 = 60,
-    /// How long (in heartbeat ticks, one tick ≈ one second) a message-id stays in
-    /// the seen-cache for duplicate suppression, measured from when the id was
-    /// FIRST observed (go's `TimeCacheDuration`, default 2 minutes / 120s; the
-    /// cache uses go's first-seen strategy, so a re-add never extends this).
+    /// How long (heartbeat ticks ≈ seconds) a message-id stays in the seen-cache,
+    /// measured from first observation (go `TimeCacheDuration`, 120s).
     seen_ttl_ticks: u64 = 120,
-    /// Floor on the number of gossip (IHAVE) targets per topic per heartbeat:
-    /// peers subscribed to the topic but NOT in its mesh/fanout. The actual count
-    /// is `max(gossip_factor * eligible, d_lazy)` (see `gossip_factor`), so a
-    /// topic with few eligible peers still gossips to at least this many.
-    /// (go-libp2p `D_lazy`.)
+    /// Floor on gossip (IHAVE) targets per topic per heartbeat (peers subscribed
+    /// but NOT in mesh/fanout). Actual count = `max(gossip_factor * eligible,
+    /// d_lazy)`, so a small topic still gossips to at least this many. (go `D_lazy`.)
     d_lazy: usize = 6,
-    /// Fraction of gossip-eligible (subscribed, non-mesh, non-fanout, above the
-    /// gossip threshold when scoring) peers that receive IHAVE each heartbeat,
-    /// when that fraction exceeds `d_lazy`. The target count is
-    /// `max(gossip_factor * eligible_count, d_lazy)`, so large topics gossip to a
-    /// proportional slice rather than a fixed floor. (go GossipSubGossipFactor.)
+    /// Fraction of gossip-eligible peers that receive IHAVE each heartbeat, so a
+    /// large topic gossips to a proportional slice rather than the `d_lazy` floor
+    /// (see `d_lazy` for the combined formula). (go GossipSubGossipFactor.)
     gossip_factor: f64 = 0.25,
     /// Upper bound on message-ids advertised in a single IHAVE; a longer id list
     /// is truncated. (go-libp2p `MaxIHaveLength`.)
@@ -559,53 +462,37 @@ const MeshParams = struct {
     /// single inbound IWANT. Bounds the work one peer can ask of us per request;
     /// finer rate-limiting is a future refinement.
     max_iwant_to_serve: usize = 5000,
-    /// Maximum times we serve the SAME message id to ONE peer in response to its
-    /// IWANTs, counted within the gossip window (the counts reset each heartbeat
-    /// alongside the message-cache window shift). Beyond this, further IWANTs for
-    /// that id from that peer are ignored — an anti-spam bound so a peer cannot
-    /// make us re-send a message endlessly. (go GossipSubGossipRetransmission.)
+    /// Max times we serve the SAME id to ONE peer per gossip window (counts reset
+    /// each heartbeat); beyond it further IWANTs for that id are ignored, so a peer
+    /// cannot make us re-send endlessly. (go GossipSubGossipRetransmission.)
     gossip_retransmission: u64 = 3,
-    /// Maximum IHAVE messages we process from ONE peer per heartbeat. Once a peer
-    /// has sent this many IHAVEs in a heartbeat window, further IHAVEs from it are
-    /// ignored until the per-peer counter resets at the next heartbeat. An
-    /// anti-spam bound (distinct from `max_ihave_length`, which caps the ids in a
-    /// single IHAVE). (go GossipSubMaxIHaveMessages.)
+    /// Max IHAVE messages we process from ONE peer per heartbeat; beyond it further
+    /// IHAVEs are ignored until the counter resets. Anti-spam (distinct from
+    /// `max_ihave_length`, which caps ids in one IHAVE). (go GossipSubMaxIHaveMessages.)
     max_ihave_messages: usize = 10,
-    /// How long (in heartbeat ticks) a per-peer IDONTWANT entry suppresses sending
-    /// that message id to the peer. After this many heartbeats the entry expires
-    /// and we may send the message again. A few heartbeats is enough to cover the
-    /// window in which the large message would otherwise be forwarded.
+    /// How long (heartbeat ticks) a per-peer IDONTWANT entry suppresses sending
+    /// that id to the peer — a few heartbeats covers the forward window.
     dont_send_ttl_ticks: u64 = 3,
-    /// Upper bound on per-peer IDONTWANT entries. A peer that floods IDONTWANTs
-    /// cannot make us hold an unbounded id set: once full, further new ids are
-    /// refused (the worst case is we still send a message the peer already has —
-    /// safe, just slightly wasteful). Stale entries are reclaimed each heartbeat.
+    /// Upper bound on per-peer IDONTWANT entries: once full, new ids are refused
+    /// (worst case we send a message the peer already has — safe), so a flooding
+    /// peer cannot grow the set unboundedly. Stale entries reclaimed each heartbeat.
     dont_send_cap: usize = 10000,
-    /// Maximum number of message-ids we process from a SINGLE inbound IDONTWANT
-    /// control message; ids past this cap are ignored (not recorded, not purged).
-    /// Bounds the work and memory one IDONTWANT can cost us, so a peer cannot
-    /// flood us with an oversized id list. (go GossipSubMaxIDontWantLength.)
+    /// Max ids we process from a SINGLE inbound IDONTWANT; ids past the cap are
+    /// ignored, bounding what one oversized IDONTWANT can cost us.
+    /// (go GossipSubMaxIDontWantLength.)
     max_idontwant_length: usize = 10,
-    /// Maximum number of IDONTWANT control messages we accept from ONE peer per
-    /// heartbeat. Once a peer has sent this many IDONTWANTs in a heartbeat window,
-    /// further IDONTWANTs from it are ignored until the per-peer counter resets at
-    /// the next heartbeat. An anti-flood bound (distinct from `max_idontwant_length`,
-    /// which caps the ids in a single IDONTWANT). (go GossipSubMaxIDontWantMessages.)
+    /// Max IDONTWANT messages we accept from ONE peer per heartbeat; beyond it
+    /// further IDONTWANTs are ignored until the counter resets. Anti-flood (distinct
+    /// from `max_idontwant_length`). (go GossipSubMaxIDontWantMessages.)
     max_idontwant_messages: usize = 1000,
-    /// How long (in heartbeat ticks, one tick ≈ one second) a peer has to deliver a
-    /// message it implicitly promised by advertising it (IHAVE) and that we then
-    /// requested (IWANT). When we send the IWANT we record a promise with deadline
-    /// `heartbeat_tick + iwant_followup_ticks`; if the message is not delivered (by
-    /// anyone) before the deadline, the heartbeat charges the promising peer a P7
-    /// behaviour penalty. This deters peers that advertise ids they do not serve.
-    /// (go GossipSubIWantFollowupTime, default 3 seconds.)
+    /// How long (heartbeat ticks ≈ seconds) a peer has to deliver a message it
+    /// promised via IHAVE and we requested via IWANT. If undelivered by the deadline
+    /// (`heartbeat_tick + iwant_followup_ticks`) the heartbeat charges the promiser a
+    /// P7 penalty, deterring advertised-but-unserved ids. (go GossipSubIWantFollowupTime.)
     iwant_followup_ticks: u64 = 3,
-    /// How often (in heartbeat ticks) the router re-dials any configured direct
-    /// peer that is not currently connected, keeping the explicit peering up
-    /// (go GossipSubDirectConnectTicks, default 300 ticks ≈ 5 minutes). Direct
-    /// peers are ALSO dialed once at start (go dials them after an initial delay);
-    /// the periodic re-dial covers reconnect after a drop. Only the disconnected
-    /// ones are dialed — a still-connected direct peer is left alone.
+    /// How often (heartbeat ticks) the router re-dials a disconnected direct peer,
+    /// keeping the explicit peering up (go GossipSubDirectConnectTicks ≈ 5 min).
+    /// Direct peers are also dialed once at start; this covers reconnect after a drop.
     direct_connect_ticks: u64 = 300,
 };
 
@@ -672,13 +559,10 @@ const StoredRecord = struct {
 ///
 ///   pub fn dial(self: *Transport, io: std.Io, addr: []const u8) void;
 ///       Fire-and-forget: kick off a connection to the multiaddr STRING `addr`
-///       and return IMMEDIATELY. The router calls this to (re)connect a direct
-///       peer; it does NOT wait and gets no result. Success surfaces later as the
-///       normal connect event (a `peer_connected` Command → `onPeerConnected`,
-///       which sets up the per-peer streams); a failure is the transport's to log
-///       and drop (the router re-dials a still-disconnected direct peer on its
-///       next direct-connect tick). The transport owns any fiber it spawns to do
-///       the dial and must join it on its own teardown (the router never does).
+///       and return IMMEDIATELY (no wait, no result). The router calls this to
+///       (re)connect a direct peer; success surfaces as the normal connect event,
+///       a failure is the transport's to log and drop (the router re-dials next
+///       tick). The transport owns + joins any fiber it spawns (the router never does).
 pub fn Router(comptime Transport: type) type {
     return struct {
         const Self = @This();
@@ -697,34 +581,26 @@ pub fn Router(comptime Transport: type) type {
                 conn: ConnHandle,
                 remote_addr: std.Io.net.IpAddress,
             },
-            /// A connection to a peer is gone. Fired once per CONNECTION, so
-            /// with two connections to one peer (simultaneous dial) each close
-            /// posts its own event. `conn` is an identity token only — it names
-            /// WHICH connection died (the handler compares it against the
-            /// PeerState's bound connection and ignores a non-matching one) and
-            /// must not be dereferenced: the connection may already be freed.
-            /// The Switch's unregister callback must be this command's ONLY
-            /// producer: it posts before the connection's memory is freed, so
-            /// the FIFO inbox processes the event before any later event can
-            /// name a recycled address. A producer that cannot order its post
-            /// before the free (e.g. a writer fiber) must NOT post this —
-            /// see `reap_dead_writers` / `onWriterDisconnect` for the ABA it
-            /// would reintroduce.
+            /// A connection to a peer is gone. Fired once per CONNECTION (so a
+            /// simultaneous dial's two closes each post). `conn` is an identity
+            /// token only — never dereferenced (it may be freed); the handler tears
+            /// down only when it matches the PeerState's bound connection. The
+            /// Switch's unregister callback must be the ONLY producer: it posts
+            /// before the connection's memory frees, so the FIFO inbox sees the event
+            /// before any later event can name a recycled address. A producer that
+            /// cannot order its post before the free (e.g. a writer fiber) must NOT
+            /// post this (see `reap_dead_writers` for the ABA it would reintroduce).
             peer_disconnected: struct { peer: PeerId, conn: ConnHandle },
-            /// The /meshsub protocol version a peer negotiated, learned when it
-            /// opens an inbound stream to us (the peer proposes its best version;
-            /// we accept it, so this is the highest version that peer supports).
-            /// Recorded per peer so version-gated control (e.g. IDONTWANT, 1.2+)
-            /// only targets peers that can parse it. May arrive before or after
-            /// `peer_connected`; the handler tolerates either order.
+            /// The /meshsub version a peer negotiated on its inbound stream (the
+            /// highest it supports). Recorded so version-gated control (IDONTWANT,
+            /// 1.2+) only targets peers that can parse it. May arrive before or
+            /// after `peer_connected`; the handler tolerates either order.
             peer_protocol: struct { peer: PeerId, version: pubsub.Version },
-            /// A verified signed peer record for `peer` (its `signedPeerRecord`
-            /// from libp2p identify, or a PX offer). The router owns
-            /// `envelope_bytes` and frees them once processed: it re-verifies the
-            /// envelope (the same statelessly-checkable bytes a producer could send)
-            /// and, on success, stores it in the certified-record store so PX can
-            /// vouch for the peer. Posted by the identify binding, off the router
-            /// fiber, so the cert store stays router-fiber-owned.
+            /// A signed peer record for `peer` (from identify, or a PX offer). The
+            /// router owns `envelope_bytes`, re-verifies the envelope, and on success
+            /// stores it in the cert store so PX can vouch for the peer; freed once
+            /// processed. Posted off the router fiber, so the cert store stays
+            /// router-fiber-owned.
             peer_record: struct { peer: PeerId, envelope_bytes: []u8 },
             /// An RPC arrived on a peer's inbound stream. The router owns it and
             /// must free it after parsing + forward-frame construction.
@@ -751,12 +627,9 @@ pub fn Router(comptime Transport: type) type {
             /// at comptime would churn every dispatch/drain switch for nothing.
             ///
             /// Test-only: enqueue a frame reference onto a tracked peer's outbound
-            /// queue, on the router fiber (so the peer-map lookup is race-free).
-            /// Used by router unit tests to make a peer's writer actually attempt
-            /// to open its stream (the writer opens lazily on its first frame).
-            /// The command carries one reference; if the push fails or the peer is
-            /// not tracked the reference is released. The reply event is set once
-            /// the push (or release) is done.
+            /// queue, on the router fiber (race-free peer-map lookup), to make the
+            /// peer's writer attempt its lazy stream open. Carries one reference,
+            /// released if the push fails or the peer is gone; `reply` is set when done.
             enqueue_for_test: struct {
                 peer: PeerId,
                 frame: *peer_io.OutboundFrame,
@@ -777,32 +650,24 @@ pub fn Router(comptime Transport: type) type {
             /// scrape is served ahead of any data backlog — saturation is when
             /// the numbers matter most.
             stats: struct { reply: *StatsReply },
-            /// Test-only barrier: the handler does nothing but set `reply`. Because
-            /// the inbox is FIFO and the router is single-consumer, when this reply
-            /// fires every command posted before it has been fully processed and the
-            /// router fiber is back parked on the inbox (it will not touch its state
-            /// again until the next command). A test posts this after its commands
-            /// and awaits the reply, then reads router-owned state race-free — the
-            /// router fiber owns that state exclusively, so a test must never read it
-            /// concurrently with the fiber; this barrier is how a test serializes.
+            /// Test-only barrier: the handler only sets `reply`. The inbox is FIFO
+            /// and single-consumer, so when this reply fires every command posted
+            /// before it has been fully processed and the router fiber is back parked
+            /// on the inbox. This is how a test reads router-owned state race-free.
             sync: struct { reply: *std.Io.Event },
-            /// An ASYNC message validation finished off the router fiber: its
-            /// outcome is `verdict` (signature check + app validator combined —
-            /// see `ValidationOutcome`) and `ctx` holds the owned message context
-            /// the post-verdict effects need (built before the validation fiber
-            /// spawned; freed once this command is processed, or on the
-            /// inbox-drain at teardown). Posted by a validation fiber; only
-            /// enabled when `validation_concurrency > 0`. See `ValidationContext`.
+            /// An ASYNC validation finished off the router fiber: `verdict` is the
+            /// combined outcome (see `ValidationOutcome`) and `ctx` the owned message
+            /// snapshot the post-verdict effects need, freed once this command is
+            /// processed (or on the teardown drain). Only enabled when
+            /// `validation_concurrency > 0`. See `ValidationContext`.
             validation_result: struct { ctx: *ValidationContext, verdict: ValidationOutcome },
-            /// Prompt-wake for the dead-writer reap (see `reapDeadWriters`).
-            /// Posted by a writer fiber after it sets its PeerState's
-            /// `writer_dead` flag. Deliberately carries NO payload — in
-            /// particular no connection handle: a writer-sourced event cannot be
-            /// ordered before its connection's free, so a carried pointer could
-            /// alias a recycled address and tear down a just-rebound live peer
-            /// (ABA). The flag lives on the PeerState itself, so the reap always
-            /// acts on current identity. Best-effort: dropped when the inbox is
-            /// full, the heartbeat's own reap pass is the lossless fallback.
+            /// Prompt-wake for the dead-writer reap (see `reapDeadWriters`), posted
+            /// by a writer fiber after it sets its PeerState's `writer_dead` flag.
+            /// Carries NO payload — a writer-sourced event cannot be ordered before
+            /// its connection's free, so a carried handle could alias a recycled
+            /// address and tear down a just-rebound peer (ABA); the flag on the
+            /// PeerState ties the reap to current identity. Best-effort: dropped on a
+            /// full inbox (the heartbeat's reap pass is the lossless fallback).
             reap_dead_writers,
             /// Wake marker a control post drops into the DATA inbox so a
             /// consumer parked in `getOne` re-runs its control drain. Carries
@@ -812,25 +677,20 @@ pub fn Router(comptime Transport: type) type {
         };
 
         /// The combined outcome of an ASYNC validation fiber: the StrictSign
-        /// signature check folded together with the app validator's verdict
-        /// (go's worker validate() runs exactly these two, in this order).
-        /// `reject_signature` is distinct from `reject_validator` because their
-        /// seen-cache effects differ: a validator-rejected message IS marked
-        /// seen (later copies must not re-validate), while a signature-rejected
-        /// one is NOT (a forged (from, seqno) must not censor the real message).
+        /// signature check folded with the app validator's verdict (go's worker
+        /// validate() order). `reject_signature` is split from `reject_validator`
+        /// because their seen-cache effects differ: a validator-rejected message IS
+        /// marked seen (later copies must not re-validate), a signature-rejected one
+        /// is NOT (a forged (from, seqno) must not censor the real message).
         const ValidationOutcome = enum { accept, reject_validator, ignore, reject_signature };
 
-        /// An owned, self-contained snapshot of a received message, HELD from the
-        /// moment an async validation is spawned until its verdict is applied (then
-        /// freed). It exists because the wire slices a received message borrows
-        /// (the `inbound_rpc`'s `OwnedRpc` bytes) are freed as soon as
-        /// `onInboundRpc` returns, which is BEFORE the off-fiber validation finishes
-        /// — so the validation fiber and the post-verdict accept/reject/ignore
-        /// effects must own everything they touch. Owns copies of the message
-        /// fields, the relaying peer id (the P4 reject target / forward exclusion),
-        /// and the derived message id. Freed exactly once via `deinit` — by the
-        /// router fiber when the `validation_result` command is processed, or by the
-        /// inbox drain at teardown for a result that never got processed.
+        /// An owned, self-contained snapshot of a received message, HELD from when
+        /// an async validation spawns until its verdict applies. It exists because
+        /// the wire slices (`inbound_rpc`'s `OwnedRpc` bytes) are freed when
+        /// `onInboundRpc` returns, BEFORE the off-fiber validation finishes — so the
+        /// fiber and the post-verdict effects must own everything they touch. Freed
+        /// exactly once via `deinit` (by the router fiber on `validation_result`, or
+        /// by the teardown drain for a result that never got processed).
         pub const ValidationContext = struct {
             /// The peer the message arrived from (the inbound stream's peer): the
             /// forward-exclusion target and, on reject, the P4 penalty target.
@@ -878,29 +738,22 @@ pub fn Router(comptime Transport: type) type {
             /// `peer_versions`). Gates version-specific control toward the peer.
             protocol_version: pubsub.Version = .v1_1,
             /// Message ids this peer told us (via IDONTWANT) it already has, so we
-            /// must NOT send it those messages. Maps id → expiry heartbeat tick;
-            /// the entry suppresses sending until `heartbeat_tick > expiry`, at
-            /// which point the heartbeat reclaims it. Each entry holds one
-            /// reference on the SHARED interned id (released on expiry and on
-            /// teardown — never an explicit byte free). Bounded by `dont_send_cap`.
+            /// must NOT send it those messages. id → expiry heartbeat tick; the
+            /// heartbeat reclaims an entry once `heartbeat_tick > expiry`. Bounded by
+            /// `dont_send_cap`. Each entry holds one SHARED-interned-id reference,
+            /// released on expiry/teardown (no explicit byte free).
             dont_send: std.StringHashMapUnmanaged(IdEntry(u64)) = .empty,
-            /// How many times we have served each message id to this peer via
-            /// IWANT within the current gossip window. Incremented each time we
-            /// serve the id; once it reaches `gossip_retransmission` we stop
-            /// serving that id to this peer (anti-spam). Each entry holds one
-            /// reference on the SHARED interned id (released on clear and on
-            /// teardown); the whole map is cleared each heartbeat (mirroring go,
-            /// which ages these with the mcache window).
+            /// Per-id served counts to this peer via IWANT in the current gossip
+            /// window; once an id reaches `gossip_retransmission` we stop serving it
+            /// (anti-spam). Each entry holds one interned-id reference (released on
+            /// clear/teardown); cleared each heartbeat, ageing with the mcache window.
             iwant_counts: std.StringHashMapUnmanaged(IdEntry(u64)) = .empty,
-            /// Outstanding IWANT promises this peer made: message id → the
-            /// heartbeat tick by which the peer must deliver the message. A promise
-            /// is recorded when we send the peer an IWANT for an id it advertised
-            /// (IHAVE), fulfilled (removed) when any peer delivers a message with
-            /// that id, and — if still outstanding once the tick passes the
-            /// deadline — harvested by the heartbeat into a P7 behaviour penalty
-            /// (go's "broken promise"). Each entry holds one reference on the SHARED
-            /// interned id (released on fulfill, on harvest, and on teardown).
-            /// Populated only when scoring is enabled.
+            /// Outstanding IWANT promises this peer made: id → the heartbeat tick by
+            /// which it must deliver. Recorded when we IWANT an id it advertised,
+            /// removed when any peer delivers it, and — if still outstanding past the
+            /// deadline — harvested by the heartbeat into a P7 penalty (go's "broken
+            /// promise"). Each entry holds one interned-id reference (released on
+            /// fulfill/harvest/teardown). Populated only when scoring is enabled.
             iwant_promises: std.StringHashMapUnmanaged(IdEntry(u64)) = .empty,
             /// How many IHAVE messages this peer has sent us in the current
             /// heartbeat window. Incremented on each inbound IHAVE; once it
@@ -931,16 +784,13 @@ pub fn Router(comptime Transport: type) type {
             /// post peer_disconnected. Set in the initializer below so it is
             /// valid before the writer fiber spawns.
             router_for_disconnect: *Self,
-            /// Set (release) by the writer fiber when it gives up (open
-            /// exhaustion) — the LOSSLESS disconnect signal. The writer's inbox
-            /// post is only a best-effort wake and is dropped when the inbox is
-            /// full, because the router JOINS the writer in teardownPeer: a
-            /// writer parked on the router's own full inbox would deadlock the
-            /// whole router (it would await a fiber that waits for the router
-            /// to drain the queue it is parked on). The heartbeat sweeps this
-            /// flag and tears down flagged peers, so a dropped post only delays
-            /// the teardown by up to one heartbeat. Atomic: written on the
-            /// writer fiber, read on the router fiber.
+            /// Set by the writer fiber when it gives up (open exhaustion) — the
+            /// LOSSLESS disconnect signal. Its inbox-post wake is only best-effort
+            /// (dropped on a full inbox), because the router JOINS the writer in
+            /// teardownPeer: a writer parked on the router's own full inbox would
+            /// deadlock the router. The heartbeat sweeps this flag and tears flagged
+            /// peers down, so a dropped post delays teardown by at most one heartbeat.
+            /// Atomic: written on the writer fiber, read on the router fiber.
             writer_dead: std.atomic.Value(bool) = .init(false),
         };
 
@@ -979,53 +829,35 @@ pub fn Router(comptime Transport: type) type {
         /// Keyed by zero-padded peer bytes (see PeerKey). Values are heap-owned.
         peers: std.AutoHashMap(PeerKey, *PeerState),
         /// Negotiated /meshsub version for peers whose inbound stream reported it
-        /// BEFORE their `peer_connected` arrived (the inbound handler and the
-        /// peer-event callback fire on independent fibers, so either can win the
-        /// race). Holds the version until `peer_connected` creates the PeerState,
-        /// which then adopts it and removes the entry; entries are also dropped on
-        /// disconnect. Without a matching PeerState an entry is a transient note,
-        /// not a leak — disconnect always purges it. Keyed like `peers`.
+        /// BEFORE their `peer_connected` arrived (the inbound handler and peer-event
+        /// callback race on independent fibers). `peer_connected` adopts it into the
+        /// new PeerState; an undrained entry is a transient note (not a leak),
+        /// purged on disconnect. Keyed like `peers`.
         peer_versions: std.AutoHashMap(PeerKey, pubsub.Version),
-        /// Topic subscriptions a peer announced on its inbound stream BEFORE its
-        /// `peer_connected` arrived (the same independent-fiber race that
-        /// `peer_versions` handles). Each value is the set of topics the peer is
-        /// currently subscribed to (its own owned key copies); `peer_connected`
-        /// drains it into the new PeerState's `topics` and removes the entry.
-        /// Without this the early SUBSCRIBE is dropped (the peer is untracked) and
-        /// never re-sent, so the peer is never recorded as a subscriber — it is
-        /// excluded from flood-publish targets AND mesh GRAFT candidates, and an
-        /// all-same-impl network fails to propagate. Keyed like `peers`; purged on
-        /// disconnect.
+        /// Topic subscriptions a peer announced BEFORE its `peer_connected` arrived
+        /// (the same independent-fiber race `peer_versions` handles). Each value is
+        /// the peer's topic set (owned key copies); `peer_connected` drains it into
+        /// the PeerState's `topics`. Without this the early SUBSCRIBE is dropped and
+        /// never re-sent, so the peer is never recorded as a subscriber — excluding it
+        /// from flood-publish AND mesh GRAFT. Keyed like `peers`; purged on disconnect.
         pending_subscriptions: std.AutoHashMap(PeerKey, std.StringHashMapUnmanaged(void)),
-        /// Direct (explicit) peers — the go-libp2p `direct` set. A peer whose key
-        /// is in here is treated as a trusted out-of-mesh forward target: it
-        /// receives every valid message on a topic it subscribes to, is never
-        /// added to a mesh (a GRAFT from it draws a PRUNE back), and bypasses the
-        /// score gates. The value is the owned multiaddr-string copy used to
-        /// (re)dial the peer for connection maintenance (`DirectConnectTicks`).
-        /// Populated once in `create` from `RouterConfig.direct_peers` (each id
-        /// copied into an owned key, each address into an owned value) and never
-        /// mutated; both the keys and the address values are freed on teardown.
-        /// Keyed like `peers` (zero-padded peer bytes).
+        /// Direct (explicit) peers — go-libp2p's `direct` set. A key here is a
+        /// trusted out-of-mesh forward target (see `RouterConfig.direct_peers`); the
+        /// value is the owned multiaddr-string copy used to re-dial it
+        /// (`DirectConnectTicks`). Populated once in `create`, never mutated; keys and
+        /// address values freed on teardown. Keyed like `peers`.
         direct: std.AutoHashMapUnmanaged(PeerKey, []const u8) = .empty,
-        /// Whether peer-exchange (PX) is enabled (go-libp2p `WithPeerExchange`,
-        /// default OFF). Gates both PX emit (attaching signed records to a
-        /// doPX-eligible PRUNE) and PX consume (dialing peers offered in an
-        /// inbound PRUNE above the accept-PX score). See
-        /// `RouterConfig.peer_exchange_enabled`.
+        /// Whether peer-exchange is enabled (see `RouterConfig.peer_exchange_enabled`).
         peer_exchange_enabled: bool,
-        /// The resolved mesh DEGREE targets (`d`/`d_low`/`d_high`) the heartbeat's
-        /// mesh maintenance uses to decide graft-up / prune-down. Set once in
-        /// `create` from `RouterConfig.mesh_degree` (or the `mesh_params` baseline
-        /// when that is null) and never mutated. Only the maintenance degree
+        /// The resolved mesh DEGREE targets the heartbeat's maintenance uses (see
+        /// `RouterConfig.mesh_degree`). Set once in `create` (from config or the
+        /// `mesh_params` baseline), never mutated. Only the maintenance degree
         /// decision reads it; every other mesh parameter stays at the baseline.
         mesh_degree: MeshDegree,
         /// Certified-record store: peer → its newest verified signed peer record.
-        /// Populated by PX consume (a verified inbound record is kept here) and
-        /// read by PX emit (`getRecord`) to vouch for an offered peer. A later
-        /// step also populates it from identify. `putRecord` replaces an entry
-        /// only with a strictly-newer `seq`. Keyed like `peers`; every entry owns
-        /// its bytes and is freed on replacement and on teardown.
+        /// Populated by PX consume + identify, read by PX emit (`getRecord`) to vouch
+        /// for an offered peer. `putRecord` replaces only with a strictly-newer `seq`.
+        /// Keyed like `peers`; every entry owns its bytes, freed on replacement/teardown.
         cert_store: std.AutoHashMapUnmanaged(PeerKey, StoredRecord) = .empty,
         /// Topics the local node subscribes to. Keys are owned copies; freed on
         /// unsubscribe and on teardown. We announce these to every peer (on our
@@ -1061,13 +893,10 @@ pub fn Router(comptime Transport: type) type {
         /// The heartbeat fiber's future, when one was spawned. Cancelled + awaited
         /// on destroy (mirrors the per-peer writer teardown).
         heartbeat_future: ?std.Io.Future(void) = null,
-        /// The single index of live interned message ids. `seen`, every peer's
-        /// `dont_send`/`iwant_counts`/`iwant_promises` all intern through this, so
-        /// an id referenced by several maps is ONE allocation shared via reference
-        /// counting (freed when the last holder releases). Address-stable because
-        /// the Router itself is heap-allocated, so `&router.intern_table` is the
-        /// stable `*InternTable` the maps and `MsgId.deinit` hold. Asserts empty at
-        /// destroy (every interned id was released).
+        /// The single index of live interned message ids (see the intern-machinery
+        /// note above). Address-stable because the Router is heap-allocated, so
+        /// `&router.intern_table` is the stable `*InternTable` the maps hold. Asserts
+        /// empty at destroy (every interned id was released).
         intern_table: InternTable,
         /// Time-bounded dedup window over recently-seen message ids (TTL =
         /// `seen_ttl_ticks` heartbeats from when each id was first observed).
@@ -1080,17 +909,15 @@ pub fn Router(comptime Transport: type) type {
         /// heartbeat (`shift`).
         message_cache: mcache.MessageCache,
         /// Monotonic sequence number for messages WE originate; encoded big-endian
-        /// into Message.seqno so (from, seqno) is a unique message id. Seeded at
-        /// create with wall-clock nanoseconds (`initialSeqno`), NOT 0: peers
-        /// remember message ids for the seen TTL, so a counter restarting at 0
-        /// would make every publish after a process restart reuse an already-seen
-        /// id and be silently dropped network-wide until the TTL expires.
+        /// into Message.seqno so (from, seqno) is a unique id. Seeded at create with
+        /// wall-clock nanoseconds (`initialSeqno`), NOT 0: peers remember ids for the
+        /// seen TTL, so a counter restarting at 0 would make every post-restart
+        /// publish reuse an already-seen id and be dropped network-wide until the TTL.
         seqno: u64,
         /// PRNG behind every peer-selection shuffle (graft, prune, gossip, PX,
-        /// fanout): each selection gathers ALL eligible candidates, shuffles,
-        /// then truncates, so peer-map insertion order can't steer it (an
-        /// eclipse lever; go shuffles candidates for the same reason). Seeded
-        /// from OS entropy at create. Router-fiber-only.
+        /// fanout): each selection gathers all eligible candidates, shuffles, then
+        /// truncates, so peer-map order can't steer it (an eclipse lever; go shuffles
+        /// for the same reason). Seeded from OS entropy at create. Router-fiber-only.
         prng: std.Random.DefaultPrng,
         /// Our own peer id, used as Message.from on publish (under strict_sign /
         /// none; under anonymous publish omits `from` entirely).
@@ -1100,12 +927,10 @@ pub fn Router(comptime Transport: type) type {
         /// and — together with `message_id_fn` — how `computeMessageId` derives the
         /// id. Set once in `create` and never mutated.
         signature_policy: SignaturePolicy,
-        /// The signing engine, present only under `strict_sign`. When present every
-        /// published message is signed and every inbound published message is
-        /// verified — invalid or unsigned inbound messages are rejected (dropped,
-        /// never delivered or forwarded). Under `none` and `anonymous` it is null:
-        /// messages are not signed and inbound messages are not verified. Owns its
-        /// cached pubkey bytes; freed on destroy.
+        /// The signing engine, present only under `strict_sign`: when present every
+        /// published message is signed and every inbound one verified (invalid/unsigned
+        /// dropped). Null under `none`/`anonymous` (no signing, no verification). Owns
+        /// its cached pubkey bytes; freed on destroy.
         signer: ?signing.Signer,
         /// Optional message-id override (see `RouterConfig.message_id_fn`). When
         /// set, `computeMessageId` calls it instead of the policy's built-in
@@ -1114,35 +939,23 @@ pub fn Router(comptime Transport: type) type {
         /// Optional sink for messages delivered on topics we subscribe to.
         message_handler: ?MessageHandler,
         /// Optional application topic-message validator (see `MessageValidator`).
-        /// When set, gates delivery + forwarding of each received published message
-        /// on its verdict (accept/reject/ignore) after the signature + seen checks.
-        /// Null means accept-all (the historic behaviour). Set once in `create`
-        /// from `RouterConfig.validator` and never mutated; called only on the
-        /// router fiber (inline) or on a validation fiber (async), so it must be
-        /// thread-safe when `validation_concurrency > 0`.
+        /// Gates delivery + forwarding of each received message after the signature +
+        /// seen checks; null = accept-all. Set once in `create`, never mutated.
         validator: ?MessageValidator,
         /// Cap on validations running OFF the router fiber at once (0 = inline; see
         /// `RouterConfig.validation_concurrency`). Set once in `create`.
         validation_concurrency: usize,
-        /// How many async validations are currently in flight (spawned, verdict not
-        /// yet applied). Incremented when a validation fiber is spawned, decremented
-        /// when its `validation_result` is processed. (The teardown drain does NOT
-        /// decrement — by then the main loop has exited and nothing reads the
-        /// counter again, so the stale value is dead state.)
-        /// Mutated ONLY on the router fiber (the spawn happens in
-        /// `handleIncomingMessage`, the decrement in `onValidationResult` / the
-        /// drain), so it needs no atomic. Bounds spawning against
-        /// `validation_concurrency`; over the cap a message is throttle-DROPPED
-        /// (go parity), never validated inline.
+        /// Async validations in flight (spawned, verdict not yet applied): +1 on
+        /// spawn, -1 on `validation_result` (the teardown drain does not decrement —
+        /// nothing reads it again by then). Mutated ONLY on the router fiber, so no
+        /// atomic. Bounds spawning against `validation_concurrency`; over the cap a
+        /// message is throttle-DROPPED, never validated inline.
         validations_in_flight: usize = 0,
-        /// Owns every async validation fiber. Cancelled + awaited in `destroy`
-        /// BEFORE any router state the post-verdict effects touch (peers, intern
-        /// table, score, maps) is freed, so a still-running validation fiber cannot
-        /// race the teardown. A validation fiber only computes a verdict and posts a
-        /// `validation_result` command (it touches no router state directly), but it
-        /// holds the `*ValidationContext` it allocated; joining it before the inbox
-        /// drain guarantees no fiber is mid-post when the drain frees pending
-        /// contexts. Empty (no resources) when `validation_concurrency == 0`.
+        /// Owns every async validation fiber. Cancelled + awaited in `destroy` BEFORE
+        /// any router state the post-verdict effects touch is freed, so a running
+        /// fiber cannot race teardown; joining before the inbox drain guarantees no
+        /// fiber is mid-post when the drain frees pending contexts. Empty (no
+        /// resources) when `validation_concurrency == 0`.
         validation_group: std.Io.Group = .init,
         /// Bounded local-delivery queue (see RouterConfig.delivery_queue_len).
         /// Zero-length storage = inline mode (the queue is never used). The
@@ -1171,9 +984,8 @@ pub fn Router(comptime Transport: type) type {
         /// Inbound-RPC posts that found the data inbox FULL and had to park
         /// until the router drained it. Written by per-peer reader fibers — atomic.
         inbox_stalls: std.atomic.Value(u64) = .init(0),
-        /// When true (go-libp2p default), a message the local node ORIGINATES is
-        /// flooded to every topic subscriber above the publish threshold rather
-        /// than only its mesh/fanout. Relayed messages are unaffected (always
+        /// When true, an ORIGINATED message floods to every eligible topic
+        /// subscriber rather than only the mesh/fanout (relayed messages are always
         /// mesh-only). See `RouterConfig.flood_publish`.
         flood_publish: bool,
         /// Data-size threshold (bytes) at or above which accepting a NEW received
@@ -1186,12 +998,10 @@ pub fn Router(comptime Transport: type) type {
         /// heap-owned (built in `create`, freed in `destroy`) and driven only on
         /// the single router fiber, so it needs no locking.
         score: ?*score_mod.PeerScore,
-        /// Per-heartbeat snapshot of every tracked peer's score, recomputed once
-        /// at the top of each heartbeat (after `decay`) so the gates run on
-        /// fresh scores without recomputing `score()` in the hot mesh/gossip
-        /// loops (go-libp2p caches scores per heartbeat the same way). Empty when
-        /// scoring is disabled; cleared + rebuilt each heartbeat. Freed on
-        /// destroy. Keys mirror the engine's `PeerKey` (zero-padded peer bytes).
+        /// Per-heartbeat snapshot of every tracked peer's score, rebuilt at the top
+        /// of each heartbeat (after `decay`) so the gates run on fresh scores without
+        /// recomputing `score()` in the hot loops (go caches per heartbeat too).
+        /// Empty when scoring is disabled. Keys mirror the engine's `PeerKey`.
         score_snapshot: std.AutoHashMapUnmanaged(score_mod.PeerKey, f64) = .empty,
         main_future: ?std.Io.Future(void) = null,
         /// Set once when teardown begins so the main loop stops after the inbox
@@ -1202,17 +1012,14 @@ pub fn Router(comptime Transport: type) type {
         peer_count: std.atomic.Value(usize) = .init(0),
 
         /// The signature policy is resolved from `config.signature_policy` and
-        /// `host_key`: a null `signature_policy` is inferred from the key
-        /// (`strict_sign` when present, `none` when absent), keeping the historic
-        /// behaviour; an explicit policy overrides. The two must be consistent —
-        /// `strict_sign` requires a key, `none`/`anonymous` require the key to be
-        /// absent — or `create` returns `error.InvalidSignaturePolicy`.
+        /// `host_key`: null infers it from the key (key → `strict_sign`, no key →
+        /// `none`); explicit overrides. They must be consistent (`strict_sign`
+        /// requires a key, `none`/`anonymous` its absence) or `create` returns
+        /// `error.InvalidSignaturePolicy`.
         ///
-        /// Under `strict_sign` the router derives + uses the key's peer-id as
-        /// `local_peer` (ignoring the passed `local_peer`, which must match — they
-        /// are the same node). Under `none`/`anonymous` `local_peer` is used as
-        /// given (and under `anonymous` it never reaches the wire). The KeyPair is
-        /// borrowed and must outlive the router.
+        /// Under `strict_sign` the router uses the key's peer-id as `local_peer`
+        /// (the passed one must match); otherwise it uses `local_peer` as given (and
+        /// under `anonymous` it never reaches the wire). The KeyPair is borrowed.
         pub fn create(
             allocator: std.mem.Allocator,
             io: std.Io,
@@ -1294,9 +1101,8 @@ pub fn Router(comptime Transport: type) type {
                 .flood_publish = config.flood_publish,
                 .idontwant_message_threshold = config.idontwant_message_threshold,
                 .peer_exchange_enabled = config.peer_exchange_enabled,
-                // Resolve the mesh-degree targets: an explicit override is used as
-                // given; null keeps the `mesh_params` baseline, so the default path
-                // is byte-for-byte the historic behaviour.
+                // An explicit mesh-degree override is used as given; null keeps the
+                // `mesh_params` baseline.
                 .mesh_degree = config.mesh_degree orelse .{
                     .d = mesh_params.d,
                     .d_low = mesh_params.d_low,
@@ -1315,13 +1121,10 @@ pub fn Router(comptime Transport: type) type {
             router.seen = try SeenCache.init(allocator, &router.intern_table, mesh_params.seen_ttl_ticks);
             router.message_cache = mcache.MessageCache.init(allocator, &router.intern_table);
 
-            // Copy the configured direct peers into the router-owned set (the
-            // config slice is borrowed only for this call). Each id is stored as a
-            // zero-padded PeerKey (the same key the peer map / mesh use, so a
-            // direct lookup is a plain map probe) mapped to an owned copy of its
-            // dial address. A failed copy/insert (OOM) just leaves that peer
-            // non-direct — degraded but safe (it falls back to ordinary mesh
-            // treatment, and is not auto-dialed); the rest still load.
+            // Copy the configured direct peers into the router-owned set (the config
+            // slice is borrowed only for this call): each id → an owned copy of its
+            // dial address. A failed copy (OOM) just leaves that peer non-direct —
+            // degraded but safe; the rest still load.
             for (config.direct_peers) |peer| {
                 const addr_owned = allocator.dupe(u8, peer.addr) catch continue;
                 router.direct.put(allocator, peerKey(&peer.id), addr_owned) catch {
@@ -1331,13 +1134,10 @@ pub fn Router(comptime Transport: type) type {
             return router;
         }
 
-        /// Seed for the publish seqno: wall-clock nanoseconds since the Unix
-        /// epoch (go-libp2p parity). Under strict_sign/none the message-id is
-        /// `from ++ seqno` and peers hold ids for the seen TTL, so a counter
-        /// restarting at 0 would self-censor every publish for up to the TTL
-        /// after a process restart. Wall time is unique AND increasing across
-        /// restarts (a random seed would only be unique). Falls back to 0 only
-        /// if the platform reports a pre-epoch wall clock.
+        /// Seed for the publish seqno: wall-clock nanoseconds (go-libp2p parity).
+        /// Wall time is unique AND increasing across restarts, so a post-restart
+        /// publish never reuses a still-seen `from ++ seqno` id (see `seqno`). Falls
+        /// back to 0 only on a pre-epoch wall clock.
         fn initialSeqno(io: std.Io) u64 {
             const wall_ns: i96 = std.Io.Clock.real.now(io).toNanoseconds();
             if (wall_ns <= 0) return 0;
@@ -1355,13 +1155,10 @@ pub fn Router(comptime Transport: type) type {
         /// Spawn the main fiber (and, when the heartbeat interval is non-zero, the
         /// heartbeat fiber). Call once after `create`.
         ///
-        /// Also dials every configured direct peer once, so an explicit peering is
-        /// established at startup without waiting for the first direct-connect tick
-        /// (go-libp2p dials its direct peers once after an initial delay, then the
-        /// heartbeat re-dials disconnected ones). No peer is connected yet at this
-        /// point — and the binding registers the peer-event callback only AFTER
-        /// `start`, so no connect can race this — making the `peers` read here safe
-        /// from the caller fiber. Each dial is fire-and-forget.
+        /// Also dials every configured direct peer once at startup (the heartbeat
+        /// re-dials disconnected ones thereafter). Safe to read `peers` from the
+        /// caller fiber here: no peer is connected yet, and the binding registers the
+        /// peer-event callback only AFTER `start`, so no connect can race this.
         pub fn start(router: *Self) std.Io.ConcurrentError!void {
             if (router.delivery_storage.len > 0) {
                 router.delivery_future = try std.Io.concurrent(router.io, deliveryLoop, .{router});
@@ -1438,24 +1235,19 @@ pub fn Router(comptime Transport: type) type {
         pub fn destroy(router: *Self) void {
             router.stopping.store(true, .release);
 
-            // Stop the heartbeat fiber before draining the main loop: it posts to
-            // the inbox, so it must be joined before the inbox storage is freed.
-            // Cancel collapses any in-flight interval `sleep` (a cancellation
-            // point); await then joins. cancel+await on one Future is safe (cancel
-            // is idempotent and clears the future, so await returns the cached
-            // result). Mirrors the per-peer writer teardown.
+            // Stop the heartbeat fiber first: it posts to the inbox, so it must be
+            // joined before the inbox storage is freed. Cancel collapses any in-flight
+            // interval `sleep`; await then joins (cancel+await on one Future is safe —
+            // cancel is idempotent and clears it).
             if (router.heartbeat_future) |*future| {
                 future.cancel(router.io);
                 future.await(router.io);
                 router.heartbeat_future = null;
             }
 
-            // Post shutdown first (so a main loop parked in getOne wakes and runs
-            // the peer teardown on its own fiber), then close the inbox. close()
-            // alone would make getOne return Closed before processing shutdown,
-            // but the main loop also tears peers down on Closed via
-            // `teardownAllPeers`, so either path is safe. Use the uncancelable
-            // post to avoid losing it.
+            // Post shutdown (uncancelable, so it is not lost) so a main loop parked
+            // in getOne wakes and tears peers down on its own fiber. A Closed inbox
+            // would also reach `teardownAllPeers`, so either path is safe.
             router.control_inbox.putOneUncancelable(router.io, .shutdown) catch {};
             router.notifyControl();
 
@@ -1473,19 +1265,14 @@ pub fn Router(comptime Transport: type) type {
                 router.teardownAllPeers();
             }
 
-            // Cancel + join every async validation fiber AFTER the main loop has
-            // fully exited (its `defer` ran `teardownAllPeers` + `drainInbox`, so the
-            // inbox is now CLOSED) and BEFORE any router state the post-verdict
-            // effects touch (peers, intern table, score, maps) is freed below. The
-            // main loop is the only producer that spawns into this group, so once it
-            // has exited no `concurrent` can race this `cancel` (the group's
-            // not-threadsafe contract). Each still-running validation fiber is
-            // collapsed at its `validate` sleep / its result post (both cancellation
-            // points); its post then fails against the now-closed inbox, so the fiber
-            // frees its own held context — no leak, no UAF, freed exactly once.
-            // (A result the fiber posted BEFORE the inbox closed was already freed by
-            // `drainInbox`.) Idempotent and free when no validation fiber ever ran
-            // (the inline default, or an async router that was never flooded).
+            // Cancel + join every async validation fiber AFTER the main loop exited
+            // (inbox now CLOSED) and BEFORE any post-verdict state is freed below. The
+            // main loop was the only producer into this group, so no `concurrent` can
+            // race this `cancel` (the group's not-threadsafe contract). A still-running
+            // fiber collapses at its result post, which then fails the closed inbox, so
+            // it frees its own held context — freed exactly once (a result posted
+            // before the close was already freed by `drainInbox`). Inert when no
+            // validation fiber ever ran.
             router.validation_group.cancel(router.io);
 
             // Retire the delivery fiber AFTER the main loop and the validation
@@ -1525,10 +1312,9 @@ pub fn Router(comptime Transport: type) type {
             // table is empty: the cache shares the same interned ids as seen / the
             // per-peer maps, so its release must happen before the empty-check.
             router.message_cache.deinit();
-            // Every interned id is released by now (seen.deinit + message_cache.deinit
-            // above + each peer's dont_send/iwant_counts/iwant_promises released in
-            // teardownPeer), so the intern table is empty: its deinit asserts this (a
-            // straggler would be a leaked id byte copy / a missed release).
+            // Every interned id is released by now (seen + message_cache above, each
+            // peer's maps in teardownPeer), so the table is empty — its deinit asserts
+            // this (a straggler would be a leaked id / missed release).
             router.intern_table.deinit();
             if (router.signer) |*s| s.deinit();
             if (router.score) |ps| {
@@ -1561,14 +1347,10 @@ pub fn Router(comptime Transport: type) type {
 
         // ----- certified-record store (peer exchange) ---------------------
 
-        /// Store `consumed` (a verified peer record) for `peer`, taking ownership
-        /// of owned copies of its addresses and envelope bytes. An existing entry
-        /// is REPLACED only when the new record is strictly newer (`seq` greater),
-        /// so an older or equal record is ignored (go keeps the certified address
-        /// book monotonic by seq). On replacement the old entry's owned bytes are
-        /// freed. Best-effort: on allocation failure nothing is stored (PX simply
-        /// has no record to vouch for that peer — safe). `consumed` itself is NOT
-        /// freed here; the caller owns and frees it.
+        /// Store `consumed` for `peer` as owned copies of its addresses + envelope
+        /// bytes. An existing entry is REPLACED only by a strictly-newer `seq` (go
+        /// keeps the certified address book monotonic by seq); the old bytes are then
+        /// freed. Best-effort on OOM (nothing stored). `consumed` is NOT freed here.
         fn putRecord(router: *Self, peer: PeerId, consumed: *const peer_record.ConsumedRecord, envelope_bytes: []const u8) void {
             const key = peerKey(&peer);
             if (router.cert_store.get(key)) |existing| {
@@ -1617,15 +1399,11 @@ pub fn Router(comptime Transport: type) type {
             return rec.envelope_bytes;
         }
 
-        /// Handle a `peer_record` command: re-verify the signed envelope and, on
-        /// success, store it for `peer` so PX can vouch for it. `envelope_bytes`
-        /// are router-owned and freed here in every case (the store keeps its own
-        /// copy via `putRecord`). The envelope is re-verified even though the
-        /// poster already did (the verification is cheap and stateless, and it
-        /// keeps the router self-defending: a bad or peer-mismatched record is
-        /// dropped, never stored). The record's peer-id must equal `peer` — a
-        /// validly-signed record for a DIFFERENT peer would otherwise vouch for
-        /// `peer` with another node's addresses.
+        /// Handle a `peer_record` command: re-verify the signed envelope and store it
+        /// for `peer` so PX can vouch for it. `envelope_bytes` are router-owned and
+        /// freed here in every case (the store copies via `putRecord`). Re-verifying
+        /// (cheap, stateless) keeps the router self-defending. The record's peer-id
+        /// must equal `peer`, else it would vouch for `peer` with another node's addrs.
         fn onPeerRecord(router: *Self, peer: PeerId, envelope_bytes: []u8) void {
             defer router.allocator.free(envelope_bytes);
 
@@ -1721,15 +1499,11 @@ pub fn Router(comptime Transport: type) type {
             return expiry > router.heartbeat_tick;
         }
 
-        /// Back `peer` off for `topic` for `ticks` heartbeats from now (the expiry
-        /// tick is `heartbeat_tick +| ticks`, saturating). Creates the topic's
-        /// BackoffSet (with an owned topic-key copy) on first use. A later/larger
-        /// expiry already stored is kept (never shortened). Best-effort on
-        /// allocation failure. `ticks` can be an attacker-controlled wire value
-        /// (PRUNE backoff seconds): the saturating add can never overflow, so a
-        /// peer sending a huge backoff only locks itself out (its own loss) rather
-        /// than crashing us (Debug/safe builds) or wrapping to a near-zero expiry
-        /// that would silently disable the backoff (release builds).
+        /// Back `peer` off for `topic` until `heartbeat_tick +| ticks` (saturating).
+        /// Creates the topic's BackoffSet on first use; an already-stored later expiry
+        /// is kept (never shortened). Best-effort on OOM. `ticks` is attacker-controlled
+        /// (PRUNE backoff seconds), so the SATURATING add matters: a huge value only
+        /// locks the peer out, never overflows to a near-zero expiry or crashes us.
         fn setBackoff(router: *Self, topic: []const u8, peer: PeerId, ticks: u64) void {
             const expiry = router.heartbeat_tick +| ticks;
             const gop = router.backoff.getOrPut(router.allocator, topic) catch return;
@@ -1747,17 +1521,11 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
-        /// Drop `peer` from every topic's mesh and every topic's fanout set.
-        /// Called when a peer disconnects so no stale membership survives it.
-        ///
-        /// Backoff is intentionally NOT cleared here: prune-backoff is keyed by
-        /// peer+topic and is independent of connection state. If we PRUNEd a peer
-        /// and backed it off, that backoff must persist across a disconnect —
-        /// otherwise the peer could disconnect and immediately reconnect to bypass
-        /// the backoff and re-GRAFT straight back into our mesh. A disconnected
-        /// peer's backoff entry is time-bounded and expires naturally on schedule
-        /// via the heartbeat's expiry scan (no leak), so dropping it here is both
-        /// unnecessary and exploitable.
+        /// Drop `peer` from every topic's mesh and fanout set on disconnect, so no
+        /// stale membership survives it. Backoff is intentionally NOT cleared: it is
+        /// keyed by peer+topic and must persist across a disconnect, else a peer could
+        /// reconnect to bypass it and re-GRAFT straight back in. The backoff entry is
+        /// time-bounded and expires via the heartbeat scan, so leaving it is safe.
         fn dropPeerFromMeshAndFanout(router: *Self, peer: PeerId) void {
             const key = peerKey(&peer);
             var mesh_it = router.mesh.valueIterator();
@@ -1768,21 +1536,16 @@ pub fn Router(comptime Transport: type) type {
 
         // ----- direct-peer helpers ----------------------------------------
 
-        /// Whether `peer` is a configured direct (explicit) peer. A direct peer is
-        /// treated as trusted and out-of-mesh: it receives every valid message on a
-        /// topic it subscribes to, is never grafted/pruned into a mesh, and bypasses
-        /// the score gates. Inert (always false) when no direct peers are configured.
+        /// Whether `peer` is a configured direct (explicit) peer (see `direct`).
+        /// Inert (always false) when no direct peers are configured.
         fn isDirect(router: *const Self, peer: PeerId) bool {
             return router.direct.contains(peerKey(&peer));
         }
 
-        /// Fire-and-forget (re)dial every configured direct peer that is NOT
-        /// currently connected, via `transport.dial`. Keeps the explicit peering
-        /// up (go-libp2p `directConnect`): a direct peer that drops is reconnected,
-        /// a still-connected one is left alone (no redundant dial). Runs on the
-        /// router fiber, so the `peers`/`direct` reads are race-free; each dial
-        /// returns immediately (the transport owns the connection attempt), so
-        /// this never blocks the fiber. Inert when no direct peers are configured.
+        /// Fire-and-forget (re)dial every direct peer NOT currently connected, via
+        /// `transport.dial`, keeping the explicit peering up (go `directConnect`).
+        /// Runs on the router fiber (race-free `peers`/`direct` reads); each dial
+        /// returns immediately, so it never blocks. Inert when none are configured.
         fn dialDisconnectedDirectPeers(router: *Self) void {
             var it = router.direct.iterator();
             while (it.next()) |entry| {
@@ -1795,12 +1558,10 @@ pub fn Router(comptime Transport: type) type {
 
         // ----- scoring helpers --------------------------------------------
 
-        /// The peer's current score for gate decisions: read from the
-        /// per-heartbeat snapshot if present (the common case during mesh/gossip
-        /// maintenance, where the snapshot was just refreshed), else computed
-        /// live from the engine. Returns 0 when scoring is disabled (no engine),
-        /// so an "is this peer below zero?" gate is naturally inert. An untracked
-        /// peer also scores 0.
+        /// The peer's score for gate decisions: the per-heartbeat snapshot if present
+        /// (the common case during maintenance), else computed live. Returns 0 when
+        /// scoring is disabled or the peer is untracked, so a "below zero?" gate is
+        /// naturally inert.
         fn peerScore(router: *Self, peer: PeerId) f64 {
             const sc = router.score orelse return 0;
             if (router.score_snapshot.get(score_mod.peerKey(&peer))) |s| return s;
@@ -1837,28 +1598,22 @@ pub fn Router(comptime Transport: type) type {
 
         // ----- graft / prune peer selection -------------------------------
 
-        /// Select up to `n` peers to GRAFT into `topic`'s mesh: peers that
-        /// announced they subscribe to `topic`, are not already in its mesh, and
-        /// are not in backoff for it. Appends the chosen peers to `out` (capped at
-        /// `n`) and returns the count appended. ALL eligible candidates are
-        /// gathered, shuffled, and truncated to `n`, so grafts are a uniform
-        /// sample of the topic's peers rather than peer-map order (anti-eclipse;
-        /// go-libp2p shuffles its graft candidates the same way).
+        /// Select up to `n` peers to GRAFT into `topic`'s mesh: subscribed to
+        /// `topic`, not already in its mesh, not in backoff. Appends them to `out`
+        /// and returns the count. ALL eligible candidates are gathered, shuffled,
+        /// then truncated to `n`, so grafts are a uniform sample rather than peer-map
+        /// order (anti-eclipse; go-libp2p shuffles selection candidates the same way).
         fn selectGraftCandidates(router: *Self, topic: []const u8, n: usize, out: *std.ArrayListUnmanaged(PeerId)) usize {
             if (n == 0) return 0;
             var it = router.peers.iterator();
             while (it.next()) |entry| {
                 const peer = entry.value_ptr.*.peer;
                 if (!entry.value_ptr.*.topics.contains(topic)) continue;
-                // Never graft a direct (explicit) peer into a mesh — it is an
-                // out-of-mesh trusted forward target (go-libp2p filters direct
-                // peers out of every mesh-maintenance candidate selection).
-                if (router.isDirect(peer)) continue;
+                if (router.isDirect(peer)) continue; // direct peers are out-of-mesh
                 if (router.meshContains(topic, peer)) continue;
                 if (router.inBackoff(topic, peer)) continue;
-                // Never graft a negative-scoring peer into the mesh (go-libp2p
-                // only grafts peers at or above zero during maintenance). Inert
-                // when scoring is disabled (peerScore is 0).
+                // Maintenance only grafts peers at or above zero (inert when scoring
+                // is off, where peerScore is 0).
                 if (router.peerScore(peer) < 0) continue;
                 out.append(router.allocator, peer) catch break;
             }
@@ -1867,17 +1622,11 @@ pub fn Router(comptime Transport: type) type {
             return out.items.len;
         }
 
-        /// Select up to `n` current members of `topic`'s mesh to PRUNE out (used to
-        /// shrink an over-full mesh back toward D). Appends the chosen peers to
-        /// `out` and returns the count appended.
-        ///
-        /// With scoring enabled, the victims are the LOWEST-scoring excess: the
-        /// mesh members are sorted by score (descending) and the bottom `n` are
-        /// dropped, so the heartbeat retains the highest-scoring ~D peers (a
-        /// simplified form of go-libp2p's score-aware prune; the finer D_out
-        /// outbound-quota retention is a future refinement; equal scores break
-        /// ties randomly via a pre-sort shuffle). With scoring disabled the
-        /// victims are a uniform shuffled sample of the mesh.
+        /// Select up to `n` members of `topic`'s mesh to PRUNE out (shrinking an
+        /// over-full mesh toward D); appends them to `out` and returns the count.
+        /// With scoring enabled the victims are the LOWEST-scoring excess (retaining
+        /// the highest-scoring ~D peers; ties broken randomly via a pre-sort shuffle).
+        /// With scoring disabled they are a uniform shuffled sample.
         fn selectPruneVictims(router: *Self, topic: []const u8, n: usize, out: *std.ArrayListUnmanaged(PeerKey)) usize {
             if (n == 0) return 0;
             const set = router.mesh.getPtr(topic) orelse return 0;
@@ -1968,10 +1717,7 @@ pub fn Router(comptime Transport: type) type {
             while (it.next()) |entry| {
                 const peer = entry.value_ptr.*.peer;
                 if (!entry.value_ptr.*.topics.contains(topic)) continue;
-                // A direct (explicit) peer is never placed in a fanout set: it is
-                // an out-of-mesh trusted forward target, reached via the direct
-                // path on every publish (go filters direct peers out of fanout).
-                if (router.isDirect(peer)) continue;
+                if (router.isDirect(peer)) continue; // direct peers are out-of-fanout
                 if (set.contains(peerKey(&peer))) continue;
                 candidates.append(router.allocator, peer) catch break;
             }
@@ -1982,23 +1728,19 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
-        /// Build a transient PeerSet of every tracked peer subscribed to `topic`
-        /// that is eligible to receive an originated (flood-published) message —
-        /// i.e. above the publish threshold when scoring is on, all of them when
-        /// scoring is off. The caller OWNS the returned set and must `deinit` it;
-        /// it is used only to TARGET the flood (the frame's references are held by
-        /// the per-peer queues, not the set), so freeing it does not touch any
-        /// frame. Returns an empty set on allocation failure (the publish still
-        /// caches; it simply reaches no peers).
+        /// Build a transient PeerSet of every topic subscriber eligible for an
+        /// originated (flood-published) message (above the publish threshold when
+        /// scoring is on, all of them when off). The caller OWNS and must `deinit`
+        /// it; it only TARGETS the flood (frame references live on the per-peer
+        /// queues), so freeing it touches no frame. Empty on OOM.
         fn floodTargets(router: *Self, topic: []const u8) PeerSet {
             var set: PeerSet = .empty;
             var it = router.peers.iterator();
             while (it.next()) |entry| {
                 const peer = entry.value_ptr.*.peer;
                 if (!entry.value_ptr.*.topics.contains(topic)) continue;
-                // A direct peer is always flooded to (go floods to `direct ||
-                // score >= publishThreshold`), so it skips the publish-threshold
-                // gate; any other peer must be at or above the threshold.
+                // go floods to `direct || score >= publishThreshold`: a direct peer
+                // skips the threshold gate, any other must clear it.
                 if (!router.isDirect(peer) and !router.abovePublishThreshold(peer)) continue;
                 set.put(router.allocator, peerKey(&peer), {}) catch break;
             }
@@ -2093,13 +1835,11 @@ pub fn Router(comptime Transport: type) type {
         // ----- main fiber --------------------------------------------------
 
         fn mainLoop(router: *Self) void {
-            // On any exit (shutdown, closed inboxes, cancellation) tear down
-            // every peer and drain both inboxes so nothing leaks. Close the
-            // inboxes FIRST: close wakes every producer parked on a full queue
-            // with error.Closed — including a writer's disconnect post —
-            // BEFORE teardownAllPeers joins those writer fibers. The reverse
-            // order would await a fiber parked on a queue that only this (now
-            // tearing-down) fiber drains. drainInbox's own closes are
+            // On any exit, tear down every peer and drain both inboxes so nothing
+            // leaks. Close the inboxes FIRST: close wakes every parked producer
+            // (including a writer's disconnect post) with error.Closed BEFORE
+            // teardownAllPeers joins those writers — the reverse order would await a
+            // fiber parked on a queue only this fiber drains. drainInbox's closes are
             // idempotent.
             defer {
                 router.control_inbox.close(router.io);
@@ -2108,20 +1848,15 @@ pub fn Router(comptime Transport: type) type {
                 router.drainInbox();
             }
 
-            // TWO inboxes, control before data: every iteration drains ALL
-            // queued CONTROL commands (validation verdicts — which free the
-            // bounded in-flight validation slots — peer lifecycle, the
-            // heartbeat, shutdown) before taking ONE data command. A single
-            // FIFO inbox lets a data flood queue ahead of the verdicts that
-            // recycle validation slots, starving the async pipeline into
-            // throttle-dropping nearly all of itself, and backpressures
-            // lifecycle events behind data. Two queues bound control latency by
-            // ONE data command's processing time. Wakeups need no extra
-            // primitive: a
-            // control producer follows its post with a best-effort
-            // `.control_ready` marker into the DATA queue (see notifyControl)
-            // — if the data queue is full the consumer is necessarily awake
-            // already, so the dropped marker loses nothing.
+            // TWO inboxes, control before data: each iteration drains ALL queued
+            // CONTROL commands (verdicts that recycle validation slots, peer
+            // lifecycle, heartbeat, shutdown) before taking ONE data command. A single
+            // FIFO inbox would let a data flood queue ahead of the verdicts, starving
+            // the async pipeline into throttle-dropping itself, and backpressure
+            // lifecycle behind data. Two queues bound control latency to one data
+            // command. Wakeup: a control post drops a best-effort `.control_ready`
+            // marker into the DATA queue (see notifyControl) — a full data queue means
+            // the consumer is already awake, so the dropped marker loses nothing.
             while (true) {
                 if (router.drainControl()) return;
                 const command = router.inbox.getOne(router.io) catch return; // Closed/Canceled
@@ -2177,17 +1912,14 @@ pub fn Router(comptime Transport: type) type {
             return false;
         }
 
-        /// Best-effort wake for a control post: a `.control_ready` marker into
-        /// the data inbox unparks a consumer blocked in `getOne`. Non-blocking
-        /// (`min = 0`): a FULL data inbox means the consumer is awake and will
-        /// drain control at its next loop top, so dropping the marker is safe —
-        /// the marker is ONLY a waker, never a carrier.
-        /// Resolve a `sync` barrier. In queued-delivery mode the reply is
-        /// ROUTED THROUGH the delivery queue as a fence, so "sync returned"
-        /// keeps meaning "every prior command AND every delivery it produced
-        /// has fully happened" — the contract the test suite is built on. The
-        /// put is cancelable: at teardown-cancel (or a closed queue) nothing
-        /// is pending for the syncing fiber to observe, so set directly.
+        /// Best-effort wake for a control post: a `.control_ready` marker into the
+        /// data inbox unparks a consumer blocked in `getOne`. Non-blocking — a full
+        /// data inbox means the consumer is already awake, so the dropped marker is
+        /// safe (it is ONLY a waker, never a carrier).
+        /// Resolve a `sync` barrier. In queued-delivery mode the reply is ROUTED
+        /// THROUGH the delivery queue as a fence, so "sync returned" keeps meaning
+        /// "every prior command AND its deliveries have happened" (the test contract).
+        /// On a closed/cancelled queue nothing is pending, so set directly.
         fn fenceSync(router: *Self, reply: *std.Io.Event) void {
             if (router.delivery_storage.len == 0) {
                 reply.set(router.io);
@@ -2257,12 +1989,10 @@ pub fn Router(comptime Transport: type) type {
             // the PeerState (and the writer fiber draining its queue) survives.
             state.writer_future = future;
             router.peers.put(key, state) catch {
-                // The map insert failed after the writer fiber started. Tear the
-                // writer down cleanly (close queue, cancel+await fiber) before
-                // freeing, so we don't leak the fiber or use-after-free the sink.
-                // Cancel before await so a writer parked in its reopen backoff
-                // does not stall this fiber; the backoff sleep is a cancellation
-                // point.
+                // Map insert failed after the writer fiber started. Tear it down
+                // cleanly (close queue, cancel+await) before freeing, so the fiber is
+                // not leaked nor the sink used-after-free. Cancel before await so a
+                // writer parked in its reopen backoff does not stall this fiber.
                 state.queue.close(router.io);
                 var f = future;
                 f.cancel(router.io);
@@ -2283,12 +2013,9 @@ pub fn Router(comptime Transport: type) type {
                 state.protocol_version = kv.value;
             }
 
-            // Adopt subscriptions the peer announced before this connect (stashed
-            // by applyPeerSubscription because the PeerState did not exist yet).
-            // Apply each now that it does, then free the stash. Without this the
-            // early SUBSCRIBE is lost and the peer is never seen as a subscriber,
-            // so it is excluded from flood-publish + mesh GRAFT (all-same-impl
-            // networks then fail to propagate).
+            // Adopt subscriptions the peer announced before this connect (stashed in
+            // `pending_subscriptions`), then free the stash — else the early SUBSCRIBE
+            // is lost and the peer is never seen as a subscriber.
             if (router.pending_subscriptions.fetchRemove(key)) |kv| {
                 var set = kv.value;
                 var kit = set.keyIterator();
@@ -2308,11 +2035,9 @@ pub fn Router(comptime Transport: type) type {
                 sc.addIP(peer, remote_addr);
             }
 
-            // Tell the new peer which topics we already subscribe to, so it can
-            // start forwarding matching messages to us right away (mirrors how
-            // go-libp2p-pubsub sends the full current subscription set on a new
-            // connection). Best-effort: a framing/push failure just means the peer
-            // learns our subscriptions on our next subscribe/unsubscribe.
+            // Tell the new peer which topics we already subscribe to, so it forwards
+            // matching messages to us right away (go sends the full subscription set
+            // on a new connection). Best-effort.
             router.sendCurrentSubscriptions(state);
         }
 
@@ -2330,17 +2055,12 @@ pub fn Router(comptime Transport: type) type {
         };
 
         /// Frame `rpc` ONCE into a refcounted shared `OutboundFrame` and hand one
-        /// reference to each resolved target's `lane` queue — the single home of
-        /// the builder-reference protocol (frame once, hold the builder reference,
-        /// `retain` before every push and `release` on a rejected push, then drop
-        /// the builder reference at the end so the frame frees itself iff no queue
-        /// kept a copy). No per-peer copy of the (up-to-1 MiB) wire bytes.
-        ///
-        /// The frames built here carry no message id: only data frames need one
-        /// (for IDONTWANT matching) and the sole data-frame producer is
-        /// `cacheAndForward`, which builds its frame directly. Best-effort
-        /// throughout (a void return): a framing failure or a per-peer push
-        /// failure logs nothing and simply drops that copy.
+        /// reference to each resolved target's `lane` queue — the builder-reference
+        /// protocol: hold the builder reference, `retain` before each push and
+        /// `release` on a rejected push, then drop the builder reference at the end so
+        /// the frame frees itself iff no queue kept a copy. No per-peer copy of the
+        /// (up-to-1 MiB) wire bytes. Frames built here carry no message id (only data
+        /// frames need one, and `cacheAndForward` builds those directly). Best-effort.
         fn fanOut(router: *Self, lane: peer_io.Lane, rpc_frame: rpc_pb.RPC, targets: Targets) void {
             const framed = pubsub.frameRpc(router.allocator, rpc_frame) catch return;
             const frame = peer_io.OutboundFrame.create(router.allocator, framed, null, 1) catch {
@@ -2353,14 +2073,11 @@ pub fn Router(comptime Transport: type) type {
             router.fanOutFrame(lane, frame, targets);
         }
 
-        /// Fan an already-built shared frame out to `targets` on `lane`, handing
-        /// one reference to each resolved peer's queue (`pushTo` retains before
-        /// the push and releases on a rejected push). The CALLER owns its builder
-        /// reference and must release it afterward — this does NOT consume one.
-        /// Lets a caller that built a frame once (e.g. the message forward path,
-        /// which also stores the frame in the message cache) reuse it across both
-        /// the cache and the fan-out without re-framing. The set, when given, is
-        /// borrowed and read on this fiber, so it cannot mutate underneath us.
+        /// Fan an already-built shared frame out to `targets` on `lane`, handing one
+        /// reference to each resolved peer's queue (`pushTo` retains per push). The
+        /// CALLER owns its builder reference and must release it afterward — this does
+        /// NOT consume one — so a caller that built the frame once (e.g. the forward
+        /// path, which also caches it) can reuse it without re-framing.
         fn fanOutFrame(router: *Self, lane: peer_io.Lane, frame: *peer_io.OutboundFrame, targets: Targets) void {
             switch (targets) {
                 .one => |peer| {
@@ -2382,14 +2099,10 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
-        /// Hand one shared-frame reference to a peer's lane queue: retain before
-        /// the push, release on a rejected push (the queue did not take it).
-        ///
-        /// Honours the peer's IDONTWANT (`dont_send`): if the id the frame carries
-        /// is one the peer told us it already has, the frame is SKIPPED (not
-        /// enqueued) — saving the bandwidth IDONTWANT is for. A skipped target
-        /// simply does not `retain`, so the refcount stays balanced. Only data
-        /// frames carry an id, so control/subscribe pushes are never skipped.
+        /// Hand one shared-frame reference to a peer's lane queue: retain before the
+        /// push, release on a rejected push. Honours the peer's IDONTWANT
+        /// (`dont_send`): a frame whose id the peer already has is SKIPPED (not
+        /// retained, so the refcount stays balanced). Only data frames carry an id.
         fn pushTo(router: *Self, state: *PeerState, lane: peer_io.Lane, frame: *peer_io.OutboundFrame) void {
             if (frame.message_id) |id| {
                 if (state.dont_send.contains(id)) {
@@ -2411,12 +2124,8 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Send the local node's full current subscription set to one peer's
-        /// `.subscribe` lane as a single subscription RPC. No-op when we have no
-        /// subscriptions. Best-effort: drops the frame on a push failure.
-        ///
-        /// The transient SubOpts array (one entry per local topic) is the only
-        /// genuinely multi-allocation scratch on this path, so it goes in a
-        /// per-command arena that is freed in one shot — no per-entry bookkeeping.
+        /// `.subscribe` lane as a single RPC. No-op when we have none; best-effort.
+        /// The transient SubOpts scratch goes in a per-command arena, freed in one shot.
         fn sendCurrentSubscriptions(router: *Self, state: *PeerState) void {
             if (router.gs_debug) {
                 std.log.info("GS_DEBUG sendCurrentSubscriptions my_topics={d} peers={d}", .{ router.my_topics.count(), router.peers.count() });
@@ -2436,22 +2145,18 @@ pub fn Router(comptime Transport: type) type {
             router.fanOut(.subscribe, (rpc.RpcOut{ .subscriptions = subs.items }).toRpc(), .{ .one = state.peer });
         }
 
-        /// Handle a connection to a peer dying: tear the peer down ONLY when the
-        /// dead connection is the one its PeerState is bound to. The event fires
-        /// once per connection, so in the simultaneous-dial case (both sides
-        /// dial; the second connect was dedup'd by onPeerConnected) the dedup'd
-        /// duplicate's close arrives here too — keyed on PeerId alone it would
-        /// destroy the LIVE peer's mesh/writer/score state out from under its
-        /// healthy connection. An absent peer (already removed) is a no-op.
+        /// Handle a connection dying: tear the peer down ONLY when the dead connection
+        /// is the one its PeerState is bound to. The event fires once per connection,
+        /// so a dedup'd duplicate's close (simultaneous dial) arrives here too — keyed
+        /// on PeerId alone it would destroy the LIVE peer's state out from under its
+        /// healthy connection. An absent peer is a no-op.
         fn onPeerDisconnected(router: *Self, peer: PeerId, conn: ConnHandle) void {
             const key = peerKey(&peer);
             if (router.peers.get(key)) |state| {
                 if (state.conn != conn) {
-                    // A connection this peer's state never adopted died. The
-                    // duplicate produced no router state of its own (dedup'd at
-                    // connect, before makeSink), so there is nothing to clean —
-                    // and the pre-connect stashes below belong to the live
-                    // peer's streams, not to it. Ignore entirely.
+                    // A connection this peer's state never adopted died — the dedup'd
+                    // duplicate produced no router state of its own, so ignore it (the
+                    // pre-connect stashes below belong to the live peer).
                     return;
                 }
             }
@@ -2473,12 +2178,10 @@ pub fn Router(comptime Transport: type) type {
             _ = router.peer_count.fetchSub(1, .release);
         }
 
-        /// Record the /meshsub version a peer negotiated on its inbound stream.
-        /// If the peer is already tracked, update its PeerState directly;
-        /// otherwise stash it in `peer_versions` so the pending `peer_connected`
-        /// adopts it (the inbound stream can be negotiated before the peer-event
-        /// callback fires). Best-effort: a failed stash just leaves the peer at
-        /// the 1.1 default until it reconnects or sends again.
+        /// Record the /meshsub version a peer negotiated: update its PeerState if
+        /// tracked, else stash it in `peer_versions` for `peer_connected` to adopt
+        /// (the inbound stream can negotiate before the peer-event callback fires).
+        /// Best-effort — a failed stash leaves the peer at the 1.1 default.
         fn onPeerProtocol(router: *Self, peer: PeerId, version: pubsub.Version) void {
             const key = peerKey(&peer);
             if (router.peers.get(key)) |state| {
@@ -2507,14 +2210,10 @@ pub fn Router(comptime Transport: type) type {
             router.notifyControl();
         }
 
-        /// Post a peer's signed peer record (from libp2p identify) onto the router
-        /// inbox so the router fiber verifies it and stores it in the certified-
-        /// record store. `envelope_bytes` MUST be a router-allocator-owned copy:
-        /// ownership transfers to the router, which frees it after processing (and
-        /// frees it too if the inbox is closed at shutdown). Called from the
-        /// identify binding — off the router fiber — so it only posts. Best-effort:
-        /// on a closed inbox (shutting down) the bytes are freed and the post is a
-        /// no-op.
+        /// Post a peer's signed record (from identify) onto the router inbox for the
+        /// router fiber to verify + store. `envelope_bytes` MUST be router-allocator
+        /// owned: ownership transfers to the router, freed after processing (or here
+        /// if the inbox is closed at shutdown). Called off the router fiber.
         pub fn postPeerRecord(router: *Self, io: std.Io, peer: PeerId, envelope_bytes: []u8) void {
             router.control_inbox.putOne(io, .{ .peer_record = .{ .peer = peer, .envelope_bytes = envelope_bytes } }) catch {
                 router.allocator.free(envelope_bytes);
@@ -2523,16 +2222,13 @@ pub fn Router(comptime Transport: type) type {
             router.notifyControl();
         }
 
-        /// Tear down every peer whose `writer_dead` flag is set — the writer
-        /// fiber gave up (open exhaustion) and signalled via the flag. Runs on
-        /// the router fiber, invoked by the writer's `reap_dead_writers` wake
-        /// and by every heartbeat (the lossless fallback when that wake was
-        /// dropped on a full inbox). The teardown passes the PeerState's OWN
-        /// bound connection, so identity always matches — unlike a
-        /// writer-carried handle, this cannot alias a recycled address (ABA).
-        /// Teardown mutates the map, so restart the iteration after each
-        /// removal — flagged peers are rare (k is almost always 0), so this
-        /// stays one O(peers) scan per call.
+        /// Tear down every peer whose `writer_dead` flag is set (its writer gave up).
+        /// Runs on the router fiber, invoked by the `reap_dead_writers` wake and by
+        /// every heartbeat (the lossless fallback for a dropped wake). Passes the
+        /// PeerState's OWN bound connection, so identity always matches — unlike a
+        /// writer-carried handle, this cannot alias a recycled address (ABA). Teardown
+        /// mutates the map, so restart the iteration after each removal (flagged peers
+        /// are rare, so this stays one O(peers) scan).
         fn reapDeadWriters(router: *Self) void {
             reap: while (true) {
                 var it = router.peers.valueIterator();
@@ -2562,13 +2258,10 @@ pub fn Router(comptime Transport: type) type {
             // `reap_dead_writers` wake.
             router.reapDeadWriters();
 
-            // Ensure direct peers are connected (go-libp2p `directConnect`): every
-            // `direct_connect_ticks` heartbeats, (re)dial any direct peer that is
-            // not currently connected. The tick was just incremented (matching go,
-            // which bumps `heartbeatTicks` before the check), so the first dial
-            // pass lands at tick `direct_connect_ticks`, not tick 0 — the start-time
-            // dial in `start` covers the initial connect. Cheap + inert when no
-            // direct peers are configured.
+            // Re-dial disconnected direct peers every `direct_connect_ticks`
+            // heartbeats (go `directConnect`). The tick was just incremented, so the
+            // first pass lands at tick `direct_connect_ticks`, not 0 (the start-time
+            // dial covers the initial connect). Inert when none are configured.
             if (mesh_params.direct_connect_ticks > 0 and tick % mesh_params.direct_connect_ticks == 0) {
                 router.dialDisconnectedDirectPeers();
             }
@@ -2598,11 +2291,9 @@ pub fn Router(comptime Transport: type) type {
                 }
             }
 
-            // Expire stale per-peer IDONTWANT entries (the id is now sendable
-            // again). Each removed entry releases its interned reference (no
-            // explicit byte free). Same restart-after-removal pattern as the
-            // backoff scan: a removal can move the unscanned tail in an
-            // open-addressing map. The map entry is removed BEFORE its rc is
+            // Expire stale per-peer IDONTWANT entries (the id is sendable again),
+            // releasing each entry's interned reference. Same restart-after-removal
+            // pattern as the backoff scan; the entry is removed BEFORE its rc is
             // released (the key aliases the rc's bytes).
             var peer_it = router.peers.valueIterator();
             while (peer_it.next()) |state_ptr| {
@@ -2622,25 +2313,18 @@ pub fn Router(comptime Transport: type) type {
                     }
                 }
 
-                // Reset the per-heartbeat anti-spam counters. The IHAVE-message and
-                // IDONTWANT-message budgets reopen for the new window (go resets
-                // both per heartbeat), and the IWANT retransmission counts age out
-                // with the gossip window (go clears these alongside the mcache
-                // slide). Freeing each owned id key keeps `iwant_counts` from
-                // leaking.
+                // Reset the per-heartbeat anti-spam budgets and age the IWANT
+                // retransmission counts out with the gossip window (clearing them
+                // releases each entry's interned id).
                 state_ptr.*.ihave_received_this_window = 0;
                 state_ptr.*.idontwant_received_this_window = 0;
                 router.clearIWantCounts(state_ptr.*);
 
-                // Harvest broken IWANT promises: any promise whose deadline tick
-                // has passed (`deadline < tick`, i.e. the peer did not deliver in
-                // time — go's strict `expire.Before(now)`) is broken. Count this
-                // peer's broken promises and release each removed entry's interned
-                // reference; the single per-peer penalty is applied below (go's
-                // GetBrokenPromises returns a per-peer count, then
-                // AddBehaviourPenalty(p, count) once each). No-op when scoring is
-                // disabled (the map is always empty then). Entry removed BEFORE its
-                // rc is released (the key aliases the rc's bytes).
+                // Harvest broken IWANT promises: any with `deadline < tick` (go's
+                // `expire.Before(now)`) is broken. Count this peer's broken promises
+                // (releasing each entry's interned reference) and charge ONE penalty
+                // for the count below (go's AddBehaviourPenalty(p, count) once each).
+                // No-op when scoring is off. Entry removed BEFORE its rc is released.
                 const promises = &state_ptr.*.iwant_promises;
                 var broken: f64 = 0;
                 var changed_p = true;
@@ -2663,11 +2347,9 @@ pub fn Router(comptime Transport: type) type {
                 }
             }
 
-            // Advance the scoring engine one tick (decays the fading counters,
-            // accrues mesh time, activates P3, purges long-gone peers) and
-            // refresh the per-heartbeat score snapshot, BEFORE mesh/gossip
-            // maintenance so every gate below runs on the freshly-decayed scores
-            // (go-libp2p caches scores per heartbeat the same way).
+            // Advance the scoring engine one tick and refresh the snapshot BEFORE
+            // mesh/gossip maintenance, so every gate below runs on freshly-decayed
+            // scores (go caches scores per heartbeat too).
             router.refreshScoreSnapshot();
 
             router.maintainMeshes();
@@ -2700,16 +2382,11 @@ pub fn Router(comptime Transport: type) type {
             router.message_cache.shift();
         }
 
-        /// Emit IHAVE gossip for every topic we participate in. For each topic
-        /// (subscribed topics, plus active fanout topics) advertise the message ids
-        /// in the cache's gossipable windows to a slice of the peers that subscribe
-        /// to the topic but are NOT in its mesh (and, for a fanout topic, not in its
-        /// fanout set) — the "lazy" peers that get gossip rather than full messages.
-        /// The slice size is `max(gossip_factor * eligible, d_lazy)`.
-        ///
-        /// Selection is deterministic (peer-map iteration order); a random shuffle
-        /// for anti-eclipse fairness is a future refinement. Score-gated emission is
-        /// applied (peers below the gossip threshold are excluded).
+        /// Emit IHAVE gossip for every topic we participate in (subscribed + active
+        /// fanout topics): advertise the cache's gossipable ids to the "lazy" peers —
+        /// subscribers NOT in the topic's mesh (or, for a fanout topic, its fanout
+        /// set) that get gossip rather than full messages. See `selectGossipTargets`
+        /// for the slice size and the score gate.
         fn emitGossip(router: *Self) void {
             var topic_it = router.my_topics.keyIterator();
             while (topic_it.next()) |key| router.emitGossipForTopic(key.*);
@@ -2742,25 +2419,18 @@ pub fn Router(comptime Transport: type) type {
             router.selectGossipTargets(topic, &targets);
             if (targets.items.len == 0) return;
 
-            // Build the IHAVE frame ONCE and hand each target a refcounted
-            // reference: every target gets the identical id list (the cap is a
-            // deterministic prefix), so encoding it once instead of per-target
-            // saves megabytes of redundant encoding per heartbeat at eth2 shape
-            // (5000 ids ≈ 170 KB per encode × ~16 targets per topic). If
-            // per-target shuffle SAMPLING of the over-cap id set is added for
-            // go-parity later, this sharing must give way for that case.
+            // Build the IHAVE frame ONCE and share it by reference: every target gets
+            // the identical (deterministically-capped) id list, so encoding once
+            // instead of per-target saves megabytes of redundant encoding per
+            // heartbeat at eth2 shape.
             router.sendIHaveShared(topic, capped, targets.items);
         }
 
-        /// Append the gossip targets for `topic` to `out`: a slice of the peers
-        /// that announced they subscribe to `topic` but are NOT in its mesh and NOT
-        /// in its fanout set (those already get full messages) and clear the gossip
-        /// score threshold. The slice size is `max(gossip_factor * eligible_count,
-        /// d_lazy)` — a proportional fan-out that still gossips to at least `d_lazy`
-        /// peers in small topics. All eligible peers are gathered first (so the
-        /// count is exact), then SHUFFLED and truncated to the target, so the
-        /// gossip fringe is a uniform sample rather than peer-map order
-        /// (go-libp2p shuffles its gossip candidates the same way).
+        /// Append the gossip targets for `topic` to `out`: subscribers NOT in its
+        /// mesh or fanout (those already get full messages) that clear the gossip
+        /// score threshold. The slice size is `max(gossip_factor * eligible, d_lazy)`.
+        /// All eligible peers are gathered, shuffled, then truncated (anti-eclipse, as
+        /// in `selectGraftCandidates`).
         fn selectGossipTargets(router: *Self, topic: []const u8, out: *std.ArrayListUnmanaged(PeerId)) void {
             const mesh_set = router.mesh.getPtr(topic);
             const fanout_set = router.fanout.getPtr(topic);
@@ -2771,16 +2441,11 @@ pub fn Router(comptime Transport: type) type {
                 const key = peerKey(&peer);
                 if (mesh_set) |s| if (s.contains(key)) continue;
                 if (fanout_set) |s| if (s.contains(key)) continue;
-                // Never emit IHAVE to a direct (explicit) peer: it already
-                // receives every full message on the topic via the direct forward
-                // path, so gossiping ids to it is pointless (go excludes direct
-                // peers from gossip emission for exactly this reason).
+                // A direct peer already gets every full message via the direct path,
+                // so gossiping ids to it is pointless.
                 if (router.isDirect(peer)) continue;
-                // Gossip gate: only advertise (IHAVE) to peers whose score clears
-                // the gossip threshold; a peer below it is denied gossip. Reads
-                // the per-heartbeat snapshot (gossip emission runs after the
-                // snapshot refresh) rather than recomputing the score. No effect
-                // when scoring is disabled (the `if` is skipped).
+                // Gossip gate: only IHAVE to peers clearing the gossip threshold.
+                // Inert when scoring is disabled.
                 if (router.score) |sc| {
                     if (router.peerScore(peer) < sc.thresholds.gossip_threshold) continue;
                 }
@@ -2798,14 +2463,11 @@ pub fn Router(comptime Transport: type) type {
             if (out.items.len > target) out.shrinkRetainingCapacity(target);
         }
 
-        /// Send one IHAVE(topic, ids) frame to every peer in `targets` on their
-        /// control lanes: the RPC is protobuf-encoded once and the resulting
-        /// frame shared by reference (`pushTo` retains per accepted push; the
-        /// builder reference is released at the end, so a total push failure
-        /// frees the frame). The borrowed `ids` are copied by `frameRpc`, so
-        /// they need only outlive this call. The IHAVE builder takes
-        /// `[]const ?[]const u8`, so the ids are wrapped through a small
-        /// scratch array of optionals (freed once the frame is built).
+        /// Send one IHAVE(topic, ids) frame to every peer in `targets` on its control
+        /// lane: encoded once and shared by reference (builder reference released at
+        /// the end, so a total push failure frees it). `ids` are copied by `frameRpc`,
+        /// so they need only outlive this call; they are wrapped through a small
+        /// scratch array of optionals for the builder.
         fn sendIHaveShared(router: *Self, topic: []const u8, ids: []const []const u8, targets: []const PeerId) void {
             const opt_ids = router.allocator.alloc(?[]const u8, ids.len) catch return;
             defer router.allocator.free(opt_ids);
@@ -2825,24 +2487,19 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
-        /// Mesh maintenance for every subscribed topic: first (when scoring is
-        /// enabled) prune any current mesh peer that has gone negative, then graft
-        /// new peers in when the mesh is below D_low (up to the target D), and
-        /// prune excess peers out when it is above D_high (down to D). The
-        /// negative-peer prune runs every heartbeat, independent of the D_high
-        /// overflow, so a misbehaving peer leaves the mesh promptly. Iterating
-        /// `my_topics` while grafting/pruning only mutates the `mesh`/`backoff`
-        /// maps (never `my_topics`), so the iterator stays valid.
+        /// Mesh maintenance for every subscribed topic: first (when scoring is on)
+        /// prune any mesh peer gone negative, then graft up to D when below D_low and
+        /// prune down to D when above D_high. The negative-peer prune runs every
+        /// heartbeat (independent of the D_high overflow), so a misbehaving peer
+        /// leaves promptly. Grafting/pruning only mutates `mesh`/`backoff`, never
+        /// `my_topics`, so the iterator stays valid.
         fn maintainMeshes(router: *Self) void {
             var topic_it = router.my_topics.keyIterator();
             while (topic_it.next()) |key| {
                 const topic = key.*;
                 router.pruneNegativeMeshPeers(topic);
                 const size = router.meshSize(topic);
-                // The degree targets come from `router.mesh_degree` (the
-                // `mesh_params` baseline unless overridden via config), so a small
-                // topology can be driven over-degree on purpose. Every other mesh
-                // parameter stays at the module baseline.
+                // Degree targets from `router.mesh_degree` (see that field).
                 const degree = router.mesh_degree;
                 if (size < degree.d_low) {
                     router.graftToTarget(topic, degree.d - size);
@@ -2904,12 +2561,10 @@ pub fn Router(comptime Transport: type) type {
             defer victims.deinit(router.allocator);
             _ = router.selectPruneVictims(topic, excess, &victims);
 
-            // Remove + back off EVERY victim FIRST, then send the PRUNEs. This
-            // matches go (the heartbeat decides all prunes, then `sendGraftPrune`
-            // builds each PRUNE against the FINAL mesh): peer-exchange offers in a
-            // PRUNE are drawn from the SURVIVING mesh peers only, never a peer we
-            // are simultaneously pruning. Doing the removal in a first pass keeps
-            // the PX selection deterministic and leak-free.
+            // Remove + back off EVERY victim FIRST, then send the PRUNEs, so the
+            // peer-exchange offers in each PRUNE are drawn from the SURVIVING mesh
+            // only — never a peer we are simultaneously pruning (matching go, which
+            // builds PRUNEs against the final mesh).
             for (victims.items) |key| {
                 if (router.peers.get(key)) |peer| {
                     router.meshRemove(topic, peer.peer);
@@ -2962,16 +2617,12 @@ pub fn Router(comptime Transport: type) type {
             const source = owned.peer;
             var reader = owned.rpc.reader;
 
-            // Graylist gate: a peer whose score has sunk at or below the graylist
-            // threshold is ignored entirely — drop the whole RPC without parsing
-            // its subscriptions, publishes, or control. The OwnedRpc is freed by
-            // the defer above. No-op when scoring is disabled. (Uses a live score
-            // rather than the per-heartbeat snapshot: an RPC can arrive between
-            // heartbeats, and a peer that just crossed the graylist line should be
-            // shut out immediately, matching go-libp2p's per-RPC check.) A direct
-            // (explicit) peer is exempt — go-libp2p's `AcceptFrom` returns
-            // AcceptAll for a direct peer, so its RPCs are processed regardless of
-            // score (it is trusted by configuration).
+            // Graylist gate: a peer at or below the graylist threshold is ignored
+            // entirely (the whole RPC is dropped unparsed, freed by the defer above).
+            // Uses a LIVE score, not the snapshot, so a peer that just crossed the
+            // line is shut out immediately (go's per-RPC check). A direct peer is
+            // exempt (go's `AcceptFrom` returns AcceptAll for it). Inert when scoring
+            // is off.
             if (router.score) |sc| {
                 if (!router.isDirect(source) and sc.belowGraylist(source)) return;
             }
@@ -2997,14 +2648,9 @@ pub fn Router(comptime Transport: type) type {
                 );
             }
 
-            // Mesh + gossip control. GRAFT/PRUNE move the source peer in/out of a
-            // topic's mesh. IHAVE makes us reply with an IWANT for the ids we have
-            // not seen; IWANT makes us serve the requested messages from the cache.
-            // IDONTWANT records the ids the source already has (so we stop sending
-            // them) and purges any still-queued copies to it. Any control replies
-            // (a PRUNE rejecting a GRAFT, an IWANT, a served message) are built +
-            // framed inside the handlers, which copy the bytes, so freeing the
-            // OwnedRpc after this returns is safe.
+            // Mesh + gossip control (GRAFT/PRUNE/IHAVE/IWANT/IDONTWANT — see each
+            // handler). Control replies are framed inside the handlers, which copy the
+            // bytes, so freeing the OwnedRpc after this returns is safe.
             if (reader.getControl()) |ctrl_reader| {
                 var control = ctrl_reader;
                 while (control.graftNext()) |graft| {
@@ -3029,23 +2675,12 @@ pub fn Router(comptime Transport: type) type {
             } else |_| {}
         }
 
-        /// Handle an inbound IHAVE: the source peer announces it holds the listed
-        /// message ids for a topic. Request (in ONE IWANT, on the control lane) the
-        /// ids we have NOT already seen — capped at `max_iwant_request_ids` so one
-        /// peer's IHAVE cannot make us request an unbounded set. The unseen ids are
-        /// copied into a transient owned list (the wire-borrowed ids back the reader
-        /// bytes, which `frameRpc` copies, but a local list keeps the call simple
-        /// and lets us dedup within the IHAVE). We do NOT mark these ids seen — that
-        /// happens only on actual receipt of the message (via the normal inbound
-        /// path), so a dropped IWANT/serve does not permanently suppress the id.
-        ///
-        /// Finer rate-limiting and IWANT-promise tracking (so a peer that fails to
-        /// deliver what it advertised is penalised) arrive with peer scoring.
-        ///
-        /// Anti-spam: each inbound IHAVE counts against the peer's per-heartbeat
-        /// budget (`max_ihave_messages`). Once the peer has spent it for this
-        /// heartbeat window, further IHAVEs from it are dropped (no IWANT) until
-        /// the next heartbeat resets the counter.
+        /// Handle an inbound IHAVE: request (in ONE IWANT) the advertised ids we have
+        /// NOT already seen, capped at `max_iwant_request_ids`. We do NOT mark these
+        /// ids seen — that happens only on actual receipt — so a dropped IWANT/serve
+        /// does not permanently suppress the id. Anti-spam: each IHAVE counts against
+        /// the peer's per-heartbeat `max_ihave_messages` budget; once spent, further
+        /// IHAVEs are dropped until the next heartbeat.
         fn handleIHave(router: *Self, source: PeerId, ihave: *rpc_pb.ControlIHaveReader) void {
             const state = router.peers.get(peerKey(&source)) orelse return;
 
@@ -3064,11 +2699,9 @@ pub fn Router(comptime Transport: type) type {
             }
             if (wanted.items.len == 0) return;
 
-            // Track an IWANT promise so a peer that advertises an id (IHAVE) it then
-            // fails to serve is charged a P7 behaviour penalty. go records exactly
-            // ONE promise per IWANT (a random id from the requested list); we record
-            // the first requested id. Only when scoring is enabled — the penalty has
-            // nowhere to land otherwise, so we skip the bookkeeping entirely.
+            // Track an IWANT promise so an advertiser that fails to serve is charged
+            // P7. go records exactly ONE promise per IWANT (a random id); we record
+            // the first. Only when scoring is on (the penalty has nowhere to land otherwise).
             if (router.score != null) {
                 if (wanted.items[0]) |first_id| router.addPromise(state, first_id);
             }
@@ -3078,13 +2711,10 @@ pub fn Router(comptime Transport: type) type {
             router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), .{ .one = source });
         }
 
-        /// Record an IWANT promise: `state`'s peer must deliver message id `id` by
-        /// `heartbeat_tick + iwant_followup_ticks` or the heartbeat charges it a P7
-        /// behaviour penalty. An existing promise for the id is left as-is (its
-        /// earlier deadline stands, matching go, which does not refresh a promise a
-        /// peer already made). The first promise for an id owns a copy of the key
-        /// (freed on fulfill, on harvest, or on teardown). Best-effort on OOM (a
-        /// failed insert just means no promise — no penalty, which is safe).
+        /// Record an IWANT promise: the peer must deliver `id` by `heartbeat_tick +
+        /// iwant_followup_ticks` or the heartbeat charges it P7. An existing promise's
+        /// earlier deadline stands (go does not refresh one). The first promise interns
+        /// the id (released on fulfill/harvest/teardown). Best-effort on OOM (no promise).
         fn addPromise(router: *Self, state: *PeerState, id: []const u8) void {
             if (state.iwant_promises.contains(id)) return;
             const rc = router.intern_table.intern(id) orelse return;
@@ -3108,18 +2738,12 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
-        /// Handle an inbound IWANT: the source peer requests the listed message
-        /// ids. For each id still in the cache, retain its frame and push it onto
-        /// the source's `.data` lane — the cached frame is already a complete
-        /// single-message publish RPC, so the served message re-enters the peer's
-        /// normal inbound path on the other side (dedup, deliver, cache, forward).
-        /// Ids we do not have are ignored. Capped at `max_iwant_to_serve` messages
-        /// per request so one peer cannot make us serve an unbounded set.
-        ///
-        /// Anti-spam: we serve the same id to the same peer at most
-        /// `gossip_retransmission` times within the gossip window (tracked in the
-        /// peer's `iwant_counts`, reset each heartbeat). A repeat request for an id
-        /// already served that many times is ignored.
+        /// Handle an inbound IWANT: for each requested id still in the cache, push its
+        /// frame onto the source's `.data` lane (the cached frame is a complete publish
+        /// RPC, so it re-enters the peer's normal inbound path on the other side). Ids
+        /// we lack are ignored; capped at `max_iwant_to_serve` per request. Anti-spam:
+        /// serve the same id to the same peer at most `gossip_retransmission` times per
+        /// gossip window (`iwant_counts`, reset each heartbeat).
         fn handleIWant(router: *Self, source: PeerId, iwant: *rpc_pb.ControlIWantReader) void {
             const state = router.peers.get(peerKey(&source)) orelse return;
             var served: usize = 0;
@@ -3162,45 +2786,30 @@ pub fn Router(comptime Transport: type) type {
             gop.value_ptr.payload += 1;
         }
 
-        /// Handle an inbound IDONTWANT(ids) from `source`: the peer already holds
-        /// those (typically large) messages and does not want us to send them. For
-        /// each id we (a) record it in the peer's `dont_send` set with a TTL so the
-        /// send-side skip honours it going forward, and (b) purge any not-yet-sent
-        /// copies already queued for the peer.
-        ///
-        /// The ids are gathered into a borrowed-key set (keys point into the wire
-        /// bytes, which outlive this call) so the purge predicate can test a
-        /// frame's carried id(s) against the whole IDONTWANT set in one queue scan.
-        /// The same set drives the per-id `dont_send` inserts. Honouring IDONTWANT
-        /// from any peer is harmless, so this is not version-gated. Untracked
-        /// source is ignored.
-        ///
-        /// Flood protection mirrors go-libp2p: we accept at most
-        /// `max_idontwant_messages` IDONTWANT control messages from one peer per
-        /// heartbeat (tracked in the peer's `idontwant_received_this_window`, reset
-        /// each heartbeat) — once spent, further IDONTWANTs from the peer are
-        /// dropped — and we process at most `max_idontwant_length` ids from a single
-        /// IDONTWANT (ids past the cap are ignored).
+        /// Handle an inbound IDONTWANT(ids): the peer already holds those (large)
+        /// messages. For each id (a) record it in the peer's `dont_send` set with a
+        /// TTL so the send-side skip honours it, and (b) purge any still-queued copies
+        /// to the peer. The ids are gathered into a borrowed-key set (keys alias the
+        /// wire bytes) driving both the inserts and a single-pass queue purge.
+        /// Honouring IDONTWANT is harmless, so it is not version-gated; untracked
+        /// source ignored. Flood protection: at most `max_idontwant_messages` per peer
+        /// per heartbeat, and `max_idontwant_length` ids per message.
         fn handleIDontWant(router: *Self, source: PeerId, idontwant: *rpc_pb.ControlIDontWantReader) void {
             const state = router.peers.get(peerKey(&source)) orelse return;
 
-            // Per-heartbeat IDONTWANT-message budget (go GossipSubMaxIDontWantMessages):
-            // drop this IDONTWANT once the peer has reached its cap for the window
-            // (the counter resets each heartbeat). Checked-then-incremented so the
+            // Per-heartbeat IDONTWANT-message budget; checked-then-incremented so the
             // cap-th message is still processed.
             if (state.idontwant_received_this_window >= mesh_params.max_idontwant_messages) return;
             state.idontwant_received_this_window += 1;
 
-            // Borrowed-key set of the IDONTWANT ids: keys alias the OwnedRpc's wire
-            // bytes (valid until onInboundRpc frees them, after this returns), so no
-            // copies here. Drives both the per-id dont_send inserts (which DO own a
-            // copy of the id) and the single-pass queue purge below.
+            // Borrowed-key set of the IDONTWANT ids (keys alias the OwnedRpc's wire
+            // bytes, valid for this call): drives both the dont_send inserts (which DO
+            // copy the id) and the single-pass queue purge below.
             var ids: std.StringHashMapUnmanaged(void) = .empty;
             defer ids.deinit(router.allocator);
 
-            // Per-message id budget (go GossipSubMaxIDontWantLength): stop after the
-            // cap so a peer cannot make us record/purge an unbounded id list from
-            // one IDONTWANT. Ids past the cap are ignored entirely.
+            // Per-message id budget: stop after the cap so one IDONTWANT cannot make
+            // us record/purge an unbounded id list.
             var processed: usize = 0;
             const expiry = router.heartbeat_tick +| mesh_params.dont_send_ttl_ticks;
             while (idontwant.messageIDsNext()) |id| {
@@ -3211,10 +2820,9 @@ pub fn Router(comptime Transport: type) type {
             }
             if (ids.count() == 0) return;
 
-            // Purge every queued DATA frame whose carried id(s) the peer just said
-            // it does not want. `removeData` releases each removed frame's
-            // reference, keeping the shared-frame refcount balanced. The ctx is a
-            // const pointer to the id set (the predicate only reads it).
+            // Purge every queued DATA frame whose carried id the peer no longer wants.
+            // `removeData` releases each removed frame's reference (refcount stays
+            // balanced); the ctx is a const pointer the predicate only reads.
             const ids_ptr: *const std.StringHashMapUnmanaged(void) = &ids;
             _ = state.queue.removeData(router.io, ids_ptr, dontWantPred);
         }
@@ -3228,13 +2836,10 @@ pub fn Router(comptime Transport: type) type {
             return ids.contains(id);
         }
 
-        /// Record (a copy of) message id `id` in the peer's `dont_send` set with
-        /// the given expiry tick, so the send-side skip suppresses sending it to
-        /// the peer until the heartbeat reclaims the entry. A no-op if already
-        /// present (refreshing the expiry of an existing entry is not needed — the
-        /// peer re-IDONTWANTs if it still has the message). Refused (and freed) once
-        /// the set is at `dont_send_cap` so a flooding peer cannot grow it without
-        /// bound. Best-effort on OOM (the message may still be sent — safe).
+        /// Record `id` in the peer's `dont_send` set (interned) with `expiry`, so the
+        /// send-side skip suppresses it until the heartbeat reclaims the entry. No-op
+        /// if present, and refused once the set is at `dont_send_cap` (a flooding peer
+        /// cannot grow it unboundedly). Best-effort on OOM (the message may still send).
         fn recordDontSend(router: *Self, state: *PeerState, id: []const u8, expiry: u64) void {
             if (state.dont_send.contains(id)) return;
             if (state.dont_send.count() >= mesh_params.dont_send_cap) return;
@@ -3244,27 +2849,18 @@ pub fn Router(comptime Transport: type) type {
             };
         }
 
-        /// Handle an inbound GRAFT(topic) from `source`: add the peer to the
-        /// topic's mesh iff we subscribe to the topic and the peer is not in
-        /// backoff for it. A GRAFT from a peer that is already a mesh member is an
-        /// idempotent accept (no self-eviction). Crucially there is NO upper-size
-        /// reject here (go-libp2p / rust-libp2p behaviour): a GRAFT can push the
-        /// mesh past D_high and the HEARTBEAT prunes it back to D. Growth is still
-        /// bounded — a GRAFT is only accepted for a topic we subscribe to, and the
-        /// next heartbeat shrinks any over-full mesh. Rejecting at D_high would
-        /// make heartbeat-prune unreachable and diverge from interop. On reject,
-        /// reply with a PRUNE (default backoff, no PX yet) on the peer's control
-        /// lane and back the peer off so we do not immediately re-accept. Untracked
-        /// source is ignored.
+        /// Handle an inbound GRAFT(topic): add the peer to the mesh iff we subscribe
+        /// and it is not in backoff (already a member = idempotent accept). Crucially
+        /// there is NO upper-size reject (go-libp2p / rust-libp2p behaviour): a GRAFT
+        /// may push the mesh past D_high and the HEARTBEAT prunes it back — rejecting
+        /// at D_high would make heartbeat-prune unreachable and diverge from interop.
+        /// On reject, reply with a PRUNE and back the peer off. Untracked source ignored.
         fn handleGraft(router: *Self, source: PeerId, topic: []const u8) void {
             if (!router.peers.contains(peerKey(&source))) return;
 
-            // A direct (explicit) peer is never grafted into a mesh — it is an
-            // out-of-mesh trusted forward target. A GRAFT from one signals a
-            // non-reciprocal peering config (the remote thinks we are a regular
-            // mesh peer); reply with a PRUNE so it stops, but do NOT back it off
-            // (it stays a direct forward target). Matches go-libp2p, which warns
-            // and PRUNEs the direct peer back without adding it to the mesh.
+            // A direct peer is never grafted in. A GRAFT from one signals a
+            // non-reciprocal config; reply with a PRUNE so it stops, but do NOT back
+            // it off (it stays a direct forward target).
             if (router.isDirect(source)) {
                 // GRAFT-reject: NO PX (go sets doPX=false on every reject branch).
                 router.sendPrune(source, topic, mesh_params.prune_backoff_ticks, false);
@@ -3299,23 +2895,16 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
-        /// Handle an inbound PRUNE from `source`: drop the peer from the topic's
-        /// mesh and back it off. The wire `backoff` is in seconds (≈ ticks at one
-        /// tick per second). When the peer specifies a backoff (> 0) we obey it
-        /// exactly — including a shorter one, e.g. the 10s a peer sends when it is
-        /// unsubscribing — matching go (`handlePrune`: "is there a backoff specified
-        /// by the peer? if so obey it"). Flooring it up to `prune_backoff_ticks` would
-        /// defeat the unsubscribe backoff. A PRUNE without a backoff (0) falls back to
-        /// `prune_backoff_ticks`. `setBackoff` never SHORTENS an already-later expiry
-        /// (go `doAddBackoff`), so a peer cannot use this to cut an existing backoff.
-        /// Untracked source is ignored.
+        /// Handle an inbound PRUNE from `source`: drop the peer from the topic's mesh
+        /// and back it off. A peer-specified wire backoff (> 0, in seconds ≈ ticks) is
+        /// obeyed EXACTLY — including a shorter unsubscribe backoff (go: "obey it") —
+        /// since flooring it up would defeat that; a 0 falls back to
+        /// `prune_backoff_ticks`. `setBackoff` never SHORTENS an existing later expiry,
+        /// so a peer cannot cut its own backoff. Untracked source ignored.
         ///
-        /// Peer exchange (PX): if the PRUNE carries PX peer offers AND peer exchange
-        /// is enabled AND `source`'s score clears the accept-PX threshold (go's
-        /// `score < acceptPXThreshold` gate; with scoring disabled this is score 0
-        /// vs the threshold default, so it depends on the threshold), each offer is
-        /// consumed via `consumePxPeers`. A PRUNE with PX from a too-low-scoring
-        /// peer has its offers ignored entirely (we still apply the prune+backoff).
+        /// PX: if the PRUNE carries offers AND PX is enabled AND `source` clears the
+        /// accept-PX threshold, each offer is consumed via `consumePxPeers`; otherwise
+        /// the offers are ignored (the prune + backoff still apply).
         fn handlePrune(router: *Self, source: PeerId, prune: *rpc_pb.ControlPruneReader) void {
             if (!router.peers.contains(peerKey(&source))) return;
             const topic = prune.getTopicID();
@@ -3324,14 +2913,10 @@ pub fn Router(comptime Transport: type) type {
             const ticks = if (backoff_secs > 0) backoff_secs else mesh_params.prune_backoff_ticks;
             router.setBackoff(topic, source, ticks);
 
-            // Peer exchange consume. Gate on the config flag first (default OFF), so
-            // a non-PX deployment never touches the offers. Then the accept-PX score
-            // gate: ignore offers from a peer we do not trust enough (go's
-            // `score < acceptPXThreshold` → "ignoring PX"). When scoring is off
-            // there is no engine, so we fall back to score 0 implicitly — but the
-            // gate still depends on the threshold (go behaves the same: with no
-            // scoring the score is 0 and the default threshold is 0, so PX is
-            // accepted; a positive threshold rejects it).
+            // PX consume: gate on the config flag first (a non-PX deployment never
+            // touches the offers), then the accept-PX score gate (go's
+            // `score < acceptPXThreshold` → "ignoring PX"). With scoring off the score
+            // is 0, so it depends on the threshold (same as go).
             if (!router.peer_exchange_enabled) return;
             if (prune.peersCount() == 0) return;
             if (router.score) |sc| {
@@ -3340,18 +2925,13 @@ pub fn Router(comptime Transport: type) type {
             router.consumePxPeers(prune);
         }
 
-        /// Consume the PX peer offers in `prune` (already gated on enable +
-        /// accept-PX score). For each offer carrying a signed peer record, verify
-        /// the envelope (`consumeEnvelope`), confirm the record's peer-id matches
-        /// the offer's `peerID` (an offer cannot vouch for a different peer than the
-        /// record proves — go's `rec.PeerID != p` check), store the verified record
-        /// (`putRecord`), and fire a fire-and-forget `dial` toward each of the
-        /// record's addresses so we connect to the suggested peer. An offer with an
-        /// invalid record, a peer-id mismatch, or no record at all is skipped (a
-        /// record-less offer is just a peer id — go would consult the DHT for an
-        /// address; we have none, so we cannot dial it). At most `prune_peers`
-        /// offers are processed (go shuffles + caps to PrunePeers); we cap in
-        /// iteration order (a randomised sample is a refinement).
+        /// Consume the PX peer offers in `prune` (already gated on enable + accept-PX
+        /// score). For each offer with a signed record: verify the envelope, confirm
+        /// its peer-id matches the offer's `peerID` (else it could vouch for a
+        /// different peer than the record proves — go's `rec.PeerID != p`), store it,
+        /// and fire-and-forget `dial` each address. An invalid/mismatched/record-less
+        /// offer is skipped (we have no DHT to resolve a bare id). At most
+        /// `prune_peers` offers processed.
         fn consumePxPeers(router: *Self, prune: *rpc_pb.ControlPruneReader) void {
             var processed: usize = 0;
             while (prune.peersNext()) |info| {
@@ -3366,20 +2946,15 @@ pub fn Router(comptime Transport: type) type {
                 var consumed = peer_record.consumeEnvelope(router.allocator, record_bytes) catch continue;
                 defer consumed.deinit(router.allocator);
 
-                // The record must vouch for the SAME peer the offer names; a
-                // mismatch means the offer is trying to attach another peer's
-                // (validly signed) record to a different id — reject it.
+                // The record must vouch for the SAME peer the offer names (else it is
+                // attaching another peer's signed record to a different id).
                 const offered = PeerId.fromBytes(info.getPeerID()) catch continue;
                 if (!consumed.peer_id.eql(&offered)) continue;
 
-                // Keep the verified record (newest-seq wins) so we can vouch for
-                // this peer in our own future PX, then dial each advertised address
-                // (fire-and-forget — a connect surfaces later as the normal connect
-                // event). The signed addresses are BINARY multiaddrs (the libp2p
-                // wire form go/rust emit); decode each to the STRING form
-                // `transport.dial` expects. An address we cannot decode (an
-                // unsupported transport) is skipped; `dial` copies the string, so
-                // the temporary is freed immediately after.
+                // Keep the record (newest-seq wins) so we can vouch for the peer in our
+                // own PX, then dial each address. The signed addresses are BINARY
+                // multiaddrs (go/rust wire form); decode each to the STRING form `dial`
+                // expects (an undecodable one is skipped; `dial` copies the string).
                 router.putRecord(consumed.peer_id, &consumed, record_bytes);
                 for (consumed.addrs) |addr| {
                     var ma = Multiaddr.fromBytes(router.allocator, addr) catch continue;
@@ -3389,21 +2964,15 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
-        /// Send a PRUNE(topic) to `peer` on its control lane, carrying `backoff_ticks`
-        /// as the wire backoff (in seconds, ≈ ticks). The caller passes
-        /// `prune_backoff_ticks` for a mesh-maintenance prune and the shorter
-        /// `unsubscribe_backoff_ticks` when LEAVING the topic, so the receiver backs
-        /// us off for the matching duration.
+        /// Send a PRUNE(topic) to `peer` carrying `backoff_ticks` as the wire backoff
+        /// (seconds ≈ ticks): the caller passes `prune_backoff_ticks` for maintenance
+        /// or the shorter `unsubscribe_backoff_ticks` on LEAVE.
         ///
-        /// When `do_px` is set AND peer exchange is enabled, the PRUNE also carries
-        /// up to `prune_peers` OTHER peers in the topic as peer-exchange offers
-        /// (each a `PeerInfo{ peerID, signed_peer_record }`, the record present only
-        /// if we hold one for that peer) — go's PX-on-PRUNE. Only doPX-eligible
-        /// paths pass `do_px = true` (an over-degree heartbeat prune); a LEAVE, a
-        /// GRAFT-reject and a negative-score prune pass false so we never leak our
-        /// mesh to a peer we are cutting off. `frameRpc` copies the offer bytes
-        /// synchronously inside `fanOut`, so the transient offer list is freed here.
-        /// Framed once via `fanOut` to the single target.
+        /// When `do_px` is set AND PX is enabled, the PRUNE also carries up to
+        /// `prune_peers` OTHER topic peers as offers. Only doPX-eligible paths pass
+        /// `do_px = true` (an over-degree heartbeat prune); a LEAVE, GRAFT-reject, or
+        /// negative-score prune pass false so we never leak our mesh to a peer we cut
+        /// off. The offer list is freed here (`fanOut` copies the bytes synchronously).
         fn sendPrune(router: *Self, peer: PeerId, topic: []const u8, backoff_ticks: u64, do_px: bool) void {
             var px: std.ArrayListUnmanaged(?rpc_pb.PeerInfo) = .empty;
             defer px.deinit(router.allocator);
@@ -3414,17 +2983,12 @@ pub fn Router(comptime Transport: type) type {
             router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), .{ .one = peer });
         }
 
-        /// Append up to `prune_peers` peer-exchange offers for `topic` to `out`:
-        /// other peers in the topic's mesh, EXCLUDING the peer being pruned and any
-        /// peer with a negative score (go's `p != xp && score(xp) >= 0` filter), and
-        /// direct peers (never offered). Each offer is a `PeerInfo` borrowing the
-        /// peer's id bytes (from the live `PeerState`, valid for this call) and, if
-        /// we hold a certified record for the peer, its stored signed-envelope bytes
-        /// (otherwise only the peer id — go sends the bare id and lets the receiver
-        /// find addresses elsewhere). Eligible members are shuffled before the
-        /// `prune_peers` cut, so the offer is a uniform sample of the mesh. The
-        /// borrowed slices stay valid until `fanOut` returns (it copies them),
-        /// which is why `out` is freed there.
+        /// Append up to `prune_peers` PX offers for `topic` to `out`: other mesh
+        /// members, EXCLUDING the pruned peer, negative-scoring peers (go's
+        /// `p != xp && score(xp) >= 0`), and direct peers. Each offer carries the
+        /// peer's id and, if we hold a certified record, its signed envelope (else the
+        /// bare id, as go does). Candidates are shuffled before the cut, so the offer
+        /// is a uniform sample. Borrowed slices stay valid until `fanOut` copies them.
         fn selectPxPeers(router: *Self, topic: []const u8, pruned: PeerId, out: *std.ArrayListUnmanaged(?rpc_pb.PeerInfo)) void {
             const set = router.mesh.getPtr(topic) orelse return;
             // Gather every eligible member, shuffle, then offer the first
@@ -3444,11 +3008,9 @@ pub fn Router(comptime Transport: type) type {
             router.prng.random().shuffle(*PeerState, candidates.items);
             const take = @min(candidates.items.len, mesh_params.prune_peers);
             for (candidates.items[0..take]) |state| {
-                // Borrow the peer-id bytes from the HEAP-stable PeerState (not a
-                // stack-local copy, which dies when this returns) so the slice
-                // stays valid until `fanOut`'s `frameRpc` copies it. The record
-                // bytes (when present) are owned by the cert store, so they are
-                // stable too.
+                // Borrow the id bytes from the HEAP-stable PeerState (a stack copy
+                // would die when this returns) so the slice survives until `fanOut`
+                // copies it; record bytes are cert-store-owned, also stable.
                 out.append(router.allocator, .{
                     .peer_i_d = state.peer.bytes[0..state.peer.len],
                     .signed_peer_record = router.getRecord(state.peer),
@@ -3474,11 +3036,9 @@ pub fn Router(comptime Transport: type) type {
                 std.log.info("GS_DEBUG applyPeerSubscription topic={s} subscribe={} tracked={}", .{ topic, subscribe, router.peers.contains(peerKey(&source)) });
             }
             const state = router.peers.get(peerKey(&source)) orelse {
-                // The peer's SUBSCRIBE arrived before its `peer_connected` (the
-                // inbound-stream-vs-peer-event race). Stash it so `peer_connected`
-                // applies it once the PeerState exists, rather than dropping it —
-                // it is never re-sent, so a drop permanently loses the peer's
-                // subscription. Mirrors the `peer_versions` stash.
+                // SUBSCRIBE arrived before `peer_connected` — stash it for
+                // `peer_connected` to apply (it is never re-sent, so a drop would
+                // permanently lose the subscription). Mirrors the `peer_versions` stash.
                 router.stashPendingSubscription(source, topic, subscribe);
                 return;
             };
@@ -3502,15 +3062,11 @@ pub fn Router(comptime Transport: type) type {
         /// outcome as before this stash existed).
         fn stashPendingSubscription(router: *Self, source: PeerId, topic: []const u8, subscribe: bool) void {
             const key = peerKey(&source);
-            // Cap the stash map: a SUBSCRIBE that trails its peer's disconnect
-            // (the disconnect rides the priority control inbox, so it can
-            // overtake queued data from the same peer) creates an entry no
-            // `peer_connected` will ever adopt and no disconnect will sweep
-            // again. The cap bounds that garbage — and adversarial
-            // connect/SUBSCRIBE/disconnect churn — at a fixed size; dropping a
-            // stash for a genuinely-pending peer is the pre-existing
-            // best-effort behaviour (the peer re-announces on its next
-            // subscription change or reconnect).
+            // Cap the stash map: a SUBSCRIBE that trails its peer's disconnect (which
+            // rides the priority control inbox and can overtake queued data) creates
+            // an entry no `peer_connected` will adopt and no disconnect will sweep. The
+            // cap bounds that garbage (and churn); a dropped stash for a real pending
+            // peer is best-effort (it re-announces on reconnect).
             if (!router.pending_subscriptions.contains(key) and
                 router.pending_subscriptions.count() >= max_pending_subscription_peers)
             {
@@ -3527,13 +3083,12 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
-        /// Compute a message's id under the active policy. The one place both the
-        /// publish and the receive paths derive an id, so the two always agree:
-        ///   - a configured `message_id_fn` wins (apps override id derivation),
-        ///   - else under `anonymous` the id is content-derived
-        ///     (`sha256(topic ++ data)`), because an anonymous message has no
-        ///     `from`/`seqno` to key on (they would be empty and collide),
-        ///   - else (strict_sign / none) the id is the default `from ++ seqno`.
+        /// Compute a message's id under the active policy — the one place both the
+        /// publish and receive paths derive it, so the two always agree:
+        ///   - a configured `message_id_fn` wins,
+        ///   - else under `anonymous` the id is content-derived (`sha256(topic++data)`),
+        ///     since an anonymous message has no `from`/`seqno` to key on,
+        ///   - else (strict_sign / none) the id is `from ++ seqno`.
         /// The caller owns the returned MessageId and frees it.
         fn computeMessageId(
             router: *Self,
@@ -3565,60 +3120,40 @@ pub fn Router(comptime Transport: type) type {
             signature: []const u8,
             key: []const u8,
         ) void {
-            // The id is policy-derived: content-based under anonymous (where the
-            // message has no from/seqno), from++seqno otherwise. The receive and
-            // publish paths both go through computeMessageId so they always agree.
-            // Computed FIRST — before any crypto — so a duplicate can be dropped
-            // without paying signature verification (go checks seen in shouldPush
-            // before pushing to its validation workers; a gossipsub mesh delivers
-            // each message up to D times, so for sub-IDONTWANT-threshold messages
-            // this is the difference between 1 verify and ~D verifies per id).
+            // Compute the id FIRST — before any crypto (see computeMessageId) — so a
+            // duplicate is dropped without paying signature verification (go checks
+            // seen before its validation workers; a mesh delivers each message up to D
+            // times, so this is 1 verify vs ~D per id for sub-IDONTWANT messages).
             router.msgs_received += 1;
             var id = router.computeMessageId(topic, from, seqno, data) catch return;
             defer id.deinit(router.allocator);
 
-            // IWANT-promise fulfilment follows go's gossip tracer exactly: a
-            // promise is fulfilled by a duplicate delivery (DuplicateMessage), a
-            // throttle-dropped delivery (RejectValidationThrottled is NOT in the
-            // tracer's carve-out), and any post-signature verdict — but NOT by a
-            // message whose SIGNATURE fails (go's RejectMessage explicitly skips
-            // fulfilment for RejectInvalidSignature/RejectMissingSignature, so
-            // the promise stays pending, expires, and draws the P7 broken-promise
-            // penalty: a peer cannot make good on an IHAVE with garbage). So the
-            // fulfilment sites are: the duplicate return + the throttle-drop
-            // return + the inline post-verify point below, and the verdict
-            // re-entry for the async path (`onValidationResult`) — never before
-            // verification.
+            // IWANT-promise fulfilment follows go's tracer: fulfilled by a duplicate,
+            // a throttle-drop, and any post-signature verdict — but NOT by a SIGNATURE
+            // failure (the promise stays pending and draws P7, so a peer cannot make
+            // good on an IHAVE with garbage). So the fulfilment sites are the duplicate
+            // return, the throttle-drop return, the inline post-verify point below, and
+            // the async verdict re-entry — never before verification.
 
             if (router.seen.contains(id.bytes, router.heartbeat_tick)) {
                 router.msgs_duplicate += 1;
                 if (router.score != null) router.fulfillPromise(id.bytes);
-                // A duplicate of an already-seen message. If the relaying peer is
-                // a current mesh member for this topic, credit it the P3
-                // mesh-delivery counter (it did relay the message to us, just not
-                // first). The engine itself no-ops for a non-mesh peer.
+                // Duplicate: credit a mesh-member relayer the P3 mesh-delivery counter
+                // (it relayed to us, just not first). The engine no-ops for a non-member.
                 if (router.score) |sc| {
                     if (router.meshContains(topic, exclude)) sc.duplicateMessage(exclude, topic);
                 }
                 return;
             }
 
-            // ASYNC pipeline (go-libp2p's validation-worker model): with
-            // `validation_concurrency > 0`, BOTH the StrictSign signature check
-            // and the app validator run OFF the router fiber — go's validate()
-            // does exactly this (signature first, then user validators) on its
-            // NumCPU worker pool, and its processLoop never touches crypto. We
-            // HOLD an owned copy of the message (the wire slices here are freed
-            // when `onInboundRpc` returns), spawn a validation fiber, and DEFER
-            // every effect — including the seen MARK — to its `validation_result`
-            // command (see onValidationResult for why seen is marked there).
-            //
-            // At the in-flight cap the message is throttle-DROPPED, exactly like
-            // go ("message validation throttled: queue full; dropping"): an
-            // inline fallback here would let a validation flood stall the router
-            // fiber — the very thing the offload exists to prevent. The drop
-            // neither marks seen (a later copy can still be validated) nor
-            // penalizes the sender (the message was never judged).
+            // ASYNC pipeline (go's validation-worker model): with
+            // `validation_concurrency > 0`, BOTH the signature check and the app
+            // validator run OFF the router fiber. We hold an owned copy (the wire
+            // slices free when `onInboundRpc` returns), spawn a fiber, and DEFER every
+            // effect — including the seen MARK — to its `validation_result` (see
+            // onValidationResult). At the cap the message is throttle-DROPPED (an
+            // inline fallback would let a flood stall the fiber, what the offload
+            // prevents); the drop neither marks seen nor penalizes.
             const needs_signature_check = router.signer != null;
             if ((needs_signature_check or router.validator != null) and
                 router.validation_concurrency > 0)
@@ -3643,19 +3178,12 @@ pub fn Router(comptime Transport: type) type {
             }
 
             // INLINE path (`validation_concurrency == 0`, or the OOM fallback).
-            //
-            // StrictSign: reject (drop — no deliver, no cache, no forward) any
-            // message whose signature does not verify against the key carried on
-            // the wire AND whose `from` is not that key's peer-id. An unsigned
-            // message (empty signature/key) also fails verification, so it is
-            // dropped. Under the none policy we accept everything and the
-            // message's signature/key — if any — pass through unchanged on
-            // forward. Runs AFTER the seen check (above): duplicates never pay
-            // verification. P4: the SENDING peer (the inbound stream's peer, not
-            // the message's `from`) relayed the invalid message and is charged
-            // the squared invalid-delivery penalty. The id is deliberately NOT
-            // marked seen on a bad signature — a forged (from, seqno) must not
-            // be able to censor the real message (go returns before markSeen).
+            // StrictSign: drop (no deliver/cache/forward) any message whose signature
+            // does not verify against the wire key AND whose `from` is that key's
+            // peer-id (an unsigned message also fails). P4 charges the SENDING peer
+            // (not the message's `from`) the squared invalid-delivery penalty. The id
+            // is deliberately NOT marked seen on a bad signature — a forged
+            // (from, seqno) must not censor the real message.
             if (needs_signature_check) {
                 if (!signing.verifyMessage(router.allocator, from, seqno, topic, data, signature, key)) {
                     router.msgs_rejected += 1;
@@ -3671,25 +3199,17 @@ pub fn Router(comptime Transport: type) type {
             // fulfils on deliver, duplicate, AND validator-reject/ignore).
             if (router.score != null) router.fulfillPromise(id.bytes);
 
-            // Marked seen only now — after the signature verified (go: "we can
-            // mark the message as seen now that we have verified the signature
-            // and avoid invoking user validators more than once") and before the
-            // app validator, so a duplicate of an ignored/rejected message is
-            // suppressed by the seen-cache and never re-validated or re-forwarded.
+            // Marked seen only now — after the signature verified, before the app
+            // validator (go marks here to "avoid invoking user validators more than
+            // once") — so a duplicate of an ignored/rejected message is suppressed and
+            // never re-validated or re-forwarded.
             router.seen.add(id.bytes, router.heartbeat_tick);
 
-            // Application topic-message validator (go-libp2p-pubsub's
-            // validate-then-forward gate / rust-libp2p's MessageAcceptance). The
-            // message is new and signature-checked; the app's verdict decides
-            // whether we propagate it.
-            //   - reject: the message is invalid; do NOT deliver/forward, and charge
-            //     the relaying peer the squared invalid-delivery penalty (P4), the
-            //     same penalty a bad signature draws. Keyed on the SENDING peer
-            //     (`exclude`, the inbound stream's peer), not the message's `from`.
-            //   - ignore: do NOT deliver/forward, but do NOT penalize the sender.
-            //   - accept: fall through to the normal P2/deliver/IDONTWANT/forward
-            //     path below (the historic behaviour).
-            // No validator (null) means accept-all, so the behaviour is unchanged.
+            // Application validator gate (see `ValidationResult` for the effects):
+            //   - reject: no deliver/forward + charge the SENDING peer P4,
+            //   - ignore: no deliver/forward, no penalty,
+            //   - accept: fall through to the deliver/forward path below.
+            // Null = accept-all.
             if (router.validator) |v| {
                 switch (v.validate(v.ctx, topic, from, data)) {
                     .accept => {},
@@ -3708,15 +3228,11 @@ pub fn Router(comptime Transport: type) type {
             router.applyAccept(exclude, from, seqno, topic, data, signature, key, id.bytes);
         }
 
-        /// Apply the ACCEPT effects of a NEW, signature-checked, accepted message:
-        /// the P2/P3 first-/mesh-delivery score credit, local delivery, the
-        /// IDONTWANT-on-large broadcast, and the cache + mesh forward. Shared by the
-        /// inline accept path (`handleIncomingMessage`) and the async accept path
-        /// (`onValidationResult`) so both forward through IDENTICAL logic — the one
-        /// place an accepted received message is delivered + propagated. The
-        /// signature/key are the raw wire slices (empty when absent under the
-        /// none/anonymous policy); an empty slice maps to a null Message field on
-        /// forward (the field is absent), keeping relayed copies byte-identical.
+        /// Apply the ACCEPT effects of a NEW, accepted message: P2/P3 score credit,
+        /// local delivery, the IDONTWANT-on-large broadcast, and the cache + mesh
+        /// forward. The ONE shared path for the inline (`handleIncomingMessage`) and
+        /// async (`onValidationResult`) accepts. Empty signature/key slices map to a
+        /// null Message field on forward, keeping relayed copies byte-identical.
         fn applyAccept(
             router: *Self,
             exclude: PeerId,
@@ -3736,21 +3252,15 @@ pub fn Router(comptime Transport: type) type {
 
             router.deliverLocal(topic, from, data);
 
-            // For a large NEW message, tell our v1.2 mesh peers (except the sender)
-            // that we already have it via an IDONTWANT, so they skip forwarding us
-            // a redundant copy — the bandwidth saving this control message exists
-            // for. Done only on RECEIVED messages (we are not the origin) and only
-            // when the data is at or above the configured threshold.
+            // For a large NEW message, IDONTWANT our v1.2 mesh peers (except the
+            // sender) so they skip forwarding a redundant copy — the bandwidth saving.
             if (data.len >= router.idontwant_message_threshold) {
                 router.broadcastIDontWant(topic, id, exclude);
             }
 
-            // Cache EVERY accepted message (so a later IWANT can be served and a
-            // heartbeat IHAVE can advertise it) and forward it over the topic's
-            // mesh, minus the sender. Caching is independent of forwarding: a
-            // message accepted on a topic with no mesh members is still cached.
-            // Forward the ORIGINAL signature/key so relayed copies keep the
-            // publisher's signature (empty slices map to null = field absent).
+            // Cache EVERY accepted message (independent of forwarding — cached even
+            // with no mesh members) and forward over the topic's mesh minus the sender,
+            // carrying the ORIGINAL signature/key (empty slices → null = field absent).
             router.cacheAndForward(
                 router.mesh.getPtr(topic),
                 exclude,
@@ -3764,15 +3274,13 @@ pub fn Router(comptime Transport: type) type {
             );
         }
 
-        /// Build an owned `ValidationContext` from a received message and spawn a
-        /// validation fiber that runs the validator off the router fiber and posts
-        /// the verdict back as a `validation_result` command. Returns true on
-        /// success (the held context is now owned by the fiber → the result command
-        /// → freed when the command is applied or drained) and false if the owned
-        /// copy or the fiber spawn failed (NOTHING is held; the caller validates
-        /// inline instead). Called only on the router fiber, so the in-flight
-        /// counter increment is race-free; it is decremented when the result is
-        /// applied (`onValidationResult`) or drained at teardown.
+        /// Build an owned `ValidationContext` and spawn a validation fiber that runs
+        /// the checks off the router fiber and posts a `validation_result`. Returns
+        /// true on success (the context is now owned by the fiber → the result command,
+        /// freed when applied or drained); false if the owned copy or spawn failed
+        /// (NOTHING held; caller validates inline). Called only on the router fiber, so
+        /// the in-flight counter increment is race-free (decremented in
+        /// `onValidationResult` or the teardown drain).
         fn spawnValidation(
             router: *Self,
             exclude: PeerId,
@@ -3858,22 +3366,14 @@ pub fn Router(comptime Transport: type) type {
             return true;
         }
 
-        /// Validation-fiber body (one per async-validated message; runs OFF the
-        /// router fiber in `validation_group`). Runs go's worker pipeline on the
-        /// held copy — the StrictSign SIGNATURE check first, then the app
-        /// validator (go's validate() order; either may be absent) — and posts
-        /// the combined outcome + the context back to the router inbox as a
-        /// `validation_result` command. `router.signer` and `router.validator`
-        /// are set once in `create` and never reassigned, so reading them off
-        /// the router fiber is safe; `verifyMessage`'s scratch allocation uses
-        /// the same thread-safe-allocator contract as `ctx.deinit` below. The
-        /// crypto/validator calls are CPU-bound (no cancellation point); the
-        /// inbox post IS a cancellation point, so a teardown `cancel` collapses
-        /// it — on a closed/cancelled post we free the held context HERE (this
-        /// fiber is then its sole owner). On a successful post the router (or
-        /// the inbox drain) owns + frees the context: freed EXACTLY once.
-        /// The validator must be thread-safe (it can run on this fiber
-        /// concurrently with the router fiber).
+        /// Validation-fiber body (one per async-validated message; runs OFF the router
+        /// fiber). Runs the signature check then the app validator (go's validate()
+        /// order; either may be absent) and posts the outcome + context back as a
+        /// `validation_result`. `signer`/`validator` are set once in `create`, so
+        /// reading them off-fiber is safe; the validator must be thread-safe. The crypto
+        /// is CPU-bound; the inbox post IS a cancellation point, so on a closed/cancelled
+        /// post this fiber frees the held context HERE, otherwise the router (or the
+        /// drain) does — freed EXACTLY once.
         fn validationFiber(router: *Self, ctx: *ValidationContext) void {
             const outcome: ValidationOutcome = blk: {
                 if (router.signer != null and
@@ -3900,28 +3400,17 @@ pub fn Router(comptime Transport: type) type {
             router.notifyControl();
         }
 
-        /// Apply an async validation outcome on the router fiber (the deferred
-        /// tail of `handleIncomingMessage`, now that the off-fiber signature
-        /// check + validator have returned). This is also where the seen MARK
-        /// happens for the async path: `seen` (and the intern table under it)
-        /// is router-fiber-confined, so the worker cannot mark it — go marks
-        /// seen inside its worker because its timecache is locked; ours moves
-        /// the mark to the verdict re-entry instead. Consequences, both matching
-        /// go's semantics:
-        ///   - A bad-signature message is NEVER marked (go returns before
-        ///     markSeen): a forged (from, seqno) cannot censor the real message.
-        ///   - Two copies of one id can both be IN FLIGHT (both passed the seen
-        ///     CHECK before either was MARKED — go has the same window between
-        ///     shouldPush and the worker's markSeen). Verdicts apply serially
-        ///     here: the first marks seen and applies; a later one finds the id
-        ///     seen and is handled as a duplicate (go: markSeen=false →
-        ///     DuplicateMessage), crediting the relayer's P3 like any duplicate.
-        /// ACCEPT runs the SHARED accept effects (`applyAccept`) — identical to
-        /// the inline accept path; a validator REJECT charges the relaying peer
-        /// the P4 penalty (and IS marked seen, so later copies never
-        /// re-validate); IGNORE just marks seen. Always decrements the in-flight
-        /// counter and frees the held context (freed exactly once — the teardown
-        /// drain frees only contexts that never reach here).
+        /// Apply an async validation outcome on the router fiber (the deferred tail of
+        /// `handleIncomingMessage`). This is also where the seen MARK happens for the
+        /// async path, since `seen` is router-fiber-confined. Consequences (matching go):
+        ///   - a bad-signature message is NEVER marked, so a forged (from, seqno)
+        ///     cannot censor the real message,
+        ///   - two copies of one id can be IN FLIGHT (both passed the seen CHECK before
+        ///     either was MARKED); verdicts apply serially, so the first applies and a
+        ///     later one is handled as a duplicate.
+        /// ACCEPT runs the SHARED `applyAccept`; validator REJECT charges P4 (and IS
+        /// marked seen); IGNORE just marks seen. Always decrements the in-flight counter
+        /// and frees the context (freed exactly once).
         fn onValidationResult(router: *Self, ctx: *ValidationContext, verdict: ValidationOutcome) void {
             defer {
                 router.validations_in_flight -= 1;
@@ -3989,17 +3478,11 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
-        /// Broadcast an IDONTWANT(`id`) on the control lane to every member of
-        /// `topic`'s mesh that negotiated v1.2 and is NOT `exclude` (the peer the
-        /// message arrived from). Tells those peers we already hold the message so
-        /// they skip forwarding it to us. No-op if the topic has no mesh.
-        ///
-        /// v1.2 gating: a pre-1.2 peer would not understand (and would reject) the
-        /// control message, so it is wasteful to send. Honouring an inbound
-        /// IDONTWANT is unconditional (see `handleIDontWant`); only EMITTING one is
-        /// gated. Each eligible peer is targeted individually so the gate applies
-        /// per peer. The id is borrowed (valid for the call) and `frameRpc` copies
-        /// it into each frame.
+        /// Broadcast an IDONTWANT(`id`) to every v1.2 member of `topic`'s mesh except
+        /// `exclude` (the source), telling them we already hold the message so they
+        /// skip forwarding it. Only EMITTING is v1.2-gated (a pre-1.2 peer would reject
+        /// it); honouring an inbound IDONTWANT is unconditional (`handleIDontWant`).
+        /// No-op if the topic has no mesh.
         fn broadcastIDontWant(router: *Self, topic: []const u8, id: []const u8, exclude: PeerId) void {
             const set = router.mesh.getPtr(topic) orelse return;
             var it = set.keyIterator();
@@ -4021,24 +3504,15 @@ pub fn Router(comptime Transport: type) type {
             router.fanOut(.control, (rpc.RpcOut{ .control = ctrl }).toRpc(), .{ .one = peer });
         }
 
-        /// Frame a single message ONCE, store it in the message cache (so a later
-        /// IWANT can be served and a heartbeat IHAVE can advertise it), and — when
-        /// `set` is non-null — hand one reference to every still-tracked peer in it
-        /// (a mesh or fanout PeerSet), optionally excluding one peer (the relay
-        /// source). The shared frame carries the message id for a later IDONTWANT
-        /// purge. Fanned out on the `.data` lane.
-        ///
-        /// Caching is unconditional and independent of forwarding: a message
-        /// accepted on a topic we have no mesh for (a null `set`) is still cached,
-        /// matching go-libp2p (every accepted message enters the cache). The
-        /// fan-out target set may also be empty.
-        ///
-        /// Builds the frame here (ref = 1, the builder reference) rather than via
-        /// `fanOut` so the single allocation can be shared with the cache: `put`
-        /// retains it (the cache then holds a reference for ~history_length
-        /// heartbeats), `fanOutFrame` retains it per target, and the trailing
-        /// `release` drops the builder reference — leaving exactly the cache's and
-        /// the accepting queues' references live.
+        /// Frame a single message ONCE, store it in the message cache (for a later
+        /// IWANT/IHAVE), and — when `set` is non-null — fan it out to its peers on the
+        /// `.data` lane (excluding the relay source). The shared frame carries the
+        /// message id for a later IDONTWANT purge. Caching is unconditional and
+        /// independent of forwarding (a null/empty `set` still caches). Builds the frame
+        /// here (not via `fanOut`) so the single allocation is shared with the cache:
+        /// `put` retains it, `fanOutFrame` retains it per target, and the trailing
+        /// `release` drops the builder reference (see the builder-reference protocol in
+        /// `fanOut`).
         fn cacheAndForward(
             router: *Self,
             set: ?*const PeerSet,
@@ -4051,15 +3525,12 @@ pub fn Router(comptime Transport: type) type {
             key: ?[]const u8,
             id: []const u8,
         ) void {
-            // The frame owns a private copy of the id (for later IDONTWANT
-            // purging), not the interned one: a frame's last ref usually drops on
-            // a writer fiber, where releasing an interned id would unlink it from
-            // the router-fiber-owned intern table off-fiber. Freed on pre-frame failure.
+            // The frame owns a PRIVATE id copy (not the interned one): a frame's last
+            // ref usually drops on a writer fiber, where releasing an interned id would
+            // touch the router-fiber-owned intern table off-fiber.
             const id_copy = router.allocator.dupe(u8, id) catch return;
-            // The cached/forwarded frame carries whatever signature/key the
-            // message was published or relayed with (null under the none policy),
-            // so IWANT-served and mesh-forwarded copies stay byte-identical and
-            // keep the original publisher's signature.
+            // Carry whatever signature/key the message arrived with, so relayed copies
+            // stay byte-identical and keep the publisher's signature.
             const msg = rpc_pb.Message{ .from = from, .seqno = seqno, .topic = topic, .data = data, .signature = signature, .key = key };
             const framed = pubsub.frameRpc(router.allocator, (rpc.RpcOut{ .publish = &.{msg} }).toRpc()) catch {
                 router.allocator.free(id_copy);
@@ -4074,20 +3545,14 @@ pub fn Router(comptime Transport: type) type {
             // queues hold the rest. If none keeps a reference this frees the frame.
             defer frame.release();
 
-            // Cache the message (retains the frame) so an IWANT can later be
-            // served by retaining + pushing it; `put` dedups so the same id is
-            // never stored or retained twice. Done for every accepted message,
-            // whether or not there are mesh peers to forward to.
+            // Cache the message (retains the frame) so an IWANT can serve it; `put`
+            // dedups. Done for every accepted message, mesh peers or not.
             router.message_cache.put(id, topic, frame) catch {};
 
-            // Forward over the mesh/fanout/flood set PLUS every connected direct
-            // peer subscribed to the topic. Direct peers are out-of-mesh trusted
-            // targets that go-libp2p adds to the send set alongside the mesh, so a
-            // valid message always reaches them. Build a transient UNION of the
-            // base set and those direct peers (a set, so a peer that is both a mesh
-            // member and direct is targeted exactly once), then fan out over it.
-            // When no direct peers are configured (the common case) this is a no-op
-            // and we forward over the base set directly, unchanged.
+            // Forward over the base set PLUS every connected direct peer subscribed to
+            // the topic (out-of-mesh trusted targets a valid message must reach). Build
+            // a transient UNION (a set, so a mesh+direct peer is targeted once) and fan
+            // out over it; with no direct peers this falls through to the base set.
             if (router.directSubscribers(topic, exclude)) |direct_targets| {
                 var combined = direct_targets;
                 defer combined.deinit(router.allocator);
@@ -4102,14 +3567,11 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Build a transient PeerSet of every connected direct peer subscribed to
-        /// `topic`, excluding `exclude` (the relay source — never echo a message
-        /// back to where it came from). Returns null when no direct peer qualifies
-        /// (no direct peers configured, none connected, or none subscribed) so the
-        /// common no-direct-peers path stays allocation-free. The caller OWNS the
-        /// returned set and must `deinit` it; it only TARGETS the fan-out (the
-        /// frame's references live on the per-peer queues), so freeing it touches no
-        /// frame. Mirrors go-libp2p, which forwards to a direct peer only for topics
-        /// it has SUBSCRIBEd to (the `tmap`/`inTopic` check in Publish).
+        /// `topic`, excluding `exclude` (the relay source). Returns null when none
+        /// qualify, so the common no-direct-peers path stays allocation-free. The
+        /// caller OWNS and must `deinit` it; it only TARGETS the fan-out, so freeing it
+        /// touches no frame. Forwards to a direct peer only for topics it has
+        /// SUBSCRIBEd to (go's `inTopic` check).
         fn directSubscribers(router: *Self, topic: []const u8, exclude: ?PeerId) ?PeerSet {
             if (router.direct.count() == 0) return null;
             var set: PeerSet = .empty;
@@ -4154,9 +3616,8 @@ pub fn Router(comptime Transport: type) type {
                     if (router.meshSize(topic) >= mesh_params.d) break;
                     const state = router.peers.get(key_ptr.*) orelse continue;
                     const peer = state.peer;
-                    // A direct peer is never placed in the mesh, even when seeding
-                    // from a fanout set (which already excludes direct peers, so
-                    // this is a belt-and-braces guard on the mesh-add invariant).
+                    // Belt-and-braces: a direct peer is never placed in the mesh (the
+                    // fanout set already excludes them).
                     if (router.isDirect(peer)) continue;
                     if (router.meshContains(topic, peer) or router.inBackoff(topic, peer)) continue;
                     router.meshAdd(topic, peer);
@@ -4217,32 +3678,19 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Local publish: build a Message from us, dedup it, deliver locally if we
-        /// subscribe, then forward it.
-        ///
-        /// With flood-publish on (the go-libp2p default), the message floods to a
-        /// transient set of EVERY topic subscriber above the publish threshold —
-        /// not just the mesh/fanout — to maximise propagation of a message we
-        /// originated. With it off, we fall back to the relay topology: forward
-        /// over the topic's MESH if we subscribe, otherwise over a transient
-        /// FANOUT set (created / replenished to D from peers subscribed to the
-        /// topic) whose last-publish tick the heartbeat uses to expire it after
-        /// the TTL. Flooding does NOT touch the fanout state — it is a one-shot
-        /// target set, distinct from the relay path. (Relayed messages never
-        /// flood; only this originator path does.)
-        ///
-        /// Owns `topic` and `data` (frees both AFTER framing/handler, since
-        /// frameRpc copies them and the handler reads them).
+        /// subscribe, then forward it. With flood-publish on, an originated message
+        /// floods to EVERY eligible topic subscriber (not just the mesh/fanout); with
+        /// it off it uses the relay topology — the MESH if we subscribe, else a transient
+        /// FANOUT set the heartbeat times out by TTL. Flooding does NOT touch fanout
+        /// state (only the originator path floods; relayed messages never do). Owns
+        /// `topic` and `data`, freed AFTER framing/handler.
         fn onPublish(router: *Self, topic: []u8, data: []u8) void {
             defer router.allocator.free(topic);
             defer router.allocator.free(data);
 
-            // Anonymous (StrictNoSign) publishes carry ONLY topic+data — no
-            // `from`/`seqno`/`signature`/`key`, so the publisher's peer-id never
-            // reaches the wire (the privacy guarantee) and the seqno counter is
-            // not advanced. Under strict_sign / none the message carries our
-            // peer-id as `from` and the next seqno. Empty `from`/`seqno` encode to
-            // absent fields (the protobuf encoder omits empty bytes), so the
-            // anonymous frame is just topic+data.
+            // Anonymous (StrictNoSign) carries ONLY topic+data (the publisher's peer-id
+            // never reaches the wire, and the seqno is not advanced); empty `from`/`seqno`
+            // encode to absent fields. strict_sign / none carry our peer-id + next seqno.
             const anonymous = router.signature_policy == .anonymous;
 
             var seqno_buf: [8]u8 = undefined;
@@ -4255,11 +3703,10 @@ pub fn Router(comptime Transport: type) type {
                 seqno = seqno_buf[0..];
             }
 
-            // Under StrictSign, sign the message and attach the signature + the
-            // marshaled libp2p public key. A signing failure drops the publish (we
-            // must not emit an unsigned message a StrictSign peer would reject).
-            // Under none and anonymous both stay null. `sig` is owned here and
-            // freed after framing (cacheAndForward copies the bytes into the frame).
+            // Under StrictSign, sign and attach the signature + marshaled pubkey; a
+            // signing failure drops the publish (a StrictSign peer would reject an
+            // unsigned one). Null under none/anonymous. `sig` is owned, freed after
+            // framing (cacheAndForward copies it into the frame).
             var sig: ?[]u8 = null;
             defer if (sig) |s| router.allocator.free(s);
             var key: ?[]const u8 = null;
@@ -4287,17 +3734,12 @@ pub fn Router(comptime Transport: type) type {
 
             router.deliverLocal(topic, from, data);
 
-            // A published message is ALWAYS cached (so a later IWANT can serve it
-            // and a heartbeat IHAVE can advertise it), whether or not we have any
-            // mesh/fanout peers to forward it to right now. The frame is built and
-            // cached once, then fanned out over whichever set applies.
+            // The message is ALWAYS cached (cacheAndForward does this once), then
+            // fanned out over whichever set applies below.
 
-            // Flood-publish: an ORIGINATED message goes to every topic subscriber
-            // above the publish threshold (a transient set), bypassing the
-            // mesh/fanout topology entirely. The set targets the flood only; the
-            // frame's references live on the per-peer queues, so freeing the set
-            // afterward touches no frame. Caching still happens (in cacheAndForward)
-            // exactly once. No source to exclude — we are the origin.
+            // Flood-publish: bypass the mesh/fanout topology and target every eligible
+            // topic subscriber (a transient set, freed afterward — it targets only; the
+            // frame's references live on the per-peer queues). No source to exclude.
             if (router.flood_publish) {
                 var flood_set = router.floodTargets(topic);
                 defer flood_set.deinit(router.allocator);
@@ -4313,11 +3755,9 @@ pub fn Router(comptime Transport: type) type {
                 // or absent — no source to exclude).
                 router.cacheAndForward(router.mesh.getPtr(topic), null, from, seqno, topic, data, sig, key, id.bytes);
             } else if (router.fanoutGetOrCreate(topic)) |set| {
-                // Not subscribed: cache + forward over the fanout set, topping it
-                // up to D first, and refresh the last-publish tick (the entry
-                // exists — fanoutGetOrCreate inserted it — so this only updates the
-                // value, never stores a new key) so the heartbeat times out the TTL
-                // from the most recent publish.
+                // Not subscribed: forward over the fanout set (topped up to D) and
+                // refresh its last-publish tick so the heartbeat times out the TTL from
+                // the most recent publish.
                 router.fanoutReplenish(topic, set);
                 if (router.fanout_last_pub.getPtr(topic)) |last| last.* = router.heartbeat_tick;
                 router.cacheAndForward(set, null, from, seqno, topic, data, sig, key, id.bytes);
@@ -4328,12 +3768,8 @@ pub fn Router(comptime Transport: type) type {
             }
         }
 
-        /// Test-only: push a frame reference onto a tracked peer's outbound queue,
-        /// running on the router fiber so the peer-map lookup never races the
-        /// router's own mutations. Releases the reference if the peer is gone or
-        /// the push fails. Always sets the reply event.
-        /// `stats` handler: every read runs on the router fiber, the sole
-        /// writer of all the non-atomic counters.
+        /// `stats` handler: every read runs on the router fiber, the sole writer of
+        /// the non-atomic counters.
         fn onStats(router: *Self, reply: *StatsReply) void {
             reply.snap = .{
                 .msgs_received = router.msgs_received,
@@ -4376,23 +3812,15 @@ pub fn Router(comptime Transport: type) type {
         }
 
         /// Tear down one peer's state. Order matters: close the queue (the writer
-        /// drains remaining frames and exits), then CANCEL+AWAIT the writer fiber
-        /// BEFORE freeing the sink (the writer's trailing `sink.close` must not
-        /// race a freed sink), then close the sink, deinit the queue, and free
-        /// the heap allocations.
+        /// drains and exits), CANCEL+AWAIT the writer fiber BEFORE freeing the sink
+        /// (its trailing `sink.close` must not race a freed sink), then close the sink,
+        /// deinit the queue, and free the heap allocations.
         ///
-        /// Cancel before await so a writer parked in `ensureStream`'s reopen
-        /// backoff does not stall this single router fiber for up to
-        /// max_open_retries × reopen_backoff_ms (which would serialize every
-        /// peer's teardown). The backoff `sleep` is a cancellation point, so
-        /// cancel collapses the wait; await then joins. cancel+await on the same
-        /// Future is safe here: cancel is idempotent and clears the future, so
-        /// the following await returns the cached result without double-
-        /// consuming. Under cancellation the writer unwinds cleanly —
-        /// popBlocking returns Closed (queue already closed) or Canceled, or a
-        /// Cancelable surfaces from open/writeFrame/sleep — runs its
-        /// `defer sink.close`, and returns; the router's own `sink.close` below
-        /// is idempotent.
+        /// Cancel before await so a writer parked in its reopen backoff does not stall
+        /// this single router fiber (which would serialize every peer's teardown); the
+        /// backoff `sleep` is a cancellation point. cancel+await on one Future is safe
+        /// (cancel is idempotent and clears it). The writer unwinds cleanly and runs
+        /// its own `defer sink.close`; the router's `sink.close` below is idempotent.
         fn teardownPeer(router: *Self, state: *PeerState) void {
             // Mark the peer disconnected in the scoring engine: its stats (and
             // any negative score) are retained for a while so a quick reconnect
@@ -4510,44 +3938,30 @@ pub fn Router(comptime Transport: type) type {
                 .probe_for_test => |pr| pr.reply.event.set(router.io),
                 .stats => |st| st.reply.event.set(router.io),
                 .sync => |s| s.reply.set(router.io),
-                // An async validation that posted its result before the inbox
-                // closed but never got processed by the main loop: free its held
-                // context here (the fiber that produced it handed off ownership on
-                // the successful post, so the drain is the sole remaining owner).
-                // Freed exactly once — a processed result is freed in
-                // `onValidationResult`, a fiber whose post FAILS frees its own
-                // context, and the shutdown-batch path in drainControl frees
-                // exactly the commands it stranded. `destroy` cancels + joins the
-                // validation group AFTER the teardown drain, so no fiber posts a
-                // new result into the (now-closed) inbox past this point.
+                // A validation result posted before the inbox closed but never
+                // processed: free its held context here (the drain is the sole owner).
+                // Freed exactly once — a processed result frees in `onValidationResult`,
+                // a failed post frees in the fiber, drainControl frees its stranded
+                // batch; `destroy` joins the validation group AFTER this drain, so no
+                // fiber posts a new result past this point.
                 .validation_result => |r| r.ctx.deinit(router.allocator),
                 else => {},
             }
         }
 
-        /// PeerWriter on_disconnect callback. The writer exhausted its open
-        /// retries, so hand the peer back to the router. Runs on the WRITER
-        /// fiber, so it must only signal — never free the state/sink (the
-        /// writer's trailing `sink.close` still fires after this returns) —
+        /// PeerWriter on_disconnect callback (the writer exhausted its open retries).
+        /// Runs on the WRITER fiber, so it must only signal — never free state/sink —
         /// and the signal must satisfy TWO constraints:
         ///
-        /// - It MUST NOT block: the router cancel+awaits this fiber in
-        ///   teardownPeer, so parking (uncancelably) on the router's own full
-        ///   inbox would wedge the router forever — it would join a fiber that
-        ///   waits for the router to drain the very queue it is parked on.
-        /// - It MUST NOT carry the connection handle (or any identity): a
-        ///   writer-sourced event cannot be ordered before the connection's
-        ///   free, so a carried pointer can alias a RECYCLED address — a stale
-        ///   `peer_disconnected{peer, old_ptr}` processed after the peer
-        ///   rebound to a new connection at the same address would pass the
-        ///   identity check and destroy the live peer (ABA). This also fires
-        ///   spuriously when teardownPeer cancels a writer parked in its
-        ///   reopen backoff, which is exactly when the old handle is dangling.
+        /// - (a) MUST NOT block: the router cancel+awaits this fiber in teardownPeer,
+        ///   so parking on the router's own full inbox would wedge it forever.
+        /// - (b) MUST NOT carry the connection handle: a writer-sourced event cannot be
+        ///   ordered before the connection's free, so a carried pointer can alias a
+        ///   RECYCLED address and destroy a just-rebound live peer (ABA).
         ///
-        /// So: set the atomic flag on the PeerState (the lossless signal, tied
-        /// to current identity by construction) and post a payload-free
-        /// `reap_dead_writers` wake, non-blocking (`min = 0` never parks; a
-        /// full inbox drops the wake and the heartbeat's reap pass covers it).
+        /// So: set the atomic flag on the PeerState (the lossless signal, tied to
+        /// current identity) and post a payload-free `reap_dead_writers` wake,
+        /// non-blocking (a full inbox drops it; the heartbeat reap covers it).
         fn onWriterDisconnect(ctx: ?*anyopaque) void {
             const state: *PeerState = @ptrCast(@alignCast(ctx.?));
             const router = state.router_for_disconnect;
@@ -4577,15 +3991,10 @@ test "peerKey distinguishes peers and matches equal ids" {
 
 // --- FakeTransport: an in-memory transport for router-level unit tests -----
 
-/// A fake outbound sink that records every byte written to each "stream" it
-/// opens, into transport-owned storage so the recording survives the sink being
-/// closed + destroyed during teardown. Supports a configurable open-failure mode
-/// to exercise the writer's give-up path. Satisfies the PeerWriter Sink
-/// contract.
-///
-/// The recording (`record`) is borrowed from the FakeTransport; the sink only
-/// appends to it, so a sink destroyed in teardownPeer does not lose the frames a
-/// test wants to assert on.
+/// A fake outbound sink (PeerWriter Sink contract) recording every written byte
+/// into transport-owned storage (`record`, borrowed from the FakeTransport), so the
+/// recording survives the sink being destroyed in teardown. Configurable open/write
+/// failure modes exercise the writer's give-up path.
 const FakeSink = struct {
     allocator: std.mem.Allocator,
     record: *FakeRecord,
@@ -4601,10 +4010,8 @@ const FakeSink = struct {
         if (self.record.open_calls <= self.fail_open_count) return error.OpenFailed;
         // While the test holds `block_open`, park here (short poll) so the writer
         // does not drain the queue and a test can observe queued frames. The test
-        // CLEARS the flag before teardown, so the writer exits this loop on its
-        // own; the short sleep is also a cancellation point but the flag, not
-        // cancel, is what releases it (cancel-driven teardown of a long sleep is
-        // fragile, so this never depends on it).
+        // CLEARS the flag before teardown, so the writer exits on its own — never
+        // relying on cancel to collapse the sleep.
         while (self.record.block_open.load(.acquire)) {
             io_time.ms(5).sleep(io) catch break;
         }
@@ -4642,12 +4049,9 @@ const FakeRecord = struct {
     /// recordCount*/recordHas* reader helpers below take it before walking the
     /// buffer. std.Io.Mutex is fiber/thread-safe under std.Io.Threaded.
     mutex: std.Io.Mutex = .init,
-    /// While set, the peer's writer parks at the top of open() (short cancellable
-    /// poll), so a test can observe frames sitting un-drained in the peer's queue
-    /// (e.g. an IDONTWANT purge). The test CLEARS it before teardown so the writer
-    /// exits open() on its own — never relying on cancel to collapse a long sleep
-    /// (which the writer-teardown path treats as fragile). Written by the test
-    /// fiber, read by the writer fiber, so atomic.
+    /// While set, the peer's writer parks at the top of open() (see FakeSink.open),
+    /// so a test can observe un-drained queued frames. The test CLEARS it before
+    /// teardown. Written by the test fiber, read by the writer fiber, so atomic.
     block_open: std.atomic.Value(bool) = .init(false),
 
     fn deinit(self: *FakeRecord) void {
@@ -4739,28 +4143,21 @@ const FakeTransport = struct {
     }
 };
 
-/// Build a FakeConn on the heap with a fresh recording. The test owns it and
-/// frees it with `destroyFakeConn`. By test convention the conn is freed only
-/// after the router has fully processed the peer's last operation and the peer's
-/// writer fiber is idle (the tests poll the record for the expected frames, or
-/// post no further outbound, before tearing down) — so the writer is parked, not
-/// mid-append, when the record is freed.
+/// Build a FakeConn on the heap with a fresh recording. The test owns it and frees
+/// it with `destroyFakeConn` only after the peer's writer fiber is idle (see that
+/// function's ordering invariant), so the writer is never mid-append at the free.
 fn makeFakeConn(allocator: std.mem.Allocator) !*FakeTransport.FakeConn {
     const conn = try allocator.create(FakeTransport.FakeConn);
     conn.* = .{ .record = .{ .allocator = allocator } };
     return conn;
 }
 
-/// Frees a FakeConn and its embedded FakeRecord. ORDERING INVARIANT: a peer's
-/// writer fiber (router-owned) appends to this record in writeFrame; those fibers
-/// are only cancelled+joined by `router.destroy()`. So for any conn whose peer is
-/// still connected at end of test, `router.destroy()` MUST run before this frees
-/// the record, or a writer mid-writeFrame touches freed memory (an `index 0xAA…`
-/// panic in appendSlice). Tests guarantee this by declaring `defer router.destroy()`
-/// AFTER the `defer destroyFakeConn(...)` calls (defers are LIFO, so destroy runs
-/// first → joins writers → then records free). Records stay inspectable until freed.
-/// (Tests that disconnect the peer first — peer_disconnected joins that writer — or
-/// quiesce the writer before teardown may free inline / in any order safely.)
+/// Frees a FakeConn and its FakeRecord. ORDERING INVARIANT: a writer fiber appends
+/// to this record and is only joined by `router.destroy()`, so for any
+/// still-connected peer `router.destroy()` MUST run first or a writer touches freed
+/// memory. Tests guarantee this by declaring `defer router.destroy()` AFTER the
+/// `defer destroyFakeConn(...)` calls (LIFO → destroy runs first, joins writers).
+/// A test that disconnects or quiesces the peer first may free in any order.
 fn destroyFakeConn(allocator: std.mem.Allocator, conn: *FakeTransport.FakeConn) void {
     conn.record.deinit();
     allocator.destroy(conn);
@@ -4806,19 +4203,11 @@ fn waitFor(io: std.Io, comptime pred: fn (*FakeRouter) bool, router: *FakeRouter
     return pred(router);
 }
 
-/// Barrier: post a `sync` command and await its reply, so every command posted
-/// before it has been fully processed by the router fiber, which is then back
-/// parked on the inbox. After this returns, the test fiber may read router-owned
-/// state (mesh / peers / fanout / backoff / peer_versions / message_cache /
-/// score / heartbeat_tick) race-free — but only because no other command is
-/// posted and no heartbeat/inbound fiber is concurrently active during the read
-/// window (the router tests run with heartbeat_interval_ms = 0).
-///
-/// This is the one safe way for a test to read the router's HashMaps: the router
-/// is a single-fiber actor that owns that state exclusively, so a test must never
-/// read it while the router fiber might mutate it (a read racing a HashMap resize
-/// gets a torn metadata pointer and panics). `sync` serializes the test fiber
-/// behind the router fiber's FIFO inbox; read only after it returns.
+/// Barrier: post a `sync` command and await its reply, so every prior command has
+/// been processed and the router fiber is back parked. This is the one safe way for
+/// a test to read the router's HashMaps — the router owns that state exclusively, so
+/// a read racing a mutation (e.g. a HashMap resize) panics. Valid only because the
+/// router tests post no concurrent command and run with heartbeat_interval_ms = 0.
 fn sync(router: *FakeRouter, io: std.Io) !void {
     var reply: std.Io.Event = .unset;
     try router.inbox.putOne(io, .{ .sync = .{ .reply = &reply } });
@@ -4972,17 +4361,12 @@ test "writer give-up with a FULL inbox neither parks the writer nor wedges teard
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Deadlock regression: the writer's disconnect signal used to be a BLOCKING
-    // uncancelable inbox post. With the inbox full, the writer parked forever
-    // (uncancelable puts ignore cancel), and any teardown joining the writer —
-    // teardownPeer / teardownAllPeers, both on the router fiber, the inbox's
-    // only consumer — wedged the router permanently: it awaited a fiber that
-    // was waiting for the router to drain the very queue it was parked on.
-    // Post-fix the writer signals via the atomic `writer_dead` flag plus a
-    // non-blocking post, and the heartbeat reaps flagged peers.
-    //
-    // start() is never called: with no main loop draining, the test fiber
-    // stands in for the router fiber and the inbox stays deterministically FULL.
+    // Deadlock regression: a BLOCKING uncancelable disconnect post used to park the
+    // writer forever on a full inbox, wedging any teardown that joins it on the router
+    // fiber (the inbox's only consumer). Post-fix the writer signals via the
+    // `writer_dead` flag + a non-blocking post, and the heartbeat reaps flagged peers.
+    // start() is never called: the test fiber stands in for the router fiber, so the
+    // inbox stays deterministically FULL.
     const router = try FakeRouter.create(allocator, io, .{ .fail_open_count = std.math.maxInt(usize) }, local_test_peer, null, 0, null, null, .{});
     const peer = try PeerId.random();
     const conn = try makeFakeConn(allocator);
@@ -7707,15 +7091,11 @@ test "max IHAVE messages: only the first max_ihave_messages IHAVEs per heartbeat
 
 // --- peer-scoring gate fake tests ------------------------------------------
 //
-// These tests ENABLE scoring (pass a ScoreConfig to create) to exercise the
-// gates. Every other router test leaves scoring disabled (the trailing `null`),
-// so this block alone proves the gates fire while the rest proves disabled =
-// unchanged behaviour. Scores are driven deterministically through the wiring:
-// a peer's invalid-message penalty (P4) is raised by sending it unsigned inbound
-// publishes through a router that has StrictSign enabled — each fails
-// verification and fires `rejectMessage` against the SENDING peer, dropping its
-// score. (Clean, signed deliveries raise it via P2.) All `*_decay` are 1.0 and
-// the P1/P3/P3b/P6 weights are zero, so a peer's score is exactly
+// These tests ENABLE scoring to exercise the gates (every other router test leaves
+// it disabled). Scores are driven deterministically: an invalid-message penalty (P4)
+// is raised by sending unsigned publishes through a StrictSign router (each fires
+// `rejectMessage` against the SENDING peer); clean signed deliveries raise it via P2.
+// All `*_decay` are 1.0 and P1/P3/P3b/P6 weights are zero, so a score is exactly
 //   -(invalid_count^2) - (behaviour_excess^2) + first_deliveries,
 // stable across heartbeats — making the gate boundaries deterministic.
 
@@ -9024,15 +8404,10 @@ test "IDONTWANT dont_send entry expires after its TTL, un-skipping the message" 
 
 // --- direct (explicit) peers ----------------------------------------------
 //
-// A direct peer has an out-of-band peering agreement (go-libp2p WithDirectPeers).
-// It is treated as a trusted out-of-mesh forward target: every valid message on a
-// topic it subscribes to reaches it (alongside the mesh, deduped), it is never
-// grafted/pruned into a mesh (a GRAFT from it draws a PRUNE back), and it bypasses
-// the score gates (graylist / GRAFT-negative-reject / publish threshold). These
-// forwarding tests pass its id (and a placeholder dial address) through
-// `RouterConfig.direct_peers`; the connection itself is driven by the test (it
-// posts peer_connected). The auto-dial behaviour is covered by its own tests
-// below, which inspect the FakeTransport's DialLog.
+// Direct peers (the trusted out-of-mesh forward targets, see
+// `RouterConfig.direct_peers`). These forwarding tests pass the id + a placeholder
+// address through that config and drive the connect manually (post peer_connected);
+// the auto-dial behaviour has its own DialLog tests below.
 
 /// Placeholder dial address for the forwarding tests above, which configure a
 /// direct peer but drive its connect manually (so the FakeTransport's recorded
@@ -9912,16 +9287,13 @@ test "intern churn through all four maps + peer teardown empties the table (no l
 
 // --- topic message validator (ACCEPT / REJECT / IGNORE) --------------------
 //
-// The validator gates delivery + forwarding of a NEW, signature-checked received
-// message on the app's verdict, matching go-libp2p-pubsub's validate-then-forward
-// and rust-libp2p's MessageAcceptance:
-//   accept -> deliver locally (if subscribed) + forward over the mesh + the usual
-//             P2 first-delivery credit (the historic accept-all behaviour);
-//   reject -> neither deliver nor forward, and charge the relaying peer the P4
-//             invalid-message-delivery penalty (score.rejectMessage);
-//   ignore -> neither deliver nor forward, and do NOT penalize the sender.
-// In every case the message is marked seen before the verdict, so a re-send of the
-// same id is suppressed and the validator is not invoked twice for it.
+// The validator gates delivery + forwarding of a new, signature-checked message on
+// the app's verdict (see `ValidationResult`):
+//   accept -> deliver + forward + P2 credit;
+//   reject -> no deliver/forward, charge the relayer P4;
+//   ignore -> no deliver/forward, no penalty.
+// The message is marked seen before the verdict, so a re-send is suppressed and the
+// validator is not invoked twice.
 
 /// A test validator returning a fixed verdict, counting its invocations so a test
 /// can assert it ran (or did not). Owns no heap.
@@ -10131,14 +9503,11 @@ test "validator null (default): accept-all — delivered + forwarded, unchanged 
 
 // --- ASYNC topic message validation (off the router fiber) -----------------
 //
-// With `validation_concurrency > 0` the validator runs on a validation fiber off
-// the single router fiber (go-libp2p's validator-worker model), and the verdict is
-// posted back as a `validation_result` command the router applies: ACCEPT runs the
-// same accept effects as the inline path (deliver + forward + score), REJECT
-// charges P4, IGNORE does nothing. The effects are DEFERRED until the verdict, so a
-// test posts the message, lets the validation fiber run, and polls the observable
-// effect (a forwarded publish on the mesh peer's record, a score change) — then a
-// final `sync` makes the router-state read race-free.
+// With `validation_concurrency > 0` the validator runs on a validation fiber and the
+// verdict is applied back via a `validation_result` command (ACCEPT = the inline
+// accept effects, REJECT = P4, IGNORE = nothing). The effects are DEFERRED until the
+// verdict, so a test posts the message, lets the fiber run, polls the observable
+// effect, then `sync`s for a race-free read.
 
 /// A thread-safe async-validation test validator. Its `validate` runs on a
 /// validation fiber (a worker thread under `std.Io.Threaded`), so its call counter

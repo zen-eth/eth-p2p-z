@@ -1,14 +1,10 @@
-//! cgroup-aware logical CPU count for Linux.
+//! cgroup-aware logical CPU count for Linux, to size the executor pool so a
+//! CPU-quota-limited container does not oversubscribe threads.
 //!
 //! `std.Thread.getCpuCount()` only reads the CPU affinity mask and is blind to
 //! the cgroup CFS quota (`cpu.max` / `cpu.cfs_quota_us`), so under
 //! `docker --cpus=N` or k8s `limits.cpu` it reports the host core count. This
-//! returns `min(quota, affinity)` instead, where the quota is the smallest one
-//! along the cgroup ancestor chain — the kernel enforces every level, but each
-//! level's quota file reports only its own limit.
-//!
-//! Sizes the zio executor pool so a CPU-quota-limited container does not
-//! oversubscribe executor threads against its quota.
+//! returns `min(quota, affinity)` instead.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,13 +14,11 @@ const Io = std.Io;
 
 const CgroupVersion = enum { v1, v2 };
 
-/// cgroup-aware logical CPU count: `min(cgroup quota, affinity)`, or the affinity
-/// count when no quota can be located. Drop-in for `std.Thread.getCpuCount()`
-/// when sizing a thread pool. Falls back to the affinity count whenever no quota
-/// is locatable (non-Linux, no cpu controller, no cgroup mount, unlimited);
-/// errors only when detection genuinely breaks — an unreadable affinity, `/proc`,
-/// or cgroup file, an unopenable cgroup dir, or malformed quota content. `gpa` is
-/// used only for two short-lived `/proc` reads.
+/// cgroup-aware `min(cgroup quota, affinity)`; drop-in for
+/// `std.Thread.getCpuCount()` when sizing a thread pool. Falls back to the
+/// affinity count when no quota is locatable; errors only when detection itself
+/// breaks (unreadable affinity/`/proc`/cgroup file, unopenable dir, malformed
+/// quota). `gpa` is used only for two short-lived `/proc` reads.
 pub fn getNumCpus(gpa: Allocator, io: Io) !usize {
     const logical = try std.Thread.getCpuCount();
     assert(logical >= 1);
@@ -38,13 +32,10 @@ pub fn getNumCpus(gpa: Allocator, io: Io) !usize {
 }
 
 /// The cgroup CPU quota as an effective core count (Linux only): locate the cpu
-/// controller via `/proc/self/{cgroup,mountinfo}`, then read the quota at every
-/// level from the process's cgroup up to the mount point, taking the minimum.
-/// `null` when no quota can be located (non-Linux, no cpu controller, no cgroup
-/// mount, unresolvable path, controller not enabled, unlimited). Errors only on a
-/// broken read of an existing resource (unreadable `/proc` or quota file,
-/// unopenable cgroup dir) or malformed content — so a *readable* quota is never
-/// silently masked.
+/// controller via `/proc/self/{cgroup,mountinfo}`, then take the minimum quota
+/// from the process's cgroup up to the mount point. `null` when no quota is
+/// locatable; errors only on a broken read of an existing resource or malformed
+/// content, so a *readable* quota is never silently masked.
 fn cgroupsNumCpus(gpa: Allocator, io: Io) !?usize {
     if (builtin.os.tag != .linux) return null;
 
@@ -113,12 +104,11 @@ fn readQuotaFile(io: Io, dir: Io.Dir, sub_path: []const u8, buf: []u8) !?[]u8 {
 }
 
 /// Minimum CPU quota along the cgroup chain from `leaf` up to and including the
-/// mount point. The kernel enforces the smallest limit of the whole ancestor
-/// chain, but a constrained child still reads `max` from its own file, so every
-/// level must be read (LXC/Proxmox `cpulimit` and systemd `CPUQuota=` on a
-/// parent slice live above the leaf). The leaf must open — its failure is a
-/// detection error — while ancestors are best-effort: an unopenable ancestor
-/// ends the walk. Bounded by the component count of `leaf`.
+/// mount point. The kernel enforces the smallest limit of the whole chain, but a
+/// constrained child still reads `max` from its own file, so every level must be
+/// read (a parent slice may carry the only limit). The leaf must open — its
+/// failure is a detection error — while ancestors are best-effort: an unopenable
+/// one ends the walk. Bounded by the component count of `leaf`.
 fn cpuQuotaChain(
     io: Io,
     root_dir: Io.Dir,

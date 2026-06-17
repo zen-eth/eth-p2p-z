@@ -1,23 +1,15 @@
-//! End-to-end multi-executor integration tests (Layer 2-6 net).
-//!
-//! Drives two real QUIC endpoints over a loopback UDP socket on a REAL
-//! `zio.Runtime` with >=2 executors: handshake + bidirectional stream echo,
-//! with the server `accept()` running on a concurrent fiber (worker executor)
-//! rather than the OS thread the std.Io.Threaded unit tests are forced to use.
-//!
-//! This exercises the full multi-executor stack — router fiber, per-connection
-//! actors, stream byte queues, TLS handshake, teardown — under genuine
-//! cross-executor scheduling. It is the regression net for the multi-executor
-//! refactor of the upper layers.
+//! End-to-end multi-executor integration tests (Layer 2-6 net): two real QUIC
+//! endpoints over loopback UDP on a REAL `zio.Runtime` with >=2 executors, with
+//! the server `accept()` on a concurrent fiber so dial+accept progress across
+//! executors under genuine cross-executor scheduling — the regression net for the
+//! multi-executor refactor of the upper layers.
 //!
 //! Pulls BoringSSL (via the quiche dep), so it is a separate, slower-compiling
 //! target from the Layer-0 zio-io-test. Run: `zig build zio-integ-test`.
 //!
-//! Runs on every backend (macOS kqueue, Linux epoll / io_uring), including the
-//! teardown path (`endpoint.deinit()` -> `router.closeListener()`). Teardown is
-//! cooperative (a stop flag + closing `route_commands` to wake the router's select
-//! arm), not `router_future.cancel()`: cancel-based teardown of the router's
-//! multi-arm `Select` deadlocks on macOS kqueue. See `router.closeListener`.
+//! Teardown is cooperative (a stop flag + closing `route_commands` to wake the
+//! router's select arm), not `router_future.cancel()`: cancel-based teardown of
+//! the router's multi-arm `Select` deadlocks on macOS kqueue.
 
 const std = @import("std");
 const zio = @import("zio");
@@ -131,20 +123,15 @@ test "endpoint loopback: handshake + stream echo on exact(4)" {
 // ---------------------------------------------------------------------------
 // Switch connection teardown under multi-executor scheduling.
 //
-// Regression guard for a teardown deadlock: a Switch connection's inbound
-// dispatcher parks inside acceptStream (futexWait on the connection's accept
-// waitset) waiting for a stream that never arrives. A cross-executor cancel to
-// unblock it can lose its wakeup on a real multi-executor runtime, so the join
-// blocks forever.
-//
-// Teardown must instead drive the dispatcher to exit via a PERSISTENT signal:
-// closing the connection marks it closed and notifies the accept waitset
-// (level-triggered), so the parked acceptStream wakes via notify, observes
-// isClosed(), and returns ConnectionClosed; the dispatcher loop exits on its
-// own and the join is then trivial. This test loops bring-up/teardown across 2
-// and 4 executors to surface the intermittent lost-wakeup race; a hang here is
-// the deadlock, a clean (leak-checked) completion proves the persistent-signal
-// teardown is reliable.
+// Regression guard for a teardown deadlock: the inbound dispatcher parks inside
+// acceptStream on the connection's accept waitset for a stream that never
+// arrives; a cross-executor cancel to unblock it can lose its wakeup, hanging
+// the join forever. Teardown must instead use a PERSISTENT signal — closing the
+// connection marks it closed and notifies the accept waitset (level-triggered),
+// so the parked acceptStream wakes, observes isClosed(), returns
+// ConnectionClosed, and the dispatcher loop exits on its own. The loop surfaces
+// the intermittent lost-wakeup race: a hang is the deadlock, clean completion
+// proves the persistent-signal teardown reliable.
 
 /// Minimal inbound handler so the server has a registered protocol (an empty
 /// registry makes the dispatcher exit immediately with NoRegisteredProtocols,
@@ -263,12 +250,11 @@ test "switch connection teardown: parked dispatcher unblocks on exact(4)" {
 // Dual-stack listener on the production (zio) backend.
 //
 // Regression guard for the `ip6_only` backend divergence: std.Io.Threaded
-// applies the flag INVERTED (true -> IPV6_V6ONLY=0, dual-stack) while zio is
-// literal (true -> IPV6_V6ONLY=1, v6-only). The bind path therefore sets no
-// flag at all and relies on the OS default (dual-stack on Linux and macOS),
-// verifying it post-bind. This pins the production-backend behavior the
-// std-backend twin in router/loop_tests.zig cannot see: a [::] listener must
-// accept an IPv4 dial.
+// applies the flag INVERTED (true -> IPV6_V6ONLY=0) while zio is literal (true
+// -> IPV6_V6ONLY=1), so the bind path sets no flag and relies on the OS default
+// (dual-stack on Linux and macOS), verifying it post-bind. Pins production-backend
+// behavior the std-backend twin in router/loop_tests.zig cannot see: a [::]
+// listener must accept an IPv4 dial.
 
 /// Bind the server on `[::]:0`, dial it over IPv4 loopback: the dual-stack
 /// listener must complete the handshake with the v4-mapped peer.
@@ -315,11 +301,9 @@ test "endpoint loopback: ipv6 unspecified listener accepts an ipv4 dial on exact
 
 // ---------------------------------------------------------------------------
 // Graceful half-close: a peer must observe EOF after the writer half-closes
-// (closeWrite -> FIN) and then tears the stream down — the pattern the standard
-// libp2p /perf/1.0.0 relies on (responder writes its reply, half-closes, and
-// returns; the Switch then closes+deinits the stream). quinn/quic-go guarantee
-// the buffered data + FIN are delivered even after the handle is closed; this
-// pins the same guarantee for our stream layer.
+// (closeWrite -> FIN) and tears the stream down — the standard libp2p
+// /perf/1.0.0 responder pattern. Pins for our stream layer the quinn/quic-go
+// guarantee that buffered data + FIN are delivered even after the handle closes.
 
 const HalfCloseMode = enum {
     // Switch inbound-handler teardown: graceful bidi close() then deinit().
@@ -354,9 +338,8 @@ const HalfCloseServerCtx = struct {
                 },
             };
         }
-        // Write the reply, then half-close + tear the stream down — the
-        // standard /perf/1.0.0 responder pattern. The buffered reply + FIN
-        // must reach the peer even though the handle is dropped immediately.
+        // Reply, half-close, then drop the handle immediately: the buffered
+        // reply + FIN must still reach the peer.
         inbound.writeAll(io, "pong", .{}) catch |err| {
             ctx.err = err;
             inbound.deinit();

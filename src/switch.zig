@@ -1,15 +1,12 @@
 //! libp2p protocol multiplexer over a QUIC endpoint.
 //!
-//! The Switch is the libp2p layer over a `quic.QuicEndpoint`: it wraps the
-//! endpoint's connection-level API with multiaddr-aware helpers, runs
+//! The Switch wraps a `quic.QuicEndpoint` with multiaddr-aware helpers, runs
 //! multistream-select for inbound streams, and dispatches them to registered
 //! protocol handlers. Identity / TLS / endpoint lifetime are NOT a Switch
-//! concern — construct your `QuicEndpoint` (typically via
-//! `quic.QuicEndpoint.initWithIdentity`) and hand it to `Switch.init`. The
-//! Switch borrows it and owns the managed connections returned by `dial` and
-//! `accept`. A managed connection may be deinited directly; any still-live
-//! managed connections are canceled before the Switch frees its handler
-//! registry. The endpoint can be deinited once Switch teardown is complete.
+//! concern: construct the endpoint and hand it to `Switch.init`. The Switch
+//! BORROWS the endpoint and OWNS the managed connections from `dial`/`accept`.
+//! Still-live managed connections are canceled before the Switch frees its
+//! handler registry; deinit the endpoint only after Switch teardown completes.
 
 const std = @import("std");
 const identity = @import("identity.zig");
@@ -22,13 +19,11 @@ const io_time = @import("quic/io/time.zig");
 
 const command_queue_capacity = 32;
 /// Aggregate cap on concurrent inbound stream-handler fibers across all
-/// connections. The PER-CONNECTION limit is the QUIC stream credit itself
-/// (`initial_max_streams_bidi`): one inbound stream is one handler, and the peer
-/// cannot open more streams than its credit, so the transport bounds per-peer
-/// concurrency with no extra gate — set that credit to the per-peer limit you
-/// want. This aggregate cap is the cross-connection limit QUIC can't express; it
-/// is claimed non-blockingly, and a full aggregate closes the inbound stream
-/// rather than parking the dispatcher.
+/// connections — the cross-connection limit QUIC can't express (the
+/// per-connection limit is already the QUIC stream credit
+/// `initial_max_streams_bidi`, one handler per inbound stream). Claimed
+/// non-blockingly; a full aggregate closes the inbound stream rather than
+/// parking the dispatcher.
 const default_max_inflight_handlers_total: usize = 256;
 const default_negotiation_timeout: std.Io.Timeout = .{
     .duration = .{ .raw = .fromNanoseconds(10 * std.time.ns_per_s), .clock = .awake },
@@ -43,14 +38,13 @@ pub const Switch = struct {
     services_lock: std.Io.Mutex = .init,
     registry_frozen: bool = false,
     /// When true (default), every managed connection — dialed OR accepted —
-    /// automatically starts serving inbound streams. libp2p connections are
-    /// bidirectional: the dialer must serve the peer's inbound streams too
-    /// (otherwise the peer's stream-opens negotiation-timeout and it scores us
-    /// down / disconnects). Matches go-libp2p and rust-libp2p, which always serve
-    /// inbound on every connection. Set false BEFORE dialing/listening for
-    /// pure-outbound connections, or to drive `startInboundDispatcher` yourself
-    /// with custom DispatchOptions. NOTE: auto-dispatch freezes the protocol
-    /// registry on the first connection, so register all services first.
+    /// automatically starts serving inbound streams, because libp2p connections
+    /// are bidirectional: a dialer that doesn't serve the peer's inbound streams
+    /// makes them negotiation-timeout and get scored down / disconnected
+    /// (go-libp2p and rust-libp2p both always serve inbound on every connection).
+    /// Set false BEFORE dialing/listening to opt out (pure-outbound, or to drive
+    /// `startInboundDispatcher` yourself). NOTE: auto-dispatch freezes the
+    /// protocol registry on the first connection, so register all services first.
     auto_inbound_dispatch: bool = true,
     connections: std.ArrayList(*SwitchConnection) = .empty,
     connections_lock: std.Io.Mutex = .init,
@@ -65,26 +59,21 @@ pub const Switch = struct {
     /// `connections_lock` (see `manageConnection` / `unregisterConnection`).
     peer_event_callback: ?PeerEventCallback = null,
 
-    /// Observer of peer-level lifecycle: a peer connected (handshake done, peer
-    /// id known) or disconnected. The intended consumer is a gossipsub router
-    /// that opens/closes its per-peer outbound stream + state.
-    ///
-    /// The callbacks run on the fiber that called `dial`/`accept` (connected) or
-    /// `SwitchConnection.deinit` (disconnected), and ALWAYS outside the Switch's
-    /// `connections_lock`. They must be cheap and non-blocking (the intended use
-    /// just posts to a queue) and must not re-enter Switch connection management
-    /// (dial/accept/deinit) in a way that could block or deadlock.
+    /// Observer of peer-level lifecycle (connected: handshake done, peer id
+    /// known; disconnected). The callbacks run on the fiber that called
+    /// `dial`/`accept` (connected) or `SwitchConnection.deinit` (disconnected),
+    /// ALWAYS outside `connections_lock`. They must be cheap, non-blocking, and
+    /// must not re-enter Switch connection management (dial/accept/deinit) in a
+    /// way that could block or deadlock.
     pub const PeerEventCallback = struct {
         ctx: *anyopaque,
         on_connected: *const fn (ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection, remote_addr: std.Io.net.IpAddress) void,
-        /// Fired once per CONNECTION unregister, not per peer: with two
-        /// connections to one peer (simultaneous dial) each close fires its own
-        /// event. `conn` identifies WHICH connection died so the observer can
-        /// ignore the death of a connection it never adopted — tearing peer
-        /// state down keyed on PeerId alone would let a redundant connection's
-        /// close destroy the live peer's state. The pointer is only an identity
-        /// token here: the connection may already be torn down, so the observer
-        /// must not dereference it.
+        /// Fired once per CONNECTION unregister, not per peer: two connections to
+        /// one peer (simultaneous dial) each fire. `conn` identifies WHICH
+        /// connection died so the observer can ignore one it never adopted —
+        /// keying teardown on PeerId alone would let a redundant connection's
+        /// close destroy the live peer's state. The pointer is an identity token
+        /// only: the connection may already be torn down, so do not dereference.
         on_disconnected: *const fn (ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection) void,
     };
 
@@ -117,11 +106,9 @@ pub const Switch = struct {
         negotiation_timeout: std.Io.Timeout = default_negotiation_timeout,
     };
     /// Result of a multi-protocol open: the negotiated stream plus the protocol
-    /// id the peer accepted. `selected` aliases one element of the caller's
-    /// proposed `protocols` slice (multistream returns the matched candidate, not
-    /// a copy), so the caller must keep that slice alive as long as it reads
-    /// `selected` — passing a static/comptime list (as gossipsub does) makes this
-    /// trivially safe.
+    /// id the peer accepted. `selected` ALIASES one element of the caller's
+    /// proposed slice (not a copy), so that slice must stay alive as long as
+    /// `selected` is read — a static/comptime list (as gossipsub uses) is safe.
     pub const SelectedStream = struct {
         stream: *quic.Stream,
         selected: protocols.ProtocolId,
@@ -176,21 +163,19 @@ pub const Switch = struct {
     }
 
     /// Unregisters the peer connect/disconnect observer. The observing service
-    /// (e.g. a gossipsub router about to be freed) MUST call this before freeing
-    /// the object the callback's `ctx` points at, so no later connect/disconnect
-    /// fires into freed memory. Like `setPeerEventCallback`, this writes the
-    /// `?PeerEventCallback` field without synchronization, so the caller must
-    /// ensure no concurrent connect/disconnect (dial/accept/SwitchConnection.deinit
-    /// firing the callback) is in flight when it runs.
+    /// MUST call this before freeing the object `ctx` points at, so no later
+    /// event fires into freed memory. Writes the field without synchronization,
+    /// so the caller must ensure no concurrent connect/disconnect (a
+    /// dial/accept/deinit firing the callback) is in flight.
     pub fn clearPeerEventCallback(sw: *Switch) void {
         sw.peer_event_callback = null;
     }
 
     pub fn deinit(sw: *Switch) void {
-        // Stop the background accept loop (if `serve` was used) BEFORE tearing down
-        // connections, so it can't accept/append concurrently. `closeListener`
-        // wakes a parked accept() with ListenerClosed; the fiber then exits and we
-        // join it. (Persistent-signal + await, not a bare cancel of a parked wait.)
+        // Stop the background accept loop BEFORE tearing down connections, so it
+        // can't accept/append concurrently: `closeListener` wakes a parked
+        // accept() with ListenerClosed (persistent signal, not a bare cancel of a
+        // parked wait), then we join the fiber.
         if (sw.accept_future) |*future| {
             sw.closeListener(sw.io);
             future.await(sw.io);
@@ -211,11 +196,10 @@ pub const Switch = struct {
         }
         sw.connections.deinit(sw.allocator);
 
-        // The aggregate slot counter is just an atomic freed with the Switch
-        // below. That is only safe because the loop above tore down every
-        // connection first, which joins all handler fibers — so no handler can
-        // still touch the counter. Don't change this to a fire-and-forget
-        // teardown without preserving that ordering.
+        // The aggregate slot counter is freed with the Switch below. Safe only
+        // because the loop above tore down every connection first, joining all
+        // handler fibers — so no handler can still touch the counter. Preserve
+        // that ordering before any fire-and-forget teardown.
 
         sw.services_lock.lockUncancelable(sw.io);
         var it = sw.services.iterator();
@@ -259,25 +243,18 @@ pub const Switch = struct {
         return sw.manageConnection(conn);
     }
 
-    /// THE standard way a server serves inbound connections. Spawns a Switch-owned
-    /// fiber that loops `accept()`, so every inbound connection is managed (tracked
-    /// in `connections`) and — with `auto_inbound_dispatch` — has its inbound stream
-    /// dispatcher started, WITHOUT the caller writing its own accept loop. Usage:
-    /// `listen()`, register all protocol handlers, then `serve()`. Register handlers
-    /// BEFORE the first connection arrives (the registry freezes on first connection).
-    ///
-    /// This is a background-fiber model (like go-libp2p's Host, which auto-serves)
-    /// rather than rust-libp2p's app-drives-the-poll-loop model — consistent with
-    /// the rest of eth-p2p-z, where the library owns its connection-actor and
-    /// dispatcher fibers. The fiber is Switch-owned and joined in `deinit`.
+    /// THE standard way a server serves inbound connections: spawns a
+    /// Switch-owned fiber that loops `accept()`, so every inbound connection is
+    /// managed and — with `auto_inbound_dispatch` — has its dispatcher started,
+    /// with no caller accept loop. Background-fiber model like go-libp2p's Host
+    /// (vs rust-libp2p's app-driven poll loop). The fiber is joined in `deinit`.
+    /// Usage: `listen()`, register all handlers (registry freezes on first
+    /// connection), then `serve()`.
     ///
     /// Idempotent. Do NOT also drive `accept()` manually — both consume the same
-    /// accept queue. Reach for a manual `accept()` loop ONLY when you need
-    /// per-connection access that the dispatcher does not give you — e.g. running
-    /// identify as a CLIENT on each inbound peer when the peer-event callback is
-    /// already taken (see the gossipsub interop binary), or in tests. `deinit`
-    /// stops the loop (`closeListener` wakes the parked accept) and tears down the
-    /// accepted connections.
+    /// accept queue. Reach for a manual `accept()` loop ONLY for per-connection
+    /// access the dispatcher doesn't give (e.g. running identify as a CLIENT on
+    /// each inbound peer when the peer-event callback is already taken), or tests.
     pub fn serve(sw: *Switch, io: std.Io) std.Io.ConcurrentError!void {
         if (sw.accept_future != null) return;
         sw.accept_future = try std.Io.concurrent(io, acceptLoop, .{sw});
@@ -301,17 +278,12 @@ pub const Switch = struct {
         }
     }
 
-    /// Graceful-shutdown helper: unblock a fiber parked in `accept`. After this,
-    /// a blocked `accept` returns `error.ListenerClosed` (distinct from
-    /// `error.Canceled`), so an accept loop can detect the stop and exit cleanly
-    /// instead of treating it as an unexpected failure. The underlying endpoint
-    /// is NOT torn down — existing connections keep working — so a caller can
-    /// quiesce inbound accepts before closing connections and running `deinit`.
-    /// Idempotent and safe to call before `deinit`; the later listener teardown
-    /// in `endpoint.deinit` won't double-close the accept channel. The `io`
-    /// argument is accepted for call-site symmetry with the rest of the
-    /// concurrency API; the Switch closes the accept channel via its own stored
-    /// `io`, so the passed value is not required to differ.
+    /// Graceful-shutdown helper: unblock a fiber parked in `accept`, which then
+    /// returns `error.ListenerClosed` (distinct from `error.Canceled`) so an
+    /// accept loop can stop cleanly. The endpoint is NOT torn down — existing
+    /// connections keep working — so a caller can quiesce inbound accepts before
+    /// `deinit`. Idempotent (later `endpoint.deinit` teardown won't double-close).
+    /// `io` is taken for call-site symmetry; the Switch uses its own stored `io`.
     pub fn closeListener(sw: *Switch, io: std.Io) void {
         _ = io;
         sw.endpoint.stopAccepting();
@@ -331,9 +303,8 @@ pub const Switch = struct {
     }
 
     /// Snapshot the peer ids of all currently-managed connections. Caller owns
-    /// the returned slice (free with `allocator.free`). Lets a caller enumerate
-    /// connected peers without a separate registry — the connection list IS the
-    /// registry.
+    /// the returned slice (free with `allocator.free`). The connection list IS
+    /// the registry; no separate one is kept.
     pub fn snapshotPeerIds(sw: *Switch, allocator: std.mem.Allocator) std.mem.Allocator.Error![]PeerId {
         sw.connections_lock.lockUncancelable(sw.io);
         defer sw.connections_lock.unlock(sw.io);
@@ -394,11 +365,10 @@ pub const Switch = struct {
             conn.deinit();
             return err;
         };
-        // Exactly one actor-cleanup path may run on the error path. Both
-        // `destroyUnspawned` and `shutdownAndDestroy` free `inbox_storage` and
-        // destroy `actor`, so two stacked errdefers would double-free (and run
-        // the second against freed memory). Guard on whether the main fiber was
-        // spawned: before spawn -> `destroyUnspawned`; after -> `shutdownAndDestroy`.
+        // Exactly one actor-cleanup path may run on error: both free
+        // `inbox_storage` and destroy `actor`, so two stacked errdefers would
+        // double-free. Guard on spawn state — before spawn `destroyUnspawned`,
+        // after `shutdownAndDestroy`.
         var actor_spawned = false;
         errdefer if (actor_spawned) actor.shutdownAndDestroy() else actor.destroyUnspawned();
 
@@ -415,12 +385,9 @@ pub const Switch = struct {
         actor_spawned = true;
 
         // Register under the lock, then fire the connect event OUTSIDE it: the
-        // observer (a router) may post to its own inbox, and holding
-        // connections_lock across that risks lock-ordering / blocking issues.
-        // Capture the peer id + remote address while registered so the values
-        // are valid even though we fire after unlocking. Both peer_id and
-        // remote_addr are set in the actor's init before it spawns, so they are
-        // already valid here.
+        // observer may post to its own inbox, and holding connections_lock across
+        // that risks lock-ordering / blocking. peer_id and remote_addr are set in
+        // the actor's init before spawn, so they are valid to read after unlock.
         {
             sw.connections_lock.lockUncancelable(sw.io);
             defer sw.connections_lock.unlock(sw.io);
@@ -435,14 +402,12 @@ pub const Switch = struct {
             cb.on_connected(cb.ctx, managed.peerId(), managed, managed.remoteAddress());
         }
 
-        // Serve the peer's inbound streams by default (libp2p connections are
-        // bidirectional). Only when at least one protocol service is registered:
-        // starting the dispatcher with an empty registry makes it exit
-        // immediately ("no protocol handlers"), and consumers that register
-        // handlers after connecting (or drive dispatch manually) should be left
-        // alone — they freeze/start the registry themselves. Best-effort and
-        // idempotent with any later explicit startInboundDispatcher call. Opt out
-        // entirely via `sw.auto_inbound_dispatch`.
+        // Serve the peer's inbound streams by default (connections are
+        // bidirectional), but only with a non-empty registry: an empty one makes
+        // the dispatcher exit immediately, and consumers registering handlers
+        // later (or driving dispatch manually) start it themselves. Best-effort
+        // and idempotent with any later startInboundDispatcher call; opt out via
+        // `sw.auto_inbound_dispatch`.
         if (sw.auto_inbound_dispatch and sw.hasRegisteredServices()) {
             managed.startInboundDispatch(.{}) catch |err| {
                 std.log.warn("switch: auto inbound-dispatch failed: {s}", .{@errorName(err)});
@@ -452,11 +417,10 @@ pub const Switch = struct {
     }
 
     fn unregisterConnection(sw: *Switch, conn: *SwitchConnection) void {
-        // Capture the peer id while still registered, perform the removal under
-        // the lock, then fire the disconnect event OUTSIDE the lock (same reason
-        // as the connect event in `manageConnection`). `did_unregister` guards
-        // against a double-fire: this returns early without firing when called
-        // on an already-unregistered connection.
+        // Capture the peer id while registered, remove under the lock, then fire
+        // the disconnect event OUTSIDE it (as in `manageConnection`).
+        // `did_unregister` guards a double-fire: an already-unregistered
+        // connection returns early without firing.
         var did_unregister = false;
         const peer_id = conn.peerId();
         {
@@ -542,12 +506,10 @@ pub const SwitchConnection = struct {
     }
 
     /// Open an outbound stream proposing `protocol_ids` in preference order and
-    /// return both the stream and the protocol the peer accepted. Unlike
-    /// `openProtocolStream` (which proposes one id and fails on any mismatch),
-    /// this negotiates the best common protocol from a list — the initiator
-    /// proposes each id in turn until the responder accepts one. Used by
-    /// gossipsub to speak the highest /meshsub version a peer supports while
-    /// falling back cleanly to older ones.
+    /// return the stream plus the protocol the peer accepted: the initiator
+    /// proposes each id in turn until the responder accepts one (vs
+    /// `openProtocolStream`, which proposes a single id). Lets gossipsub speak the
+    /// highest /meshsub version a peer supports, falling back to older ones.
     ///
     /// `protocol_ids` is borrowed; `result.selected` aliases one of its elements
     /// (see `SelectedStream`), so it must outlive the caller's use of `selected`.
@@ -790,13 +752,12 @@ const SwitchConnectionActor = struct {
                 actor.inbox.putOneUncancelable(actor.io, .{ .shutdown = &reply }) catch break :blk false;
                 break :blk true;
             };
-            // The `.shutdown` command only gets seen between commands; while
-            // actorMain is parked inside a command (e.g. an untimed acceptStream)
-            // it never reaches it. Cancel the main future too: every blocking
-            // point in actorMain is a cancel point that unwinds to fiber exit, so
-            // this can't re-park. Cancel before waiting on the reply, since a
-            // parked actorMain would never complete it otherwise (its defer's
-            // completePending does, once cancel unparks it).
+            // The `.shutdown` command is only seen between commands; while
+            // actorMain is parked inside one it never reaches it. So also cancel
+            // the main future — every blocking point is a cancel point that
+            // unwinds to fiber exit. Cancel before waiting on the reply: a parked
+            // actorMain completes it only once cancel unparks it (via its defer's
+            // completePending).
             future.cancel(actor.io) catch {};
             if (sent) reply.event.waitUncancelable(actor.io);
             _ = future.await(actor.io) catch {};
@@ -815,23 +776,18 @@ const SwitchConnectionActor = struct {
 
         // Close the connection BEFORE joining the dispatcher/handler fibers.
         //
-        // The inbound dispatcher parks inside `acceptStream`, which blocks in a
-        // futex-style wait on the connection's accept waitset until a stream
-        // arrives. Joining that fiber (what `Group.cancel` does) relies on
-        // something unblocking the wait first. Relying on the cross-executor
-        // cancel itself to do that is fragile: on a multi-executor runtime the
-        // cancel's wakeup can be lost while the fiber is parked, so the wait
-        // never returns and the join blocks forever.
-        //
-        // Closing the connection first marks it closed and NOTIFIES the accept
-        // waitset (a persistent, level-triggered signal). That wakes the parked
-        // `acceptStream` via notify — not via cancel — it observes the now-closed
-        // connection and returns `ConnectionClosed`, so the dispatcher loop exits
-        // on its own. Any in-flight handler fibers likewise unblock once their
-        // streams see the closed connection. The subsequent `cancel` calls then
-        // only JOIN already-unblocking fibers (and serve as a backstop), which
-        // cannot deadlock. The connection is fully deinited LAST, after both
-        // groups have joined, so no fiber can still be touching it.
+        // The dispatcher parks in `acceptStream`, a futex-style wait on the
+        // connection's accept waitset. Joining via `Group.cancel` needs that wait
+        // unblocked first, and relying on the cross-executor cancel to do it is
+        // fragile: on a multi-executor runtime the cancel's wakeup can be lost
+        // while the fiber is parked, so the join blocks forever. Closing first
+        // marks the connection closed and NOTIFIES the accept waitset (a
+        // persistent, level-triggered signal), waking the wait via notify — it
+        // observes the closed connection and exits on its own; in-flight handlers
+        // likewise unblock once their streams see it. The later `cancel` calls
+        // then only JOIN already-unblocking fibers (a backstop), never deadlock.
+        // The connection is deinited LAST, after both groups join, so no fiber
+        // can still touch it.
         if (actor.conn) |conn| {
             const prev = actor.io.swapCancelProtection(.blocked);
             defer _ = actor.io.swapCancelProtection(prev);
@@ -843,10 +799,9 @@ const SwitchConnectionActor = struct {
             conn.deinit();
             actor.conn = null;
         } else {
-            // No live connection to notify through (already torn down); fall back
-            // to canceling the groups directly. With nothing parked in
-            // acceptStream against a live connection, this join cannot lose a
-            // wakeup the way the connection-backed wait can.
+            // No live connection to notify through; cancel the groups directly.
+            // With nothing parked in acceptStream against a live connection, this
+            // join cannot lose a wakeup the way the connection-backed wait can.
             actor.dispatcher_group.cancel(actor.io);
             actor.handler_group.cancel(actor.io);
         }
@@ -861,17 +816,13 @@ const SwitchConnectionActor = struct {
         }
     }
 
-    /// Open + initiator-negotiate on a `handler_group` fiber, off the actor's
-    /// command fiber, so a slow responder doesn't queue this connection's other
-    /// commands (close, stats, dispatch) behind it. Touches only the `conn`
-    /// handle (resolved at spawn), never `actor.conn`/`actor.closing`: the
-    /// handle stays valid because handler_group is cancelled+joined before
-    /// `cleanup` deinits it, and `close` only `conn.close`s — its teardown
-    /// closes every per-stream queue, unparking a negotiation blocked in a read.
-    ///
-    /// Completes `reply` on every path including cancellation (stream ops
-    /// surface Canceled as a value, never unwinding past completion), because
-    /// the caller is parked uncancelably on it.
+    /// Open + initiator-negotiate on a `handler_group` fiber, off the command
+    /// fiber, so a slow responder doesn't queue this connection's other commands
+    /// behind it. Touches only the `conn` handle (resolved at spawn), never
+    /// `actor.conn`/`actor.closing`: the handle stays valid because handler_group
+    /// is cancelled+joined before `cleanup` deinits it. Completes `reply` on every
+    /// path including cancellation (stream ops surface Canceled as a value, never
+    /// unwinding past completion), since the caller parks uncancelably on it.
     fn outboundNegotiationMulti(
         io: std.Io,
         conn: *quic.Connection,
@@ -940,11 +891,9 @@ const SwitchConnectionActor = struct {
             stream.deinit();
         };
 
-        // Claim an aggregate handler slot (the per-connection limit is the QUIC
-        // stream credit, enforced by the transport). A full aggregate is not an
-        // error to retry on this stream: close it and return HandlerLimitReached.
-        // The close is a graceful FIN/STOP_SENDING(0) — the peer's negotiation
-        // fails but can't tell a limit from a completed handler.
+        // Claim an aggregate handler slot. A full aggregate isn't retryable on
+        // this stream: close it gracefully and return HandlerLimitReached — the
+        // peer's negotiation fails but can't tell a limit from a finished handler.
         if (!channel.tryDecrementToFloor(&actor.sw.handler_slots_total)) return error.HandlerLimitReached;
         errdefer _ = actor.sw.handler_slots_total.fetchAdd(1, .release);
 
@@ -986,14 +935,11 @@ const SwitchConnectionActor = struct {
         const conn = actor.liveConnection() orelse return error.ConnectionClosed;
         actor.closing = true;
 
-        // Close the connection BEFORE stopping the dispatcher / joining handlers.
-        // Closing marks the connection closed and notifies its accept waitset, so
-        // a dispatcher parked in acceptStream wakes via that persistent signal,
-        // observes the closed connection, and exits on its own. The subsequent
-        // dispatcher/handler joins then only reap already-unblocking fibers rather
-        // than depending on a cross-executor cancel to wake a parked wait (whose
-        // wakeup can be lost). Capture the close result and return it after the
-        // joins so the caller still sees the real close outcome.
+        // Close the connection BEFORE stopping the dispatcher / joining handlers,
+        // for the same persistent-signal reason as `cleanup`: closing wakes a
+        // dispatcher parked in acceptStream so it exits on its own, and the joins
+        // then only reap already-unblocking fibers. Capture and return the close
+        // result after the joins so the caller still sees the real outcome.
         const result = conn.close(actor.io, code, reason);
         actor.stopInboundDispatch();
         actor.handler_group.cancel(actor.io);
@@ -1109,19 +1055,17 @@ fn inboundDispatcher(actor: *SwitchConnectionActor, opts: Switch.DispatchOptions
             },
             error.OutOfMemory => return,
             error.ConcurrencyUnavailable => {
-                // Out of fibers/threads — usually the same exhaustion as
-                // OutOfMemory. Looping would tight-spin (accept and roll back
-                // instantly), so exit like OutOfMemory; the connection stays up,
-                // inbound dispatch stops.
+                // Out of fibers/threads — like OutOfMemory, looping would
+                // tight-spin (accept and roll back instantly), so exit. The
+                // connection stays up; inbound dispatch stops.
                 std.log.warn("switch dispatcher exiting: cannot spawn handler (concurrency unavailable)", .{});
                 return;
             },
             error.HandlerLimitReached => {
-                // The aggregate cap is full (only reachable when the whole process
-                // is at capacity). Keep accepting, but back off so a flood of
-                // queued streams can't spin the loop accepting-and-closing them at
-                // full speed. A slot frees within a handler's lifetime, so a coarse
-                // poll is fine. Cancel = teardown.
+                // Aggregate cap full. Keep accepting but back off, so a flood of
+                // queued streams can't spin the loop accepting-and-closing at full
+                // speed; a slot frees within a handler's lifetime so a coarse poll
+                // suffices. Cancel = teardown.
                 io_time.ms(5).sleep(actor.io) catch return;
                 continue;
             },
@@ -1190,11 +1134,10 @@ fn runNegotiatedProtocolHandler(
 }
 
 fn closeStreamForCleanup(io: std.Io, stream: *quic.Stream) void {
-    // FIN-only: finish our write side but do NOT STOP_SENDING(0) the read side.
-    // A handler may have server-pushed a response (e.g. identify) that the peer is
-    // still reading; an eager STOP_SENDING races that read on some stacks. This
-    // matches go-libp2p `CloseWrite` / rust-libp2p `Stream::poll_close`. The actor
-    // reaps the stream record once the peer also finishes.
+    // FIN-only: finish our write side but do NOT STOP_SENDING(0) the read side,
+    // because a handler may have pushed a response (e.g. identify) the peer is
+    // still reading and an eager STOP_SENDING races that read on some stacks
+    // (matches go-libp2p `CloseWrite` / rust-libp2p `Stream::poll_close`).
     stream.closeGraceful(io) catch |err| std.log.debug("failed to close QUIC stream during cleanup: {}", .{err});
 }
 
@@ -1298,10 +1241,9 @@ test "switch dispatches inbound streams to registered protocol handlers" {
     defer server.deinit();
     const client = try Switch.init(allocator, io, client_endpoint);
     defer client.deinit();
-    // This test drives inbound dispatch MANUALLY (both startInboundDispatch and
-    // the single-shot dispatchInboundStream primitive), so it opts out of the
-    // default auto inbound-dispatch — otherwise the auto continuous dispatcher
-    // races the manual single-stream accept on the same connection.
+    // This test drives inbound dispatch MANUALLY, so it opts out of auto
+    // inbound-dispatch — otherwise the auto continuous dispatcher races the
+    // manual single-stream accept on the same connection.
     server.auto_inbound_dispatch = false;
     client.auto_inbound_dispatch = false;
 
@@ -1517,12 +1459,11 @@ test "switch dispatches inbound streams to registered protocol handlers" {
 }
 
 test "serve accepts and dispatches every inbound connection without a manual accept loop" {
-    // `serve` spawns a Switch-owned background accept loop, so a server just
-    // listen()s, registers handlers, and serve()s — no per-app accept loop. Two
-    // independent clients dial the same server and the registered handler must run
-    // for BOTH connections. A one-shot accept() would serve only the first; this
-    // guards the multi-connection case (e.g. py-libp2p opens a second connection
-    // after a successful identify exchange).
+    // `serve` spawns a Switch-owned accept loop, so a server just listen()s,
+    // registers handlers, and serve()s. Two clients dial the same server and the
+    // handler must run for BOTH connections — guarding the multi-connection case
+    // a one-shot accept() would miss (e.g. py-libp2p opens a second connection
+    // after identify).
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -1628,11 +1569,9 @@ test "openProtocolStreamMulti negotiates the best protocol the peer supports" {
     const client = try Switch.init(allocator, io, client_endpoint);
     defer client.deinit();
 
-    // A trivial inbound handler that just reads one byte, registered under the
-    // SERVER's middle and low protocol ids but NOT the high one. The client
-    // proposes [high, middle, low]; the responder rejects "high" (not
-    // registered) and accepts "middle" (the first it supports), so the
-    // negotiated protocol must be "middle".
+    // Server registers middle + low but NOT high. The client proposes
+    // [high, middle, low]; the responder rejects "high" and accepts "middle" (the
+    // first it supports), so the negotiated protocol must be "middle".
     const high = "/test/multi/3.0.0";
     const middle = "/test/multi/2.0.0";
     const low = "/test/multi/1.0.0";
@@ -2176,11 +2115,10 @@ test "closeListener is idempotent across repeated calls and teardown" {
 }
 
 test "closeListener drains a queued-but-unaccepted inbound connection without leak" {
-    // When an inbound connection has been accepted by the router and buffered in
-    // the accept queue but never handed to a Switch.accept() caller, closing the
-    // listener (and the following endpoint teardown) must release that buffered
-    // connection. The std.testing.allocator asserts no leak: the queued
-    // connection is dropped/closed on teardown rather than orphaned.
+    // An inbound connection buffered in the accept queue but never handed to a
+    // Switch.accept() caller must be released by closing the listener (and the
+    // following endpoint teardown), not orphaned — the testing allocator's leak
+    // check is the assertion.
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -2230,11 +2168,9 @@ test "closeListener drains a queued-but-unaccepted inbound connection without le
     // A small extra settle so the publish into the queue has definitely landed.
     io_time.ms(50).sleep(io) catch {};
 
-    // Stop accepting WITHOUT ever calling server.accept(): the inbound connection
-    // stays buffered in the closed accept queue. The listener teardown
-    // (server.deinit -> endpoint.deinit) must drain and release that buffered
-    // connection rather than orphan it. The std.testing.allocator's leak check at
-    // the end of the test is the assertion: a leaked queued connection fails here.
+    // Stop accepting WITHOUT ever calling server.accept(): the connection stays
+    // buffered in the closed accept queue. The listener teardown (server.deinit
+    // -> endpoint.deinit) must drain and release it; a leak fails the test.
     server.closeListener(io);
     server.closeListener(io); // still idempotent with a buffered item present.
 }

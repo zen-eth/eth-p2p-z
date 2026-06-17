@@ -65,12 +65,11 @@ const Impl = struct {
         self.state = null;
         self.unlockHandle();
         if (state) |st| {
-            // Best-effort drop notification, fire-and-forget. If the write side
-            // was gracefully finished (closeWrite/close already queued our FIN),
-            // tear down via the graceful close_stream path so the buffered data +
-            // FIN still flush — an abrupt drop_stream (RESET_STREAM) would discard
-            // them. Otherwise the app abandoned an open write side, so RESET it
-            // (quinn/quic-go: dropping an unfinished stream resets it).
+            // Fire-and-forget drop. If the write side was gracefully finished
+            // (FIN already queued), use close_stream so buffered data + FIN still
+            // flush; abrupt drop_stream (RESET_STREAM) would discard them.
+            // Otherwise the app abandoned an open write side, so RESET it
+            // (dropping an unfinished stream resets it, per quinn/quic-go).
             if (!st.isClosed()) {
                 const write_finished = st.isWriteShutdown();
                 st.markClosedLocal();
@@ -104,10 +103,9 @@ pub const Stream = opaque {
 
     /// Destroy the handle. CONTRACT — external synchronization required: no
     /// other fiber may be inside, or subsequently enter, ANY method of this
-    /// handle once deinit starts; the handle memory is freed here, so a racing
-    /// call is a use-after-free (the internal lock only serializes the
-    /// state-pointer swap, exactly like Connection's — see that handle's
-    /// `Impl.handle_lock` for why an internal refcount could not do better).
+    /// handle once deinit starts; the memory is freed here, so a racing call is
+    /// a use-after-free (the internal lock only serializes the state-pointer
+    /// swap, not handle lifetime).
     pub fn deinit(self: *Stream) void {
         self.impl().deinit();
     }
@@ -198,15 +196,13 @@ pub const Stream = opaque {
     }
 
     /// FIN-only graceful close for tearing down an inbound protocol-handler
-    /// stream. Finishes the write side (sending FIN + draining buffered bytes,
-    /// like `closeWrite`) and then marks the handle closed so `deinit` is a clean
-    /// free — but, unlike `close`, it does NOT send STOP_SENDING(0) on the read
-    /// side. STOP_SENDING on a stream whose peer may still be reading a
-    /// server-pushed response (e.g. identify) races that read on some stacks
-    /// (py-libp2p over QUIC reports "fail to read from multiselect communicator").
-    /// The connection actor reaps the record via its normal finished-stream sweep
-    /// once the peer also finishes (FIN was set here). Mirrors rust-libp2p
-    /// `Stream::poll_close` (finish send only) and go-libp2p `CloseWrite`.
+    /// stream: finishes the write side (like `closeWrite`) then marks the handle
+    /// closed, but unlike `close` does NOT send STOP_SENDING(0). STOP_SENDING on a
+    /// stream whose peer may still be reading a server-pushed response (e.g.
+    /// identify) races that read on some stacks (py-libp2p reports "fail to read
+    /// from multiselect communicator"). The actor reaps the record via its normal
+    /// finished-stream sweep once the peer also finishes. Finish-send-only matches
+    /// rust-libp2p `Stream::poll_close` and go-libp2p `CloseWrite`.
     pub fn closeGraceful(self: *Stream, io: std.Io) ShutdownWriteError!void {
         const state = self.impl().liveRetained() orelse return;
         defer state.release();
@@ -406,10 +402,9 @@ pub const StreamReader = struct {
             },
         };
         if (data_capacity == 0) {
-            // writableVector queues caller slices ahead of the reader's own
-            // buffer, so zero caller capacity means the read landed in
-            // `interface.buffer`: advance `end` and return 0 bytes-to-`data`.
-            // Returning `n` makes the fill loop re-read and drop these bytes.
+            // Zero caller capacity means the read landed in `interface.buffer`,
+            // so advance `end` and report 0 bytes-to-`data`. Returning `n` would
+            // make the fill loop re-read and drop these bytes.
             io_r.end += n;
             return 0;
         }

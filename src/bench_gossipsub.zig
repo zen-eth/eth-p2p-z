@@ -1,28 +1,13 @@
 //! Gossipsub router micro-benchmark (`zig build bench-gossipsub`).
 //!
 //! Measures the ROUTER hot path in-process — protobuf decode, signature
-//! verification (inline vs the async worker pipeline), seen-cache dedup, mesh
+//! verification (inline vs async worker pipeline), seen-cache dedup, mesh
 //! fan-out through real per-peer writer fibers — against a discard transport,
-//! so the numbers isolate router cost from the network. Scenarios:
+//! so the numbers isolate router cost from the network. Scenarios are defined
+//! by the `scenarios` table and the heartbeat/gossip-emit runners below.
 //!
-//!   strict/inline     signed messages, verification ON the router fiber
-//!                     (validation_concurrency = 0)
-//!   strict/async      same load, verification on validation fibers
-//!                     (validation_concurrency = executor count)
-//!   strict/async dupx4 every id delivered 4x (relayed by 4 peers): duplicates
-//!                     must skip crypto via the seen check
-//!   anonymous         no signatures, content-derived ids (the eth2 StrictNoSign
-//!                     shape; app/BLS validation is out of scope here)
-//!   heartbeat         heartbeat latency with a loaded seen cache, and the
-//!                     expiry tick where every id ages out at once
-//!
-//! Reported per scenario: delivered msgs/s, µs/msg, end-to-end wall time,
-//! deliveries vs offered (a shortfall under strict/async = validation throttle
-//! drops, go-parity behaviour), forwarded frames+bytes (discard-sink counters),
-//! and allocator op counts (allocs/frees per message).
-//!
-//! Run with -Doptimize=ReleaseFast for meaningful numbers. The runtime is zio
-//! (production parity: epoll/kqueue), executors = clamp(cpus, 2, 64).
+//! A delivered-vs-offered shortfall under strict/async is validation-throttle
+//! drops (go-parity), not a bug. Run with -Doptimize=ReleaseFast.
 
 const std = @import("std");
 const zio = @import("zio");
@@ -186,8 +171,7 @@ const Workload = struct {
     unique: usize,
 
     fn deinit(w: *Workload, allocator: std.mem.Allocator) void {
-        // Posted rpcs are owned (and freed) by the router; this frees only a
-        // workload that was never posted. After a run, call forget() instead.
+        // Posted rpcs are owned (and freed) by the router; free only the arrays.
         allocator.free(w.rpcs);
         allocator.free(w.relayer);
     }
@@ -249,12 +233,10 @@ const Scenario = struct {
     validation_concurrency: usize,
     dup_factor: usize,
     msgs: usize,
-    /// Paced (closed-loop): post in batches of the concurrency cap with a sync
-    /// barrier between batches, so verdict re-entries are never starved behind
-    /// queued ingress — measures the pipeline's sustained validated capacity.
-    /// Unpaced (open-loop) posts everything at memcpy speed and measures burst
-    /// behaviour. The remaining unpaced shortfall is the real
-    /// offered-vs-verification capacity gap.
+    /// Paced (closed-loop): batch to the concurrency cap with a sync barrier
+    /// between batches, so verdicts aren't starved behind queued ingress —
+    /// measures sustained validated capacity. Unpaced posts at memcpy speed; its
+    /// shortfall is the real offered-vs-verification capacity gap.
     paced: bool = false,
     /// Enable peer scoring: every accepted message then runs the per-message
     /// promise fulfilment probe (O(all peers): one iwant_promises map probe per
@@ -334,10 +316,9 @@ fn runScenario(
     const transport = BenchTransport{ .counters = &counters };
 
     const local_peer = try PeerId.random();
-    // Inline local delivery: the bench handler is one atomic increment, and
-    // the bench's job is to measure the ROUTER pipeline — queued delivery
-    // (the production default) would fold delivery-fiber scheduling and
-    // full-queue local drops into the delivered-throughput metric.
+    // Inline local delivery (delivery_queue_len = 0): the production queued
+    // default would fold delivery-fiber scheduling and full-queue local drops
+    // into the throughput metric, masking router cost.
     const cfg: router_mod.RouterConfig = if (sc.host_key == null)
         .{ .signature_policy = .anonymous, .validation_concurrency = sc.validation_concurrency, .delivery_queue_len = 0 }
     else
@@ -353,10 +334,8 @@ fn runScenario(
         const t = try allocator.dupe(u8, topic);
         try r.inbox.putOne(io, .{ .subscribe = .{ .topic = t } });
     }
-    // Mesh peers (grafted) + optional non-mesh extras: the extras receive no
-    // traffic but scale every O(connected peers) per-message term (promise
-    // fulfilment probes, IHAVE candidate scans) the way a real node's gossip
-    // fringe does.
+    // Mesh peers (grafted) + optional non-mesh extras (untraffic'd, only to
+    // scale the O(connected peers) per-message terms).
     const total_peers = mesh_peers + sc.extra_peers;
     const conns = try allocator.alloc(BenchConn, total_peers);
     defer allocator.free(conns);
@@ -508,11 +487,10 @@ fn runHeartbeatScenario(counting: *CountingAllocator, io: std.Io) !void {
     std.debug.print("  post-expiry tick: {d:.2} ms\n", .{@as(f64, @floatFromInt(timedHeartbeat(r, io))) / 1e6});
 }
 
-/// Heartbeat gossip-emission cost: a full IHAVE window (max_ihave_length ids
-/// in the current mcache gossip slot) advertised to the gossip fringe — 64
-/// non-mesh peers that announced the topic. Measures the per-tick cost of
-/// emitGossip: the IDENTICAL IHAVE RPC is protobuf-encoded and frame-allocated
-/// once PER TARGET PEER; the frames/bytes/alloc counters attribute it.
+/// Heartbeat gossip-emission cost: a full IHAVE window (max_ihave_length ids)
+/// advertised to 64 non-mesh fringe peers. The key cost is that emitGossip
+/// protobuf-encodes and frame-allocates the IDENTICAL IHAVE RPC once PER TARGET
+/// PEER; the frames/bytes/alloc counters attribute it.
 fn runGossipEmitScenario(counting: *CountingAllocator, io: std.Io) !void {
     const allocator = counting.allocator();
     var counters = SinkCounters{};

@@ -1,40 +1,23 @@
-//! test-plans gossipsub-interop participant mode.
+//! test-plans gossipsub-interop participant mode: a drop-in node for the official
+//! libp2p `test-plans/gossipsub-interop` framework under Shadow over QUIC. Entered
+//! ONLY when invoked as `<bin> --params <path.json>`; any other invocation keeps
+//! `main.zig`'s `key=value` smoke-test behavior.
 //!
-//! This makes the gossipsub interop node a drop-in participant in the official
-//! libp2p `test-plans/gossipsub-interop` framework, run under the Shadow network
-//! simulator over QUIC alongside the go-libp2p and rust-libp2p reference nodes.
-//! It is entered ONLY when the binary is invoked as `<bin> --params <path.json>`
-//! (the exact invocation the framework uses); every other invocation keeps the
-//! existing `key=value` smoke-test behavior in `main.zig` untouched.
+//! Nodes get NO out-of-band coordination — they find each other by convention, so
+//! every implementation (go-libp2p / rust-libp2p / this) must agree byte-for-byte:
 //!
-//! The framework gives each node NO out-of-band coordination — nodes find each
-//! other by convention, so every implementation must agree byte-for-byte on:
+//!   * Identity: host `node<N>`; Ed25519 key from a 32-byte seed = little-endian(N)
+//!     then zero, so the derived peer-id is computable from a node's number alone.
+//!   * Connector: dial `/ip4/<ip>/udp/9000/quic-v1/p2p/<peerId>`, resolving DNS
+//!     `node<i>` to its IP and the peer-id from the seed.
+//!   * Pubsub: anonymous (StrictNoSign + NoAuthor), message-id = first 8 bytes of
+//!     data, max 10 MiB. A published message is big-endian(messageID) zero-padded.
+//!   * Tracer log: JSON lines on STDOUT for `analyze_message_deliveries.py` — a
+//!     `PeerID` line and a `Received Message` line per delivery.
 //!
-//!   * Identity: the host is named `node<N>` (Shadow hostname). The Ed25519 key
-//!     is built from a 32-byte seed whose first 8 bytes are `little-endian(N)`
-//!     and the rest zero (Go's `ed25519.NewKeyFromSeed`). The derived libp2p
-//!     peer-id is therefore identical across implementations, so any node can
-//!     compute any other node's peer-id from just its number.
-//!
-//!   * Connector: to reach node `i`, resolve the DNS name `node<i>` (Shadow's
-//!     resolver returns its IP), compute node `i`'s peer-id from the seed above,
-//!     and dial `/ip4/<ip>/udp/9000/quic-v1/p2p/<peerId>`.
-//!
-//!   * Pubsub: StrictNoSign + NoAuthor (anonymous), message-id = the first 8
-//!     bytes of the message data (the framework's `CalcID`), max message size
-//!     10 MiB. A published message is `big-endian(messageID)` zero-padded to the
-//!     requested size, so its first 8 bytes are the message number.
-//!
-//!   * Tracer log: JSON lines on STDOUT that the framework's
-//!     `analyze_message_deliveries.py` parses — a `PeerID` line mapping node-id
-//!     to peer-id, and a `Received Message` line per delivered message carrying
-//!     the topic and the message-id rendered as the DECIMAL of its big-endian
-//!     u64 (the analyzer's `formatMessageID`).
-//!
-//! The node executes a `params.json` script: a list of instructions
-//! (initGossipSub / setTopicValidationDelay / connect / subscribeToTopic /
-//! waitUntil / publish, optionally wrapped in ifNodeIDEquals) that every
-//! implementation runs identically so the experiment is reproducible.
+//! The node runs a `params.json` script of instructions (initGossipSub /
+//! setTopicValidationDelay / connect / subscribeToTopic / waitUntil / publish,
+//! optionally wrapped in ifNodeIDEquals) identically across implementations.
 
 const std = @import("std");
 const libp2p = @import("zig-libp2p");
@@ -48,16 +31,13 @@ const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 const listen_port: u16 = 9000;
 /// gossipsub max message size (go reference: `WithMaxMessageSize(10 * 1 << 20)`).
 const max_message_size: usize = 10 * (1 << 20);
-/// How many topic-message validations may run off the router fiber at once. The
-/// scenario installs a small per-message validation delay; running it async (go's
-/// validator-worker model, `WithValidateQueueSize(600)`) keeps the delay from
+/// How many topic-message validations may run off the router fiber at once.
+/// Running the scenario's per-message validation delay async keeps it from
 /// stalling the single router fiber.
 const validation_concurrency: usize = 1024;
 
 /// Build the deterministic Ed25519 key for `node_id`: a 32-byte seed with
-/// `little-endian(node_id)` in the first 8 bytes, zero after. Matches Go's
-/// `ed25519.NewKeyFromSeed(seed)`, so the derived peer-id is byte-identical
-/// across implementations.
+/// `little-endian(node_id)` in the first 8 bytes, zero after.
 fn nodeKey(node_id: u64) !identity.KeyPair {
     var seed = [_]u8{0} ** 32;
     std.mem.writeInt(u64, seed[0..8], node_id, .little);
@@ -73,10 +53,9 @@ fn nodePeerIdString(allocator: std.mem.Allocator, node_id: u64) ![]u8 {
     return pid.toString(allocator);
 }
 
-/// The framework message-id (`CalcID`): the first 8 bytes of the message data.
-/// All nodes in a topic MUST use the same function or dedup/interop breaks. A
-/// shorter-than-8-byte message yields its whole content as the id (matching the
-/// "first 8 bytes" slice on a short buffer).
+/// The framework message-id (`CalcID`): the first 8 bytes of the message data
+/// (or the whole content if shorter). All nodes in a topic MUST agree on it or
+/// dedup/interop breaks.
 fn calcId(
     ctx: ?*anyopaque,
     topic: []const u8,
@@ -94,10 +73,9 @@ fn calcId(
     return .{ .bytes = bytes };
 }
 
-/// A per-topic validation delay (the scenario's `setTopicValidationDelay`): when
-/// installed it accepts every message but only AFTER sleeping `delay`, mocking a
-/// validation cost. Runs on an async validation fiber (a zio fiber), so the sleep
-/// is a normal cooperative suspension and does not block the router.
+/// The scenario's `setTopicValidationDelay`: accept every message, but only after
+/// sleeping `delay` to mock a validation cost. Runs on an async validation fiber,
+/// so the sleep is a cooperative suspension that does not block the router.
 const Validator = struct {
     io: std.Io,
     /// Validation delay in nanoseconds (0 = accept immediately).
@@ -120,9 +98,8 @@ const Validator = struct {
     }
 };
 
-/// Emits the tracer JSON lines `analyze_message_deliveries.py` parses, and records
-/// every delivered message so a run can be inspected. The router fiber calls
-/// `onMessage`; the timestamp comes from the wall clock (Shadow virtualizes it).
+/// Emits the tracer JSON lines `analyze_message_deliveries.py` parses. The router
+/// fiber calls `onMessage`; the timestamp is the wall clock (Shadow virtualizes it).
 const Tracer = struct {
     io: std.Io,
     node_id: u64,
@@ -131,11 +108,8 @@ const Tracer = struct {
         return .{ .ctx = self, .on_message = onMessage };
     }
 
-    /// A delivered message. The analyzer keys on the message-id rendered as the
-    /// decimal of its big-endian u64 (its `formatMessageID`), so emit exactly
-    /// that. The id bytes are the first 8 bytes of the data (`CalcID`); a message
-    /// shorter than 8 bytes is zero-extended on the left, matching how the analyzer
-    /// would read `binary.BigEndian.Uint64` on the padded id.
+    /// A delivered message. The analyzer keys on the id as the decimal of its
+    /// big-endian u64 (`formatMessageID`), so emit exactly that.
     fn onMessage(ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void {
         const self: *Tracer = @ptrCast(@alignCast(ctx));
         _ = from;
@@ -175,10 +149,8 @@ fn emitPeerId(allocator: std.mem.Allocator, node_id: u64, peer_id_str: []const u
 }
 
 /// Emit a `Received Message` line: the analyzer treats the FIRST occurrence of an
-/// id at a node as a delivery and any repeat as a duplicate. `time` is RFC3339
-/// UTC with nanoseconds (Python `datetime.fromisoformat` parses it); `id` is the
-/// message-id as a decimal u64 (the analyzer's `formatMessageID`); `topic` lets it
-/// scope deliveries per topic.
+/// id at a node as a delivery and any repeat as a duplicate. `time` is RFC3339 UTC
+/// with nanoseconds (Python `datetime.fromisoformat` parses it).
 fn emitReceived(io: std.Io, node_id: u64, topic: []const u8, msg_id: u64) void {
     var ts_buf: [40]u8 = undefined;
     const ts = formatNowRfc3339(io, &ts_buf) catch return;
@@ -240,9 +212,8 @@ const Setup = struct {
     validation_delay_ns: u64 = 0,
 };
 
-/// Pre-scan the script for the configuration that must be applied at gossipsub
-/// construction (this node's `initGossipSub` mesh degree and any topic validation
-/// delay), since our router takes that config up front rather than lazily. The
+/// Pre-scan the script for config the router needs up front at construction (this
+/// node's `initGossipSub` mesh degree and any topic validation delay). The
 /// connect/subscribe/publish/waitUntil instructions are executed later, in order.
 fn scanSetup(script: []const std.json.Value, node_id: u64) Setup {
     var setup = Setup{};
@@ -274,7 +245,7 @@ fn applySetupInstruction(setup: *Setup, ins: std.json.Value) void {
         const dlo = jsonInt(params.object.get("Dlo"));
         const dhi = jsonInt(params.object.get("Dhi"));
         if (d != null or dlo != null or dhi != null) {
-            // Defaults match go-libp2p so an unset field keeps the baseline.
+            // 6/5/12 are the go-libp2p defaults, so an unset field keeps the baseline.
             setup.mesh_degree = .{
                 .d = @intCast(d orelse 6),
                 .d_low = @intCast(dlo orelse 5),
@@ -329,10 +300,9 @@ const Node = struct {
         self.subscribed.deinit(self.allocator);
     }
 
-    /// Execute one script instruction. `ifNodeIDEquals` is unwrapped to its inner
-    /// instruction only when the node matches; `initGossipSub` /
-    /// `setTopicValidationDelay` were already applied at construction and are
-    /// no-ops here.
+    /// Execute one script instruction. `ifNodeIDEquals` is unwrapped only when the
+    /// node matches; `initGossipSub` / `setTopicValidationDelay` were applied at
+    /// construction (see scanSetup) and are no-ops here.
     fn runInstruction(self: *Node, ins: std.json.Value) !void {
         const obj = ins.object;
         const ty = (obj.get("type") orelse return).string;
@@ -369,7 +339,7 @@ const Node = struct {
     }
 
     /// Resolve `node<id>` to an IP and dial it over QUIC at the deterministic
-    /// peer-id for that node. Mirrors the go reference's ShadowConnector.
+    /// peer-id for that node.
     fn connectTo(self: *Node, target_id: u64) !void {
         const peer_str = try nodePeerIdString(self.allocator, target_id);
         defer self.allocator.free(peer_str);
@@ -410,9 +380,8 @@ const Node = struct {
         try self.gs.subscribe(topic);
     }
 
-    /// Wait until `elapsed_seconds` have passed since the node's start. Like the
-    /// go reference, deliveries keep flowing on the router fiber while this fiber
-    /// sleeps the remaining delta.
+    /// Wait until `elapsed_seconds` have passed since the node's start. Deliveries
+    /// keep flowing on the router fiber while this fiber sleeps the remaining delta.
     fn waitUntil(self: *Node, elapsed_seconds: u64) !void {
         const target = self.start.addDuration(.{ .raw = .fromNanoseconds(@intCast(elapsed_seconds * std.time.ns_per_s)), .clock = .awake });
         const now = std.Io.Clock.Timestamp.now(self.io, .awake);
@@ -423,11 +392,9 @@ const Node = struct {
         }
     }
 
-    /// Publish a message: `big-endian(messageID)` zero-padded to `messageSizeBytes`,
-    /// so its first 8 bytes (the `CalcID`) are the message number. With flood-publish
-    /// (on by default) the message reaches every topic subscriber via the mesh (or a
-    /// fanout set if this node has not subscribed); the scenario subscribes every node
-    /// before the publish phase, so the publisher is already in the topic mesh.
+    /// Publish a message: big-endian(messageID) zero-padded to `messageSizeBytes`.
+    /// The scenario subscribes every node before the publish phase, so the publisher
+    /// is already in the topic mesh and flood-publish reaches every subscriber.
     fn publish(self: *Node, obj: std.json.ObjectMap) !void {
         const msg_id = jsonInt(obj.get("messageID")) orelse return error.InvalidPublish;
         const topic = (obj.get("topicID") orelse return error.InvalidPublish).string;
@@ -616,14 +583,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, params_path: []const u8, op
 
     std.log.info("node{d} script complete", .{node_id});
 
-    // Hard-exit rather than unwind the fiber teardown. Every node finishes its
-    // script at about the same simulated time and all log lines are already on
-    // STDOUT via direct write(2), so there is nothing to flush. A short-lived
-    // interop node has no reason to orchestrate the multi-layer graceful teardown
-    // (gossipsub -> its connections -> switch -> endpoint); the per-connection
-    // actor teardown can stall the cooperative runtime, and Shadow would then wait
-    // out the whole stop_time on a hung process. exit(0) keeps shutdown prompt and
-    // robust, matching the smoke-test path's `finishAndExit`.
+    // Hard-exit rather than unwind the fiber teardown: all log lines are already on
+    // STDOUT via direct write(2), and the per-connection actor teardown can stall the
+    // cooperative runtime, leaving Shadow to wait out the whole stop_time on a hung
+    // process. exit(0) keeps shutdown prompt, matching the smoke path's `finishAndExit`.
     std.process.exit(0);
 }
 

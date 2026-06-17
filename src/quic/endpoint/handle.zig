@@ -15,13 +15,10 @@ const log = @import("../log.zig");
 
 pub const EndpointStats = endpoint_core.EndpointStats;
 
-/// Opaque handle over a heap-allocated, stable-address `Impl`. Deliberately
-/// opaque (not a plain struct) because the endpoint is self-referential: the
-/// spawned router fiber borrows interior pointers into `Impl` (see
-/// `routerContext`: `&endpoint.socket`, `&endpoint.router_future`,
-/// `&endpoint.router_stopping`, `&endpoint.accept_available`, ...). It must
-/// therefore never be copied or moved — `opaque` makes "pointer-only, never by
-/// value" a compile-time guarantee.
+/// Opaque handle over a heap-allocated, stable-address `Impl`. Opaque (not a
+/// plain struct) because the spawned router fiber borrows interior pointers into
+/// `Impl` (see `routerContext`), so it must never be copied or moved — `opaque`
+/// makes "pointer-only, never by value" a compile-time guarantee.
 pub const QuicEndpoint = opaque {
     pub const Options = config.Options;
     pub const InitError = config.ConfigError || error{RandomFailed} || std.mem.Allocator.Error;
@@ -31,10 +28,8 @@ pub const QuicEndpoint = opaque {
     pub const DialError = dialer.DialError;
     pub const DialOptions = dialer.DialOptions;
 
-    /// Lower-level constructor: caller provides a configured `*ssl.SSL_CTX`
-    /// and is responsible for its lifetime. For the common case where you
-    /// just want a libp2p-flavored endpoint built from a `KeyPair`, use
-    /// `initWithIdentity` instead.
+    /// Lower-level constructor: caller provides and owns the `*ssl.SSL_CTX`. For
+    /// a libp2p endpoint built from a `KeyPair`, use `initWithIdentity` instead.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, ssl_ctx: *ssl.SSL_CTX, opts: Options) InitError!*QuicEndpoint {
         log.enableFromEnv();
         const core = try endpoint_core.EndpointCore.init(allocator, io);
@@ -57,12 +52,10 @@ pub const QuicEndpoint = opaque {
         return @ptrCast(endpoint);
     }
 
-    /// Convenience constructor: builds a libp2p TLS context from `host_key`
-    /// internally and binds the endpoint's lifetime to it. The endpoint takes
-    /// ownership of the constructed TLS context (deinit on `endpoint.deinit`),
-    /// but does NOT take ownership of `host_key`. Caller must keep `host_key`
-    /// alive for the endpoint's lifetime — the TLS context calls back into it
-    /// during cert generation and signing.
+    /// Convenience constructor: builds a libp2p TLS context from `host_key`. The
+    /// endpoint owns and deinits that TLS context, but NOT `host_key` — the caller
+    /// must keep `host_key` alive for the endpoint's lifetime, as the TLS context
+    /// calls back into it during cert generation and signing.
     pub fn initWithIdentity(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -72,15 +65,12 @@ pub const QuicEndpoint = opaque {
         var owned_tls = try tls.Context.create(
             allocator,
             host_key,
-            // ECDSA P-256 for the ephemeral TLS certificate key: its scheme
-            // (ecdsa_secp256r1_sha256) is mandatory-to-implement in TLS 1.3
-            // (RFC 8446 §9.1), so every peer advertises it in
-            // signature_algorithms. ed25519 is only optional there — some
-            // stacks (e.g. jvm-libp2p / netty-quiche's BoringSSL) do not
-            // advertise it, which made our CertificateVerify unverifiable and
-            // failed the handshake with NO_COMMON_SIGNATURE_ALGORITHMS. The
-            // libp2p identity (host) key type is unaffected — it signs the
-            // libp2p extension, not the certificate.
+            // ECDSA P-256 ephemeral cert key: its scheme ecdsa_secp256r1_sha256 is
+            // mandatory-to-implement in TLS 1.3 (RFC 8446 §9.1) so every peer
+            // advertises it. ed25519 is optional and unadvertised by some stacks
+            // (jvm-libp2p / netty-quiche), which fails the handshake with
+            // NO_COMMON_SIGNATURE_ALGORITHMS. The libp2p host key is unaffected —
+            // it signs the libp2p extension, not the certificate.
             .ECDSA,
             @ptrCast(host_key),
             identity.signWithKeyPair,
@@ -118,11 +108,10 @@ pub const QuicEndpoint = opaque {
     pub fn dial(e: *QuicEndpoint, addr: std.Io.net.IpAddress, opts: DialOptions) DialError!*Connection {
         const ep = internal(e);
         {
-            // Auto-bind an ephemeral local socket for a dial-only endpoint. Read
-            // ep.socket under bind_lock (it is plain, not atomic, and bind() writes
-            // it under this same lock), so concurrent first-dials see a consistent
-            // value and only one runs router.bind — the rest find it already bound.
-            // bind_lock is uncontended once bound; dials are not a hot path.
+            // Auto-bind an ephemeral local socket for a dial-only endpoint.
+            // ep.socket is plain (not atomic) and written under bind_lock, so read
+            // it under the same lock: concurrent first-dials then see a consistent
+            // value and only one runs router.bind, the rest find it already bound.
             ep.bind_lock.lockUncancelable(ep.io);
             defer ep.bind_lock.unlock(ep.io);
             if (ep.socket == null) {
@@ -151,13 +140,10 @@ pub const QuicEndpoint = opaque {
         return router.accept(routerContext(e));
     }
 
-    /// Graceful-shutdown helper: unblock a fiber parked in `accept` so it can
-    /// exit, WITHOUT tearing the listener down. A blocked `accept` then returns
-    /// `error.ListenerClosed` (distinct from `error.Canceled`), letting an
-    /// accept loop stop cleanly. The endpoint stays usable for existing
-    /// connections; `deinit` still performs the full teardown afterward.
-    /// Idempotent and safe before `bind` (no-op on an unbound endpoint), and
-    /// safe to call before `deinit` (the later listener close won't double-free).
+    /// Graceful-shutdown helper: unblock a fiber parked in `accept` (it then
+    /// returns `error.ListenerClosed`, distinct from `error.Canceled`) WITHOUT
+    /// tearing the listener down — the endpoint stays usable and `deinit` still
+    /// does the full teardown. Idempotent and safe before `bind` and `deinit`.
     pub fn stopAccepting(e: *QuicEndpoint) void {
         router.stopAccepting(routerContext(e));
     }
@@ -178,10 +164,8 @@ const Impl = struct {
     quiche_config: *quiche.quiche_config,
     options: config.Options,
     core: *endpoint_core.EndpointCore,
-    /// Set when the endpoint was constructed via `initWithIdentity`. The
-    /// endpoint owns and tears down this TLS context. When `init` is used
-    /// with a caller-provided `ssl_ctx`, this stays null and the caller
-    /// remains responsible for the TLS context lifetime.
+    /// Non-null only when built via `initWithIdentity`: the endpoint then owns
+    /// and tears down this TLS context. Null under `init` (caller owns ssl_ctx).
     owned_tls: ?tls.Context = null,
     socket: ?*transport_mod.SharedUdpSocket = null,
     /// Serializes bind() (including dial()'s auto-bind). router.bind's
@@ -270,11 +254,8 @@ fn constInternal(e: *const QuicEndpoint) *const Impl {
 }
 
 test "production endpoint certificate uses the TLS-MTI ECDSA P-256 scheme" {
-    // Regression guard for cross-impl interop: the ephemeral TLS certificate key
-    // must stay ECDSA P-256 so our CertificateVerify uses ecdsa_secp256r1_sha256,
-    // the TLS 1.3 mandatory-to-implement scheme every peer advertises. ed25519
-    // is optional in TLS 1.3 and is NOT advertised by some stacks (jvm-libp2p /
-    // netty-quiche), which fails the handshake with NO_COMMON_SIGNATURE_ALGORITHMS.
+    // Interop regression guard: the ephemeral cert key must stay ECDSA P-256
+    // (see initWithIdentity for the TLS-MTI signature-algorithm rationale).
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();

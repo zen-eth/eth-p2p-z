@@ -103,12 +103,9 @@ pub const KeyPair = struct {
         };
     }
 
-    /// Builds an Ed25519 KeyPair deterministically from a raw 32-byte seed (the
-    /// Ed25519 private seed). The same seed always yields the same key — and the
-    /// same libp2p peer-id — so independently-running nodes (across languages) can
-    /// agree on each other's identity without coordination. The encoding matches
-    /// Go's `ed25519.NewKeyFromSeed(seed)` + `crypto.UnmarshalEd25519PrivateKey`,
-    /// so the peer-id is byte-identical to go-libp2p's for the same seed.
+    /// Deterministically derives an Ed25519 KeyPair from a raw 32-byte seed, so
+    /// nodes agree on each other's peer-id without coordination. Byte-identical
+    /// to go-libp2p (`ed25519.NewKeyFromSeed(seed)`) for the same seed.
     pub fn fromEd25519Seed(seed: []const u8) Error!Self {
         const pkey = tls.ed25519KeyFromSeed(seed) catch return error.OpenSSLFailed;
         return .{
@@ -203,13 +200,9 @@ pub const KeyPair = struct {
 };
 
 test "deterministic Ed25519 seed peer-id matches go-libp2p" {
-    // Cross-implementation contract: a node identity is an Ed25519 key whose
-    // 32-byte seed is `little-endian(nodeId)` in the first 8 bytes, zero after
-    // (Go's `ed25519.NewKeyFromSeed(seed)`). The derived libp2p peer-id MUST be
-    // byte-identical across implementations so nodes compute each other's
-    // peer-id without coordination. go-libp2p's own test pins the SHA-256 of the
-    // `>nodeId:peerIdBase58\n` lines for nodeId 0..9999 to this hash; reproduce
-    // it here to prove our seed->key->peer-id path matches go-libp2p exactly.
+    // Seed is little-endian(nodeId) in the first 8 bytes, zero after. go-libp2p's
+    // own test pins the SHA-256 of the `>nodeId:peerIdBase58\n` lines for nodeId
+    // 0..9999 to this hash; reproducing it proves our seed->peer-id path matches.
     const allocator = std.testing.allocator;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var line_buf: [128]u8 = undefined;

@@ -30,12 +30,9 @@ pub const Signal = struct {
 };
 
 /// Atomically decrement `counter` by one iff it is > 0, returning whether a
-/// decrement happened. The lock-free counted-slot admission idiom shared by the
-/// router's accept-queue reservation (`accept_queue.tryReserve`) and the switch's
-/// aggregate handler-slot admission. Both callers are non-blocking — a `false`
-/// return means reject, not park. The cmpxchg is the single synchronizing
-/// operation; the initial `.acquire` load is only its expected-value hint, so a
-/// stale read is harmless (the loop retries on the fresh value).
+/// decrement happened (non-blocking admission: `false` means reject, not park).
+/// The cmpxchg is the only synchronizing op; the initial load is just its
+/// expected-value hint, so a stale read is harmless (the loop retries).
 pub fn tryDecrementToFloor(counter: *std.atomic.Value(usize)) bool {
     var cur = counter.load(.acquire);
     while (cur > 0) {
@@ -65,7 +62,7 @@ pub fn Bounded(
             /// waitset-integration path; `recv` uses the queue's own blocking get).
             ready: Signal = .{},
             /// Pulsed when byte budget is freed; senders blocked in
-            /// `reserveBlocking` wait on it. Distinct from `ready` — do not conflate.
+            /// `reserveBlocking` wait on it. Distinct from `ready`.
             writable: Signal = .{},
             meta_mutex: std.Io.Mutex = .init,
             closed: bool = false,

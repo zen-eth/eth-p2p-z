@@ -1,8 +1,7 @@
 const std = @import("std");
 const rpc_pb = @import("../../protobuf.zig").rpc;
 
-// MessageId holds the bytes of a computed message identifier. Call deinit to
-// free the allocation when it is no longer needed.
+// Owns the bytes of a computed message identifier.
 pub const MessageId = struct {
     bytes: []u8,
 
@@ -13,9 +12,8 @@ pub const MessageId = struct {
 };
 
 /// Default libp2p message id: from ++ seqno. Takes raw slices (not a *Message) so
-/// callers can pass either an outbound Message's fields (`msg.from orelse &.{}`) or
-/// an inbound MessageReader's getters (`reader.getFrom()`) without a temporary.
-/// Empty `from` and `seqno` are valid and yield a zero-length id.
+/// outbound fields and inbound reader getters both pass without a temporary.
+/// Empty `from`/`seqno` are valid and yield a zero-length id.
 pub fn messageId(allocator: std.mem.Allocator, from: []const u8, seqno: []const u8) std.mem.Allocator.Error!MessageId {
     const buf = try allocator.alloc(u8, from.len + seqno.len);
     @memcpy(buf[0..from.len], from);
@@ -23,12 +21,10 @@ pub fn messageId(allocator: std.mem.Allocator, from: []const u8, seqno: []const 
     return .{ .bytes = buf };
 }
 
-/// Content-derived message id for the anonymous (StrictNoSign) policy, where a
-/// message carries no `from`/`seqno` to key on: the SHA-256 digest of
-/// `topic ++ data`. The digest is the id bytes (32 bytes). This is a sensible
-/// default, but it is NOT a libp2p wire standard — every node in a topic must
-/// agree on the SAME id function for dedup to line up, so a deployment that needs
-/// a different scheme overrides it via the router's `message_id_fn`.
+/// Content-derived id for the anonymous (StrictNoSign) policy, which carries no
+/// `from`/`seqno` to key on: SHA-256(topic ++ data), 32 bytes. NOT a libp2p wire
+/// standard — every node in a topic must agree on the SAME id fn for dedup to line
+/// up, so a deployment needing another scheme overrides via `message_id_fn`.
 pub fn contentMessageId(allocator: std.mem.Allocator, topic: []const u8, data: []const u8) std.mem.Allocator.Error!MessageId {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(topic);
@@ -38,13 +34,11 @@ pub fn contentMessageId(allocator: std.mem.Allocator, topic: []const u8, data: [
     return .{ .bytes = buf };
 }
 
-// buildGraft returns a ControlGraft for the given topic, ready to encode.
 pub fn buildGraft(topic: []const u8) rpc_pb.ControlGraft {
     return .{ .topic_i_d = topic };
 }
 
-// buildPrune returns a ControlPrune for the given topic. backoff=0 is the
-// protobuf default and is omitted from the wire.
+// backoff=0 is the protobuf default and is omitted from the wire.
 pub fn buildPrune(topic: []const u8, px_peers: []const ?rpc_pb.PeerInfo, backoff: u64) rpc_pb.ControlPrune {
     return .{
         .topic_i_d = topic,
@@ -53,8 +47,6 @@ pub fn buildPrune(topic: []const u8, px_peers: []const ?rpc_pb.PeerInfo, backoff
     };
 }
 
-// buildIHave returns a ControlIHave advertising a set of message-ids for
-// the given topic.
 pub fn buildIHave(topic: []const u8, message_ids: []const ?[]const u8) rpc_pb.ControlIHave {
     return .{
         .topic_i_d = topic,
@@ -62,33 +54,28 @@ pub fn buildIHave(topic: []const u8, message_ids: []const ?[]const u8) rpc_pb.Co
     };
 }
 
-// buildIWant returns a ControlIWant requesting the listed message-ids.
 pub fn buildIWant(message_ids: []const ?[]const u8) rpc_pb.ControlIWant {
     return .{ .message_i_ds = if (message_ids.len > 0) message_ids else null };
 }
 
-// buildIDontWant returns a ControlIDontWant announcing message-ids the
-// local node has already seen (gossipsub v1.2).
+// Announces already-seen message-ids (gossipsub v1.2).
 pub fn buildIDontWant(message_ids: []const ?[]const u8) rpc_pb.ControlIDontWant {
     return .{ .message_i_ds = if (message_ids.len > 0) message_ids else null };
 }
 
-// buildSubscription returns a SubOpts for a single topic subscription or
-// unsubscription.
 pub fn buildSubscription(topic: []const u8, subscribe: bool) rpc_pb.RPC.SubOpts {
     return .{ .subscribe = subscribe, .topicid = topic };
 }
 
-// RpcOut is the unit of work the per-peer writer sends to the wire. Each
-// variant maps directly to one of the three top-level RPC shapes.
+// One unit of work for the per-peer writer; each variant maps to one of the
+// three top-level RPC shapes.
 pub const RpcOut = union(enum) {
     subscriptions: []const ?rpc_pb.RPC.SubOpts,
     publish: []const ?rpc_pb.Message,
     forward: []const ?rpc_pb.Message, // relayed messages; same wire shape as publish, separate lane
     control: rpc_pb.ControlMessage,
 
-    // toRpc assembles an rpc_pb.RPC from this variant. The returned struct
-    // borrows all slice/byte data from self — no allocation.
+    // The returned RPC borrows all slice/byte data from self — no allocation.
     pub fn toRpc(self: RpcOut) rpc_pb.RPC {
         return switch (self) {
             .subscriptions => |subs| .{ .subscriptions = subs },

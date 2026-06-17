@@ -12,10 +12,9 @@ pub fn enableFromEnv() void {
 }
 
 pub fn enable() void {
-    // One-time global registration. `swap(true)` returns the prior value, so only
-    // the first caller across all executors proceeds — `quiche_enable_debug_logging`
-    // installs a process-global callback and must not be called twice. The
-    // `.acq_rel` ordering makes the winner's swap synchronize with later observers.
+    // `quiche_enable_debug_logging` installs a process-global callback and must not be
+    // called twice; `swap` returns the prior value so only the first caller proceeds, and
+    // `.acq_rel` makes the winner's swap synchronize with later observers.
     if (enabled.swap(true, .acq_rel)) return;
     _ = quiche.quiche_enable_debug_logging(logCallback, null);
 }

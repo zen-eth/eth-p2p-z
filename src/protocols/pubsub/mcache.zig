@@ -1,33 +1,27 @@
-//! The gossipsub message cache: a windowed store of recently-published and
-//! -forwarded messages, keyed by message-id, so the router can answer an IWANT
-//! (hand back the full message) and advertise recent ids via IHAVE.
+//! The gossipsub message cache (go-libp2p MessageCache model): a windowed store
+//! of recently published/forwarded messages, keyed by message-id, answering IWANT
+//! (hand back the full message) and advertising recent ids via IHAVE.
 //!
-//! Structure (the go-libp2p MessageCache model): a ring of `history_length`
-//! windows, newest at the front. Each `put` lands in the newest window. Each
-//! heartbeat `shift` drops the oldest window — releasing every message it held —
-//! and opens a fresh empty newest window, so a message lives for about
-//! `history_length` heartbeats. The newest `gossip_length` windows are the
-//! "gossipable" ones whose ids `getGossipIDs` returns for IHAVE.
+//! A ring of `history_length` windows, newest at front. Each `put` lands in the
+//! newest window; each heartbeat `shift` drops the oldest (releasing its messages)
+//! and opens a fresh newest one, so a message lives ~`history_length` heartbeats.
+//! The newest `gossip_length` windows are the gossipable ones `getGossipIDs`
+//! advertises. A message-id is stored at most once (duplicate `put` is a no-op),
+//! so it lives in exactly one window and eviction removes it cleanly.
 //!
-//! Each stored message reuses the refcounted `OutboundFrame` that the router
-//! already framed once to forward it (a single-message publish RPC frame): the
-//! cache holds one extra reference, so answering an IWANT is just retain + push —
-//! no second copy of the (up-to-1 MiB) payload. An `id → frame` index gives O(1)
-//! `get`. A message-id is stored at most once (a duplicate `put` is a no-op), so
-//! it lives in exactly one window and eviction removes it cleanly. (The index
-//! maps id → frame rather than id → entry on purpose: the per-window entry lists
-//! reallocate as they grow, so a pointer into them would dangle — the frame
-//! pointer is stable, and eviction looks an entry's id up by value, not by
-//! pointer.)
+//! Each entry reuses the refcounted `OutboundFrame` the router already framed to
+//! forward the message: the cache holds one extra reference, so IWANT is just
+//! retain + push — no second copy of the (up-to-1 MiB) payload. The `id → frame`
+//! index gives O(1) `get`; it maps to the frame, not the entry, because per-window
+//! entry lists reallocate as they grow (a pointer into them would dangle) and the
+//! frame pointer is stable.
 //!
 //! The id KEY is an INTERNED, reference-counted `*InternedId` shared through the
-//! router's `InternTable` — the SAME allocation that `seen` and the per-peer
-//! `dont_send`/`iwant_counts`/`iwant_promises` maps hold, so an id present in both
-//! the cache and one of those maps is one heap copy. The cache interns on `put`
-//! (one reference per cached id) and releases on eviction and on `deinit`, so the
-//! id bytes are freed only when the LAST holder across all maps releases. The
-//! map/lookup keys alias the interned box's owned bytes, so `get`/`getGossipIDs`/
-//! dedup remain by content.
+//! router's `InternTable` — the SAME allocation `seen` and the per-peer maps hold,
+//! so a co-held id is one heap copy. The cache interns on `put` and releases on
+//! eviction/`deinit`, freeing the bytes only when the LAST holder releases. Map
+//! and lookup keys alias the interned box's owned bytes, so all lookups are by
+//! content.
 
 const std = @import("std");
 const peer_io = @import("peer_io.zig");
@@ -35,28 +29,27 @@ const intern = @import("intern.zig");
 const InternTable = intern.InternTable;
 const InternedId = intern.InternedId;
 
-/// Number of heartbeat windows retained. A message stays cached for about this
-/// many heartbeats before the sliding window evicts it. (go-libp2p default.)
+/// Heartbeat windows retained: a message stays cached ~this many heartbeats
+/// before the sliding window evicts it.
 const history_length = 5;
 
-/// Number of newest windows whose message-ids are advertised via IHAVE. Must be
-/// <= history_length. (go-libp2p default.)
+/// Newest windows whose message-ids are advertised via IHAVE. Must be
+/// <= history_length.
 const gossip_length = 3;
 
 comptime {
     std.debug.assert(gossip_length <= history_length);
 }
 
-/// The window count, for tests that drive `history_length` heartbeat shifts and
-/// want to track this module's source of truth rather than hard-code a number.
+/// The window count, exposed so tests track this module's source of truth rather
+/// than hard-code a number.
 pub fn historyLengthForTest() u64 {
     return history_length;
 }
 
-/// One cached message. Holds one reference on the SHARED interned id box `rc`
-/// (id bytes are `rc.value.bytes`, freed only when the last holder releases), owns
-/// its `topic` byte copy, and holds exactly one reference on `frame`. Eviction (or
-/// `deinit`) releases `rc`, frees the `topic` copy, and releases `frame` once.
+/// One cached message: holds one reference on the shared interned id box `rc`
+/// (id bytes are `rc.value.bytes`), owns its `topic` copy, and holds one reference
+/// on `frame`. `freeEntry` releases all three.
 const Entry = struct {
     rc: *InternedId,
     topic: []u8,
@@ -65,19 +58,16 @@ const Entry = struct {
 
 pub const MessageCache = struct {
     allocator: std.mem.Allocator,
-    /// The router-shared intern table. `put` interns (retains) an id; eviction and
-    /// `deinit` release. The pointer is stable: the cache is Router-owned and the
-    /// table is a field of the heap-allocated Router.
+    /// Router-shared intern table; the pointer is stable (the table is a field of
+    /// the heap-allocated Router that owns this cache).
     intern_table: *InternTable,
-    /// Ring of windows, newest first: `windows[0]` is the current window every
-    /// `put` lands in; `windows[history_length - 1]` is the oldest, dropped by
-    /// the next `shift`.
+    /// Ring of windows, newest first: `windows[0]` takes every `put`;
+    /// `windows[history_length - 1]` is the oldest, dropped by the next `shift`.
     windows: [history_length]std.ArrayListUnmanaged(Entry),
-    /// id → the stored frame, for O(1) `get` and duplicate detection. The keys
-    /// alias the owning entry's interned-id bytes (`rc.value.bytes`), so the map
-    /// never owns its keys: eviction must remove the key BEFORE releasing `rc`,
-    /// since the release may free those bytes. The value is the stable frame
-    /// pointer (pointers into the resizable per-window entry lists would dangle).
+    /// id → stored frame, for O(1) `get` and duplicate detection. Keys alias the
+    /// owning entry's interned-id bytes, so eviction must remove the key BEFORE
+    /// releasing `rc` (the release may free those bytes); the value is the stable
+    /// frame pointer.
     index: std.StringHashMapUnmanaged(*peer_io.OutboundFrame),
 
     pub fn init(allocator: std.mem.Allocator, intern_table: *InternTable) MessageCache {
@@ -89,10 +79,9 @@ pub const MessageCache = struct {
         };
     }
 
-    /// Release every entry's frame and interned id, free every topic copy, and
-    /// free the window/index storage. Every id the cache held is released here, so
-    /// the intern table's empty-at-destroy invariant holds once `seen` and the
-    /// per-peer maps have also released their holders.
+    /// Free all entries and the window/index storage. Releases every id the cache
+    /// held, so the intern table's empty-at-destroy invariant holds once the other
+    /// holders (`seen`, per-peer maps) have also released.
     pub fn deinit(self: *MessageCache) void {
         for (&self.windows) |*window| {
             for (window.items) |*entry| self.freeEntry(entry);
@@ -102,12 +91,10 @@ pub const MessageCache = struct {
         self.* = undefined;
     }
 
-    /// Insert a message into the current (newest) window, interning `id`, copying
-    /// `topic`, and retaining `frame` (one cache reference each). Duplicate `id` is
-    /// a no-op: NOT stored, interned, or retained twice, so it stays in exactly one
-    /// window. On allocation failure the message is simply not cached, which only
-    /// costs the ability to later serve it via IWANT — safer than failing the
-    /// forward.
+    /// Insert into the newest window, interning `id`, copying `topic`, retaining
+    /// `frame`. Duplicate `id` is a no-op (not stored/interned/retained twice), so
+    /// it stays in exactly one window. Allocation failure leaves the message
+    /// uncached — only costs a later IWANT, safer than failing the forward.
     pub fn put(self: *MessageCache, id: []const u8, topic: []const u8, frame: *peer_io.OutboundFrame) !void {
         if (self.index.contains(id)) return;
 
@@ -136,10 +123,9 @@ pub const MessageCache = struct {
         return self.index.get(id);
     }
 
-    /// The message-ids in the newest `gossip_length` windows whose entry topic
-    /// matches `topic`. The returned slice is allocated with `allocator` and owned
-    /// by the caller; each id within it is BORROWED from the cache and stays valid
-    /// only until a `shift` evicts the window holding it.
+    /// The `topic` message-ids in the newest `gossip_length` windows. The slice is
+    /// caller-owned; each id within is BORROWED from the cache and valid only until
+    /// a `shift` evicts its window.
     pub fn getGossipIDs(self: *MessageCache, allocator: std.mem.Allocator, topic: []const u8) ![][]const u8 {
         var ids: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer ids.deinit(allocator);
@@ -154,13 +140,9 @@ pub const MessageCache = struct {
         return ids.toOwnedSlice(allocator);
     }
 
-    /// Slide the window by one heartbeat: drop the oldest window (releasing each
-    /// of its entries' frames and interned ids, freeing the topic copies, and
-    /// removing the ids from the index), shift the rest one slot toward older, and
-    /// open a fresh empty newest window. Because an id lives in exactly one
-    /// window, eviction removes it from the index cleanly. The index key is
-    /// removed BEFORE `freeEntry` releases `rc` (the key aliases the box's bytes,
-    /// which the release may free).
+    /// Slide the ring by one heartbeat: evict the oldest window, age the rest one
+    /// slot, open a fresh newest window. Each index key is removed BEFORE
+    /// `freeEntry` releases `rc` (the key aliases bytes the release may free).
     pub fn shift(self: *MessageCache) void {
         // Evict the oldest window's entries, then reuse its emptied storage as the
         // new newest window so re-opening one needs no allocation.
@@ -177,10 +159,9 @@ pub const MessageCache = struct {
         self.windows[0] = oldest;
     }
 
-    /// Release an entry's frame reference and interned id reference, and free its
-    /// owned topic copy. Does NOT touch the index (callers remove the index key —
-    /// which aliases the interned id's bytes — first when needed, since releasing
-    /// `rc` may free those bytes).
+    /// Release the entry's frame and interned id and free its topic copy. Does NOT
+    /// touch the index: callers must remove the aliasing index key first, since
+    /// releasing `rc` may free the bytes it points at.
     fn freeEntry(self: *MessageCache, entry: *Entry) void {
         entry.frame.release();
         entry.rc.release();
@@ -192,10 +173,9 @@ pub const MessageCache = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Build a single-byte publish-shaped frame with one reference, owned by the
-/// caller. The cache `put` retains it; the caller releases its own reference
-/// afterward, leaving the cache holding exactly one (so testing.allocator
-/// catches a missed release as a leak and a double-release as a double-free).
+/// Build a single-byte frame with one reference. Caller drops its reference after
+/// `put` retains, leaving the cache holding exactly one — so testing.allocator
+/// catches a missed release (leak) or a double-release (double-free).
 fn testFrame(allocator: std.mem.Allocator, byte: u8) !*peer_io.OutboundFrame {
     const bytes = try allocator.alloc(u8, 1);
     errdefer allocator.free(bytes);
@@ -227,10 +207,8 @@ test "put dedups a repeated id: stored once, retained once" {
     defer cache.deinit();
 
     const frame = try testFrame(allocator, 0x01);
-    // Put the SAME id twice. The second is a no-op: no second store, no second
-    // retain. After dropping our builder reference the cache holds exactly one,
-    // so the eventual deinit frees the frame once (a double-retain would leak;
-    // testing.allocator would flag it).
+    // Put the SAME id twice: the second is a no-op (no second store or retain), so
+    // the cache holds exactly one reference and deinit frees the frame once.
     try cache.put("dup", "t", frame);
     try cache.put("dup", "t", frame);
     frame.release();
@@ -291,10 +269,9 @@ test "getGossipIDs excludes windows beyond the gossipable horizon" {
     var cache = MessageCache.init(allocator, &table);
     defer cache.deinit();
 
-    // Put one id, then shift it back to the (gossip_length)-th window — one past
-    // the gossipable horizon — without yet evicting it (it survives until
-    // history_length shifts). It must still be retrievable via get but absent
-    // from getGossipIDs.
+    // Shift one id to the (gossip_length)-th window — past the gossipable horizon
+    // but not yet evicted (eviction needs history_length shifts): still gettable,
+    // absent from getGossipIDs.
     const frame = try testFrame(allocator, 7);
     try cache.put("old", "t", frame);
     frame.release();
@@ -440,10 +417,9 @@ test "eviction releases the cache's interned reference; a co-held id survives un
     try std.testing.expectEqual(@as(usize, 2), table.count());
     try std.testing.expectEqual(@as(usize, 2), other.refs.load(.monotonic));
 
-    // Shift past history_length: the cache evicts both, releasing its interned
-    // reference on each. `evict_only` reaches zero holders and is freed (leaves
-    // the table); `co_held` still has its other holder (refs 2 → 1), so it
-    // survives in the table.
+    // Shift past history_length so the cache evicts both, releasing one reference
+    // on each: `evict_only` hits zero holders and is freed, `co_held` keeps its
+    // other holder (refs 2 → 1) and survives.
     var i: usize = 0;
     while (i < history_length) : (i += 1) cache.shift();
 

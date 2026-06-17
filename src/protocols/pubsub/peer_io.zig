@@ -12,29 +12,26 @@ const PeerId = @import("peer_id").PeerId;
 pub const Lane = enum { subscribe, control, data };
 
 /// A refcounted, heap-allocated, pre-framed RPC ready to write to a QUIC stream.
-/// Forwarding a message to N peers frames the wire bytes ONCE and shares this one
-/// allocation across every target's queue (the rust `Bytes` / go shared-message
-/// model), so a 1 MiB message costs one copy, not N.
+/// Forwarding to N peers frames the wire bytes ONCE and shares this one allocation
+/// across every target's queue (shared-message model), so a 1 MiB message costs
+/// one copy, not N.
 ///
 /// Ownership is the reference count: each holder (the builder, every queue that
-/// accepts a push, the writer that pops it) owns exactly one reference. A holder
-/// gives up its reference with `release`; the frame frees its own bytes/id/self
-/// when the last reference is released. Use `create` to mint one (which sets the
-/// initial count to the number of intended holders) and `retain` to add a holder.
-///
-/// bytes: length-prefixed wire bytes produced by pubsub.frameRpc; owned.
-/// message_id: owned id carried for IDONTWANT purge; null for every lane
-///   except data frames that may later be IDONTWANT-purged.
-/// rc: live holder count; the frame frees itself on the 1→0 transition.
-/// allocator: the allocator that owns bytes/id/self, used by the final release.
+/// accepts a push, the writer that pops it) owns exactly one reference, given up
+/// via `release`; the frame frees its own bytes/id/self on the last release.
+/// `create` mints one with the count set to the number of intended holders;
+/// `retain` adds a holder.
 pub const OutboundFrame = struct {
+    /// Length-prefixed wire bytes from pubsub.frameRpc; owned.
     bytes: []u8,
-    /// null except on data frames (for IDONTWANT matching). A PRIVATE copy,
-    /// never the interned id: a frame's last ref usually drops on a writer
-    /// fiber, and releasing an interned id there would unlink it from the
-    /// unsynchronized, router-fiber-owned intern table off-fiber.
+    /// Owned id for IDONTWANT matching; null except on data frames. A PRIVATE
+    /// copy, never the interned id: the last ref usually drops on a writer fiber,
+    /// where releasing an interned id would unlink it from the unsynchronized,
+    /// router-fiber-owned intern table off-fiber.
     message_id: ?[]u8,
+    /// Live holder count; the frame frees itself on the 1→0 transition.
     rc: AtomicRc,
+    /// Owns bytes/id/self; used by the final release.
     allocator: std.mem.Allocator,
 
     /// Mint a heap frame with `initial_refs` references (the number of intended
@@ -57,17 +54,15 @@ pub const OutboundFrame = struct {
         return self;
     }
 
-    /// Add one holder. Cheap and unordered: a new holder only becomes reachable
-    /// to other threads through the queue mutex / signal, which carry the
-    /// happens-before edge, so the bump itself needs no ordering.
+    /// Add one holder. Unordered: a new holder becomes reachable to other threads
+    /// only through the queue mutex/signal, which carry the happens-before edge.
     pub fn retain(self: *OutboundFrame) void {
         self.rc.retain();
     }
 
-    /// Give up one holder's reference. On the 1→0 transition this frees the
-    /// bytes, the carried message id, and the frame itself. Writers release from
-    /// different executor threads, so the decrement is `.release` and the freeing
-    /// thread issues an `.acquire` fence first, establishing happens-before with
+    /// Give up one holder's reference, freeing bytes/id/self on the 1→0
+    /// transition. Writers release from different executor threads, so the
+    /// freeing thread acquire-fences first, establishing happens-before with
     /// every prior holder's writes before the memory is reclaimed.
     pub fn release(self: *OutboundFrame) void {
         if (!self.rc.release()) return;
@@ -89,14 +84,12 @@ pub const Options = struct {
     subscribe_cap: usize = 256,
 };
 
-/// A single-lane bounded FIFO of frame references, backed by a std.ArrayList plus
-/// a head cursor. Each live slot holds one reference to a (shared) OutboundFrame;
-/// pop transfers it out, removeIf/drain release it. Pop is O(1) (head++) at the
-/// cost of dead prefix slots, which are reclaimed lazily (see `compact`) so the
-/// amortised cost stays O(1) without a circular buffer. `cap == 0` means
-/// unbounded.
-///
-/// Not synchronized on its own — OutboundQueue holds these behind its mutex.
+/// A single-lane bounded FIFO of frame references: a std.ArrayList plus a head
+/// cursor. Each live slot holds one reference to a (shared) OutboundFrame; pop
+/// transfers it out, removeIf/drain release it. Pop is O(1) (head++); dead prefix
+/// slots are reclaimed lazily so amortised cost stays O(1) without a ring buffer.
+/// `cap == 0` means unbounded. Not synchronized — OutboundQueue holds these
+/// behind its mutex.
 const LaneFifo = struct {
     items: std.ArrayList(*OutboundFrame) = .empty,
     head: usize = 0,
@@ -182,14 +175,10 @@ const LaneFifo = struct {
     }
 };
 
-/// Per-peer outbound queue, decoupled from the QUIC stream. A router fiber
-/// pushes frames; a writer fiber (started in a later phase) pops and writes
-/// them. Thread/fiber-safe: a std.Io.Mutex guards the lane FIFOs and a Signal
-/// wakes a blocked popper with no lost-wakeup: the epoch is observed under the
-/// lock before unlocking, so a notify that races after unlock advances the epoch
-/// and the subsequent wait() returns immediately.
-///
-/// Lanes are drained by priority subscribe > control > data; each lane is
+/// Per-peer outbound queue, decoupled from the QUIC stream. A router fiber pushes
+/// frames; a writer fiber pops and writes them. Thread/fiber-safe: a std.Io.Mutex
+/// guards the lane FIFOs and a Signal wakes a blocked popper with no lost-wakeup
+/// (see popBlocking). Lanes drain by priority subscribe > control > data; each is
 /// bounded by its matching Options cap.
 pub const OutboundQueue = struct {
     allocator: std.mem.Allocator,
@@ -325,31 +314,26 @@ pub const OutboundQueue = struct {
 };
 
 /// Drains an OutboundQueue onto a peer's outbound stream, decoupled from the
-/// stream's lifetime. The queue outlives any single stream: when a write fails
-/// mid-frame we drop only that one in-flight frame, tear the stream down, and
-/// lazily re-open a fresh stream on the next iteration to keep draining the
-/// surviving queue (rust-libp2p semantics — go drops the whole queue instead).
+/// stream's lifetime. The queue outlives any single stream: a mid-frame write
+/// failure drops only that one in-flight frame, tears the stream down, and lazily
+/// re-opens a fresh one to keep draining the surviving queue (rust-libp2p
+/// semantics; go drops the whole queue instead).
 ///
-/// Generic over a duck-typed `Sink` so it can be exercised with fakes here and
-/// adapted to the real QUIC stream later. The sink must provide:
+/// Generic over a duck-typed `Sink`. The sink must provide:
 ///   fn open(self: *Sink, io: std.Io) anyerror!void
 ///       (re)establish the current outbound stream.
 ///   fn writeFrame(self: *Sink, io: std.Io, bytes: []const u8) anyerror!void
 ///       write framed bytes to the current stream. A failure may leave a partial
-///       (truncated) length-prefixed frame on the wire: an implementation over
-///       stream.writeAll can error after some bytes have already gone out. The
-///       writer's response is to close/reset the stream and re-open, so the
-///       partial frame is never completed; the peer discards the malformed RPC
-///       and gossip redundancy covers the lost message.
+///       (truncated) frame on the wire (writeAll can error mid-flight); the
+///       writer then resets+re-opens so the frame is never completed, the peer
+///       discards the malformed RPC, and gossip redundancy covers the loss.
 ///   fn close(self: *Sink, io: std.Io) void
 ///       tear down the current stream; safe to call when none is open.
 ///
-/// Lifetime: the `Sink` (and any stream it holds) MUST stay valid until the
-/// writer fiber has fully exited. `run` may invoke `on_disconnect` and then its
-/// top-level `defer sink.close(io)` still fires on the way out, so an
-/// `on_disconnect` handler MUST NOT synchronously free or destroy the sink or
-/// its stream — that trailing `close` would be a use-after-free. The owner must
-/// join/await the writer fiber before freeing the sink.
+/// Lifetime: the `Sink` MUST stay valid until the writer fiber has fully exited.
+/// `run`'s top-level `defer sink.close(io)` fires even after `on_disconnect`, so
+/// an `on_disconnect` handler MUST NOT synchronously free the sink/stream (that
+/// trailing close would be a use-after-free); the owner joins the fiber first.
 pub fn PeerWriter(comptime Sink: type) type {
     return struct {
         const Self = @This();
@@ -358,32 +342,28 @@ pub fn PeerWriter(comptime Sink: type) type {
         sink: *Sink,
         /// Open attempts before giving up on the peer (each followed by backoff).
         max_open_retries: usize = 5,
-        /// Consecutive write failures (each followed by a stream re-open) before
-        /// giving up on the peer. A stalled-but-alive peer fails every write at
-        /// the write timeout; without this bound the writer cycles
-        /// write-timeout -> reopen forever, dropping one frame per timeout while
-        /// the peer pins its queue caps. Resets on any successful write.
+        /// Consecutive write failures before giving up on the peer; resets on any
+        /// success. A stalled-but-alive peer fails every write at the timeout;
+        /// without this bound the writer cycles write-timeout -> reopen forever
+        /// while the peer pins its queue caps.
         max_write_failures: usize = 3,
         /// Sleep between open attempts, in milliseconds.
         reopen_backoff_ms: u64 = 50,
-        /// Invoked once if open retries are exhausted, so the router can tear the
-        /// peer down. The writer never touches the queue lifecycle itself: on
-        /// disconnect it releases only the in-flight popped frame's reference and
-        /// returns — frames still queued stay in the (owner-held) OutboundQueue.
-        /// The owner is responsible for draining/deinit-ing the queue after the
-        /// disconnect, otherwise those unsent frames leak. The handler must also
-        /// not free the sink/stream synchronously (see the Sink lifetime note
-        /// above).
+        /// Invoked once on open/write give-up so the router can tear the peer
+        /// down. The writer never touches the queue lifecycle: it releases only
+        /// the in-flight popped frame and returns; still-queued frames stay in the
+        /// owner-held OutboundQueue, which the owner must drain/deinit or they
+        /// leak. The handler must not synchronously free the sink/stream (see the
+        /// Sink lifetime note above).
         on_disconnect: ?*const fn (?*anyopaque) void = null,
         disconnect_ctx: ?*anyopaque = null,
         /// Whether the sink currently holds an open stream.
         have_stream: bool = false,
 
-        /// Fiber body. Pops frame references in priority order and writes them,
-        /// re-opening the stream as needed, until the queue is closed/drained or
-        /// cancelled. Each popped reference is released after its write attempt
-        /// (the shared frame frees itself once the last writer releases it).
-        /// Always releases the current stream on exit.
+        /// Fiber body. Pops frames in priority order and writes them, re-opening
+        /// the stream as needed, until the queue is closed/drained or cancelled.
+        /// Each popped reference is released after its write attempt; the stream
+        /// is always released on exit.
         pub fn run(self: *Self, io: std.Io) void {
             defer self.sink.close(io);
             var write_failures: usize = 0;
@@ -443,16 +423,12 @@ pub const InboundRpc = struct {
     rpc: pubsub.OwnedRpc,
 };
 
-/// Reads parsed RPCs off a peer's inbound stream and posts each, tagged with
-/// the sender's PeerId, through a duck-typed `Poster`. A clean EOF or a broken
-/// stream is signalled by `read` returning an error, on which the reader simply
-/// exits — the router replaces it when a new inbound stream arrives.
-///
-/// The reader is generic over both ends so it can be exercised with fakes and
-/// adapted to the real QUIC stream + a single-inbox router. It is decoupled from
-/// the router's Command inbox: the router supplies a Poster that wraps each
-/// InboundRpc into its own Command variant and posts it to the one inbox, so the
-/// router keeps a single ordered queue for every event it processes.
+/// Reads parsed RPCs off a peer's inbound stream and posts each, tagged with the
+/// sender's PeerId, through a duck-typed `Poster`. A clean EOF or broken stream
+/// surfaces as a `read` error, on which the reader exits — the router replaces it
+/// when a new inbound stream arrives. The Poster indirection lets the router wrap
+/// each InboundRpc into a Command variant and funnel every event through one
+/// ordered inbox.
 ///
 ///   `Source` must provide:
 ///     fn read(self: *Source, allocator: std.mem.Allocator, io: std.Io)

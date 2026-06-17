@@ -1,20 +1,14 @@
-//! Two distinct lifecycle enums live here, each answering a different question:
+//! Two lifecycle enums, seeded from the same start by `actor.spawn` but
+//! answering different questions:
 //!
-//! - `HandshakeStage` is the *handshake-waiter* gate. `Handshake.wait` blocks
-//!   on this and returns once the state reaches a terminal value:
-//!   `.established` (success) or `.failed` (handshake aborted). `.idle` is the
-//!   pre-start state; `.handshaking` is the in-progress state. This is what
-//!   `Connection.waitHandshake` exposes to callers.
+//! - `HandshakeStage` is the handshake-waiter gate: `Handshake.wait` returns
+//!   once the state is terminal for waiters — `.established` or `.failed`.
+//! - `ActorStage` is the actor-fiber lifecycle (`.initial` → `.handshake` →
+//!   `.running` → `.closing` → `.closed`, plus `.failed`), driving graceful
+//!   close vs cleanup vs fail.
 //!
-//! - `ActorStage` is the *actor lifecycle* and tracks the entire span of the
-//!   per-connection actor fiber: `.initial` → `.handshake` → `.running` →
-//!   `.closing` → `.closed`, plus `.failed`. This is what the actor itself uses
-//!   to decide whether to close gracefully, run cleanup, or fail.
-//!
-//! The two overlap because `actor.spawn` seeds both from the same starting
-//! handshake stage, but they answer different questions. Handshake success is
-//! terminal for waiters (`.established`) but the actor continues running
-//! (`.running`); the handshake gate has no concept of `.closing`/`.closed`.
+//! They diverge after handshake: success is terminal for waiters but the actor
+//! keeps `.running`, and the gate has no `.closing`/`.closed`.
 
 const std = @import("std");
 const io_time = @import("../io/time.zig");
@@ -112,11 +106,9 @@ pub const Handshake = struct {
     /// actor fiber's `establish`/`fail` stores.
     state: std.atomic.Value(HandshakeStage) = .init(.idle),
     done: std.Io.Event = .unset,
-    /// Plain (non-atomic) on purpose: written once by `begin`, which `spawn`
-    /// calls strictly before `std.Io.concurrent` creates the main-loop fiber
-    /// (see actor.zig). After that the field is read only by the actor fiber
-    /// (`deadline`/`timedOut`), so there is no concurrent access. If a future
-    /// change ever calls `begin` after the fiber is running, make this atomic.
+    /// Non-atomic: `begin` writes it before `spawn` creates the main-loop fiber,
+    /// after which only that fiber reads it — no concurrent access. Make atomic
+    /// if `begin` ever runs after the fiber is started.
     deadline_ns: ?i96 = null,
 
     pub fn begin(h: *Handshake, stage: HandshakeStage, deadline_ns: ?i96) void {

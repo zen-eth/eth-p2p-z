@@ -30,10 +30,8 @@ pub const SendDatagramError = error{
 
 pub const CloseConnectionError = error{AlreadyClosed};
 
-/// Reply for commands that signal completion but carry no result value
-/// (close_stream, close_read_stream, close_write_stream, reset_stream,
-/// close_connection, send_datagram succeeded). The caller stack-allocates,
-/// the actor calls `complete` exactly once.
+/// Reply for completion-only commands carrying no result value. Caller
+/// stack-allocates; the actor calls `complete` exactly once.
 pub const VoidReply = struct {
     event: std.Io.Event = .unset,
 
@@ -73,8 +71,8 @@ pub const CloseConnectionReply = struct {
 };
 
 /// Inline reason buffer for `CONNECTION_CLOSE`. RFC 9000 §10.2 caps the
-/// reason phrase at "small" (typical impls clamp around 256 bytes); we copy
-/// into the command so the caller's slice need not outlive the call.
+/// reason phrase at "small"; copied into the command so the caller's slice
+/// need not outlive the call.
 pub const close_connection_reason_max: usize = 256;
 
 pub const Command = union(enum) {
@@ -91,10 +89,8 @@ pub const Command = union(enum) {
         stream_id: u64,
         reply: *VoidReply,
     },
-    /// Graceful write-side close (FIN). Reply fires *after* the FIN has
-    /// actually been handed to quiche — preserves the existing
-    /// `closeWrite` blocking semantics so callers can sequence "FIN sent
-    /// before connection close".
+    /// Graceful write-side close (FIN). Reply fires *after* the FIN is handed
+    /// to quiche, so callers can sequence "FIN sent before connection close".
     close_write_stream: struct {
         stream_id: u64,
         reply: *VoidReply,
@@ -111,9 +107,8 @@ pub const Command = union(enum) {
     drop_stream: u64,
 
     send_datagram: struct {
-        /// Borrowed; valid for the duration of the actor's processing of
-        /// this command (caller is parked on `reply.event` until then).
-        /// Quiche copies internally on `quiche_conn_dgram_send`.
+        /// Borrowed; valid while the actor processes this command (caller is
+        /// parked on `reply.event`). Quiche copies on `quiche_conn_dgram_send`.
         payload: []const u8,
         reply: *SendDatagramReply,
     },

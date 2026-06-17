@@ -1,18 +1,14 @@
-//! libp2p signed Envelope + PeerRecord codec.
+//! libp2p signed Envelope + PeerRecord codec — advertises a node's listen
+//! addresses. Verification is stateless: the embedded public key checks the
+//! signature AND must hash to the peer-id named inside the record, so an
+//! attacker cannot forge addresses for a peer it has no key for. Carried by
+//! gossipsub peer-exchange (PRUNE).
 //!
-//! A node advertises its listen addresses by signing a PeerRecord (its peer-id,
-//! a monotonic sequence number, and its marshaled listen multiaddrs) with its
-//! host key, wrapped in an Envelope. Any peer can statelessly verify the
-//! Envelope: the embedded public key checks the signature AND must hash to the
-//! peer-id named inside the record, so an attacker cannot forge addresses for a
-//! peer it has no key for. Peer-exchange (the PRUNE message of gossipsub) carries
-//! these signed records.
-//!
-//! Wire format (must byte-match go-libp2p / rust-libp2p):
+//! Wire format must byte-match go-libp2p / rust-libp2p:
 //!
 //!   Envelope protobuf (proto3, all `bytes` except the nested PublicKey message):
 //!     field 1 (public_key): the libp2p crypto.PublicKey protobuf {Type, Data}
-//!     field 2 (payload_type): the multicodec for the payload (peer-record: 0x03 0x01)
+//!     field 2 (payload_type): the payload's multicodec (peer-record: 0x03 0x01)
 //!     field 3 (payload): the marshaled PeerRecord
 //!     field 5 (signature): host-key signature over the signing input below
 //!
@@ -22,16 +18,8 @@
 //!     field 3 (addresses): repeated AddressInfo { field 1 (multiaddr): bytes }
 //!
 //!   Signing input (`makeUnsigned`): for each of [domain, payload_type, payload],
-//!   an unsigned varint length prefix followed by the raw bytes, concatenated:
-//!     uvarint(domain.len) || domain
-//!       || uvarint(payload_type.len) || payload_type
-//!       || uvarint(payload.len) || payload
-//!   `domain` is the constant ASCII string "libp2p-peer-record".
-//!
-//! This module is the ONLY place that knows the envelope/record byte layout. It
-//! reuses the identity / peer-id / TLS crypto primitives (host-key sign + verify,
-//! libp2p PublicKey marshaling + parsing, peer-id derivation) and the gremlin
-//! protobuf Writer/Reader rather than hand-rolling crypto or varints.
+//!   uvarint length prefix || raw bytes, concatenated in order; `domain` is the
+//!   constant ASCII "libp2p-peer-record".
 
 const std = @import("std");
 const gremlin = @import("gremlin");
@@ -47,9 +35,8 @@ const Allocator = std.mem.Allocator;
 /// peer-record context (a record cannot be replayed as a different envelope type).
 pub const peer_record_domain = "libp2p-peer-record";
 
-/// The multicodec payload-type for a peer record, used as the Envelope's
-/// `payload_type`. These are the exact bytes go-libp2p / rust-libp2p emit; see
-/// the multiformats multicodec table entry named "libp2p-peer-record".
+/// The Envelope `payload_type` for a peer record: the multiformats multicodec
+/// table entry named "libp2p-peer-record".
 pub const peer_record_payload_type = [_]u8{ 0x03, 0x01 };
 
 /// Envelope protobuf field numbers (proto3).
@@ -83,10 +70,8 @@ pub const PeerRecord = struct {
     seq: u64,
     addrs: []const []const u8,
 
-    /// Marshals the PeerRecord to its protobuf bytes. Caller owns the slice.
-    /// Mirrors go-libp2p `PeerRecord.MarshalRecord`: peer_id (field 1), seq
-    /// (field 2, omitted when zero per proto3), then each address as a nested
-    /// AddressInfo message (field 3).
+    /// Marshals the PeerRecord to its protobuf bytes (caller owns the slice).
+    /// `seq` is omitted when zero, per proto3.
     pub fn encode(self: *const PeerRecord, allocator: Allocator) Allocator.Error![]u8 {
         const id_bytes = self.peer_id.bytes[0..self.peer_id.len];
 
@@ -133,12 +118,9 @@ pub const ConsumedRecord = struct {
     }
 };
 
-/// Marshals and signs `record` into an Envelope, returning the marshaled Envelope
-/// bytes (caller owns). The signature covers the signing input
-/// (domain :: payload_type :: payload, each length-prefixed); the embedded public
-/// key lets any receiver verify it statelessly. The record's `peer_id` should be
-/// `key`'s own peer-id (otherwise the produced envelope fails the consumer's
-/// key↔peer-id binding); this is not checked here beyond requiring a non-empty id.
+/// Marshals and signs `record` into an Envelope (caller owns the bytes).
+/// `record.peer_id` should be `key`'s own peer-id, else the envelope fails the
+/// consumer's key↔peer-id binding; only a non-empty id is enforced here.
 pub fn sealPeerRecord(allocator: Allocator, key: *const identity.KeyPair, record: PeerRecord) SealError![]u8 {
     if (record.peer_id.len == 0) return error.NoPeerIdInRecord;
 
@@ -157,12 +139,10 @@ pub fn sealPeerRecord(allocator: Allocator, key: *const identity.KeyPair, record
     return encodeEnvelope(allocator, pubkey_proto, &peer_record_payload_type, payload, signature);
 }
 
-/// Parses, verifies, and returns the peer record inside `envelope_bytes`. The
-/// envelope is rejected unless: its `payload_type` is the peer-record codec, the
-/// signature verifies against the embedded public key over the reconstructed
-/// signing input, and that public key hashes to the `peer_id` named in the record
-/// (the key↔peer-id binding). On success the returned record is owned by the
-/// caller (free with `deinit`). Any failure returns a `ConsumeError`.
+/// Parses, verifies, and returns the peer record inside `envelope_bytes`
+/// (owned by the caller; free with `deinit`). Rejected unless: (a) `payload_type`
+/// is the peer-record codec, (b) the signature verifies against the embedded
+/// public key, (c) that key hashes to the record's `peer_id` (key↔peer-id binding).
 pub fn consumeEnvelope(allocator: Allocator, envelope_bytes: []const u8) ConsumeError!ConsumedRecord {
     const env = try parseEnvelope(envelope_bytes);
 
@@ -363,10 +343,8 @@ fn parseAddressInfo(bytes: []const u8) gremlin.Error![]const u8 {
 // Signing-input construction + size helpers
 // ---------------------------------------------------------------------------
 
-/// Builds the byte string a peer record signs/verifies, mirroring go-libp2p
-/// `makeUnsigned`: for each field in [domain, payload_type, payload], an unsigned
-/// varint length prefix followed by the raw bytes, concatenated in order. Caller
-/// owns the returned slice.
+/// Builds the byte string a peer record signs/verifies (see the module header
+/// for the layout). Caller owns the returned slice.
 fn makeUnsigned(
     allocator: Allocator,
     domain: []const u8,
@@ -401,8 +379,7 @@ fn writeUvarint(dest: []u8, value: usize) usize {
     return pos + 1;
 }
 
-/// Wire size of a field tag (the field number + wire type varint). All fields
-/// here use single-byte field numbers, but compute it generally.
+/// Wire size of a field tag (the field number + wire type varint).
 fn tagSize(field: gremlin.ProtoWireNumber) usize {
     return gremlin.sizes.sizeVarInt((@as(u64, @intCast(field)) << 3) | 2);
 }
@@ -613,10 +590,9 @@ test "the payload type constant is the libp2p peer-record codec 0x03 0x01" {
 test "consumes a real go-libp2p signed peer-record envelope (wire-compat)" {
     const allocator = testing.allocator;
 
-    // Fixture produced by go-libp2p `record.Seal` over a PeerRecord with an
-    // Ed25519 key (fixed seed), seq=0x1122334455667788, and two quic-v1
-    // multiaddrs. Decoding it here proves our envelope/record/signing-input byte
-    // layout matches the reference implementation exactly.
+    // Fixture produced by go-libp2p `record.Seal` (Ed25519 fixed seed,
+    // seq=0x1122334455667788, two quic-v1 multiaddrs). Decoding it proves our
+    // envelope/record/signing-input byte layout matches the reference exactly.
     const envelope = try hexDecode(allocator, "0a240801122079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664120203011a500a2600240801122079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad0496641088ef99abc5e88c91111a0d0a0b047f00000191020fa1cd031a0d0a0b04c0a8000a91022328cd032a40d85c6ac219c546773786025106fb199fa63b456e808af9cdbed155efd4dc1114cf7eb912a0b1cc2adfcb129f4fe54bdc47fb03987733be3107fed37c6495e30a");
     defer allocator.free(envelope);
 
@@ -630,9 +606,8 @@ test "consumes a real go-libp2p signed peer-record envelope (wire-compat)" {
     try testing.expectEqualSlices(u8, expected_peer_id, consumed.peer_id.bytes[0..consumed.peer_id.len]);
     try testing.expectEqual(@as(usize, 2), consumed.addrs.len);
 
-    // The record's addresses are go-libp2p's BINARY multiaddrs. Decoding them with
-    // our `fromBytes` must yield the exact STRING multiaddrs go advertised, proving
-    // we read go's binary address encoding correctly.
+    // The addresses are binary multiaddrs; `fromBytes` must yield the exact
+    // string forms go advertised, proving we read the binary encoding correctly.
     const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
     const expected_strs = [_][]const u8{
         "/ip4/127.0.0.1/udp/4001/quic-v1",

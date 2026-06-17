@@ -1,26 +1,21 @@
-//! The public gossipsub service and its Switch/QUIC binding. `Gossipsub`
-//! constructs and owns a single-fiber `Router(SwitchTransport)`, registers it on
-//! a `*Switch` (as the `/meshsub/1.1.0` inbound service and as the peer
-//! connect/disconnect observer), and exposes the lifecycle.
+//! The public gossipsub service and its Switch/QUIC binding. `Gossipsub` owns a
+//! single-fiber `Router(SwitchTransport)` and registers it on a `*Switch` (as the
+//! `/meshsub/1.1.0` inbound service and the peer connect/disconnect observer).
 //!
-//! This file is the ONLY place that knows the router talks to a real Switch over
-//! QUIC. The transport-agnostic router lives in router.zig; the concrete pieces
-//! it needs from the real transport are here:
-//!   - `SwitchTransport`: supplies the per-peer outbound `StreamSink` and the
-//!     `*SwitchConnection` connection handle the `peer_connected` command carries.
-//!   - `StreamSink` / `StreamSource`: the QUIC-stream sink/source satisfying the
+//! The ONLY place that knows the transport-agnostic router (router.zig) talks to a
+//! real Switch over QUIC. The concrete pieces it needs live here:
+//!   - `SwitchTransport`: the per-peer outbound `StreamSink` + the
+//!     `*SwitchConnection` the `peer_connected` command carries.
+//!   - `StreamSink` / `StreamSource`: QUIC-stream sink/source for the
 //!     PeerWriter / PeerReader contracts.
 //!   - the inbound service/handler registered on the Switch.
 //!
 //! The Switch's peer-event callbacks fire on whichever fiber called
-//! dial/accept/deinit, OUTSIDE the Switch's connection lock. They must only post
-//! to the router inbox and return — which is exactly what the callbacks here do,
-//! keeping all router-state mutation on the single router fiber.
+//! dial/accept/deinit, OUTSIDE the Switch's connection lock, so they only post to
+//! the router inbox — keeping all router-state mutation on the single router fiber.
 //!
-//! This is wired on the root import path (root.zig), NOT through protocols.zig:
-//! the router imports peer_io/pubsub and this file imports switch.zig, which
-//! imports protocols.zig, so routing gossipsub through the protocols chain would
-//! risk an import cycle.
+//! Wired on the root import path (root.zig), NOT protocols.zig: this file imports
+//! switch.zig → protocols.zig, so routing through that chain would risk a cycle.
 
 const std = @import("std");
 const protocols = @import("../../protocols.zig");
@@ -37,18 +32,15 @@ const SwitchConnection = swarm.SwitchConnection;
 const ProtocolId = protocols.ProtocolId;
 const Stream = quic.Stream;
 
-/// Drains a peer's OutboundQueue onto its `/meshsub` stream. The sink owns the
-/// current QUIC stream and re-opens it lazily; it satisfies the PeerWriter Sink
-/// contract (open / writeFrame / close, with close idempotent).
-///
-/// On open it proposes the full `/meshsub` version list (1.2.0, 1.1.0, 1.0.0)
-/// and uses whichever the peer accepts, recording the negotiated protocol id in
-/// `selected` so the router can learn our outbound version for the peer.
-/// Matches the switch's multistream negotiation timeout.
+/// Per-write deadline on the `/meshsub` stream; matches the switch's multistream
+/// negotiation timeout.
 const write_timeout: std.Io.Timeout = .{
     .duration = .{ .raw = .fromNanoseconds(10 * std.time.ns_per_s), .clock = .awake },
 };
 
+/// Drains a peer's OutboundQueue onto its `/meshsub` stream, satisfying the
+/// PeerWriter Sink contract (open / writeFrame / close, close idempotent). Owns
+/// the current QUIC stream and re-opens it lazily.
 pub const StreamSink = struct {
     conn: *SwitchConnection,
     /// The protocol id the peer accepted on the most recent open, or null before
@@ -59,9 +51,8 @@ pub const StreamSink = struct {
     current: ?*Stream = null,
 
     /// (Re)establish the outbound stream by negotiating the best common /meshsub
-    /// version on a new QUIC stream. Leaves `current` and `selected` set on
-    /// success; on failure both are untouched (the writer only opens when it has
-    /// none).
+    /// version on a new QUIC stream. On failure `current`/`selected` are untouched
+    /// (the writer only opens when it has none).
     pub fn open(self: *StreamSink, io: std.Io) !void {
         _ = io;
         const result = try self.conn.openProtocolStreamMulti(&pubsub.supported_protocols, .{});
@@ -70,11 +61,9 @@ pub const StreamSink = struct {
         std.log.info("gossipsub: outbound stream negotiated {s}", .{result.selected});
     }
 
-    /// Write one framed RPC to the current stream. Errors propagate so the
-    /// writer can tear the stream down and re-open. Bounded per write so a
-    /// stalled-but-alive peer (flow-control frozen, not reading) can't park the
-    /// writer fiber forever; a slow-but-progressing peer never trips it, and
-    /// repeated timeouts become a disconnect via the give-up counter.
+    /// Write one framed RPC. Errors propagate so the writer can re-open. Bounded
+    /// per write so a stalled-but-alive peer (flow-control frozen) can't park the
+    /// writer forever; repeated timeouts become a disconnect via the give-up counter.
     pub fn writeFrame(self: *StreamSink, io: std.Io, bytes: []const u8) !void {
         try self.current.?.writeAll(io, bytes, .{ .timeout = write_timeout });
     }
@@ -109,18 +98,14 @@ pub const StreamSource = struct {
     }
 };
 
-/// The real transport binding for the gossipsub Router: it produces a per-peer
-/// `StreamSink` over a `*SwitchConnection`, and dials peers on the router's
-/// behalf. The router stays generic over this (see router.zig's Transport
-/// contract); it asks for `makeSink` and `dial`, plus the `Sink`/`ConnHandle`
-/// types.
+/// The real transport binding for the gossipsub Router (router.zig's Transport
+/// contract: `makeSink`, `dial`, `Sink`/`ConnHandle`): produces a per-peer
+/// `StreamSink` over a `*SwitchConnection` and dials peers on the router's behalf.
 ///
-/// Held by value in the router but NOT stateless: it borrows the `*Switch` (to
-/// dial + to start inbound dispatch on a dialed connection) and a `*std.Io.Group`
-/// that OWNS the detached dial fibers. The group lives in the `Gossipsub` handle
-/// so its `deinit` can await/cancel every dial fiber — the router never joins
-/// them. `makeSink` allocates the sink but does no I/O (the writer fiber opens
-/// the stream lazily on its first frame).
+/// Held by value in the router but NOT stateless: borrows the `*Switch` and a
+/// `*std.Io.Group` that OWNS the detached dial fibers. The group lives in the
+/// `Gossipsub` handle so its `deinit` can cancel/await every dial fiber — the
+/// router never joins them. `makeSink` does no I/O (the writer opens lazily).
 pub const SwitchTransport = struct {
     /// Borrowed; must outlive the router. Used by `dial` to establish a
     /// connection and start its inbound dispatcher.
@@ -143,20 +128,11 @@ pub const SwitchTransport = struct {
         return sink;
     }
 
-    /// Fire-and-forget dial of the multiaddr STRING `addr`. Spawns a detached
-    /// fiber (tracked in `dial_group`) that parses the address, dials it through
-    /// the Switch, and on success starts the connection's inbound dispatcher so
-    /// inbound /meshsub streams are read — mirroring the manual dial in the 2-node
-    /// tests. Success surfaces as the Switch's peer-event callback firing
-    /// `onConnected` → the router's `onPeerConnected` (the normal connect path
-    /// that opens the outbound stream). On any failure the fiber logs and returns;
-    /// the router re-dials a still-disconnected direct peer on its next tick. The
-    /// dialed connection is owned by the Switch (registered in its connection
-    /// list, torn down by `Switch.deinit`), so the fiber does not retain it.
-    ///
-    /// If the spawn itself fails (executor exhaustion) the dial is dropped with a
-    /// log — the next direct-connect tick retries — so a transient spawn failure
-    /// never crashes the router fiber that called this.
+    /// Fire-and-forget dial of the multiaddr STRING `addr`: spawns the detached
+    /// `dialFiber` into `dial_group`. Success surfaces via the Switch's
+    /// `onConnected` callback (the normal connect path that opens the outbound
+    /// stream); a spawn failure is dropped with a log (the next direct-connect tick
+    /// retries) so it never crashes the calling router fiber.
     pub fn dial(self: *SwitchTransport, io: std.Io, addr: []const u8) void {
         // Copy the address: the borrowed `addr` (a router-owned direct-peer
         // string) outlives this call, but the detached fiber runs past it, so it
@@ -165,9 +141,7 @@ pub const SwitchTransport = struct {
             std.log.warn("gossipsub: dial dropped (out of memory copying address)", .{});
             return;
         };
-        // The dial fiber dials via `sw.io` (the Switch's own Io); it needs no
-        // separate Io, so only `sw`, the allocator, and the owned address are
-        // passed. `io` here is just the spawn context for `concurrent`.
+        // The dial fiber dials via `sw.io`; `io` here is just the spawn context.
         self.dial_group.concurrent(io, dialFiber, .{ self.sw, self.allocator, addr_copy }) catch {
             std.log.warn("gossipsub: dial dropped (could not spawn dial fiber)", .{});
             self.allocator.free(addr_copy);
@@ -177,10 +151,8 @@ pub const SwitchTransport = struct {
 
 /// Detached dial-fiber body. Parses `addr` (owned, freed here), dials it through
 /// `sw`, and on success starts the connection's inbound dispatcher. All failures
-/// are logged and dropped — a direct peer is re-dialed by the router on its next
-/// direct-connect tick. The connection is owned by the Switch once dialed (it is
-/// registered there and torn down by `Switch.deinit`), so this fiber does not
-/// hold or free it.
+/// are logged and dropped (the router re-dials on its next tick). The dialed
+/// connection is owned by the Switch, so this fiber does not retain it.
 fn dialFiber(sw: *Switch, allocator: std.mem.Allocator, addr: []u8) void {
     defer allocator.free(addr);
 
@@ -194,11 +166,9 @@ fn dialFiber(sw: *Switch, allocator: std.mem.Allocator, addr: []u8) void {
         std.log.info("gossipsub: dial to {s} failed: {s}", .{ addr, @errorName(err) });
         return;
     };
-    // The peer-event callback already fired `onConnected` synchronously inside
-    // `sw.dial` (before it returned), so the router is wiring the peer up. Start
-    // the inbound dispatcher so inbound /meshsub streams dispatch; a failure here
-    // leaves the connection up (the peer is still connected) but without inbound
-    // reads — logged, and the connection lives on under the Switch.
+    // `sw.dial` already fired `onConnected` synchronously, so the peer is wiring
+    // up; start the inbound dispatcher so its /meshsub streams read. A failure
+    // here leaves the connection up but without inbound reads — logged only.
     conn.startInboundDispatcher(.{}) catch |err| {
         std.log.warn("gossipsub: dial to {s} connected but inbound dispatch failed: {s}", .{ addr, @errorName(err) });
     };
@@ -207,56 +177,45 @@ fn dialFiber(sw: *Switch, allocator: std.mem.Allocator, addr: []u8) void {
 const Router = router_mod.Router(SwitchTransport);
 
 /// The gossipsub heartbeat period (go-libp2p default: one second). The router
-/// runs a heartbeat fiber on this interval to age out backoffs (and, in later
-/// layers, to maintain the mesh).
+/// runs a heartbeat fiber on this interval to maintain the mesh and age backoffs.
 const heartbeat_interval_ms: u64 = 1000;
 
-/// Re-export so callers construct a handler without importing router.zig.
+/// Receiver for messages delivered on subscribed topics.
 pub const MessageHandler = router_mod.MessageHandler;
 
-/// Re-export the application topic-message validator (and its verdict enum) so a
-/// caller can gate message propagation — accept/reject/ignore, matching
-/// go-libp2p-pubsub `RegisterTopicValidator` / rust-libp2p `MessageAcceptance` —
-/// via `RouterConfig.validator` without importing router.zig. Null (the default)
-/// accepts every message.
+/// Application topic-message validator (and its verdict enum): gate propagation
+/// accept/reject/ignore via `RouterConfig.validator`, matching go-libp2p-pubsub
+/// `RegisterTopicValidator` / rust-libp2p `MessageAcceptance`. Null accepts every
+/// message.
 pub const MessageValidator = router_mod.MessageValidator;
 pub const ValidationResult = router_mod.ValidationResult;
 
-/// Re-export the optional peer-scoring config type (and a ready-made baseline)
-/// so callers can opt into scoring without importing router.zig / score.zig.
-/// Pass `null` to `Gossipsub.init` to leave scoring disabled (the default — no
-/// events, no gates, behaviour unchanged), or `Gossipsub.default_score_config`
-/// to enable it with the documented baseline params/thresholds.
+/// Optional peer-scoring config. Pass `null` to `Gossipsub.init` to leave scoring
+/// disabled (the default — no events, no gates), or `Gossipsub.default_score_config`
+/// to enable it with the baseline params/thresholds.
 pub const ScoreConfig = router_mod.ScoreConfig;
 
-/// Re-export the router behaviour config (flood-publish, signature policy, etc.)
-/// so callers can tune it without importing router.zig. Pass `.{}` to
-/// `Gossipsub.init` for the go-libp2p defaults (flood-publish ON, signature
-/// policy inferred from the host key).
+/// Router behaviour config (flood-publish, signature policy, etc.). Pass `.{}` to
+/// `Gossipsub.init` for the go-libp2p defaults (flood-publish ON, signature policy
+/// inferred from the host key).
 pub const RouterConfig = router_mod.RouterConfig;
 
-/// Re-export the direct-peer descriptor (peer id + multiaddr string to dial) so
-/// a caller can populate `RouterConfig.direct_peers` without importing
-/// router.zig. The router keeps each configured direct peer connected itself
-/// (dials at start, re-dials disconnected ones on a tick).
+/// Direct-peer descriptor (peer id + multiaddr string to dial) for
+/// `RouterConfig.direct_peers`. The router keeps each configured direct peer
+/// connected itself (dials at start, re-dials disconnected ones on a tick).
 pub const DirectPeer = router_mod.DirectPeer;
 
-/// Re-export the mesh-degree override (`d`/`d_low`/`d_high`) so a caller can
-/// drive a small topology over-degree — e.g. set `d_high = 1` on a three-node
-/// star so the centre's two-leaf mesh is pruned by the heartbeat (the
-/// peer-exchange path) — via `RouterConfig.mesh_degree` without importing
-/// router.zig. Null (the default) keeps the go-libp2p baseline.
+/// Mesh-degree override (`d`/`d_low`/`d_high`) for `RouterConfig.mesh_degree`,
+/// e.g. to drive a small topology over-degree so the heartbeat prunes it. Null
+/// (the default) keeps the go-libp2p baseline.
 pub const MeshDegree = router_mod.MeshDegree;
 
-/// Re-export the signature-policy enum (and the message-id override types) so a
-/// caller can select `anonymous` (StrictNoSign) — or supply a custom message-id
-/// function — via `RouterConfig` without importing router.zig.
+/// Signature-policy enum + message-id override types: select `anonymous`
+/// (StrictNoSign) or supply a custom message-id function via `RouterConfig`.
 pub const SignaturePolicy = router_mod.SignaturePolicy;
 pub const MessageIdFn = router_mod.MessageIdFn;
 pub const MessageIdConfig = router_mod.MessageIdConfig;
-/// The id bytes a `MessageIdFn` returns (owned, freed by the router). Re-exported
-/// so a caller supplying a custom `message_id_fn` can build its return value
-/// without importing rpc.zig.
+/// The id bytes a `MessageIdFn` returns (owned, freed by the router).
 pub const MessageId = pubsub.rpc.MessageId;
 
 const score_mod = @import("score.zig");
@@ -265,19 +224,17 @@ pub const default_score_config: ScoreConfig = .{
     .thresholds = score_mod.default_thresholds,
 };
 
-/// The gossipsub stream protocol id (`/meshsub/1.1.0`). Re-exported so callers
-/// holding only this module (e.g. an identify responder advertising which
-/// protocols this node speaks) can name it without importing pubsub.zig.
+/// The gossipsub stream protocol id (`/meshsub/1.1.0`), e.g. for an identify
+/// responder advertising which protocols this node speaks.
 pub const protocol_id = pubsub.protocol_id;
 
-/// Every `/meshsub` version this node speaks, newest-first (1.2.0, 1.1.0,
-/// 1.0.0). Re-exported so an identify responder can advertise the full set (a
-/// peer then negotiates the best common version) without importing pubsub.zig.
+/// Every `/meshsub` version this node speaks, newest-first (1.2.0, 1.1.0, 1.0.0):
+/// an identify responder advertises the full set; a peer then negotiates the best
+/// common version.
 pub const supported_protocols = pubsub.supported_protocols;
 
-/// The individual `/meshsub` version ids (newest to oldest). `protocol_id` above
-/// is the 1.1.0 id; these name the others so a consumer can register/advertise a
-/// specific version without importing pubsub.zig.
+/// The other `/meshsub` version ids (`protocol_id` above is 1.1.0), to
+/// register/advertise a specific version.
 pub const protocol_id_v1_2 = pubsub.protocol_id_v1_2;
 pub const protocol_id_v1_0 = pubsub.protocol_id_v1_0;
 
@@ -293,17 +250,15 @@ pub const frameRpc = pubsub.frameRpc;
 const InboundHandler = struct {
     router: *Router,
     peer: PeerId,
-    /// The /meshsub version the peer negotiated on THIS inbound stream (parsed
-    /// from the protocol id it selected). The peer proposes its best version and
-    /// we accept it, so this is the highest version that peer supports.
+    /// The /meshsub version negotiated on THIS inbound stream. The peer proposes
+    /// its best version and we accept it, so this is its highest supported version.
     version: pubsub.Version,
 
     /// Fiber body run by the Switch. Reads + posts until the stream breaks.
     fn run(self: *InboundHandler, io: std.Io, stream: *Stream) anyerror!void {
         std.log.info("gossipsub: inbound stream negotiated {s}", .{@tagName(self.version)});
-        // Tell the router which /meshsub version this peer speaks before reading,
-        // so the per-peer version is recorded as soon as the peer reaches us
-        // (even if its RPCs are slow to follow). Best-effort post.
+        // Record the peer's /meshsub version before reading, so it's known as soon
+        // as the peer reaches us even if its RPCs are slow. Best-effort post.
         self.router.postPeerProtocol(io, self.peer, self.version);
 
         var source = StreamSource{ .stream = stream };
@@ -325,15 +280,10 @@ const InboundHandler = struct {
 /// returns.
 const InboundService = struct {
     router: *Router,
-    /// Held DIRECTLY (a copy of the router's allocator) so `destroyInboundService`
-    /// can free this object WITHOUT dereferencing `router`. The Switch frees its
-    /// registered service objects in its own `deinit`, which runs AFTER
-    /// `Gossipsub.deinit` has already called `router.destroy()` — so by the time
-    /// `destroyInboundService` runs, `router` points at freed memory. Reaching the
-    /// allocator through `router.allocator` would be a use-after-free (latent: it
-    /// only faults once the freed Router allocation is reused/poisoned, which the
-    /// allocator's size class makes layout-dependent). Storing the allocator here
-    /// closes that hole.
+    /// A copy of the router's allocator so `destroyInboundService` can free this
+    /// WITHOUT dereferencing `router`: the Switch frees its service objects in its
+    /// own `deinit`, which runs AFTER `Gossipsub.deinit` has destroyed the router,
+    /// so reaching the allocator through `router.allocator` would be a UAF.
     allocator: std.mem.Allocator,
 
     fn openInbound(
@@ -358,52 +308,42 @@ const InboundService = struct {
 pub const Gossipsub = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    /// Borrowed; must outlive the router (the router's per-peer state borrows
-    /// the Switch's connections, and the Switch holds the peer-event callback
-    /// and inbound service that reference the router). Cleared via this on
-    /// deinit before the router is freed.
+    /// Borrowed; must outlive the router (its per-peer state borrows the Switch's
+    /// connections; the Switch holds the peer-event callback + inbound service that
+    /// reference the router). The callback is cleared on deinit before the router is freed.
     sw: *Switch,
     router: *Router,
-    /// Owns the detached dial fibers the `SwitchTransport.dial` spawns (direct
-    /// peer auto-connect). Heap-owned so its address is stable for the router's
-    /// by-value `SwitchTransport`, which holds a `*std.Io.Group` into it. Cancel
-    /// + awaited in `deinit` (before the router is freed) so no dial fiber leaks
-    /// or outlives the Gossipsub.
+    /// Owns the detached dial fibers `SwitchTransport.dial` spawns. Heap-owned for
+    /// a stable address (the by-value `SwitchTransport` holds a `*std.Io.Group`
+    /// into it); cancelled + awaited in `deinit` before the router is freed.
     dial_group: *std.Io.Group,
 
     /// Construct the router, start its fiber, register the inbound service and
     /// the peer-event callback on the Switch. On any failure the router is torn
     /// down so nothing leaks.
     ///
-    /// `local_peer` is this node's own peer id (used as Message.from on publish).
-    /// The Switch/QuicEndpoint here does not expose a local-peer-id accessor (the
-    /// endpoint does not even retain the host KeyPair), so the caller — which owns
-    /// the KeyPair — passes it in (e.g. `try key.peerId(allocator)`).
+    /// `local_peer` is this node's own peer id (Message.from on publish). The
+    /// caller passes it in because the endpoint exposes no local-peer accessor and
+    /// does not retain the host KeyPair (e.g. `try key.peerId(allocator)`).
     ///
-    /// `host_key` (together with `config.signature_policy`) selects the signature
-    /// policy. By default (`config.signature_policy == null`) the key infers it:
-    /// pass the node's host KeyPair (the same one used for the endpoint identity)
-    /// to enable StrictSign — outbound messages are signed and inbound messages
-    /// are verified + rejected if their signature is invalid or absent, required
-    /// for interop with go-libp2p (whose default is StrictSign) — or pass null for
-    /// the none policy (from+seqno, no signature, no verification). When a key is
-    /// given the router derives `local_peer` from it. To run anonymously
-    /// (StrictNoSign — published messages carry only topic+data, no peer-id,
-    /// content-based message-ids) pass `null` for `host_key` AND set
-    /// `config.signature_policy = .anonymous`; a key + anonymous is rejected. The
-    /// key is BORROWED and must outlive this Gossipsub.
+    /// `host_key` (with `config.signature_policy`) selects the signature policy;
+    /// the key is BORROWED and must outlive this Gossipsub. By default
+    /// (`signature_policy == null`) the key infers it: (a) pass the host KeyPair to
+    /// enable StrictSign (sign outbound, verify+reject inbound — go-libp2p's default,
+    /// required for interop), deriving `local_peer` from the key; (b) pass null for
+    /// the none policy (from+seqno, no signature). To run anonymously (StrictNoSign:
+    /// topic+data only, content-based ids) pass null AND
+    /// `config.signature_policy = .anonymous`; a key + anonymous is rejected.
     ///
-    /// `message_handler` (optional) receives messages delivered on topics this
-    /// node subscribes to; see router's MessageHandler for the call contract.
+    /// `message_handler` (optional) receives messages on subscribed topics; see
+    /// router's MessageHandler for the call contract.
     ///
-    /// `score_config` (optional) enables gossipsub peer scoring: pass null (the
-    /// default behaviour, and what the interop binary uses) to leave scoring off
-    /// — no scoring events, no score-based gates — or pass a config (e.g.
-    /// `Gossipsub.default_score_config`) to have the router score peers and gate
-    /// its mesh/gossip/graylist decisions on those scores.
+    /// `score_config` (optional) enables peer scoring: null leaves it off (no
+    /// events, no gates); a config (e.g. `Gossipsub.default_score_config`) gates
+    /// mesh/gossip/graylist decisions on scores.
     ///
-    /// `config` tunes router behaviour (e.g. flood-publish); pass `.{}` for the
-    /// go-libp2p defaults (flood-publish ON, matching go's out-of-the-box node).
+    /// `config` tunes router behaviour; pass `.{}` for the defaults (see
+    /// `RouterConfig`).
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -414,12 +354,10 @@ pub const Gossipsub = struct {
         score_config: ?ScoreConfig,
         config: RouterConfig,
     ) !*Gossipsub {
-        // The dial-fiber group must outlive the router's by-value SwitchTransport
-        // (which holds a pointer into it) and be awaited in deinit, so heap-own it
-        // up front with a stable address. This `destroy` errdefer is declared
-        // first so it runs LAST on the error path — after the cancel errdefer
-        // below joins every dial fiber, since a group with running fibers must not
-        // be freed.
+        // Heap-own the dial-fiber group for a stable address (the by-value
+        // SwitchTransport points into it). This `destroy` errdefer is declared
+        // first so it runs LAST — after the cancel errdefer below joins every dial
+        // fiber, since a group with running fibers must not be freed.
         const dial_group = try allocator.create(std.Io.Group);
         errdefer allocator.destroy(dial_group);
         dial_group.* = .init;
@@ -432,20 +370,16 @@ pub const Gossipsub = struct {
         const router = try Router.create(allocator, io, transport, local_peer, message_handler, heartbeat_interval_ms, host_key, score_config, config);
         errdefer router.destroy();
 
-        // Cancel + await any spawned dial fibers BEFORE the router is destroyed on
-        // the error path. Declared after `router.destroy`'s errdefer so it runs
-        // FIRST (LIFO): a dial fiber mid-`sw.dial` can fire `onConnected` into the
-        // router, so it must be joined before the router is freed. Idempotent —
-        // deinit's own cancel on the success path is a second (no-op) call, and a
-        // group with no spawned fibers cancels for free.
+        // Declared after `router.destroy`'s errdefer so it runs FIRST (LIFO): a
+        // dial fiber mid-`sw.dial` can fire `onConnected` into the router, so it
+        // must be joined before the router is freed. Idempotent (deinit cancels
+        // again on the success path; an empty group cancels for free).
         errdefer dial_group.cancel(io);
 
-        // Register the inbound service for EVERY /meshsub version we speak so we
-        // accept inbound streams from 1.0/1.1/1.2 peers alike. Each id gets its
-        // own heap-owned InboundService instance (all pointing at the same
-        // router) so the Switch can free each independently — registering one
-        // shared instance under several keys would double-free it on teardown.
-        // The negotiated version reaches the handler via ctx.protocol_id.
+        // Register the inbound service for EVERY /meshsub version so we accept
+        // 1.0/1.1/1.2 peers alike. Each id gets its OWN heap-owned InboundService
+        // (all pointing at the same router) so the Switch can free each
+        // independently — one shared instance under several keys would double-free.
         for (pubsub.supported_protocols) |proto| {
             const service = try inboundService(router);
             var service_owned = true;
@@ -456,10 +390,9 @@ pub const Gossipsub = struct {
             service_owned = false;
         }
 
-        // Register the peer-event callback BEFORE starting the router: start()
-        // dials the configured direct peers, and a dial that connects fires this
-        // callback (onConnected) synchronously. Registering first guarantees the
-        // connect is observed by the router rather than dropped.
+        // Register the callback BEFORE start(): start() dials direct peers and a
+        // connect fires `onConnected` synchronously, so registering first
+        // guarantees the connect is observed rather than dropped.
         sw.setPeerEventCallback(.{
             .ctx = router,
             .on_connected = onConnected,
@@ -491,49 +424,30 @@ pub const Gossipsub = struct {
     }
 
     fn destroyInboundService(svc: *InboundService) void {
-        // Use the directly-held allocator, NOT `svc.router.allocator`: the router
-        // is already freed by the time the Switch tears down its service objects
-        // (see `InboundService.allocator`). Dereferencing `svc.router` here would
-        // be a use-after-free.
+        // The directly-held allocator, NOT `svc.router.allocator` (already freed —
+        // see `InboundService.allocator`): dereferencing `svc.router` would be a UAF.
         svc.allocator.destroy(svc);
     }
 
     /// Shut the router down (tears down every peer, joins its fiber) and free.
-    /// Call before deiniting the Switch: the Switch cancels the inbound handler
-    /// fibers on connection teardown, and the router's peer state borrows the
-    /// Switch connections, so the router must stop while the Switch is still live.
+    /// Call before deiniting the Switch: the router's peer state borrows the Switch
+    /// connections, so the router must stop while the Switch is still live.
     ///
     /// PRECONDITION (closes the router↔Switch lifetime hole): before this runs,
-    /// every connection on this Switch that uses gossipsub must already be torn
-    /// down (or be torn down with no inbound `/meshsub` RPC in flight), OR this
-    /// Gossipsub must be deinited before any such connection outlives it.
+    /// every gossipsub connection on this Switch must already be torn down (with no
+    /// inbound `/meshsub` RPC in flight), OR this Gossipsub must be deinited before
+    /// any such connection outlives it.
     ///
-    /// The Switch holds three references that point at the router we are about to
-    /// free: (a) the peer-event callback's `ctx`, (b) the registered `/meshsub`
-    /// inbound-service instance's `router` field, and (c) any live Switch-owned
-    /// inbound handler fiber holding `*Router`. We close all three holes here:
-    ///   - First `clearPeerEventCallback`: after this, no connect/disconnect can
-    ///     post into the router, so freeing it cannot be raced by a peer event.
-    ///     (Per its contract this assumes no concurrent connect/disconnect is in
-    ///     flight — the precondition above.)
-    ///   - Then `router.destroy`: it tears down every peer (closing each peer's
-    ///     sink/stream while the connections are still alive) and frees.
-    /// The inbound-handler hole (b)/(c) is closed by the Switch's own teardown
-    /// property: inbound handler fibers are Switch-owned and the Switch cancels
-    /// them on connection teardown, so once a connection is closed no handler can
-    /// post to the router. Given the precondition (connections torn down first),
-    /// no handler survives to touch the freed router; the dangling service-object
-    /// `router` field is likewise only reached via `openInbound` on a new inbound
-    /// stream, which cannot arrive once the connections are gone.
-    ///
-    /// FIRST cancel + await the dial-fiber group: a detached direct-peer dial
-    /// fiber borrows the Switch (to dial / start dispatch) and would fire
-    /// `onConnected` into the router. Joining it before clearing the callback and
-    /// freeing the router ensures no dial fiber is left running (no leak) and none
-    /// touches the router or Switch after this returns. `cancel` collapses any
-    /// in-flight dial (the dial's blocking points are cancellation points) and
-    /// joins; it is idempotent, so an init-path `errdefer` having already called
-    /// it is harmless.
+    /// The Switch holds three references at the router we free: (a) the peer-event
+    /// callback's `ctx`, (b) the inbound-service instance's `router` field, (c) any
+    /// live Switch-owned inbound handler fiber holding `*Router`. Closed here in
+    /// order: FIRST cancel+await the dial-fiber group (a detached dial borrows the
+    /// Switch and would fire `onConnected` into the router; cancel is idempotent so
+    /// init's errdefer double-call is harmless); then `clearPeerEventCallback` (no
+    /// connect/disconnect can post after); then `router.destroy` (tears every peer
+    /// down while connections are still alive). (b)/(c) hold via the precondition:
+    /// the Switch cancels inbound handler fibers on connection teardown, and
+    /// `openInbound` cannot fire once the connections are gone.
     pub fn deinit(self: *Gossipsub) void {
         self.dial_group.cancel(self.io);
         self.sw.clearPeerEventCallback();
@@ -598,16 +512,12 @@ pub const Gossipsub = struct {
         };
     }
 
-    /// Hand a peer's signed peer record — its `signedPeerRecord` from a completed
-    /// libp2p identify exchange — to the router so it verifies and stores it in the
-    /// certified-record store. With the record on hand, our peer-exchange can vouch
-    /// for `peer` (offer its certified addresses to others) and we hold its
-    /// authenticated addresses. The caller passes the ORIGINAL envelope wire bytes
-    /// (after checking they verify + bind to `peer`); this dups them into the
-    /// router allocator and posts a `peer_record` command (the router re-verifies,
-    /// then `putRecord`s). On OOM or a closed inbox the record is dropped (PX simply
-    /// has nothing to offer for that peer — safe). Standalone-safe: a node with no
-    /// identify integration never calls this, so the cert store stays PX-only.
+    /// Hand a peer's signed peer record (its `signedPeerRecord` from a completed
+    /// identify exchange) to the router's certified-record store, so peer-exchange
+    /// can vouch for `peer`'s certified addresses. The caller passes the ORIGINAL
+    /// envelope wire bytes (already verified + bound to `peer`); this dups them and
+    /// posts a `peer_record` command (the router re-verifies). On OOM or a closed
+    /// inbox the record is dropped — PX simply has nothing to offer, safe.
     pub fn consumeIdentifyRecord(self: *Gossipsub, peer: PeerId, envelope_bytes: []const u8) void {
         const owned = self.allocator.dupe(u8, envelope_bytes) catch {
             std.log.warn("gossipsub: dropped identify peer record (out of memory)", .{});
@@ -616,16 +526,12 @@ pub const Gossipsub = struct {
         self.router.postPeerRecord(self.router.io, peer, owned);
     }
 
-    // The Switch peer-event callbacks: ctx is the *Router. Each posts one
-    // Command to the router's CONTROL inbox and returns — lifecycle events are
-    // drained with priority over data, so a connect/disconnect can never be
-    // backpressured behind an inbound-RPC flood (and the dial/accept fiber the
-    // callback runs on can no longer be stalled by one). `putOne` blocks only
-    // if the control inbox is full (its producers are churn-bound, so that is
-    // not expected in practice); dropping a `peer_disconnected` would leak a
-    // peer, so the blocking variant stays the safe choice. The callbacks must
-    // stay cheap (just this post); on a closed inbox the post fails and is
-    // swallowed (the router is shutting down anyway).
+    // The Switch peer-event callbacks: ctx is the *Router. Each posts one Command
+    // to the router's CONTROL inbox (drained with priority over data, so a
+    // connect/disconnect is never backpressured behind an inbound-RPC flood) and
+    // returns. The blocking `putOne` is the safe choice: dropping a
+    // `peer_disconnected` would leak a peer. A closed inbox swallows the post (the
+    // router is shutting down anyway).
 
     fn onConnected(ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection, remote_addr: std.Io.net.IpAddress) void {
         const router: *Router = @ptrCast(@alignCast(ctx));
@@ -711,11 +617,9 @@ test "two gossipsub nodes wire up per-peer I/O on connect and tear down on disco
     var server_conn_live = true;
     defer if (server_conn_live) server_conn.deinit();
 
-    // Both routers must observe the peer and bring its per-peer I/O up. peer_count
-    // reaching 1 on BOTH sides proves: peer_connected was processed, the writer
-    // opened (or is keeping) its outbound /meshsub stream (an open-exhaustion give-up
-    // would post peer_disconnected and drop the count back to 0), and the inbound
-    // handler is running. Poll with a bounded timeout for the cross-fiber connect.
+    // peerCount==1 on BOTH sides proves the full wire-up: peer_connected processed,
+    // the writer opened its outbound /meshsub stream (an open-exhaustion give-up
+    // would drop the count back to 0), and the inbound handler is running.
     var waited_ms: u64 = 0;
     while (waited_ms < 2000) : (waited_ms += 10) {
         if (server_gs.peerCount() == 1 and client_gs.peerCount() == 1) break;
@@ -740,15 +644,9 @@ test "two gossipsub nodes wire up per-peer I/O on connect and tear down on disco
     try std.testing.expectEqual(@as(usize, 0), client_gs.peerCount());
     try std.testing.expectEqual(@as(usize, 0), server_gs.peerCount());
 
-    // Shut the routers down before the switches/endpoints (the deinit order the
-    // gossipsub service requires). The remaining `defer`s free switches/endpoints.
-    //
-    // Order matters and satisfies Gossipsub.deinit's precondition: both
-    // connections were already torn down above (peerCount dropped to 0 on both
-    // sides), so by the time we deinit each gossipsub no inbound `/meshsub`
-    // handler fiber is alive and no connect/disconnect can fire. Gossipsub.deinit
-    // then clears the Switch peer-event callback before freeing the router, so the
-    // Switch holds no live reference to the freed router.
+    // Routers before switches/endpoints (Gossipsub.deinit's required order). Both
+    // connections are already torn down (peerCount 0 on both), satisfying its
+    // precondition: no inbound handler is alive and no peer event can fire.
     server_gs.deinit();
     server_gs_live = false;
     client_gs.deinit();
@@ -773,11 +671,9 @@ const DeliveryRecorder = struct {
         if (self.data) |d| self.allocator.free(d);
     }
 
-    /// Clear the captured delivery so the recorder can accept a fresh one (used
-    /// by the reconnect test to assert a SECOND publish is delivered after the
-    /// connection was dropped and re-established). Runs on the test fiber while
-    /// no router fiber is delivering (the test waits for the prior receipt and
-    /// drops the connection before resetting).
+    /// Clear the captured delivery so the recorder can accept a fresh one (the
+    /// reconnect test asserts a SECOND publish lands). Runs on the test fiber while
+    /// no router fiber is delivering.
     fn reset(self: *DeliveryRecorder) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -914,12 +810,9 @@ test "two gossipsub nodes: subscribe propagates and a publish is delivered end t
     try std.testing.expectEqualSlices(u8, client_peer.bytes[0..client_peer.len], rec.from.?);
 
     // Both sides advertise [1.2, 1.1, 1.0] and accept the first proposed, so each
-    // peer's inbound /meshsub stream negotiates 1.2.0 → each router records the
-    // other as a 1.2 peer. A side only learns the version once the OTHER side
-    // opens its outbound stream (lazy, on its first frame): the server opened on
-    // its subscription announce and the client opened to publish above, so by now
-    // both inbound streams exist. The version post races with peer_connected, so
-    // poll for it to settle.
+    // inbound stream negotiates 1.2.0. A side learns the version only once the
+    // OTHER opens its outbound stream (lazy, on first frame) — both have by now
+    // (server's announce, client's publish). The post races peer_connected, so poll.
     waited_ms = 0;
     while (waited_ms < 3000) : (waited_ms += 10) {
         const c = client_gs.router.probeForTest(server_peer, "t");
@@ -935,10 +828,8 @@ test "two gossipsub nodes: subscribe propagates and a publish is delivered end t
         try std.testing.expectEqual(pubsub.Version.v1_2, server_probe.version);
     }
 
-    // Tear down in the gossipsub-required order: close connections first (so no
-    // inbound /meshsub handler survives and no peer event can fire), then deinit
-    // each gossipsub (clears the Switch callback + frees the router) before the
-    // switches/endpoints are freed by the remaining defers.
+    // Gossipsub-required teardown order: close connections first (so no inbound
+    // handler survives and no peer event can fire), then deinit each gossipsub.
     client_conn.deinit();
     client_conn_live = false;
     server_conn.deinit();
@@ -967,13 +858,10 @@ test "two gossipsub nodes: keep-alive holds an idle connection past max_idle_tim
     var client_key = try identity.KeyPair.generate(.ED25519);
     defer client_key.deinit();
 
-    // Short idle timeout (1s) + shorter keep-alive (200ms). The test then idles
-    // 1.6s with NO application traffic — longer than max_idle_timeout — so WITHOUT
-    // keep-alive the QUIC connection would idle-time-out (peer disconnect, and the
-    // post-idle publish would never deliver). With keep-alive the actor's periodic
-    // ack-eliciting PING resets both ends' idle timers and the connection survives.
-    // Regression guard for the gossipsub-interop idle-then-publish failure (a
-    // subscriber that waits between bursts must not silently lose its mesh).
+    // Idle 1s + keep-alive 200ms. Idling 1.6s (> max_idle_timeout) with no app
+    // traffic would idle-close the connection WITHOUT keep-alive; the periodic
+    // ack-eliciting PING resets both ends' idle timers so it survives. Regression
+    // guard: a subscriber that waits between bursts must not silently lose its mesh.
     const opts: quic.Options = .{ .transport = .{ .max_idle_timeout_ms = 1000, .keep_alive_period_ms = 200 } };
 
     const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, opts);
@@ -1037,10 +925,9 @@ test "two gossipsub nodes: keep-alive holds an idle connection past max_idle_tim
         io_time.ms(10).sleep(io) catch {};
     }
 
-    // Idle 1.6s (> max_idle_timeout 1s) with no application traffic. Keep the
-    // runtime turning so the actors can emit keep-alive PINGs; the gossipsub
-    // heartbeat is silent here (empty mcache, no mesh to GRAFT), so ONLY keep-alive
-    // can hold the connection.
+    // Idle 1.6s (> max_idle_timeout) with no app traffic, keeping the runtime
+    // turning for keep-alive PINGs. The heartbeat is silent here (empty mcache, no
+    // mesh to GRAFT), so ONLY keep-alive can hold the connection.
     var idled_ms: u64 = 0;
     while (idled_ms < 1600) : (idled_ms += 50) {
         io_time.ms(50).sleep(io) catch {};
@@ -1086,14 +973,11 @@ test "two gossipsub nodes: keep-alive clamps to a peer's shorter negotiated idle
     var client_key = try identity.KeyPair.generate(.ED25519);
     defer client_key.deinit();
 
-    // Asymmetric idle timeouts. The SERVER advertises a short 600ms idle and runs
-    // NO keep-alive of its own. The CLIENT's configured keep-alive (1500ms) is
-    // LONGER than the negotiated idle (min(2000,600)=600ms) — so without the
-    // peer-idle clamp the client would PING too late and the connection would
-    // idle-close at 600ms (the server isn't keeping it alive), and the post-idle
-    // publish would never deliver. With the clamp the client drops its period to
-    // peer_idle/2 (300ms) and the connection survives. (Matches go-libp2p's
-    // min(KeepAlivePeriod, idleTimeout/2).)
+    // Asymmetric idle timeouts: server advertises 600ms idle and runs NO keep-alive;
+    // the client's 1500ms keep-alive is LONGER than the negotiated idle
+    // (min(2000,600)=600ms). Without the peer-idle clamp the client PINGs too late
+    // and the connection idle-closes at 600ms; the clamp drops its period to
+    // peer_idle/2 (300ms) so it survives — go-libp2p's min(KeepAlivePeriod, idleTimeout/2).
     const server_opts: quic.Options = .{ .transport = .{ .max_idle_timeout_ms = 600, .keep_alive_period_ms = 0 } };
     const client_opts: quic.Options = .{ .transport = .{ .max_idle_timeout_ms = 2000, .keep_alive_period_ms = 1500 } };
 
@@ -1190,11 +1074,9 @@ test "two gossipsub nodes: keep-alive clamps to a peer's shorter negotiated idle
 }
 
 test "two gossipsub nodes: a publish larger than the stream outbound queue is delivered" {
-    // A message bigger than the per-stream outbound byte queue forces the writer
-    // to fill the queue, block, and resume as the connection actor drains it onto
-    // the wire — the multi-chunk path a small publish never exercises. The
-    // gossipsub-interop blob scenario publishes ~96 KiB messages, so this is the
-    // path that must work for an all-zig mesh to propagate.
+    // A message bigger than the per-stream outbound queue forces the writer to
+    // block and resume as the connection actor drains it — the multi-chunk path a
+    // small publish never exercises (the interop blob scenario sends ~96 KiB).
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -1400,10 +1282,9 @@ test "two gossipsub nodes: pub/sub survives a drop+reconnect of the connection" 
             try std.testing.expect(client_gs.router.probeForTest(server_peer, "t").subscribed);
         }
 
-        // A publishes; B's handler must receive it. Republish on a short interval
-        // until it lands: right after a reconnect the mesh/flood topology can take
-        // a moment to settle, so a single publish may race the wire-up — repeating
-        // is how the other 2-node tests handle this timing without a fixed sleep.
+        // A publishes; B must receive. Republish until it lands: right after a
+        // reconnect the topology can take a moment to settle, so a single publish
+        // may race the wire-up.
         waited_ms = 0;
         while (waited_ms < 3000) : (waited_ms += 50) {
             try client_gs.publish("t", want);
@@ -1459,14 +1340,12 @@ fn routerMeshSize(router: *Router, topic: []const u8) usize {
     return router.probeForTest(router.local_peer, topic).mesh_size;
 }
 
-/// A live gossipsub node for the peer-exchange end-to-end test: a real
-/// QUIC endpoint + Switch + Gossipsub, an identify responder advertising a
-/// signed peer record (so a peer can certify this node's address and offer it
-/// via PX), and a background fiber that accepts EVERY inbound connection (a
-/// star centre is dialed by every leaf; a PX-offered peer is dialed out of
-/// band, so a leaf must accept that too). Accepted connections are stashed so
-/// teardown can deinit them — and thereby stop their inbound handler fibers —
-/// before the gossipsub is freed (the Switch-borrows-router lifetime rule).
+/// A live gossipsub node for the peer-exchange end-to-end test: real QUIC
+/// endpoint + Switch + Gossipsub, an identify responder advertising a signed peer
+/// record (so a peer can certify this node's address and offer it via PX), and a
+/// fiber accepting EVERY inbound connection (both star-centre dials and out-of-band
+/// PX dials). Accepted connections are stashed so teardown can stop their inbound
+/// handler fibers before the gossipsub is freed (Switch-borrows-router rule).
 const PxNode = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1524,11 +1403,10 @@ const PxNode = struct {
         defer listen_addr.deinit(allocator);
         try node.sw.listen(listen_addr);
 
-        // Register identify with a signed record over the REAL bound listen
-        // addrs, so a peer that runs identify against us certifies a dialable
-        // address and can vouch for us in its own PX. The handler BORROWS these
-        // slices, so they are owned by the node (freed in `deinitRest`), not a
-        // local — `writeIdentify` re-reads them on every inbound stream.
+        // Register identify with a signed record over the REAL bound listen addrs,
+        // so a peer running identify against us certifies a dialable address and can
+        // vouch for us in its own PX. The slices are node-owned (freed in
+        // `deinitRest`) because the handler borrows and re-reads them per stream.
         node.listen_addrs = try node.sw.listenMultiaddrs(allocator);
         errdefer {
             for (node.listen_addrs.items) |item| allocator.free(item);
@@ -1589,11 +1467,10 @@ const PxNode = struct {
         );
     }
 
-    /// Quiesce inbound accepts and join the accept fiber, then deinit every
-    /// accepted connection — stopping their inbound handler fibers — so the
-    /// gossipsub can be freed with no Switch-owned handler still holding the
-    /// router. Safe to call once; leaves the gossipsub/switch/endpoint for
-    /// `deinitRest` (which the test orders across all nodes).
+    /// Stop accepting, join the accept fiber, and deinit every accepted connection
+    /// — stopping their inbound handler fibers so the gossipsub can later be freed
+    /// with no Switch-owned handler holding the router. Leaves the rest to
+    /// `deinitRest`.
     fn quiesce(node: *PxNode) void {
         node.sw.closeListener(node.io);
         if (node.accept_future) |*future| {
@@ -1606,11 +1483,9 @@ const PxNode = struct {
         node.accepted = .empty;
     }
 
-    /// Tear down the rest (gossipsub before switch: the router's per-peer state
-    /// borrows the Switch's connections, so the router must stop while the
-    /// Switch is still live) and free the key. Call after every node has been
-    /// `quiesce`d (so no accept fiber is running and no accepted connection's
-    /// inbound handler survives to post into a freed router).
+    /// Tear down the rest (gossipsub before switch — the router borrows the Switch's
+    /// connections) and free the key. Call after every node is `quiesce`d, so no
+    /// accept fiber or inbound handler survives to post into a freed router.
     fn deinitRest(node: *PxNode) void {
         node.gs.deinit();
         // The identify handler borrows `listen_addrs`; deinit it (frees only its
@@ -1624,13 +1499,10 @@ const PxNode = struct {
     }
 };
 
-/// Dial `target` from `from`, start the connection's inbound dispatcher, then
-/// run identify as the client and hand the peer's verified signed record to
-/// `from`'s gossipsub — exactly the path the interop node uses to populate the
-/// certified-record store that peer-exchange offers draw from. The returned
-/// connection is owned by the caller (held for teardown). Mirrors the interop
-/// `exchangeIdentify`, inlined here so the test exercises the real identify →
-/// `consumeIdentifyRecord` → cert-store chain over QUIC.
+/// Dial `target` from `from`, start its inbound dispatcher, run identify as the
+/// client, and hand the peer's verified signed record to `from`'s gossipsub —
+/// exercising the real identify → `consumeIdentifyRecord` → cert-store chain that
+/// populates the PX offer store. The returned connection is caller-owned.
 fn dialAndIdentify(allocator: std.mem.Allocator, io: std.Io, from: *PxNode, target: *PxNode) !*SwitchConnection {
     const addr_text = try target.dialAddr(allocator);
     defer allocator.free(addr_text);
@@ -1662,15 +1534,12 @@ test "live peer-exchange: an over-degree prune offers a signed record and the pr
     defer threaded.deinit();
     const io = threaded.io();
 
-    // A three-node star: centre A meshes with leaves B and C. A runs a tiny mesh
-    // degree (target 1, prune above 1), so once both leaves are in A's mesh for
-    // the topic — two peers, above `d_high = 1` — the heartbeat prunes one. With
-    // peer-exchange on, that over-degree prune is a doPX path: A offers the
-    // SURVIVING leaf's signed record to the pruned leaf, which (its accept-PX gate
-    // open — scoring is off, so the gate is skipped) dials the offered leaf. The
-    // result is a NEW leaf↔leaf connection over real QUIC that did not exist
-    // before (each leaf had dialed only the centre). The leaves keep the default
-    // degree so they graft toward A (their only peer) and stay there.
+    // Three-node star: centre A meshes with leaves B and C. A's tiny degree
+    // (target 1, prune above 1) makes the heartbeat prune one leaf once both are in
+    // A's mesh. With peer-exchange on, that over-degree prune is a doPX path: A
+    // offers the surviving leaf's signed record to the pruned leaf, which dials it
+    // (accept-PX gate skipped, scoring off) — yielding a NEW leaf↔leaf QUIC link
+    // that did not exist before (each leaf had dialed only the centre).
     const tiny_degree: MeshDegree = .{ .d = 1, .d_low = 0, .d_high = 1 };
 
     var a: PxNode = undefined;
@@ -1744,12 +1613,10 @@ test "live peer-exchange: an over-degree prune offers a signed record and the pr
     try std.testing.expect(!routerHasPeer(b.gs.router, c.peer));
     try std.testing.expect(!routerHasPeer(c.gs.router, b.peer));
 
-    // The heartbeat (one tick per second) prunes A's mesh from 2 down to 1, a doPX
-    // path: the pruned leaf is offered the surviving leaf's record and dials it.
-    // Which leaf is pruned is not deterministic (scoring off → arbitrary victim),
-    // so assert the SYMMETRIC outcome: the two leaves become peers of each other
-    // over the freshly-dialed QUIC connection. Poll with a generous bound: the dial
-    // + handshake + connect-event propagation all happen across fibers.
+    // The heartbeat prunes A's mesh from 2 to 1 via doPX. Which leaf is pruned is
+    // not deterministic (scoring off → arbitrary victim), so assert the SYMMETRIC
+    // outcome: the leaves become peers of each other over the freshly-dialed QUIC
+    // link. Poll generously — dial + handshake + connect-event span fibers.
     var connected = false;
     {
         var waited: u64 = 0;
@@ -1763,14 +1630,12 @@ test "live peer-exchange: an over-degree prune offers a signed record and the pr
     }
     try std.testing.expect(connected);
 
-    // Teardown (the established discipline: no Switch-owned inbound handler may
-    // survive into a freed router). First quiesce EVERY node — stop accepting and
-    // deinit each node's accepted connections, joining their inbound handler
-    // fibers — then deinit the dial connections A holds. After that no connection
-    // has a live inbound handler except the one PX-dialed leaf↔leaf link, whose
-    // handler reaches EOF as its peer's connections close. Only then free each
-    // node (gossipsub before switch). Done across all nodes so the order holds
-    // regardless of which leaf was pruned.
+    // Teardown discipline: no Switch-owned inbound handler may survive into a freed
+    // router. Quiesce EVERY node (joins each node's accepted-connection handlers),
+    // then deinit A's dial connections. The only remaining live handler is the
+    // PX-dialed leaf↔leaf link, which EOFs as its peer's connections close. Only
+    // then free each node (gossipsub before switch), across all nodes so the order
+    // holds regardless of which leaf was pruned.
     a.quiesce();
     a_quiesced = true;
     b.quiesce();

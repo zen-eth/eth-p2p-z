@@ -31,11 +31,9 @@ pub const Options = struct {
     enable_orig_dst: bool = false,
     enable_rx_timestamps: bool = true,
     socket_mark: ?u32 = null,
-    /// Restrict the socket to basic `sendmsg`/`recvmsg` with no ancillary control
-    /// data, for the Shadow network simulator. When set, none of the cmsg sockopts
-    /// (UDP GRO, `IP_PKTINFO`/`IPV6_RECVPKTINFO`, `IP_RECVORIGDSTADDR`,
-    /// `SO_TIMESTAMPNS`) and no socket mark are applied, yielding the same all-false
-    /// `Capabilities` that macOS already produces. The toggles above are ignored.
+    /// For the Shadow network simulator: ignore the toggles above and apply no
+    /// cmsg sockopts or socket mark, yielding the all-false `Capabilities` macOS
+    /// already produces (basic `sendmsg`/`recvmsg`, which passes QUIC interop).
     shadow_compatible: bool = false,
 };
 
@@ -60,9 +58,8 @@ pub const ConfigureError = std.posix.SetSockOptError;
 const ipv6_v6only_optname: u32 = if (builtin.os.tag == .linux) 26 else 27;
 
 /// Whether an AF_INET6 UDP socket accepts IPv4-mapped traffic (IPV6_V6ONLY ==
-/// 0). Read-only, so safe after bind; the option can only be set before bind,
-/// so the bind path relies on the OS default (dual-stack on Linux and macOS)
-/// and just verifies it here. Returns null if the platform can't report it.
+/// 0). Read-only: settable only before bind, so the bind path relies on the OS
+/// default (dual-stack) and verifies here. Null if the platform can't report it.
 pub fn dualStackEnabled(socket: *const std.Io.net.Socket) ?bool {
     var value: c_int = -1;
     var len: std.posix.socklen_t = @sizeOf(c_int);
@@ -107,10 +104,8 @@ pub const ParseIncomingControlError = error{
 pub fn configureUdpSocket(socket: *const std.Io.net.Socket, options: Options) ConfigureError!Capabilities {
     var caps: Capabilities = .{};
     if (builtin.os.tag != .linux) return caps;
-    // Shadow mode: skip every cmsg sockopt and the socket mark so the socket
-    // behaves exactly like the macOS path (which sets none of these and still
-    // passes QUIC interop). All capabilities stay false, so the send path emits
-    // no source-address cmsg and the receive loop takes the plain `recvmsg`.
+    // All-false caps: send path emits no source-address cmsg, receive loop takes
+    // the plain `recvmsg`.
     if (options.shadow_compatible) return caps;
 
     const fd = socket.handle;
@@ -414,9 +409,7 @@ test "shadow_compatible disables all cmsg capabilities" {
     const socket = try std.Io.net.IpAddress.bind(&addr, io, .{ .mode = .dgram });
     defer socket.close(io);
 
-    // Even with every optimization toggle on, shadow mode must produce the
-    // all-false capabilities the macOS path already yields — no GRO, no pktinfo,
-    // no orig-dst, no timestamps, no socket mark.
+    // Every toggle on, yet shadow mode must yield all-false capabilities.
     const caps = try configureUdpSocket(&socket, .{
         .enable_udp_gro = true,
         .enable_pktinfo = true,

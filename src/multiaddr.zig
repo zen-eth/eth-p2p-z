@@ -18,11 +18,9 @@ pub const multiaddr = struct {
         peer_id: ?peer_id.PeerId,
     };
 
-    /// Multiaddr protocol codes (the multiformats "multiaddr" table). A binary
-    /// multiaddr is a sequence of [uvarint(code)][value] tuples; these are the
-    /// codes for the transport protocols we speak, matching go-multiaddr /
-    /// rust-multiaddr / zen-eth multiformats-zig exactly. Confirmed against all
-    /// three references.
+    /// Multiformats "multiaddr" protocol codes. A binary multiaddr is a sequence
+    /// of [uvarint(code)][value] tuples; these codes are the binding interop
+    /// contract — must byte-match go-multiaddr / rust-multiaddr.
     const code_ip4: u64 = 4; // value: 4 raw IPv4 bytes
     const code_ip6: u64 = 41; // value: 16 raw IPv6 bytes
     const code_tcp: u64 = 6; // value: 2-byte big-endian port
@@ -50,14 +48,12 @@ pub const multiaddr = struct {
             return self.bytes;
         }
 
-        /// Encode the string-form multiaddr (`self.bytes`, e.g.
-        /// `/ip4/127.0.0.1/udp/9000/quic-v1`) into the libp2p BINARY multiaddr:
-        /// a concatenation of [uvarint(protocol_code)][value] tuples. This is the
-        /// on-the-wire form go-libp2p / rust-libp2p emit for signed peer-record
-        /// and identify listen addresses; the string remains the canonical
-        /// in-memory form (only the wire boundary uses these bytes). Caller owns
-        /// the returned slice. Supports the transport protocols ip4/ip6/tcp/udp/
-        /// quic/quic-v1; any other component is rejected with `InvalidMultiaddr`.
+        /// Encode the string-form multiaddr into the wire BINARY form
+        /// ([uvarint(code)][value] tuples). The string stays the canonical
+        /// in-memory form; only the wire boundary (signed peer-record / identify
+        /// listen addresses) uses these bytes. Caller owns the returned slice.
+        /// Only ip4/ip6/tcp/udp/quic/quic-v1; any other component is rejected
+        /// with `InvalidMultiaddr`.
         pub fn toBytes(self: Multiaddr, allocator: std.mem.Allocator) ![]u8 {
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(allocator);
@@ -102,12 +98,10 @@ pub const multiaddr = struct {
             return out.toOwnedSlice(allocator);
         }
 
-        /// Decode a libp2p BINARY multiaddr (`[uvarint(code)][value]` tuples) back
-        /// into the STRING form and return it as a `Multiaddr` (string stored in
-        /// `.bytes`, so the rest of the stack — `Switch.dial`, `parseIpUdp` — keeps
-        /// working on strings). Inverse of `toBytes`. Validates each tuple's length;
-        /// an unknown code or a truncated value returns `InvalidMultiaddr`. Caller
-        /// owns the returned `Multiaddr` (free with `deinit`).
+        /// Inverse of `toBytes`: decode wire bytes back to the STRING form (stored
+        /// in `.bytes`, so the rest of the stack keeps working on strings). An
+        /// unknown code or truncated value returns `InvalidMultiaddr`. Caller owns
+        /// the returned `Multiaddr` (free with `deinit`).
         pub fn fromBytes(allocator: std.mem.Allocator, binary: []const u8) !Multiaddr {
             var str: std.ArrayList(u8) = .empty;
             defer str.deinit(allocator);
@@ -318,8 +312,7 @@ test "toBytes matches the go/rust binary multiaddr byte-for-byte" {
     const binary = try addr.toBytes(allocator);
     defer allocator.free(binary);
 
-    // Worked out from the multiformats multiaddr spec (and confirmed against
-    // go-multiaddr v0.14.0 + rust multiaddr 0.18.2):
+    // Byte derivation from the multiformats spec:
     //   uvarint(4)=04 || 127.0.0.1 = 7f 00 00 01   (ip4)
     //   uvarint(273)=91 02 || 9000 big-endian = 23 28   (udp)
     //   uvarint(461)=cd 03   (quic-v1, no value)

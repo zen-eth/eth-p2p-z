@@ -41,11 +41,9 @@ pub const ByteQueue = struct {
     }
 
     pub fn tryPutSome(q: *ByteQueue, io: std.Io, bytes: []const u8) usize {
-        // SINGLE-PRODUCER per queue: available() (lock #1) then reserve() (lock #2,
-        // re-checks capacity) is only safe because one producer writes this queue —
-        // the consumer can only GROW available between the two locks, so reserve can
-        // only succeed more often, never over-commit. Do NOT share a ByteQueue across
-        // writers without rethinking this.
+        // SINGLE-PRODUCER per queue: available() then reserve() span two lock
+        // acquisitions, safe only because the lone consumer can merely GROW
+        // available between them. Do NOT share a ByteQueue across writers.
         const len = @min(bytes.len, q.available(io));
         if (len == 0) return 0;
         if (!q.reserve(io, len)) return 0;
@@ -59,13 +57,10 @@ pub const ByteQueue = struct {
         return written;
     }
 
-    /// All-or-nothing put. Returns true iff every byte in `bytes` was committed.
-    ///
-    /// Callers must pre-check capacity (e.g., via `available`) under the
-    /// single-producer invariant. A partial write here would mean a prefix is
-    /// visible to readers while the function reports failure; the queue type
-    /// does not provide a transactional rollback, so we panic rather than
-    /// silently corrupt the stream byte order.
+    /// All-or-nothing put. Returns true iff every byte was committed; callers
+    /// pre-check capacity under the single-producer invariant. There is no
+    /// rollback, so a short write would leak a visible prefix on reported
+    /// failure — we panic rather than corrupt stream byte order.
     pub fn tryPutAll(q: *ByteQueue, io: std.Io, bytes: []const u8) bool {
         if (bytes.len == 0) return true;
         if (!q.reserve(io, bytes.len)) return false;

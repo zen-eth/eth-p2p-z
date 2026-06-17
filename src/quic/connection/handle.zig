@@ -48,15 +48,12 @@ const Impl = struct {
     state: ?*SharedState,
     // Teardown-only ownership. Normal handle methods must go through `state`.
     spawned_actor: *ConnectionActor,
-    /// Guards only the `state` POINTER: concurrent handle methods read it
-    /// atomically, and a deinit nulls it exactly once. It deliberately does
-    /// NOT make `deinit` safe against CONCURRENT method calls — `deinit`
-    /// frees the Impl, including this very lock, so a fiber still inside (or
-    /// entering) a handle method would dereference freed memory. No internal
-    /// refcount could deliver that guarantee either: a caller entering after
-    /// the free corrupts the count itself. Keeping the handle's MEMORY alive
-    /// until all users are done is necessarily the OWNER's job (the same
-    /// contract as Rust's Arc-owned quinn handles and go's net.Conn docs).
+    /// Guards only the `state` POINTER (methods read it atomically; deinit nulls
+    /// it once). It deliberately does NOT make `deinit` safe against concurrent
+    /// method calls: `deinit` frees the Impl — including this lock — so a fiber
+    /// still inside a method would touch freed memory, and no refcount fixes
+    /// that (a caller entering after the free corrupts the count). Keeping the
+    /// handle's MEMORY alive until all users are done is the OWNER's job.
     handle_lock: std.atomic.Value(u8) = .init(0),
 
     fn lockHandle(self: *Impl) void {
@@ -112,12 +109,11 @@ pub const Connection = opaque {
     }
 
     /// Destroy the handle. CONTRACT — external synchronization required: no
-    /// other fiber may be inside, or subsequently enter, ANY method of this
-    /// handle once deinit starts; the handle memory is freed here, so a racing
-    /// call is a use-after-free (the internal lock only serializes the
-    /// state-pointer swap — see `Impl.handle_lock`). Note also that deinit
-    /// JOINS the connection's actor fiber (blocks until it fully unwinds), so
-    /// it can take as long as a full connection teardown.
+    /// other fiber may be inside, or later enter, ANY method once deinit starts;
+    /// the memory is freed here, so a racing call is a use-after-free (the
+    /// internal lock only serializes the state-pointer swap — see `handle_lock`).
+    /// deinit also JOINS the actor fiber, so it can take as long as a full
+    /// connection teardown.
     pub fn deinit(self: *Connection) void {
         self.impl().deinit();
     }
@@ -205,13 +201,10 @@ pub const Connection = opaque {
         return conn_stats.classifyHandshakeFailure(self.stats());
     }
 
-    /// Returns the verified libp2p public key extracted from the peer's TLS
-    /// certificate. The returned value borrows memory owned by the
-    /// connection; do not free its `data` slice.
-    ///
-    /// A `*Connection` returned by `dial()` or `accept()` has a published
-    /// public key by construction (both call `waitHandshake` before
-    /// returning); calling this method on such a handle always succeeds.
+    /// Verified libp2p public key from the peer's TLS certificate. Borrows
+    /// connection-owned memory; do not free its `data` slice. Always succeeds on
+    /// a handle from `dial()`/`accept()` — both `waitHandshake` before returning,
+    /// so the key is published by construction.
     pub fn remotePublicKey(self: *const Connection) keys.PublicKey {
         const state = @constCast(self).impl().liveRetained().?;
         defer state.release();
@@ -289,18 +282,13 @@ fn acceptStreamFromState(state: *SharedState, io: std.Io, opts: AcceptStreamOpti
         }
         if (state.isClosed()) return error.ConnectionClosed;
         if (opts.timeout != .none and io_time.timeoutExpired(io, deadline)) return error.Timeout;
-        // Park on the signal EPOCH (an edge), not the readiness bits. This is a
-        // handle-side waiter that never clears the waitset bits — only the owning
-        // actor does, via `take`, each of its loops. If we parked with the
-        // level-triggered `wait` (returns whenever ANY bit is set), the actor's
+        // Park on the signal EPOCH (an edge), not the readiness bits: this
+        // handle-side waiter never clears the bits (only the owning actor does,
+        // via `take`), so level-triggered `wait` would return on the actor's
         // routinely-set, not-yet-taken bits (inbound packets, control commands)
-        // would make us return immediately and spin: re-check the still-empty
-        // accept queue, see the connection still open, return again. That spin
-        // burns the executor and can starve the actor fiber that would push a
-        // stream or mark the connection closed — turning a quiet idle accept into
-        // a livelock. Edge detection wakes us exactly when something we care about
-        // happened (a pushed stream, or shutdown), and `isClosed()` is re-checked
-        // on each wake so a connection close reliably unblocks us.
+        // and spin — starving the actor that would push a stream or close, a
+        // livelock. The edge wakes us only on a pushed stream or shutdown;
+        // `isClosed()` is re-checked each wake so a close reliably unblocks us.
         if (opts.timeout == .none) {
             try state.waitset.waitEpoch(io, observed);
             continue;

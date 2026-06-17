@@ -1,36 +1,20 @@
-//! A runnable gossipsub node for interop smoke testing. It stands up a real
-//! QUIC endpoint + Switch + Gossipsub service and either listens for inbound
-//! connections or dials one or more peers, then subscribes to a topic and (in
-//! `pub` mode) publishes a payload repeatedly until a duration elapses.
+//! A runnable gossipsub node for interop smoke testing: stands up a QUIC
+//! endpoint + Switch + Gossipsub, listens or dials one or more peers, subscribes
+//! to a topic, and (in `pub` mode) republishes a payload until a duration
+//! elapses. One binary serves two-node and multi-node meshes: a listener accepts
+//! EVERY inbound connection (a star bootstrap is dialed by all), a dialer dials
+//! many via `peers=<ma1>,<ma2>,...`. Node coordination is file-based — the
+//! listener writes its `/p2p/<peer-id>` multiaddr to `addr_file` once bound.
 //!
-//! Connectivity is flexible: a listener accepts EVERY inbound connection (a
-//! bootstrap node in a star is dialed by every other node), and a dialer can
-//! dial MULTIPLE peers via `peers=<ma1>,<ma2>,...` (a lone `peer=<ma>` still
-//! works). gossipsub forms a mesh over whatever connections exist, so the same
-//! binary serves both the two-node smoke runs and a multi-node mixed mesh.
+//! Shadow support (additive, OFF by default): `shadow=on` restricts the QUIC UDP
+//! path to plain `recvmsg`/`sendmsg` (no GRO/GSO/`IP_PKTINFO`/timestamp cmsgs —
+//! the only socket form the Shadow simulator supports), and `announce=<ip>` binds
+//! and advertises a specific IP (Shadow hosts are single-homed, so the wildcard
+//! `0.0.0.0` bind is not dialable).
 //!
-//! Coordination between the out-of-process nodes is file-based, not Redis: the
-//! listener writes its full `/p2p/<peer-id>` multiaddr to `addr_file` once
-//! bound, and an orchestrator hands that string to the dialers' `peers` arg.
-//!
-//! Shadow support: `shadow=on` runs the QUIC endpoint in Shadow-compatible mode
-//! (plain `recvmsg`/`sendmsg`, no GRO/GSO/`IP_PKTINFO`/timestamp cmsgs — the only
-//! socket form the Shadow network simulator supports), and `announce=<ip>` makes
-//! the listener bind and advertise a specific IP instead of the wildcard
-//! `0.0.0.0`/loopback `127.0.0.1` (Shadow hosts are single-homed, and a dialer
-//! must reach the listener's assigned IP). Both are additive and OFF by default,
-//! so every non-Shadow scenario is unchanged.
-//!
-//! This mirrors the transport interop binary's endpoint/Switch setup; the new
-//! piece is the Gossipsub service plus a message handler that prints received
-//! messages and records receipt so a smoke run can assert delivery.
-//!
-//! Mesh-formation note: gossipsub forwarding is mesh-based, so a publish only
-//! reaches peers that are in the mesh for the topic. After connecting and
-//! subscribing, the heartbeat needs ~1 tick (one second) to GRAFT and form the
-//! mesh, and subscriptions need to propagate. Rather than guess a single delay,
-//! the publisher republishes the same payload every 500ms for the whole run so
-//! at least one publish lands after the mesh forms.
+//! Mesh-formation: a publish only reaches peers in the topic mesh, and the
+//! heartbeat needs ~1 tick (1s) after subscribe to GRAFT. Rather than guess one
+//! delay, the publisher republishes every 500ms so a publish lands post-mesh.
 
 pub const std_options = @import("zig-libp2p").std_options;
 
@@ -43,8 +27,7 @@ const identify = libp2p.protocols.identify;
 const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 const testplans = @import("testplans.zig");
 
-// Pull in testplans.zig's in-file tests when this module is built as a test
-// artifact (`zig build test`).
+// Pull in testplans.zig's in-file tests under `zig build test`.
 test {
     _ = testplans;
 }
@@ -93,21 +76,18 @@ fn testPlansOptions(arena: std.mem.Allocator, args: std.process.Args) !testplans
 /// How often the publisher republishes its payload (mesh-formation tolerant).
 const publish_interval_ms: u64 = 500;
 
-/// Upper bound on a printed RECV line (and any single stdout write). Sized to
-/// hold the topic, a hex author id, and a data payload well above the 1 KiB
-/// gossipsub v1.2 IDONTWANT threshold, so the large-message interop scenario's
-/// payload prints (and matches) intact rather than being truncated/dropped.
+/// Upper bound on a printed RECV line (and any single stdout write). Sized well
+/// above the 1 KiB gossipsub v1.2 IDONTWANT threshold so the large-message
+/// scenario's payload prints intact rather than truncated.
 const max_print_len: usize = 8192;
 
 const Role = enum { listen, dial };
 const Mode = enum { publish, subscribe };
 
-/// Which signing scheme this node runs. `strict` signs every outbound message
-/// and verifies inbound (the go-libp2p default, and what the base mixed-mesh
-/// runs use). `anonymous` is StrictNoSign: messages carry no author/seqno, are
-/// keyed by a content-derived id (`sha256(topic ++ data)`), and inbound is not
-/// verified — every node in the topic must agree on the SAME id scheme or dedup
-/// breaks, which is exactly what the anonymous cross-impl scenario checks.
+/// Signing scheme. `strict` signs+verifies (the go-libp2p default). `anonymous`
+/// is StrictNoSign: no author/seqno, dedup keyed by content id
+/// `sha256(topic ++ data)`, inbound unverified. Cross-impl contract: every node
+/// in the topic must use the SAME id scheme or dedup breaks.
 const Sign = enum { strict, anonymous };
 
 const Args = struct {
@@ -121,13 +101,10 @@ const Args = struct {
     /// starts an inbound dispatcher per connection, so it meshes with each peer.
     peers: ?[]const u8 = null,
     addr_file: ?[]const u8 = null,
-    /// Read a single peer multiaddr to dial from this file (`peer_file=<path>`),
-    /// the read counterpart of the listener's `addr_file=` write. For Shadow
-    /// coordination: the listener writes its published `/p2p/<peer-id>` multiaddr
-    /// to a path on the shared host filesystem, and the dialer (started a little
-    /// later) reads it — no out-of-band peer-id exchange needed. The dialer polls
-    /// briefly for the file to appear and be non-empty, tolerating the listener's
-    /// startup. Additive to `peer`/`peers`; all configured targets are dialed.
+    /// Read a single peer multiaddr to dial from this file: the read counterpart
+    /// of the listener's `addr_file=` write, for Shadow coordination over the
+    /// shared host filesystem. The dialer polls briefly for the file (the listener
+    /// may not have bound yet). Additive to `peer`/`peers`; all targets are dialed.
     peer_file: ?[]const u8 = null,
     topic: []const u8 = "interop-test",
     message: []const u8 = "hello-gossipsub",
@@ -135,33 +112,24 @@ const Args = struct {
     /// Signing scheme: `strict` (default, signs+verifies) or `anonymous`
     /// (StrictNoSign, content-id dedup). See `Sign`.
     sign: Sign = .strict,
-    /// Enable peer-exchange (PX) on PRUNE (go-libp2p `WithPeerExchange`). OFF by
-    /// default — the cross-impl PX scenario opts in with `px=on`. When ON, an
-    /// over-degree heartbeat prune offers the surviving mesh peers' signed
-    /// records, and an inbound PX'd PRUNE makes us dial the offered peers.
+    /// Enable peer-exchange (PX) on PRUNE (go-libp2p `WithPeerExchange`), OFF by
+    /// default. When ON, an over-degree heartbeat prune offers the surviving mesh
+    /// peers' signed records, and an inbound PX'd PRUNE makes us dial the offered.
     px: bool = false,
-    /// Override the per-topic mesh DEGREE targets (`d`/`d_low`/`d_high`). Null
-    /// keeps the go-libp2p baseline (6/5/12). A PX emitter sets a small `d_high`
-    /// (e.g. `d_high=2`) so a tiny topology goes over-degree and the heartbeat
-    /// prunes a peer WITH PX. Each is set independently; defaults fill the rest.
+    /// Override the per-topic mesh DEGREE targets; null keeps the go-libp2p
+    /// baseline (6/5/12). A PX emitter sets a small `d_high` so a tiny topology
+    /// goes over-degree and the heartbeat prunes WITH PX. Each set independently.
     d: ?usize = null,
     d_low: ?usize = null,
     d_high: ?usize = null,
-    /// Run the QUIC endpoint in Shadow-compatible mode (`shadow=on`). When set,
-    /// the UDP path is restricted to plain `recvmsg`/`sendmsg` with no ancillary
-    /// control data — no GRO/GSO, no `IP_PKTINFO`, no per-packet timestamps —
-    /// which is the only socket form the Shadow network simulator supports. OFF
-    /// by default, so every non-Shadow scenario is unchanged. See `EndpointOptions
-    /// .shadow_compatible`.
+    /// Run the QUIC endpoint in Shadow-compatible mode (`shadow=on`, OFF by
+    /// default): see the module header. Sets `EndpointOptions.shadow_compatible`.
     shadow: bool = false,
-    /// The IP address this listener advertises (`announce=<ip>`). Under Shadow each
-    /// host is single-homed with one assigned IP, and a wildcard `0.0.0.0` bind is
-    /// not dialable, so the listener must publish the host's real IP for a dialer to
-    /// reach it. When set, the listener BINDS to this IP (giving quiche a correct
-    /// single-homed local path address — Shadow has no `IP_PKTINFO`) and PUBLISHES
-    /// it in the addr_file, the identify listen addrs, and the sealed peer record.
-    /// When absent, the listener keeps the wildcard `0.0.0.0` bind and advertises
-    /// the loopback `127.0.0.1` (the on-host smoke-run behavior).
+    /// The IP this listener advertises (`announce=<ip>`). When set, it both BINDS
+    /// to this IP (quiche needs a concrete local path address — Shadow has no
+    /// `IP_PKTINFO`) and PUBLISHES it in the addr_file, identify listen addrs, and
+    /// sealed peer record. When absent: wildcard `0.0.0.0` bind, advertise loopback
+    /// `127.0.0.1` (on-host runs).
     announce: ?[]const u8 = null,
 
     /// Iterate the dial targets: every entry of `peers` (split on commas) plus a
@@ -288,10 +256,8 @@ const Args = struct {
 };
 
 /// Build a mesh-degree override from the `d`/`d_low`/`d_high` args, or null when
-/// none is set (keep the go-libp2p baseline 6/5/12). Any unset field falls back
-/// to that baseline so a scenario can lower just `d_high` to force an over-degree
-/// prune. A PX emitter typically sets `d_high` small; the values should stay
-/// consistent (`d_low <= d <= d_high`) — the router does not validate them.
+/// none is set. Any unset field falls back to the 6/5/12 baseline. Values should
+/// stay consistent (`d_low <= d <= d_high`) — the router does not validate them.
 fn meshDegreeFromArgs(args: *const Args) ?gossipsub.MeshDegree {
     if (args.d == null and args.d_low == null and args.d_high == null) return null;
     return .{
@@ -314,9 +280,8 @@ const Recorder = struct {
     fn onMessage(ctx: *anyopaque, topic: []const u8, from: []const u8, data: []const u8) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
         self.received.store(true, .release);
-        // A clear, greppable line so the orchestrator can assert delivery. `from`
-        // is the message AUTHOR's peer-id (raw bytes, printed as hex to stay
-        // printable). Under the anonymous policy it is empty, so `author=` prints
+        // Greppable line for the orchestrator's delivery assert. `from` is the
+        // author peer-id (hex). Under anonymous it is empty, so `author=` prints
         // blank — which the anonymous scenario asserts (no author on the wire).
         var line_buf: [max_print_len]u8 = undefined;
         const line = std.fmt.bufPrint(
@@ -337,11 +302,10 @@ pub fn main(init: std.process.Init) !void {
     defer runtime.deinit();
     const io = runtime.io();
 
-    // test-plans mode: when invoked as `<bin> --params <path>` (the official
-    // libp2p gossipsub-interop framework's exact invocation), run as a framework
-    // participant — deterministic key from the Shadow hostname, params.json script,
-    // analyzer-format tracer log. Every other invocation keeps the key=value
-    // smoke-test behavior below unchanged. See testplans.zig.
+    // test-plans mode: invoked as `<bin> --params <path>` (the libp2p
+    // gossipsub-interop framework's invocation), run as a framework participant.
+    // Any other invocation keeps the key=value smoke-test path below. See
+    // testplans.zig.
     if (try testPlansParamsPath(init.arena.allocator(), init.minimal.args)) |params_path| {
         const tp_opts = try testPlansOptions(init.arena.allocator(), init.minimal.args);
         return testplans.run(allocator, io, params_path, tp_opts);
@@ -351,10 +315,8 @@ pub fn main(init: std.process.Init) !void {
 
     var host_key = try identity.KeyPair.generate(.ED25519);
     defer host_key.deinit();
-    // In Shadow mode restrict the QUIC UDP path to plain `recvmsg`/`sendmsg` with
-    // no ancillary control data: the Shadow simulator supports neither GRO/GSO nor
-    // `IP_PKTINFO`/timestamp cmsgs. OFF by default, so the non-Shadow scenarios use
-    // the full control-message path unchanged.
+    // Shadow mode restricts the QUIC UDP path to plain `recvmsg`/`sendmsg` (see
+    // module header); OFF by default leaves the full control-message path.
     const endpoint = try libp2p.QuicEndpoint.initWithIdentity(allocator, io, &host_key, .{
         .endpoint = .{ .shadow_compatible = args.shadow },
     });
@@ -366,50 +328,31 @@ pub fn main(init: std.process.Init) !void {
 
     var recorder = Recorder{ .io = io };
     // Construct gossipsub BEFORE any dial/accept so its peer-event callback is
-    // registered when the connection comes up.
-    //
-    // In `strict` mode pass the host key to enable StrictSign (sign outbound,
-    // verify inbound) so go-libp2p — which defaults to StrictSign — accepts our
-    // published messages and we accept its signed ones. In `anonymous` mode pass
-    // NO key and the anonymous (StrictNoSign) policy: messages carry no author,
-    // inbound is not verified, and dedup keys on the content id
-    // `sha256(topic ++ data)` (the policy's built-in derivation), which the go and
-    // rust peers must match for cross-impl propagation to line up.
-    //
-    // Scoring is left disabled here (null): the interop binary exercises the
-    // base mesh/gossip behaviour against go/rust-libp2p without the score gates.
+    // registered when the connection comes up. `strict` passes the host key (enable
+    // StrictSign); `anonymous` passes none (StrictNoSign) — see `Sign`. Scoring is
+    // left disabled (null) so the binary exercises base mesh/gossip without gates.
     const host_key_opt: ?*const identity.KeyPair = if (args.sign == .strict) &host_key else null;
     var gs_config: gossipsub.RouterConfig = switch (args.sign) {
-        // Under strict signing run the go-parity ASYNC validation pipeline:
-        // inbound signature verification happens on validation fibers, never on
-        // the router fiber. The in-flight cap follows go-libp2p, whose worker
-        // count defaults to runtime.NumCPU(): one validation per executor keeps
-        // every core usable for crypto while bounding held message snapshots.
-        // This is the production configuration for signed gossip, and running
-        // it here means every strict-sign interop run (native suite, Shadow,
-        // testground) exercises the off-fiber verify + verdict-re-entry path.
+        // Strict signing runs the ASYNC validation pipeline (verify off the router
+        // fiber). The in-flight cap follows go-libp2p (worker count = NumCPU): one
+        // validation per executor keeps every core usable while bounding held
+        // message snapshots, and exercises the off-fiber verify path in interop.
         .strict => .{ .validation_concurrency = executor_count },
         .anonymous => .{ .signature_policy = .anonymous },
     };
-    // Peer-exchange opt-in (default OFF). When `px=on`, the router offers signed
-    // records on an over-degree prune and dials peers offered to it. The optional
-    // mesh-degree override lets a tiny topology go over-degree so the heartbeat
-    // prunes WITH PX — e.g. a `px=on d_high=2` bootstrap dialed by 3 leaves prunes
-    // one of them, offering the others' records.
+    // Peer-exchange + optional mesh-degree override; see the `px`/`d` fields. The
+    // small `d_high` lets a tiny topology go over-degree so the heartbeat prunes
+    // WITH PX (e.g. a `px=on d_high=2` bootstrap dialed by 3 leaves prunes one).
     gs_config.peer_exchange_enabled = args.px;
     gs_config.mesh_degree = meshDegreeFromArgs(&args);
     const gs = try gossipsub.Gossipsub.init(allocator, io, switcher, local_peer, host_key_opt, recorder.handler(), null, gs_config);
-    // Only runs on an error return from `runListener`/`runDialer` (the run never
-    // started). The success path emits its result and hard-exits from within the
-    // run functions — see the note on `finishAndExit` for why a test/interop node
-    // hard-exits rather than unwinding the per-connection teardown.
+    // Runs only on an error return from the run functions; the success path
+    // hard-exits via `finishAndExit` (see its note).
     defer gs.deinit();
 
-    // `runListener` / `runDialer` run until the duration elapses, then emit the
-    // result JSON and hard-exit (via `finishAndExit`). Control therefore does NOT
-    // return here on the success path; this switch only returns when the run fails
-    // to start, in which case the error propagates out of `main` and the deferred
-    // teardown above runs normally.
+    // `runListener`/`runDialer` hard-exit via `finishAndExit` on success, so
+    // control returns here only when the run fails to start — the error then
+    // propagates out and the deferred teardown above runs.
     switch (args.role) {
         .listen => try runListener(allocator, io, switcher, &host_key, &recorder, gs, &args),
         .dial => try runDialer(allocator, io, switcher, &host_key, &recorder, gs, &args),
@@ -417,16 +360,13 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Register the identify responder, advertising our protocols AND a signed peer
-/// record (libp2p identify field 8) sealed over our `listen_addrs` so go/rust can
-/// certify our addresses (and peer-exchange us). go-libp2p (and rust-libp2p) learn
-/// which protocols a peer speaks via the `/ipfs/id/1.0.0` exchange, and their
-/// pubsub only opens a `/meshsub` stream once identify reports meshsub — so the
-/// response advertises identify plus every `/meshsub` version we speak (1.2.0,
-/// 1.1.0, 1.0.0); the peer negotiates the best common one. The handler only reads
-/// its immutable options (and the sealed record it owns), so one instance serves
-/// every inbound identify stream; the caller keeps it alive for the whole run.
-/// `listen_addrs` are the string-form listen multiaddrs identify already sends —
-/// the sealed record uses the SAME bytes so its addresses match `listenAddrs`.
+/// record (libp2p identify field 8) sealed over `listen_addrs` so a peer can
+/// certify our addresses (and peer-exchange us). go-libp2p/rust-libp2p only open a
+/// `/meshsub` stream once identify reports meshsub, so the response advertises
+/// identify plus every `/meshsub` version we speak; the peer picks the best
+/// common one. The sealed record uses the SAME `listen_addrs` bytes so its
+/// addresses match. The handler is read-only, so one instance serves every
+/// inbound stream; the caller keeps it alive for the whole run.
 fn registerIdentify(
     allocator: std.mem.Allocator,
     switcher: *libp2p.Switch,
@@ -442,10 +382,9 @@ fn registerIdentify(
             .listen_addrs = listen_addrs,
         },
         host_key,
-        // This node seals exactly one record per process, so a fixed seq is enough
-        // (the certified-address book keeps the highest-seq record per peer; a fresh
-        // process always advertises seq 1). A long-lived node that re-published its
-        // record after an address change would bump a monotonic counter here.
+        // One record per process, so a fixed seq is enough (the cert-address book
+        // keeps the highest-seq record per peer). A node that re-published after an
+        // address change would bump a monotonic counter here.
         1,
     );
     try switcher.addProtocolService(
@@ -456,11 +395,9 @@ fn registerIdentify(
 
 /// Run the client side of identify against a freshly-connected `conn`: open
 /// `/ipfs/id/1.0.0`, read the peer's identify, and if it carries a verified
-/// `signedPeerRecord` for this peer, hand it to gossipsub's certified-record store
-/// (so our peer-exchange can vouch for the peer). Best-effort: any failure is
-/// logged and ignored — identify-as-responder still works, and the connection is
-/// already up. This mirrors how go/rust run identify as the dialer after
-/// connecting; the record consume is what populates PX end-to-end.
+/// `signedPeerRecord`, hand it to gossipsub's cert-record store so peer-exchange
+/// can vouch for the peer (the consume is what populates PX end-to-end).
+/// Best-effort: failures are logged and ignored, the connection is already up.
 fn exchangeIdentify(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -518,13 +455,10 @@ fn emitResult(recorder: *Recorder, args: *const Args) void {
     }
 }
 
-/// Emit the result, then terminate the process immediately rather than unwinding
-/// the fiber teardown. The connection-teardown deadlock that once made shutdown
-/// unreliable is fixed at the library level (Switch teardown no longer relies on
-/// a cross-executor cancel), but a short-lived test/interop node has no reason to
-/// orchestrate the multi-layer graceful teardown (gossipsub, then its
-/// connections, then the switch, then the endpoint) — emit then exit(0) keeps
-/// every node's shutdown prompt and robust.
+/// Emit the result, then `exit(0)` rather than unwinding the fiber teardown: a
+/// short-lived test/interop node has no reason to orchestrate the multi-layer
+/// graceful teardown (gossipsub → connections → switch → endpoint), and a direct
+/// exit keeps every node's shutdown prompt and robust.
 fn finishAndExit(io: std.Io, recorder: *Recorder, args: *const Args) noreturn {
     _ = io;
     emitResult(recorder, args);
@@ -540,11 +474,8 @@ fn runListener(
     gs: *gossipsub.Gossipsub,
     args: *const Args,
 ) !void {
-    // Bind on the announce IP when given (single-homed Shadow host), else the
-    // wildcard `0.0.0.0` (the on-host smoke runs). Binding the specific IP gives
-    // quiche a correct local path address under Shadow mode, where the per-packet
-    // local-destination (`IP_PKTINFO`) is unavailable and the loop falls back to
-    // the socket's bound address.
+    // Bind the announce IP when given (gives quiche a concrete local path address
+    // under Shadow, which lacks `IP_PKTINFO`), else the wildcard `0.0.0.0`.
     const bind_ip: []const u8 = args.announce orelse "0.0.0.0";
     const listen_text = try std.fmt.allocPrint(allocator, "/ip4/{s}/udp/{d}/quic-v1", .{ bind_ip, args.port });
     defer allocator.free(listen_text);
@@ -553,20 +484,13 @@ fn runListener(
     try switcher.listen(listen_addr);
     std.log.info("listener bound {s}", .{listen_text});
 
-    // The IP a peer must DIAL to reach us. The Switch may bind the wildcard
-    // 0.0.0.0 (not dialable) or a single-homed Shadow IP; either way the
-    // advertised address must name a reachable IP. Use the announce IP when given
-    // (the Shadow host's assigned IP), else the loopback 127.0.0.1 of the on-host
-    // smoke runs.
+    // The IP a peer must DIAL to reach us: the wildcard `0.0.0.0` bind is not
+    // dialable, so advertise the announce IP when given, else loopback 127.0.0.1.
     const advertise_ip: []const u8 = args.announce orelse "127.0.0.1";
 
-    // Register identify now that the socket is bound, so the sealed peer record
-    // advertises our listen multiaddrs. The bound address may be the wildcard
-    // 0.0.0.0, but a peer that learns this record (PX) must be able to DIAL it,
-    // and 0.0.0.0 is not dialable — rewrite each to the advertised IP (the same
-    // address `buildPublishedMultiaddr` advertises). The handler outlives the run
-    // on this fiber's stack (the service borrows it); free its owned record on
-    // return.
+    // Register identify now the socket is bound, so the sealed record advertises
+    // our (dialable-IP-rewritten) listen multiaddrs. The handler outlives the run
+    // on this fiber's stack (the service borrows it); free its record on return.
     var listen_addrs = try advertisedListenAddrs(allocator, switcher, advertise_ip);
     defer {
         for (listen_addrs.items) |addr| allocator.free(addr);
@@ -584,26 +508,22 @@ fn runListener(
         try writeAddrFile(io, path, published);
     }
 
-    // Accept inbound connections on a fiber so the run loop bounds the wait by
-    // duration: a peer might never connect, and `accept()` blocks otherwise. The
-    // bootstrap of a star is dialed by every other node, so the fiber loops and
-    // accepts EACH inbound connection (not just the first), starting a dispatcher
-    // per connection and stashing it for teardown.
+    // Accept on a fiber so the run loop bounds the wait by duration (`accept()`
+    // blocks and a peer might never connect). A star bootstrap is dialed by every
+    // node, so the fiber loops and accepts EACH inbound connection, not just one.
     var accept_state = AcceptState{ .allocator = allocator, .io = io, .switcher = switcher, .gs = gs };
     var accept_future = try std.Io.concurrent(io, AcceptState.run, .{&accept_state});
     defer {
-        // Error-path teardown only. The success path hard-exits via
-        // `finishAndExit` (noreturn), so this defer does not run there; it cleans
-        // up when the run fails to start. `closeListener` makes the accept fiber
-        // return, so cancel here is a no-op if it already did.
+        // Error-path only (the success path hard-exits via `finishAndExit`).
+        // `closeListener` already makes the accept fiber return, so cancel is a
+        // no-op if it did.
         accept_future.cancel(io);
         accept_state.deinit();
     }
 
-    // A listener may ALSO dial upstream peers (`peers=`), making it a node that is
-    // both reachable (bound + accepting) AND a member of a star — exactly what a
-    // PX-offered leaf needs: it must be dialable so the peer the pruner offers it
-    // to can reach it. Dials are optional here (a pure bootstrap dials nothing).
+    // A listener may ALSO dial upstream peers (`peers=`), so it is both reachable
+    // and a star member — what a PX-offered leaf needs (it must be dialable for the
+    // pruner's offer target to reach it). Optional: a pure bootstrap dials nothing.
     var dial_conns: std.ArrayList(*libp2p.SwitchConnection) = .empty;
     defer {
         for (dial_conns.items) |conn| conn.deinit();
@@ -624,28 +544,21 @@ fn runListener(
 
     try runForDuration(io, allocator, gs, args);
 
-    // Graceful quiesce of inbound accepts: `Switch.closeListener` closes the
-    // accept queue, so an accept fiber parked in `accept()` wakes with
-    // `error.ListenerClosed` and returns cleanly (no cancel of a blocked accept,
-    // no lost-wake hang). We do NOT then block on joining the accept fiber: if it
-    // is mid-flight handling a just-accepted connection (spawning that
-    // connection's inbound dispatcher), joining could wait on the per-connection
-    // actor teardown, which intermittently deadlocks the cooperative runtime — the
-    // same orthogonal connection-lifecycle issue described on `finishAndExit`.
-    // Quiescing is enough; the hard-exit reclaims the rest.
+    // Quiesce inbound accepts: `closeListener` closes the accept queue so a parked
+    // `accept()` wakes with `error.ListenerClosed` and returns cleanly. We do NOT
+    // join the accept fiber — if it is mid-flight spawning a connection's
+    // dispatcher, joining could wait on the per-connection actor teardown, which
+    // can deadlock the runtime. Quiescing is enough; the hard-exit reclaims the
+    // rest, so the teardown defers above are intentionally skipped.
     switcher.closeListener(io);
 
-    // Emit the result and hard-exit. `finishAndExit` never returns, so the
-    // accept_state/connection teardown defers above are intentionally skipped.
     finishAndExit(io, recorder, args);
 }
 
-// NOT `Switch.serve()`: besides accept + dispatch, this loop runs identify as a
-// CLIENT on each inbound peer (`exchangeIdentify`, certifying signed peer records
-// for PX). That needs per-connection access `serve()` does not expose, and it
-// can't move to the peer-event callback because gossipsub already owns it
-// (`Gossipsub` calls `setPeerEventCallback`). So a manual accept loop is the right
-// tool here — see `Switch.serve`'s doc for exactly this exception.
+// NOT `Switch.serve()`: this loop also runs identify as a CLIENT per inbound peer
+// (`exchangeIdentify`, certifying records for PX), which needs per-connection
+// access `serve()` does not expose and cannot move to the peer-event callback
+// (gossipsub already owns it). So a manual accept loop is the right tool here.
 const AcceptState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -653,18 +566,16 @@ const AcceptState = struct {
     gs: *gossipsub.Gossipsub,
     conns: std.ArrayList(*libp2p.SwitchConnection) = .empty,
 
-    /// Accept inbound connections in a loop, starting an inbound stream
-    /// dispatcher + running client-side identify for each. Returns on accept
-    /// failure or cancellation (the run loop bounds the wait). A bootstrap node is
-    /// dialed by every leaf, so it must accept more than one connection for the
-    /// mesh to span all peers.
+    /// Accept inbound connections in a loop, starting an inbound dispatcher +
+    /// client-side identify for each. Returns on accept failure or cancellation
+    /// (the run loop bounds the wait). A bootstrap must accept more than one
+    /// connection for the mesh to span all peers.
     fn run(self: *AcceptState) void {
         while (true) {
             const conn = self.switcher.accept() catch |err| {
                 switch (err) {
-                    // Both are clean stops: `ListenerClosed` is the graceful
-                    // shutdown signal from `Switch.closeListener`; `Canceled` is
-                    // a direct fiber cancel. Neither is a failure to log.
+                    // Clean stops, not failures: `ListenerClosed` (graceful
+                    // `closeListener`) and `Canceled` (direct fiber cancel).
                     error.ListenerClosed, error.Canceled => {},
                     else => std.log.warn("accept failed: {any}", .{err}),
                 }
@@ -678,18 +589,15 @@ const AcceptState = struct {
                 conn.deinit();
                 continue;
             };
-            // Run identify as the CLIENT against this inbound peer too, so a
-            // listener certifies its inbound peers' signed records into the cert
-            // store. A PX emitter (an over-degree listener) can only vouch for a
-            // peer it holds a record for, so without this an accept-only bootstrap
-            // would offer bare peer-ids (no dialable address) and PX would not
-            // complete. go/rust run identify on every connection regardless of dial
-            // direction; this matches that. Best-effort — failures are logged.
+            // Run identify as the CLIENT against inbound peers too: a PX emitter
+            // can only vouch for a peer it holds a record for, so without this an
+            // accept-only bootstrap would offer bare peer-ids (no dialable address)
+            // and PX would not complete. go/rust run identify on every connection
+            // regardless of dial direction. Best-effort — failures are logged.
             exchangeIdentify(self.allocator, self.io, conn, self.gs);
-            // The accept fiber and the teardown both touch `conns`, but never
-            // concurrently: teardown first cancels this fiber (joining it) and
-            // only then calls deinit, so appends here are sequenced before reads
-            // there. Drop the connection if we cannot record it for teardown.
+            // Accept fiber and teardown both touch `conns` but never concurrently:
+            // teardown cancels (joins) this fiber before deinit, so appends are
+            // sequenced before reads there. Drop the conn if we cannot record it.
             self.conns.append(self.allocator, conn) catch {
                 conn.deinit();
                 continue;
@@ -704,13 +612,11 @@ const AcceptState = struct {
     }
 };
 
-/// Dial every configured peer (`peers`/`peer`), start an inbound dispatcher and
-/// run identify-as-client against each, and append the live connection to `conns`
-/// (the caller owns teardown). Returns how many peers were successfully dialed.
-/// gossipsub forms a mesh over whatever connections exist, so a node that dials
-/// several peers grafts into a mesh spanning all of them; a failed dial to one
-/// peer does not abort the others. Shared by the dialer role and a listener that
-/// also dials upstream (a leaf that is both reachable and joins a star).
+/// Dial every configured peer (`peers`/`peer`/`peer_file`), starting an inbound
+/// dispatcher + identify-as-client per connection and appending each to `conns`
+/// (caller owns teardown). Returns the count dialed; a failed dial to one peer
+/// does not abort the others. Shared by the dialer role and a listener that also
+/// dials upstream.
 fn dialPeers(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -719,11 +625,9 @@ fn dialPeers(
     args: *const Args,
     conns: *std.ArrayList(*libp2p.SwitchConnection),
 ) !usize {
-    // A `peer_file` target (the read counterpart of the listener's `addr_file`):
-    // poll briefly for the file to appear and be non-empty, then dial its contents.
-    // Used for Shadow coordination where the listener publishes its multiaddr to
-    // the shared host filesystem. Read once up front; `dialTargets` handles the
-    // direct `peer`/`peers` entries.
+    // A `peer_file` target: poll briefly for the file, then dial its contents (see
+    // the `peer_file` field). Read once up front; `dialTargets` handles the direct
+    // `peer`/`peers` entries.
     var file_peer_buf: [512]u8 = undefined;
     const file_peer: ?[]const u8 = if (args.peer_file) |path|
         readPeerFile(io, path, &file_peer_buf) catch |err| blk: {
@@ -744,11 +648,9 @@ fn dialPeers(
     return dialed;
 }
 
-/// Dial a single peer multiaddr: dial, start its inbound dispatcher, run
-/// identify-as-client, and append the live connection to `conns`. Returns true on
-/// success. A bad multiaddr or a failed dial/dispatch is logged and returns false
-/// (so one failed peer does not abort the rest); only an OOM appending to `conns`
-/// propagates.
+/// Dial one peer multiaddr: dial, start its inbound dispatcher, run
+/// identify-as-client, append to `conns`. A bad multiaddr or failed dial/dispatch
+/// is logged and returns false; only an OOM appending to `conns` propagates.
 fn dialOnePeer(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -823,13 +725,10 @@ fn readFileFirstLine(io: std.Io, path: []const u8, buf: []u8) ![]const u8 {
     return std.mem.trim(u8, contents[0..newline], " \t\r\n");
 }
 
-/// Watches gossipsub's peer count for growth beyond a baseline (the number of
-/// peers the node explicitly dialed). When a PX'd PRUNE makes the router dial a
-/// peer it was OFFERED — one it never dialed itself — that peer connects and the
-/// count rises above the baseline. The monitor logs a single greppable
-/// `PX-CONNECT` line on the first such rise so a scenario can assert the
-/// cross-impl PX dial happened. Runs on its own fiber for the whole run; the
-/// caller cancels it on teardown.
+/// Watches the gossipsub peer count for growth past the baseline (peers the node
+/// dialed itself): a PX'd PRUNE makes the router dial a peer it was OFFERED, which
+/// raises the count. Logs a single greppable `PX-CONNECT` line on the first rise
+/// so a scenario can assert the PX dial happened. Own fiber; canceled on teardown.
 const PeerCountMonitor = struct {
     io: std.Io,
     gs: *gossipsub.Gossipsub,
@@ -860,19 +759,15 @@ fn runDialer(
     gs: *gossipsub.Gossipsub,
     args: *const Args,
 ) !void {
-    // Register identify (responder + sealed peer record). A dialer does not bind a
-    // listen socket, so it advertises no listen addrs — its record names only its
-    // peer-id, still letting a peer certify the (empty) address set and confirming
-    // identify works both ways. The handler outlives the run on this stack.
+    // Register identify (responder + sealed record). A dialer binds no socket, so
+    // it advertises no listen addrs — its record names only its peer-id, still
+    // letting a peer certify the (empty) set. The handler outlives the run here.
     var id_handler: identify.IdentifyHandler = undefined;
     try registerIdentify(allocator, switcher, host_key, &.{}, &id_handler);
     defer id_handler.deinit();
 
-    // Dial every configured peer and start an inbound dispatcher per connection.
-    // gossipsub forms a mesh over whatever connections exist, so a node that
-    // dials several peers can graft into a mesh spanning all of them. Every
-    // connection must stay alive for the whole run, so they are held in a list
-    // and closed together on teardown.
+    // Every connection must stay alive for the whole run, so hold them in a list
+    // and close them together on teardown.
     var conns: std.ArrayList(*libp2p.SwitchConnection) = .empty;
     defer {
         for (conns.items) |conn| conn.deinit();
@@ -895,49 +790,37 @@ fn runDialer(
 
     try runForDuration(io, allocator, gs, args);
 
-    // Emit the result and hard-exit, matching the listener path so every node
-    // terminates promptly. A dialer has no blocking accept fiber, but hard-exiting
-    // keeps shutdown uniform and immune to the per-connection actor teardown stall
-    // (each dialed connection runs an inbound dispatcher in the same uncancelable
-    // QUIC `acceptStream` as the listener's). `finishAndExit` never returns.
+    // Hard-exit like the listener: a dialer has no accept fiber, but each dialed
+    // connection runs an inbound dispatcher in the same uncancelable QUIC
+    // `acceptStream`, so this keeps shutdown uniform and immune to that stall.
     finishAndExit(io, recorder, args);
 }
 
 /// Run until `duration_ms` elapses. In publish mode, republish every
-/// `publish_interval_ms` so at least one publish lands after the mesh forms; in
-/// subscribe mode, just wait (deliveries arrive on the router fiber).
+/// `publish_interval_ms` so at least one publish lands after the mesh forms;
+/// subscribe mode just waits (deliveries arrive on the router fiber).
 ///
-/// Under the anonymous policy the message-id is content-derived
-/// (`sha256(topic ++ data)`), so republishing the IDENTICAL payload yields the
-/// same id every time and the router's seen-cache suppresses every publish after
-/// the first — which fires before the mesh has grafted, so nothing propagates.
-/// (go-libp2p's StrictNoSign behaves the same: it checks the seen-cache before
-/// publishing.) To keep the republish-until-meshed strategy working under
-/// anonymous, append an incrementing suffix so each publish has a UNIQUE payload
-/// (hence a fresh content-id) and propagates once the mesh is up. The suffix is
-/// `#<n>`, so a subscriber asserts on the message PREFIX. Signed publishes carry
-/// a fresh seqno each time, so they keep the plain payload.
+/// Under anonymous the content-derived id means republishing an IDENTICAL payload
+/// is suppressed by the seen-cache (which fires before the mesh grafts → nothing
+/// propagates). So append an incrementing `#<n>` suffix for a fresh content-id per
+/// publish; a subscriber asserts on the PREFIX. Signed publishes carry a fresh
+/// seqno, so they keep the plain payload.
 fn runForDuration(io: std.Io, allocator: std.mem.Allocator, gs: *gossipsub.Gossipsub, args: *const Args) !void {
     if (args.mode != .publish) {
         try timeoutFromMs(args.duration_ms).sleep(io);
         return;
     }
 
-    // The anonymous anti-dedup suffix ("#<seq>") must fit the FULL payload plus
-    // the suffix. A fixed max_print_len buffer silently truncated large payloads
-    // (bufPrint overflow -> `catch args.message`), so every large anonymous
-    // publish fell back to the identical plain payload, the content-id never
-    // changed, and the seen-cache suppressed all but the (pre-mesh) first publish
-    // -> a large anonymous message never propagated. Size to the payload instead.
+    // Size to the FULL payload plus the suffix: a fixed buffer would truncate a
+    // large payload, so its content-id would never change and the seen-cache would
+    // suppress every anonymous publish after the (pre-mesh) first → no propagation.
     const msg_buf = try allocator.alloc(u8, args.message.len + 32);
     defer allocator.free(msg_buf);
     var seq: u64 = 0;
     var elapsed_ms: u64 = 0;
     while (elapsed_ms < args.duration_ms) : (elapsed_ms += publish_interval_ms) {
-        // msg_buf is sized to message.len + 32 (> the "#<u64>" suffix), so bufPrint
-        // cannot overflow; `try` surfaces a real failure instead of silently falling
-        // back to the un-suffixed payload (which would re-introduce the content-id
-        // dedup that the suffix exists to avoid).
+        // `msg_buf` is sized past the suffix so bufPrint cannot overflow; `try`
+        // surfaces a real failure rather than silently dropping the suffix.
         const payload: []const u8 = if (args.sign == .anonymous)
             try std.fmt.bufPrint(msg_buf, "{s}#{d}", .{ args.message, seq })
         else
@@ -951,14 +834,10 @@ fn runForDuration(io: std.Io, allocator: std.mem.Allocator, gs: *gossipsub.Gossi
     }
 }
 
-/// The Switch's listen multiaddrs with any wildcard `/ip4/0.0.0.0/` rewritten to
-/// the dialable `/ip4/<advertise_ip>/`. The Switch may bind the wildcard 0.0.0.0,
-/// which is NOT a dialable address — a peer that learns this address through a
-/// signed peer record (peer-exchange) or identify must be able to dial it. The
-/// `advertise_ip` is 127.0.0.1 for on-host runs or the assigned Shadow IP under
-/// the simulator (and matches `buildPublishedMultiaddr`). An address already bound
-/// to a specific IP (the Shadow case binds the announce IP directly) is passed
-/// through unchanged. Caller owns each returned string.
+/// The Switch's listen multiaddrs with any wildcard `/ip4/0.0.0.0/` (not dialable)
+/// rewritten to `/ip4/<advertise_ip>/`, so a peer that learns the address via a
+/// signed peer record or identify can dial it. An address already bound to a
+/// specific IP passes through unchanged. Caller owns each returned string.
 fn advertisedListenAddrs(
     allocator: std.mem.Allocator,
     switcher: *libp2p.Switch,
@@ -987,10 +866,8 @@ fn advertisedListenAddrs(
 }
 
 /// Build the full `/ip4/<advertise_ip>/udp/<port>/quic-v1/p2p/<peer-id>` multiaddr
-/// from the Switch's first bound listen port and this node's peer id. The Switch
-/// may bind the wildcard 0.0.0.0 (not dialable) or a specific IP; either way the
-/// advertised multiaddr names `advertise_ip` — 127.0.0.1 for on-host runs, the
-/// assigned Shadow IP under the simulator — at the bound port.
+/// from the Switch's first bound listen port and this node's peer id. Names the
+/// dialable `advertise_ip`, never the possibly-wildcard bound IP.
 fn buildPublishedMultiaddr(
     allocator: std.mem.Allocator,
     switcher: *libp2p.Switch,
@@ -1029,11 +906,10 @@ fn writeAddrFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try writer.interface.flush();
 }
 
-/// Emit `bytes` to stdout. We write more than once (each `RECV` plus the final
-/// JSON), and stdout is often redirected to a regular file by the orchestrator.
-/// A positional writer would seek to offset 0 on every call and overwrite the
-/// previous line, so use a STREAMING writer: it appends at the fd's current
-/// position, which is correct for both pipes and redirected files.
+/// Emit `bytes` to stdout with a STREAMING writer: we write more than once and
+/// stdout is often redirected to a file, where a positional writer would seek to
+/// offset 0 each call and overwrite. Streaming appends at the fd's position,
+/// correct for both pipes and files.
 fn printToStdout(io: std.Io, bytes: []const u8) !void {
     const stdout_file: std.Io.File = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
     var buf: [max_print_len]u8 = undefined;

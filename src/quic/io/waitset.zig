@@ -60,24 +60,13 @@ pub const WaitSet = struct {
         return ws.signal.waitTimeout(io, observed, timeout);
     }
 
-    /// Park until the signal epoch advances past `observed` (an edge), ignoring
-    /// the readiness bits entirely. For waiters that do NOT clear the bits via
-    /// `take` (e.g. a connection handle blocked in acceptStream, distinct from
-    /// the owning actor which takes the bits each loop). Such a waiter must not
-    /// use `wait`/`waitTimeout`: those return immediately whenever ANY bit is
-    /// set, and the actor routinely sets bits the waiter does not consume (e.g.
-    /// inbound-packet or control-command readiness). A non-clearing waiter using
-    /// the level-triggered `wait` would therefore spin — observe, find its own
-    /// condition unmet, see an unrelated bit still set, return immediately, and
-    /// loop — burning the executor and starving the very actor that would make
-    /// its condition (a queued stream, or a closed connection) true.
-    ///
-    /// Edge detection on the epoch is the correct model here: `notify` advances
-    /// the epoch on every relevant event (a pushed stream, shutdown), so the
-    /// waiter re-checks its own condition exactly when something changed and
-    /// otherwise stays parked. The caller must capture `observed` via `observe`
-    /// BEFORE re-checking its condition so a notify between the check and the
-    /// park cannot be lost.
+    /// Park on an epoch edge, ignoring the readiness bits, for waiters that do
+    /// NOT clear the bits via `take` (e.g. a connection handle in acceptStream,
+    /// vs. the owning actor that takes the bits each loop). Such a waiter cannot
+    /// use the level-triggered `wait`/`waitTimeout`: those return on ANY set bit,
+    /// and the actor routinely sets bits this waiter never consumes, so it would
+    /// spin and starve the actor. Caller must capture `observed` via `observe`
+    /// BEFORE re-checking its condition, else a notify in between is lost.
     pub fn waitEpoch(ws: *WaitSet, io: std.Io, observed: u32) std.Io.Cancelable!void {
         return ws.signal.wait(io, observed);
     }

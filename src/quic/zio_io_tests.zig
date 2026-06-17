@@ -1,14 +1,10 @@
 //! Multi-executor integration tests for the lowest IO primitives (Layer 0).
 //!
-//! WHY THIS FILE EXISTS: every other test in the tree runs on `std.Io.Threaded`
-//! and is single-threaded + sequential (trySend/tryRecv with no blocking
-//! handoff), so the cross-executor wake / backpressure / refcount contracts that
-//! make the model multi-executor-safe are NOT exercised anywhere.
-//!
-//! These tests spin a REAL `zio.Runtime` with >=2 executors and put producers
-//! and consumers on different executors, so they pin the cross-executor
-//! contracts of channel.zig / waitset.zig. BoringSSL-free: imports only zio +
-//! the io primitives, so it compiles in seconds.
+//! Every other test runs on single-threaded `std.Io.Threaded` (trySend/tryRecv,
+//! no blocking handoff), so the cross-executor wake / backpressure / refcount
+//! contracts are exercised nowhere else. These spin a REAL `zio.Runtime` with
+//! >=2 executors, putting producers and consumers on different executors to pin
+//! the contracts of channel.zig / waitset.zig.
 //!
 //! Run: `zig build zio-io-test` (optionally `-Dfilter=...`).
 
@@ -22,10 +18,10 @@ const Signal = channel.Signal;
 const WaitSet = waitset_mod.WaitSet;
 const Ready = waitset_mod.Ready;
 
-/// Spin a multi-executor zio runtime, run `root(io, ctx)` as the root fiber on
-/// the main executor, and block until it completes. Worker fibers spawned via
-/// `std.Io.concurrent` land on the other executor(s), giving genuine
-/// cross-executor scheduling. Propagates the root fiber's error.
+/// Run `root(io, ctx)` as the root fiber on a multi-executor zio runtime and
+/// block until it completes. Worker fibers spawned via `std.Io.concurrent` land
+/// on other executors, giving genuine cross-executor scheduling. Propagates the
+/// root fiber's error.
 fn runRoot(comptime executors: u8, comptime root: anytype, ctx: anytype) !void {
     const rt = try zio.Runtime.init(testing.allocator, .{ .executors = .exact(executors) });
     defer rt.deinit();
@@ -47,10 +43,8 @@ const SignalCtx = struct {
 };
 
 fn signalConsumer(io: std.Io, ctx: *SignalCtx) void {
-    // Mirror the production observe-before-wait loop: snapshot the epoch, check
-    // the condition, and only park if it is not yet satisfied. A notify that
-    // races between observe() and wait() bumps the epoch, so wait() returns
-    // immediately rather than blocking forever (the lost-wakeup-free contract).
+    // Observe-before-wait: a notify racing between observe() and wait() bumps the
+    // epoch, so wait() returns immediately rather than blocking (lost-wakeup-free).
     while (true) {
         const observed = ctx.sig.observe();
         const value = ctx.payload.load(.acquire);
@@ -249,11 +243,9 @@ test "Bounded channel: refcount frees exactly once after concurrent retain/relea
 
 // ---------------------------------------------------------------------------
 // Regression: zio kqueue completion-lifecycle UAF. N fibers each blocked in a
-// receiveManyTimeout on their own socket, cancelled concurrently cross-executor.
-// The bug: poll() dereferenced a Completion freed by a resumed fiber via a stale
-// kevent udata. The fix keys pending completions by (ident,filter) in a
-// loop-owned `poll_queue` instead of storing raw Completion pointers in udata,
-// so stale events can't deref.
+// receiveManyTimeout, cancelled concurrently cross-executor. The bug: poll()
+// deref'd a Completion freed by a resumed fiber via a stale kevent udata; the
+// fix keys pending completions by (ident,filter) in a loop-owned queue.
 // ---------------------------------------------------------------------------
 const io_time = @import("io/time.zig");
 const ReproFut = std.Io.Future((std.Io.Cancelable || std.Io.ConcurrentError)!void);
@@ -296,12 +288,10 @@ test "kqueue: concurrent cross-exec cancel of N recvmsg fibers is UAF-free" {
 }
 
 // ---------------------------------------------------------------------------
-// Cancellation-wakeup regressions: an outer fiber blocked in `std.Io.Select.await()`
+// Cancellation-wakeup regressions: an outer fiber parked in `std.Io.Select.await()`
 // over `concurrent` branches (recv, idle timer, futex wait), cancelled via its
-// `Future`. These confirm a fiber parked in recv/futex/Select wakes on cancel and
-// tears down cleanly. (They do NOT reproduce the router's real teardown deadlock,
-// which came from driving teardown off the one-shot `Future.cancel` — see the NOTE
-// at the bottom and `router.closeListener`.)
+// `Future`, must wake and tear down cleanly. These do NOT reproduce the router's
+// teardown deadlock (driven off one-shot `Future.cancel` — see the NOTE below).
 // ---------------------------------------------------------------------------
 const SelResult = union(enum) {
     recv: (std.Io.Cancelable || std.Io.ConcurrentError)!void,
@@ -335,11 +325,9 @@ test "select-nested recv loop: cancelling the outer fiber tears down cleanly" {
     }.root, {});
 }
 
-// Several wake paths in the stack (the connection WaitSet's epoch signal, the
-// channel signals) park via `io.futexWait`, not a timer. Cancelling a
-// futex-blocked fiber — directly, then nested in a Select alongside an
-// unbounded recv — also wakes it. (The endpoint router itself no longer uses
-// a Select: it is one persistent recv fiber woken by a loopback datagram.)
+// Several wake paths (the connection WaitSet's epoch signal, channel signals)
+// park via `io.futexWait`, not a timer. Cancelling a futex-blocked fiber —
+// directly, then nested in a Select alongside an unbounded recv — also wakes it.
 const FutexFut = std.Io.Future(std.Io.Cancelable!void);
 
 fn futexBlockForever(io: std.Io) std.Io.Cancelable!void {
@@ -390,8 +378,8 @@ test "select recv+futex loop: cancelling the outer fiber tears down cleanly" {
     }.root, {});
 }
 
-// NOTE: the router's teardown deadlock was deterministic, not a scheduler race.
-// `std.Io.Future.cancel` is one-shot, so cancel-based teardown of a fiber parked in
-// the router's multi-arm `Select` can lose the single cancellation and re-park with
-// no waker. The router therefore stops off a persistent flag + channel-close, never
-// `cancel` (see `router.closeListener`); these single-cancel cases don't hit it.
+// NOTE: the router's teardown deadlock was deterministic. `std.Io.Future.cancel`
+// is one-shot, so cancel-based teardown of a fiber in the router's multi-arm
+// `Select` can lose the single cancellation and re-park with no waker. The router
+// therefore stops off a persistent flag + channel-close, never `cancel` (see
+// `router.closeListener`); these single-cancel cases don't hit it.

@@ -1,12 +1,9 @@
-//! Perf test application for the libp2p `unified-testing` framework
-//! (https://github.com/libp2p/unified-testing, `perf/` suite).
+//! Perf app for the libp2p `unified-testing` framework (`perf/` suite).
 //!
-//! One binary acts as both listener and dialer (selected by `IS_DIALER`). The
-//! dialer measures upload throughput, download throughput, and connection
-//! latency over QUIC and prints the results as YAML on stdout; all logs go to
-//! stderr. Coordination is via the shared Redis server the framework provides.
-//!
-//! Env vars are unified-testing's (UPPERCASE, `TEST_KEY`-namespaced redis key).
+//! One binary is both listener and dialer (selected by `IS_DIALER`). The dialer
+//! measures upload/download throughput and latency over QUIC, printing YAML on
+//! stdout (logs go to stderr). Peers rendezvous via the framework's Redis using
+//! UPPERCASE env vars and a `TEST_KEY`-namespaced redis key.
 
 pub const std_options = @import("zig-libp2p").std_options;
 
@@ -18,15 +15,13 @@ const protocols = libp2p.protocols;
 const Multiaddr = @import("multiaddr").multiaddr.Multiaddr;
 const Stream = libp2p.quic.Stream;
 
-/// Perf protocol id. Half-close request/response, wire-compatible with the
-/// libp2p `unified-testing` reference codec: the dialer writes a 16-byte header
-/// (upload_len ++ download_len, big-endian), streams `upload_len` bytes, then
-/// HALF-CLOSES its write side (FIN). The listener reads the header, drains the
-/// upload to EOF, writes `download_len` bytes, and returns — the Switch then
-/// closes the stream (FIN). The dialer reads the response to EOF, so timing
-/// captures end-to-end delivery in BOTH directions (for the upload-only case the
-/// listener's FIN is the "fully received" signal). Relies on graceful half-close:
-/// read-EOF must not shut the peer's write side.
+/// Wire format must match the libp2p `unified-testing` reference codec: dialer
+/// writes a 16-byte big-endian header (upload_len ++ download_len), streams
+/// `upload_len` bytes, then half-closes (FIN); listener drains the upload to
+/// EOF, writes `download_len` bytes, FINs; dialer reads the response to EOF so
+/// timing is end-to-end both ways (upload-only: the listener's FIN is the
+/// "fully received" signal). Requires graceful half-close: read-EOF must not
+/// shut the peer's write side.
 const perf_protocol_id = "/perf/1.0.0";
 
 /// Transfer chunk for upload/download loops.
@@ -39,9 +34,8 @@ const PerfHandler = struct {
         const upload_len = std.mem.readInt(u64, header[0..8], .big);
         const download_len = std.mem.readInt(u64, header[8..16], .big);
 
-        // Drain the dialer's upload to EOF. The dialer half-closes after
-        // `upload_len` bytes, so reading to EOF consumes its FIN — that lets
-        // this stream be collected promptly instead of lingering per request.
+        // Drain to EOF to consume the dialer's FIN, so the stream is collected
+        // promptly instead of lingering per request.
         var buf: [chunk_len]u8 = undefined;
         var received: u64 = 0;
         while (true) {
@@ -298,9 +292,8 @@ pub fn main(init: std.process.Init) !void {
 
     var host_key = try identity.KeyPair.generate(.ED25519);
     defer host_key.deinit();
-    // Uses the library default QUIC config (incl. the 64KB/128KB per-stream
-    // outbound buffer) so the perf number is a fair default-vs-default comparison
-    // with the other impls' stock perf binaries.
+    // Default QUIC config so the perf number is a fair default-vs-default
+    // comparison with the other impls' stock perf binaries.
     const endpoint = try libp2p.QuicEndpoint.initWithIdentity(allocator, io, &host_key, .{});
     defer endpoint.deinit();
     const switcher = try libp2p.Switch.init(allocator, io, endpoint);
@@ -361,9 +354,8 @@ fn runListener(
     try redis.rpush(addr_key, published_addr, &scratch);
     std.log.info("listener published {s}", .{published_addr});
 
-    // Serve all inbound connections in the background (the Switch owns the accept
-    // loop + connection lifetimes, torn down by `switcher.deinit`). This is the
-    // standard way a server serves inbound — no hand-rolled accept loop.
+    // Serve inbound in the background; the Switch owns the accept loop and
+    // connection lifetimes, torn down by `switcher.deinit`.
     try switcher.serve(io);
 
     // Stay up until the dialer finishes; docker shuts the container down when
@@ -472,10 +464,7 @@ fn perfRequest(io: std.Io, conn: *libp2p.ManagedConnection, upload_bytes: u64, d
         try stream.writeAll(io, buf[0..k], .{});
         to_write -= k;
     }
-    // Half-close: FIN signals the request is complete. The listener drains the
-    // upload to EOF, writes the download, and FINs; reading the response to EOF
-    // makes the timing end-to-end in both directions (incl. upload-only, where
-    // the listener's FIN is its "fully received" signal).
+    // Half-close: FIN signals the request is complete (see perf_protocol_id).
     try stream.closeWrite(io);
 
     var received: u64 = 0;
@@ -547,8 +536,7 @@ fn printResults(
     download: *Samples,
     latency: *Samples,
 ) !void {
-    // stdout is a pipe under the harness; this matches the transport app's
-    // streaming-writer pattern.
+    // stdout is a pipe under the harness, so use a streaming writer.
     const stdout_file: std.Io.File = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer = stdout_file.writer(io, &stdout_buf);
@@ -615,7 +603,7 @@ fn bytesPerNsToGbps(bytes: u64, elapsed_ns: u64) f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Shared scaffolding (mirrors interop/transport/main.zig)
+// Shared scaffolding (env parsing, multiaddr build, TCP/DNS helpers)
 // ---------------------------------------------------------------------------
 
 fn buildListenMultiaddr(allocator: std.mem.Allocator, bind_ip: []const u8, port: u16) ![]u8 {

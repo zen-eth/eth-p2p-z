@@ -59,18 +59,15 @@ pub const CloseReason = enum(u8) {
     closed,
 };
 
-/// Structured reason a handshake failed, derived from a published
-/// `ConnectionStats` snapshot by `classifyHandshakeFailure`. Lets dialers
-/// surface *why* a handshake failed (TLS alert vs transport param vs timeout
-/// vs peer-identity rejection) instead of an opaque `HandshakeFailed`.
+/// Structured reason a handshake failed, derived from a `ConnectionStats`
+/// snapshot by `classifyHandshakeFailure` — lets dialers surface *why* (TLS
+/// alert vs transport param vs timeout vs peer-identity) not an opaque fail.
 pub const HandshakeFailure = struct {
     kind: Kind = .none,
-    /// QUIC CONNECTION_CLOSE error code when `kind` is `.crypto_error` or
-    /// `.transport_error`; otherwise 0. For `.crypto_error` the TLS alert is the
-    /// low byte (`error_code & 0xff`), per RFC 9000 §20.1.
+    /// QUIC CONNECTION_CLOSE error code for `.crypto_error`/`.transport_error`,
+    /// else 0. For `.crypto_error` the TLS alert is the low byte, per RFC 9000 §20.1.
     error_code: u64 = 0,
-    /// True when the close came from the peer's CONNECTION_CLOSE rather than a
-    /// locally detected fault.
+    /// True when the close came from the peer's CONNECTION_CLOSE.
     from_peer: bool = false,
 
     pub const Kind = enum {
@@ -90,17 +87,15 @@ pub const HandshakeFailure = struct {
     };
 };
 
-/// Map a QUIC CONNECTION_CLOSE error code to crypto- vs transport-error.
-/// RFC 9000 §20.1: 0x0100-0x01ff is CRYPTO_ERROR (TLS alert in the low byte).
+/// 0x0100-0x01ff is CRYPTO_ERROR (TLS alert in the low byte), else transport.
 fn classifyCloseCode(code: u64, from_peer: bool) HandshakeFailure {
     if (code >= 0x100 and code <= 0x1ff)
         return .{ .kind = .crypto_error, .error_code = code, .from_peer = from_peer };
     return .{ .kind = .transport_error, .error_code = code, .from_peer = from_peer };
 }
 
-/// Derive a structured handshake-failure reason from a published stats
-/// snapshot. Pure function (no I/O) so it is unit-testable without driving a
-/// real handshake. Order matters: most-specific attribution wins.
+/// Derive a structured handshake-failure reason from a stats snapshot. Pure (no
+/// I/O), so unit-testable without a real handshake. Most-specific cause wins.
 pub fn classifyHandshakeFailure(s: ConnectionStats) HandshakeFailure {
     // 1. libp2p peer-identity rejection, recorded by the actor when
     //    tls.extractPublicKey fails on an otherwise-established connection.
@@ -139,11 +134,9 @@ pub fn classifyHandshakeFailure(s: ConnectionStats) HandshakeFailure {
         else => {},
     }
 
-    // 6. A fatal local actor fault during handshake (closeFromActorErrorCode set
-    //    close_reason=.actor_error). The peer_verify_failed / quiche / socket
-    //    cases are already handled by steps 1 and 4; anything else reaching here
-    //    (e.g. .concurrent_failed, .address_invalid) is a local transport-layer
-    //    fault, not an opaque unknown.
+    // 6. A fatal local actor fault (.actor_error). Steps 1 and 4 already handled
+    //    peer_verify_failed / quiche / socket; anything else here (e.g.
+    //    .concurrent_failed, .address_invalid) is a local transport fault.
     if (s.close_reason == .actor_error) return .{ .kind = .transport_error };
 
     return .{ .kind = .unknown };
@@ -308,11 +301,9 @@ pub const Publisher = struct {
         return .{ .published = initial };
     }
 
-    /// Reads the latest published snapshot. Logically a const read, but it must
-    /// take the lock — classic interior mutability, so we keep the `*const`
-    /// receiver (callers hold the connection by const ref) and `@constCast` only
-    /// to acquire/release the mutex. Safe: the cast never escapes and the
-    /// underlying `Publisher` is always heap-allocated and mutable.
+    /// Logically a const read (callers hold the connection by const ref) but
+    /// must take the lock — interior mutability. `@constCast` is safe: it never
+    /// escapes and the `Publisher` is always heap-allocated and mutable.
     pub fn load(p: *const Publisher, io: std.Io) ConnectionStats {
         const mutable: *Publisher = @constCast(p);
         mutable.lock.lockUncancelable(io);
@@ -375,10 +366,8 @@ test "classifyHandshakeFailure: a plain drain/close maps to closed" {
 }
 
 test "classifyHandshakeFailure: a fatal local actor fault maps to transport_error" {
-    // closeFromActorErrorCode stamps close_reason=.actor_error for faults that
-    // aren't peer_verify_failed (step 1) or quiche/socket I/O (step 4), e.g.
-    // .concurrent_failed / .address_invalid. These are local transport faults,
-    // not opaque unknowns.
+    // .actor_error faults other than step-1/step-4 cases (e.g. .concurrent_failed,
+    // .address_invalid) are local transport faults, not opaque unknowns.
     try testing.expectEqual(HandshakeFailure.Kind.transport_error, classifyHandshakeFailure(.{ .close_reason = .actor_error, .last_actor_error = .concurrent_failed }).kind);
     try testing.expectEqual(HandshakeFailure.Kind.transport_error, classifyHandshakeFailure(.{ .close_reason = .actor_error, .last_actor_error = .address_invalid }).kind);
 }

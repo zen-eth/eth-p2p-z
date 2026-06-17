@@ -261,10 +261,8 @@ pub fn main(init: std.process.Init) !void {
         protocols.streamHandlerService(protocols.ping.PingHandler, protocols.ping.PingHandler.run, &ping_handler),
     );
 
-    // Serve identify (`/ipfs/id/1.0.0`). The reference go/rust/python interop
-    // peers open an identify stream right after connecting; without a handler we
-    // answer `na` and they log a "protocol not supported" error (non-fatal, but
-    // noisy). A minimal handler responds with our protocol/agent version.
+    // Interop peers open an identify stream right after connecting; without a
+    // handler we answer `na` and they log a noisy (non-fatal) error.
     var identify_handler = protocols.identify.IdentifyHandler.init(allocator);
     try switcher.addProtocolService(
         protocols.identify.protocol_id,
@@ -334,11 +332,9 @@ fn runListener(
     try redis.rpush(listener_addr_key, published_addr, &scratch);
     std.log.info("listener published {s}", .{published_addr});
 
-    // Serve every inbound connection in the background. py-libp2p opens a SECOND
-    // QUIC connection after a successful identify exchange; serving only the first
-    // would stall a ping stream opened on the later one (~10s stream-open timeout).
-    // `Switch.serve` owns the accept loop + connection lifetimes (torn down by
-    // `switcher.deinit`), so the binary needs no accept loop of its own.
+    // Serve every inbound connection: py-libp2p opens a SECOND QUIC connection
+    // after identify, so serving only the first stalls a ping stream opened on the
+    // later one. `Switch.serve` owns the accept loop + connection lifetimes.
     try switcher.serve(io);
 
     try timeoutFromSeconds(env.timeout_seconds).sleep(io);
@@ -373,9 +369,8 @@ fn runDialer(
     const rtt_ns = try runPing(allocator, io, conn);
     const total_ns = monotonicNs(io) -| total_start_ns;
 
-    // Emit the result JSON via the std.Io file writer. stdout is a pipe under the
-    // interop harness; the default positional writer falls back to streaming on a
-    // non-seekable fd (ESPIPE -> Unseekable).
+    // stdout is a pipe under the interop harness; the positional writer falls back
+    // to streaming on a non-seekable fd (ESPIPE -> Unseekable).
     const stdout_file: std.Io.File = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
     var stdout_buf: [256]u8 = undefined;
     var stdout_writer = stdout_file.writer(io, &stdout_buf);

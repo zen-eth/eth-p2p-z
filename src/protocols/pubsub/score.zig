@@ -1,56 +1,38 @@
 //! The gossipsub peer scoring engine: a standalone, lock-free accountant that
 //! assigns every peer a real-valued score from the gossipsub v1.1 spec's P1-P7
-//! terms, exactly as go-libp2p-pubsub's `score.go`/`params.go` compute it. The
-//! router (a separate layer) drives this engine: it reports graft/prune events,
-//! message deliveries, invalid messages, behaviour penalties, and IP addresses;
-//! once per heartbeat it ticks `decay`; and it gates mesh/gossip/publish/graylist
-//! decisions on the threshold helpers. This file knows nothing about the router,
-//! the mesh, or the wire — it is pure scoring state, unit-testable in isolation.
-//!
-//! The score has four parts (go-libp2p `Score`):
+//! terms. All formulas and field semantics here byte-match go-libp2p-pubsub's
+//! `score.go`/`params.go`. The router drives it (graft/prune/delivery/penalty/IP
+//! events + a per-heartbeat `decay` tick) and gates decisions on the thresholds;
+//! this file knows nothing about the router, mesh, or wire. All math is f64.
 //!
 //!   score = Σ_topic topicScore + appScore·appWeight + ipColocation + behaviour
 //!
-//! The per-topic term sums five sub-scores (the spec's P1-P3b, P4), each clamped
-//! and weighted:
+//! The per-topic term sums five clamped, weighted sub-scores; the rest are global:
 //!
-//!   P1  time in mesh           — positive; rewards a peer for staying grafted.
+//!   P1  time in mesh             — positive; rewards staying grafted.
 //!   P2  first message deliveries — positive; rewards being first to relay a msg.
-//!   P3  mesh message deliveries — NEGATIVE; penalises a mesh peer that delivers
-//!                                 too few messages (a deficit below a threshold),
-//!                                 only after an activation grace period.
-//!   P3b mesh failure penalty   — NEGATIVE; a sticky penalty applied when a peer
-//!                                 is pruned while carrying a P3 deficit.
-//!   P4  invalid messages       — NEGATIVE; squared count of messages this peer
-//!                                 sent that failed validation.
+//!   P3  mesh message deliveries  — NEGATIVE; penalises a mesh peer below the
+//!                                  delivery threshold, only after an activation
+//!                                  grace period.
+//!   P3b mesh failure penalty     — NEGATIVE; sticky, captured when a peer is
+//!                                  pruned while carrying a P3 deficit.
+//!   P4  invalid messages         — NEGATIVE; squared count of failed-validation msgs.
+//!   P5  application-specific      — host callback × weight; optional, default zero.
+//!   P6  IP colocation            — NEGATIVE; many peers sharing one IP (sybil signal).
+//!   P7  behaviour penalty        — NEGATIVE; squared excess of a misbehaviour counter.
 //!
-//! The two global negatives:
+//! Fading counters decay geometrically once per heartbeat (factor in (0,1)); a
+//! value below `decay_to_zero` snaps to zero so it does not linger as float dust.
 //!
-//!   P6  IP colocation          — NEGATIVE; penalises many peers sharing one IP
-//!                                 (a cheap sybil signal).
-//!   P7  behaviour penalty      — NEGATIVE; squared excess of a generic misbehaviour
-//!                                 counter (e.g. broken promises, too-frequent grafts).
-//!
-//! And P5 is the application-specific score: an opaque callback the host supplies,
-//! multiplied by a weight. (We expose it as an optional function pointer; default
-//! is zero, i.e. no app scoring.)
-//!
-//! Counters that should fade decay geometrically once per heartbeat (multiply by a
-//! per-counter factor in (0,1)); a counter that decays below `decay_to_zero` snaps
-//! to zero so it does not linger as float dust. All math is f64.
-//!
-//! NOTE on tuning: the default parameters below are a self-consistent baseline
-//! that exercises every term, NOT production values — real deployments tune every
-//! weight, cap, threshold, and decay per-topic to their message rates and mesh
-//! sizes. Leaving every weight at zero disables scoring entirely (peers score 0).
+//! The default parameters/thresholds below are a self-consistent baseline that
+//! exercises every term, NOT production values; real deployments tune per-topic.
+//! All-zero weights disable scoring (peers score 0).
 
 const std = @import("std");
 const PeerId = @import("peer_id").PeerId;
 
-/// A peer key usable as an AutoHashMap key, mirroring the router's scheme: a
-/// PeerId is `[64]u8` plus a length and the tail past `len` is undefined, so we
-/// zero-pad to a fixed, content-defined key (two ids with the same meaningful
-/// prefix + length hash and compare equal).
+/// A PeerId as an AutoHashMap key. PeerId's tail past `len` is undefined, so we
+/// zero-pad to a content-defined key (same meaningful prefix + len → equal key).
 pub const PeerKey = [64]u8;
 
 pub fn peerKey(peer: *const PeerId) PeerKey {
@@ -59,13 +41,10 @@ pub fn peerKey(peer: *const PeerId) PeerKey {
     return key;
 }
 
-/// A fixed-size, port-independent key for one IP address, usable as an
-/// AutoHashMap key. go-libp2p's IP-colocation term counts peers per IP ADDRESS
-/// (the port is irrelevant — many connections from one host share an address but
-/// differ in port), so we strip the port and tag the family: byte 0 is the family
-/// (4 or 6), bytes 1.. are the raw address bytes (4 for v4, 16 for v6; the v4 tail
-/// stays zero). Two `IpAddress` values with the same family + address but
-/// different ports map to the same key.
+/// A port-independent IP-address key. P6 counts peers per ADDRESS (one host's
+/// many connections share an address, differ in port), so the port is stripped:
+/// byte 0 tags the family (4 or 6), bytes 1.. are the raw address (4 for v4 with
+/// the tail zeroed, 16 for v6).
 pub const IpKey = [17]u8;
 
 pub fn ipKey(addr: std.Io.net.IpAddress) IpKey {
@@ -87,92 +66,75 @@ pub fn ipKey(addr: std.Io.net.IpAddress) IpKey {
 // Parameters
 // ---------------------------------------------------------------------------
 
-/// Per-topic scoring parameters (go-libp2p `TopicScoreParams`). All of P1-P4 for
-/// a topic are scaled by `topic_weight` after summing. Counters that fade carry a
-/// per-heartbeat `*_decay` factor in (0,1). A weight of zero disables that term
-/// for the topic.
+/// Per-topic scoring parameters (go-libp2p `TopicScoreParams`). P1-P4 are summed
+/// then scaled by `topic_weight`. Every `*_decay` is a per-heartbeat factor in
+/// (0,1); a zero weight disables that term for the topic.
 pub const TopicScoreParams = struct {
     /// Overall multiplier for this topic's P1-P4 sum.
     topic_weight: f64,
 
     // P1: time in mesh.
-    /// Reward per `time_in_mesh_quantum_ticks` of accumulated mesh time (positive).
     time_in_mesh_weight: f64,
-    /// One unit of P1 is earned per this many ticks spent in the mesh.
+    /// One unit of P1 is earned per this many ticks in the mesh.
     time_in_mesh_quantum_ticks: u64,
     /// Upper bound on the P1 quantum count (so old peers don't dominate).
     time_in_mesh_cap: f64,
 
     // P2: first message deliveries.
-    /// Reward per first-delivery credit (positive).
     first_message_deliveries_weight: f64,
-    /// Per-heartbeat decay factor for the first-delivery counter, in (0,1).
     first_message_deliveries_decay: f64,
-    /// Upper bound on the first-delivery counter.
     first_message_deliveries_cap: f64,
 
     // P3: mesh message deliveries (deficit below a threshold).
-    /// Weight for the P3 deficit-squared term (NEGATIVE in real configs).
     mesh_message_deliveries_weight: f64,
-    /// Per-heartbeat decay factor for the mesh-delivery counter, in (0,1).
     mesh_message_deliveries_decay: f64,
-    /// The expected mesh-delivery floor; a counter below this is in deficit.
+    /// Expected mesh-delivery floor; a counter below this is in deficit.
     mesh_message_deliveries_threshold: f64,
-    /// Upper bound on the mesh-delivery counter.
     mesh_message_deliveries_cap: f64,
-    /// Ticks a peer must be in the mesh before P3 is evaluated (a grace period so
-    /// a freshly-grafted peer is not penalised before it can deliver anything).
+    /// Grace period: ticks in the mesh before P3 is evaluated, so a fresh peer is
+    /// not penalised before it can deliver anything.
     mesh_message_deliveries_activation_ticks: u64,
     /// Ticks after a message is first seen during which a duplicate from a mesh
-    /// peer still counts toward that peer's mesh-delivery credit.
+    /// peer still counts toward its mesh-delivery credit.
     mesh_message_deliveries_window_ticks: u64,
 
     // P3b: mesh failure penalty.
-    /// Weight for the sticky mesh-failure penalty (NEGATIVE in real configs).
     mesh_failure_penalty_weight: f64,
-    /// Per-heartbeat decay factor for the mesh-failure penalty, in (0,1).
     mesh_failure_penalty_decay: f64,
 
     // P4: invalid message deliveries.
-    /// Weight for the invalid-message-squared term (NEGATIVE in real configs).
     invalid_message_deliveries_weight: f64,
-    /// Per-heartbeat decay factor for the invalid-message counter, in (0,1).
     invalid_message_deliveries_decay: f64,
 };
 
-/// Global (non-topic) scoring parameters (go-libp2p `PeerScoreParams`). Holds the
-/// app-score weight, the P6 IP-colocation and P7 behaviour-penalty parameters, and
-/// the decay/retention bookkeeping. A single `topic_default` is applied to every
-/// topic (per-topic overrides are a future refinement the router can layer on; the
-/// engine stores per-peer per-topic STATE either way).
+/// Global (non-topic) scoring parameters (go-libp2p `PeerScoreParams`): the P5
+/// app-score weight, P6/P7 parameters, and decay/retention bookkeeping. A single
+/// `topic_default` is applied to every topic (per-topic overrides are a future
+/// refinement; per-peer per-topic STATE is stored regardless).
 pub const ScoreParams = struct {
     /// P5 multiplier: appScore (from `app_score_fn`) is scaled by this.
     app_specific_weight: f64,
 
     // P6: IP colocation.
-    /// Weight for the colocation surplus-squared term (NEGATIVE in real configs).
     ip_colocation_factor_weight: f64,
     /// Peers-per-IP allowed before the penalty kicks in (surplus = count above this).
     ip_colocation_factor_threshold: f64,
 
     // P7: behaviour penalty.
-    /// Weight for the behaviour excess-squared term (NEGATIVE in real configs).
     behaviour_penalty_weight: f64,
-    /// Behaviour-counter level below which P7 is zero (excess = counter above this).
+    /// Counter level below which P7 is zero (excess = counter above this).
     behaviour_penalty_threshold: f64,
-    /// Per-heartbeat decay factor for the behaviour counter, in (0,1).
     behaviour_penalty_decay: f64,
 
     // Decay / retention bookkeeping.
-    /// Decay (and the mesh-time/window/activation accounting) runs once every this
-    /// many heartbeat ticks. 1 = every heartbeat (the common case).
+    /// Decay (and mesh-time/window/activation accounting) runs once every this many
+    /// heartbeat ticks. 1 = every heartbeat (the common case).
     decay_interval_ticks: u64,
-    /// A decaying counter at or below this value snaps to zero (avoids float dust
-    /// keeping a long-dead counter marginally non-zero forever).
+    /// A decaying counter at or below this snaps to zero (avoids float dust keeping
+    /// a long-dead counter marginally non-zero forever).
     decay_to_zero: f64,
-    /// How many ticks to retain a disconnected peer's stats before purging them,
-    /// so a peer that reconnects soon keeps its (negative) score. (go-libp2p
-    /// `RetainScore`.)
+    /// Ticks to retain a disconnected peer's stats before purging, so a quick
+    /// reconnect keeps its (negative) score (go-libp2p `RetainScore`).
     retain_score_ticks: u64,
 
     /// The parameters applied to every topic.
@@ -180,7 +142,7 @@ pub const ScoreParams = struct {
 };
 
 /// The five score thresholds the router gates decisions on (go-libp2p
-/// `PeerScoreThresholds`). All are score values a peer is compared against.
+/// `PeerScoreThresholds`).
 pub const PeerScoreThresholds = struct {
     /// Below this, do not emit/accept gossip (IHAVE/IWANT) to/from the peer.
     gossip_threshold: f64,
@@ -194,11 +156,9 @@ pub const PeerScoreThresholds = struct {
     opportunistic_graft_threshold: f64,
 };
 
-/// A baseline parameter set: self-consistent and exercises every term, but NOT
-/// production-tuned (real apps tune every field per-topic). Modest positive
-/// rewards for mesh time and first deliveries; the standard negative penalty
-/// weights; geometric decays near 0.95-0.997 (a counter retains most of its value
-/// across a heartbeat). Setting every weight to zero disables scoring.
+/// A baseline (non-production) parameter set exercising every term: modest
+/// positive mesh-time/first-delivery rewards, the standard negative penalty
+/// weights, and near-unity decays (a counter keeps most value across a heartbeat).
 pub const default_params: ScoreParams = .{
     .app_specific_weight = 1.0,
     .ip_colocation_factor_weight = -5.0,
@@ -230,8 +190,7 @@ pub const default_params: ScoreParams = .{
     },
 };
 
-/// A documented baseline threshold set, matching `default_params`' scale. As with
-/// the params, these are illustrative — real deployments tune them.
+/// A baseline (non-production) threshold set matching `default_params`' scale.
 pub const default_thresholds: PeerScoreThresholds = .{
     .gossip_threshold = -10.0,
     .publish_threshold = -50.0,
@@ -240,10 +199,8 @@ pub const default_thresholds: PeerScoreThresholds = .{
     .opportunistic_graft_threshold = 20.0,
 };
 
-/// An optional application-specific score source (the spec's P5). The router (or
-/// the host) supplies a context and a function that, given a peer, returns that
-/// peer's app score; the engine multiplies it by `app_specific_weight`. Default is
-/// none (P5 contributes zero).
+/// The optional P5 app-score source: a host-supplied context + function mapping a
+/// peer to its app score, which the engine scales by `app_specific_weight`.
 pub const AppScoreFn = struct {
     ctx: *anyopaque,
     score: *const fn (ctx: *anyopaque, peer: PeerKey) f64,
@@ -253,47 +210,42 @@ pub const AppScoreFn = struct {
 // Per-peer state
 // ---------------------------------------------------------------------------
 
-/// Per-peer, per-topic accounting. Mirrors go-libp2p's `topicStats`. The engine
-/// owns one of these per (peer, topic) the peer has ever been grafted into or
-/// delivered a message for; the parent `PeerStats` owns the topic-key copy.
+/// Per-peer, per-topic accounting (go-libp2p `topicStats`). One per (peer, topic)
+/// the peer has grafted into or delivered for; the parent `PeerStats` owns the
+/// topic-key copy.
 pub const TopicStats = struct {
     /// Whether the peer is currently in this topic's mesh (grafted, not pruned).
     in_mesh: bool = false,
-    /// Total ticks accumulated while in the mesh (P1's raw input, and the gate for
-    /// P3 activation). Reset to zero on graft; accrued by `decay` each interval the
-    /// peer is `in_mesh`.
+    /// Total ticks in the mesh (P1 input + P3-activation gate). Reset on graft;
+    /// accrued by `decay` each interval the peer is `in_mesh`.
     mesh_time_ticks: u64 = 0,
-    /// First-delivery credit (P2): incremented (capped) on a delivery, decayed.
+    /// P2 first-delivery credit: incremented (capped) on a delivery, decayed.
     first_message_deliveries: f64 = 0,
-    /// Mesh-delivery credit (P3): incremented (capped) on a delivery or in-window
+    /// P3 mesh-delivery credit: incremented (capped) on a delivery or in-window
     /// duplicate while in the mesh, decayed.
     mesh_message_deliveries: f64 = 0,
-    /// Whether P3 is currently active for this peer+topic (it has been in the mesh
-    /// past the activation grace period). Set by `decay`; cleared on graft.
+    /// Whether P3 is active here (in the mesh past the activation grace period).
+    /// Set by `decay`; cleared on graft.
     mesh_message_deliveries_active: bool = false,
-    /// Sticky mesh-failure penalty (P3b): a deficit snapshot captured on prune,
-    /// decayed.
+    /// P3b sticky penalty: a deficit snapshot captured on prune, decayed.
     mesh_failure_penalty: f64 = 0,
-    /// Invalid-message count (P4): incremented on a rejected message, decayed.
+    /// P4 invalid-message count: incremented on a rejected message, decayed.
     invalid_message_deliveries: f64 = 0,
 };
 
-/// All scoring state for one peer. Mirrors go-libp2p's `peerStats`. Owns its
-/// topic-key copies (freed on per-topic removal and on peer purge) and its IP key
-/// list. While connected, `disconnected_at_tick` is unused; on disconnect it
-/// records the tick so `decay` can purge the peer once `retain_score_ticks` pass.
+/// All scoring state for one peer (go-libp2p `peerStats`). Owns its topic-key
+/// copies and IP-key list. A disconnected peer is retained (for its score) until
+/// `retain_score_ticks` after `disconnected_at_tick`, then `decay` purges it.
 pub const PeerStats = struct {
-    /// Whether the peer is currently connected. A disconnected peer is retained
-    /// (for its score) until `retain_score_ticks` elapse, then purged.
     connected: bool = true,
     /// The tick the peer disconnected at (only meaningful when `!connected`).
     disconnected_at_tick: u64 = 0,
-    /// The IP keys this peer is currently known to use (one per `addIP`). Each is
-    /// also counted in the engine's global `ip_counts`; `removeIP`/purge decrement.
+    /// IP keys this peer uses (one per `addIP`); each is also tallied in the global
+    /// `ip_counts`, which `removeIP`/purge decrement.
     ips: std.ArrayListUnmanaged(IpKey) = .empty,
-    /// The behaviour-misbehaviour counter (P7's raw input), decayed.
+    /// P7 misbehaviour counter, decayed.
     behaviour_penalty: f64 = 0,
-    /// Per-topic stats. Keys are owned copies (freed on purge).
+    /// Per-topic stats; keys are owned copies (freed on purge).
     topics: std.StringHashMapUnmanaged(TopicStats) = .empty,
 };
 
@@ -301,25 +253,23 @@ pub const PeerStats = struct {
 // The engine
 // ---------------------------------------------------------------------------
 
-/// The peer scoring engine. Holds per-peer stats, a global IP→count map (for P6),
-/// the parameters/thresholds, a monotonic `tick`, and an optional app-score
-/// callback. Single-owner (the router fiber): no internal locking. All mutation
-/// goes through the event hooks; `score`/the threshold helpers are read-only.
+/// The peer scoring engine. Single-owner (the router fiber): no internal locking.
+/// All mutation goes through the event hooks; `score` and the threshold helpers
+/// are read-only.
 pub const PeerScore = struct {
     allocator: std.mem.Allocator,
     params: ScoreParams,
     thresholds: PeerScoreThresholds,
-    /// Per-peer stats, keyed by the zero-padded peer bytes. Values are owned by
-    /// value (their nested maps/lists are freed on purge/deinit).
+    /// Per-peer stats, keyed by the zero-padded peer bytes. Nested maps/lists are
+    /// freed on purge/deinit.
     peers: std.AutoHashMapUnmanaged(PeerKey, PeerStats) = .empty,
-    /// Global IP → number of currently-tracked peers using it (P6's input). An IP
-    /// drops out of the map when its count reaches zero.
+    /// P6 input: global IP → count of tracked peers using it; an entry is removed
+    /// when its count reaches zero.
     ip_counts: std.AutoHashMapUnmanaged(IpKey, usize) = .empty,
-    /// Monotonic tick, advanced by the caller's heartbeat via `decay`. All
-    /// time-based accounting (mesh time, activation, window, retention) is measured
-    /// in these ticks.
+    /// Monotonic tick advanced by `decay`. All time-based accounting (mesh time,
+    /// activation, window, retention) is in these ticks.
     tick: u64 = 0,
-    /// Optional application-specific score source (P5). Null means P5 is zero.
+    /// Optional P5 source; null means P5 is zero.
     app_score_fn: ?AppScoreFn = null,
 
     pub fn init(
@@ -373,11 +323,9 @@ pub const PeerScore = struct {
 
     // ----- peer lifecycle ---------------------------------------------------
 
-    /// Begin (or re-activate) scoring for a peer. A brand-new peer gets fresh
-    /// stats; a peer still retained from a recent disconnect is simply marked
-    /// connected again, keeping its accumulated (negative) score — exactly the
-    /// retain-score behaviour. Best-effort: an allocation failure leaves the peer
-    /// untracked (it then scores 0, which is safe).
+    /// Begin (or re-activate) scoring for a peer. A still-retained peer is just
+    /// marked connected again, keeping its accumulated (negative) score. Best-effort:
+    /// on allocation failure the peer stays untracked and scores 0 (safe).
     pub fn addPeer(self: *PeerScore, peer: PeerId) void {
         const key = peerKey(&peer);
         const gop = self.peers.getOrPut(self.allocator, key) catch return;
@@ -388,19 +336,16 @@ pub const PeerScore = struct {
         }
     }
 
-    /// Mark a peer disconnected. Its stats are RETAINED (so a quick reconnect
-    /// keeps its score) until `retain_score_ticks` elapse, after which `decay`
-    /// purges it. The peer's IPs are released here (a disconnected peer no longer
-    /// occupies an IP slot for colocation), and its meshes are left intact in the
-    /// stats but no longer count as connected. No-op for an untracked peer.
+    /// Mark a peer disconnected. Its stats are RETAINED (so a quick reconnect keeps
+    /// its score) until `retain_score_ticks` elapse, then `decay` purges it. IPs are
+    /// released now — a disconnected peer no longer occupies a colocation slot
+    /// (go-libp2p). No-op for an untracked peer.
     pub fn removePeer(self: *PeerScore, peer: PeerId) void {
         const stats = self.peers.getPtr(peerKey(&peer)) orelse return;
         stats.connected = false;
         stats.disconnected_at_tick = self.tick;
-        // A disconnected peer frees its colocation slots immediately (go-libp2p
-        // removes the peer's IPs on disconnect); the per-peer list is cleared so a
-        // later purge does not double-decrement.
         self.releasePeerIps(stats);
+        // Clear the list so a later purge does not double-decrement the global count.
         stats.ips.clearRetainingCapacity();
     }
 
@@ -415,17 +360,16 @@ pub const PeerScore = struct {
 
     // ----- IP tracking (P6) -------------------------------------------------
 
-    /// Record that `peer` uses `ip`: add it to the peer's IP list and bump the
+    /// Record that `peer` uses `ip`: append to the peer's IP list and bump the
     /// global per-IP count. Duplicate IPs for one peer are NOT collapsed — go-libp2p
-    /// tracks per connection, so one peer with two connections from the same IP
-    /// counts twice. No-op for an untracked peer. Best-effort on allocation failure.
+    /// counts per connection, so two connections from one IP count twice. No-op for
+    /// an untracked peer; best-effort on allocation failure.
     pub fn addIP(self: *PeerScore, peer: PeerId, ip: std.Io.net.IpAddress) void {
         const stats = self.peers.getPtr(peerKey(&peer)) orelse return;
         const key = ipKey(ip);
         stats.ips.append(self.allocator, key) catch return;
         const gop = self.ip_counts.getOrPut(self.allocator, key) catch {
-            // Could not bump the global count; undo the per-peer append so the two
-            // stay consistent.
+            // Undo the per-peer append so the two stay consistent.
             _ = stats.ips.pop();
             return;
         };
@@ -469,11 +413,10 @@ pub const PeerScore = struct {
 
     // ----- mesh events ------------------------------------------------------
 
-    /// Record that `peer` was grafted into `topic`'s mesh: mark it in-mesh, restart
-    /// the mesh time so P3 activation is measured afresh, and deactivate P3 until the
-    /// activation grace period re-elapses. The decayed `mesh_message_deliveries`
-    /// counter is intentionally preserved (matching go-libp2p) — a re-grafted peer
-    /// keeps its accrued delivery credit. No-op for an untracked peer.
+    /// Record that `peer` was grafted into `topic`'s mesh: mark in-mesh, restart
+    /// mesh time, and deactivate P3 until the grace period re-elapses. The decayed
+    /// `mesh_message_deliveries` counter is intentionally preserved (go-libp2p): a
+    /// re-grafted peer keeps its accrued delivery credit. No-op for an untracked peer.
     pub fn graft(self: *PeerScore, peer: PeerId, topic: []const u8) void {
         const ts = self.topicStats(peerKey(&peer), topic) orelse return;
         ts.in_mesh = true;
@@ -482,10 +425,9 @@ pub const PeerScore = struct {
     }
 
     /// Record that `peer` was pruned from `topic`'s mesh. If P3 was active and the
-    /// peer was below the mesh-delivery threshold, capture the squared deficit into
-    /// the sticky mesh-failure penalty (P3b) — a peer that left the mesh while
-    /// under-delivering keeps paying for it as the penalty decays. Then mark it
-    /// out of mesh. No-op for an untracked peer or one with no stats for the topic.
+    /// peer was below the delivery threshold, capture the squared deficit into the
+    /// sticky P3b penalty — leaving the mesh under-delivering keeps costing the peer
+    /// as that penalty decays. No-op if untracked or no stats for the topic.
     pub fn prune(self: *PeerScore, peer: PeerId, topic: []const u8) void {
         const stats = self.peers.getPtr(peerKey(&peer)) orelse return;
         const ts = stats.topics.getPtr(topic) orelse return;
@@ -502,13 +444,10 @@ pub const PeerScore = struct {
 
     // ----- message events ---------------------------------------------------
 
-    /// Record that `peer` delivered a message we ACCEPT on `topic` (it was the
-    /// first — or among the first, within the window — to relay it, and it passed
-    /// validation). Credits P2 (first-delivery, capped) and, if the peer is in the
-    /// mesh, P3 (mesh-delivery, capped). This is the simplified accounting: we do
-    /// not run go-libp2p's full per-message validation state machine; the router
-    /// calls this once per accepted message per relaying peer. No-op for an
-    /// untracked peer.
+    /// Record that `peer` was first (or first-in-window) to relay an ACCEPTED
+    /// message on `topic`. Credits P2 (capped) and, if in the mesh, P3 (capped).
+    /// Simplified vs go-libp2p's per-message validation state machine: the router
+    /// calls this once per accepted message per relaying peer. No-op if untracked.
     pub fn deliverMessage(self: *PeerScore, peer: PeerId, topic: []const u8) void {
         const ts = self.topicStats(peerKey(&peer), topic) orelse return;
         const p = self.params.topic_default;
@@ -526,14 +465,10 @@ pub const PeerScore = struct {
         }
     }
 
-    /// Record a DUPLICATE of an already-seen message from a mesh `peer` on `topic`,
-    /// arriving within the mesh-delivery window. It still credits the peer's
-    /// P3 mesh-delivery counter (the peer did relay the message to us, just not
-    /// first), capped, but contributes nothing to P2. The caller (the router)
-    /// enforces the window — it only calls this for a duplicate within
-    /// `mesh_message_deliveries_window_ticks` of first seeing the message — so this
-    /// hook simply credits the counter. No-op if the peer is not in the mesh or is
-    /// untracked.
+    /// Record an in-window DUPLICATE from a mesh `peer` on `topic`: it relayed the
+    /// message, just not first, so credit P3 (capped) but not P2. The router enforces
+    /// the `mesh_message_deliveries_window_ticks` window before calling. No-op if the
+    /// peer is not in the mesh or is untracked.
     pub fn duplicateMessage(self: *PeerScore, peer: PeerId, topic: []const u8) void {
         const ts = self.topicStats(peerKey(&peer), topic) orelse return;
         if (!ts.in_mesh) return;
@@ -545,9 +480,8 @@ pub const PeerScore = struct {
     }
 
     /// Record that `peer` sent an INVALID message on `topic` (P4): bump its
-    /// invalid-delivery counter (the score squares it). In the router this fires on
-    /// signature/validation failure against the SENDING peer. No-op for an
-    /// untracked peer.
+    /// invalid-delivery counter (the score squares it). Fires on signature/validation
+    /// failure against the SENDING peer. No-op for an untracked peer.
     pub fn rejectMessage(self: *PeerScore, peer: PeerId, topic: []const u8) void {
         const ts = self.topicStats(peerKey(&peer), topic) orelse return;
         ts.invalid_message_deliveries += 1;
@@ -563,17 +497,13 @@ pub const PeerScore = struct {
 
     // ----- decay ------------------------------------------------------------
 
-    /// Advance the engine to `tick` (the caller's heartbeat counter) and, when a
-    /// full `decay_interval_ticks` has elapsed, run the per-interval bookkeeping:
-    /// geometrically decay every fading counter (snapping sub-`decay_to_zero`
-    /// values to zero), accrue mesh time + activate P3 for in-mesh topics, and
-    /// purge disconnected peers past their retention window.
-    ///
-    /// The decay is applied once per `decay_interval_ticks`; the caller is expected
-    /// to invoke this every heartbeat with a monotonically increasing tick. If the
-    /// tick has not advanced a whole interval since the last decay, only `self.tick`
-    /// is updated and no counters move (mirrors go-libp2p, which schedules decay on
-    /// a fixed interval independent of other heartbeat work).
+    /// Advance to `tick` (the heartbeat counter) and, once a full
+    /// `decay_interval_ticks` has elapsed, run the per-interval bookkeeping:
+    /// geometrically decay every fading counter (snapping sub-`decay_to_zero` to
+    /// zero), accrue mesh time + activate P3 for in-mesh topics, and purge
+    /// disconnected peers past their retention window. Within an interval only
+    /// `self.tick` advances and no counters move. Caller invokes every heartbeat
+    /// with a monotonic tick.
     pub fn decay(self: *PeerScore, tick: u64) void {
         const elapsed = tick -| self.tick;
         self.tick = tick;
@@ -629,11 +559,9 @@ pub const PeerScore = struct {
                     gp.decay_to_zero,
                 );
 
-                // Accrue mesh time for in-mesh topics and activate P3 once the
-                // accumulated time passes the activation grace period. Only
-                // connected peers accrue (a disconnected peer is no longer in any
-                // live mesh, though its stats may still record in_mesh from before
-                // the disconnect; go-libp2p stops accruing on disconnect).
+                // Accrue mesh time and activate P3 once past the grace period.
+                // Only connected peers accrue: a disconnected peer's stats may still
+                // record `in_mesh` from before, but it is no longer in any live mesh.
                 if (stats.connected and ts.in_mesh) {
                     ts.mesh_time_ticks += gp.decay_interval_ticks;
                     if (ts.mesh_time_ticks > tp.mesh_message_deliveries_activation_ticks) {
@@ -725,11 +653,9 @@ pub const PeerScore = struct {
         return s * p.topic_weight;
     }
 
-    /// P6: for each distinct IP the peer uses, if the number of peers sharing that
-    /// IP exceeds the colocation threshold, add the squared surplus times the
-    /// (negative) weight. A peer's repeated IP entries count once each per the IP
-    /// list (matching go's per-connection bookkeeping); the global count already
-    /// reflects all peers on the IP.
+    /// P6: for each of the peer's IP entries whose global count exceeds the
+    /// colocation threshold, add the squared surplus times the (negative) weight.
+    /// Repeated entries for one IP count once each (per-connection bookkeeping).
     fn ipColocationScore(self: *PeerScore, stats: *const PeerStats) f64 {
         if (self.params.ip_colocation_factor_weight == 0) return 0;
         var s: f64 = 0;

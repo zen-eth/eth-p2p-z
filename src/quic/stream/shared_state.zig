@@ -1,20 +1,15 @@
 //! Heap-allocated state shared between a `Stream` handle and the
-//! `ConnectionActor` (which keeps the actor-side `Record` in its streams
-//! table).
-//!
-//! Holds exactly the things that *both* sides need to touch:
+//! `ConnectionActor`. Holds only what both sides touch:
 //!   - Byte queues (inbound: actor → handle; outbound: handle → actor)
 //!   - Atomic state flags (closed, write/read shutdown, peer reset)
-//!   - Pointer back to the connection's `SharedState` so the handle can
-//!     post commands and signal the actor's wake mechanism without ever
-//!     holding a raw pointer into actor-private memory.
+//!   - Pointer to the connection's `SharedState` so the handle posts
+//!     commands and signals the actor's wake without ever holding a raw
+//!     pointer into actor-private memory.
 //!
-//! Refcount initialises to 1 (the `Stream` handle's ref, returned by `create`).
-//! The actor's `Record` takes a second ref in `StreamRecord.init` and drops it
-//! in its `deinit`; whichever side drops its ref last frees the allocation.
-//! `closeOnHandleDrop` is implemented via a `drop_stream`
-//! command on the connection's inbox — the handle never reaches into the
-//! actor's data structures.
+//! Refcount starts at 1 (handle ref from `create`); the actor's `Record`
+//! takes a second in `StreamRecord.init` and drops it in `deinit`; the last
+//! drop frees. Handle teardown goes via a `drop_stream` command on the
+//! connection inbox — never by reaching into actor data structures.
 
 const std = @import("std");
 const AtomicRc = @import("ref_count").AtomicRc;
@@ -52,10 +47,9 @@ pub const SharedState = struct {
     read_shutdown: Atomic(bool) = .init(false),
     inbound_reset_by_peer: Atomic(bool) = .init(false),
     outbound_reset_by_peer: Atomic(bool) = .init(false),
-    /// Set when this stream has been pushed onto the connection's
-    /// outbound-pending queue but the actor hasn't popped it yet.
-    /// Coalesces redundant pushes from a burst of writes. The handle CASes
-    /// false→true when it pushes; the actor stores false after popping.
+    /// True while this stream sits on the connection's outbound-pending
+    /// queue, coalescing redundant pushes from a burst of writes. Handle
+    /// CASes false→true when it pushes; actor stores false after popping.
     outbound_signaled: Atomic(bool) = .init(false),
 
     pub const Config = struct {
@@ -197,11 +191,9 @@ pub const SharedState = struct {
     }
 
     /// Handle-side: tell the actor this stream has new outbound bytes.
-    /// Coalesces concurrent writes via `outbound_signaled` so a burst of
-    /// writes results in at most one push to the connection's
-    /// outbound-pending queue. The waitset bit is always raised so the
-    /// actor will wake even on overflow (where it falls back to a full
-    /// stream scan).
+    /// `outbound_signaled` coalesces a burst of writes to at most one push.
+    /// The waitset bit is always raised so the actor wakes even on overflow
+    /// (where it falls back to a full stream scan).
     pub fn signalOutboundReady(self: *SharedState, io: std.Io) void {
         if (!self.outbound_signaled.swap(true, .acq_rel)) {
             // We transitioned false→true; we own the push.

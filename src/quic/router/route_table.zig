@@ -1,31 +1,24 @@
 //! The endpoint's CID → per-connection packet-inbox routing table, shared
-//! between the router's recv fiber (lookups, one per datagram) and every
-//! writer that manages CID lifetimes (connection actors minting/retiring CIDs,
-//! the dialer registering a fresh connection, the server accept path, and
+//! between the router's recv fiber (one lookup per datagram) and the writers
+//! that manage CID lifetimes (connection actors, dialer, server accept,
 //! teardown).
 //!
-//! This is a plain mutex-protected map written DIRECTLY by its writers — the
-//! quinn model — not actor-owned state: CID routing is not quiche state, so it
-//! needs no single-writer ordering. Direct writes let the recv loop be a single
-//! persistent fiber with zero per-packet task churn, make registration
-//! synchronous (no ack round-trip), and shrink the new-CID race window: a CID is
-//! routable the instant `quiche_conn_new_scid` returns, before the
-//! NEW_CONNECTION_ID frame reaches the peer.
+//! A plain mutex-protected map written DIRECTLY by its writers (the quinn
+//! model), not actor-owned state: CID routing is not quiche state, so it needs
+//! no single-writer ordering. Direct writes keep the recv loop a single
+//! persistent fiber and make a CID routable the instant `quiche_conn_new_scid`
+//! returns, before the NEW_CONNECTION_ID frame reaches the peer.
 //!
-//! Locking: every operation takes the one mutex for a short, bounded critical
-//! section (map probe + channel enqueue at most). `deliver` enqueues UNDER the
-//! lock — the per-connection channel's internal mutexes nest inside the table
-//! lock and nothing ever takes them in the reverse order, so there is no
-//! inversion. All locking is via `lockUncancelable`: these ops run on actor
-//! teardown paths where a cancellation point would re-introduce the
-//! one-shot-cancel fragility this codebase has already paid for.
+//! Locking: `deliver` enqueues UNDER the lock — the channel's internal mutexes
+//! nest inside the table lock and never the reverse, so no inversion. All via
+//! `lockUncancelable`: these run on teardown paths where a cancellation point
+//! would re-introduce one-shot-cancel fragility.
 //!
-//! Lifetime: embedded by value in `EndpointCore`, which every connection actor
-//! retains for its whole life (`NetworkTransport.core` is refcounted), so a
-//! writer can never dereference a freed table. Entries hold one channel retain
-//! each (acquired in `map`, released in `unmap`/`clear`). Routes die with the
-//! listener (`clear` on recv-loop exit); `clear` in core teardown is the
-//! backstop for entries registered after the loop exited.
+//! Lifetime: embedded by value in `EndpointCore`, retained for life by every
+//! connection actor (refcounted), so a writer can never deref a freed table.
+//! Each entry holds one channel retain (taken in `map`, dropped in
+//! `unmap`/`clear`); `clear` in core teardown backstops entries registered
+//! after the recv loop exited.
 
 const std = @import("std");
 const packet_route = @import("../io/packet_route.zig");
@@ -40,10 +33,10 @@ pub const RouteTable = struct {
     entries: std.AutoHashMap(CidKey, *IncomingPacketChannel),
 
     pub const DeliverResult = enum { queued, dropped, no_route };
-    /// `mapped` = a NEW entry was inserted (one new channel retain held);
-    /// `already_mapped` = the cid already maps to the SAME channel (idempotent
-    /// success, NO new retain — callers must not bump entry gauges); `failed` =
-    /// the cid belongs to a DIFFERENT channel, or the insert hit OOM.
+    /// `mapped` = NEW entry inserted (one new channel retain held);
+    /// `already_mapped` = cid already maps to the SAME channel (idempotent, NO
+    /// new retain — callers must not bump entry gauges); `failed` = cid belongs
+    /// to a DIFFERENT channel, or the insert hit OOM.
     pub const MapResult = enum { mapped, already_mapped, failed };
     pub const MapExistingResult = enum { mapped, already_mapped, unknown_existing, failed };
 
@@ -59,10 +52,9 @@ pub const RouteTable = struct {
         table.entries.deinit();
     }
 
-    /// Route one packet: look the CID up and move the packet into the owning
-    /// connection's inbox. `no_route` leaves the packet untouched (the caller
-    /// may try the accept path or drop it); `dropped` means the inbox was full
-    /// (loss-like, QUIC retransmits) and the packet has been consumed.
+    /// Route one packet into the owning connection's inbox. `no_route` leaves
+    /// the packet untouched (caller may try accept or drop); `dropped` means the
+    /// inbox was full (loss-like, QUIC retransmits) and the packet was consumed.
     pub fn deliver(table: *RouteTable, io: std.Io, cid: CidKey, packet: *RoutedPacket) DeliverResult {
         table.mutex.lockUncancelable(io);
         defer table.mutex.unlock(io);
@@ -106,11 +98,10 @@ pub const RouteTable = struct {
         return false;
     }
 
-    /// All-or-nothing registration of a fresh connection's CIDs (the dialer /
-    /// server-accept path). Returns the number of NEWLY inserted entries (the
-    /// caller's gauge delta), or null on failure — in which case only the
-    /// entries THIS call inserted were rolled back (a cid that was already
-    /// mapped to the same channel is left untouched). At most 64 cids per call.
+    /// All-or-nothing registration of a fresh connection's CIDs. Returns the
+    /// count of NEWLY inserted entries (the caller's gauge delta), or null on
+    /// failure — rolling back only the entries THIS call inserted (an already
+    /// same-channel cid is left untouched). At most 64 cids per call.
     pub fn registerMany(table: *RouteTable, io: std.Io, cids: []const CidKey, channel: *IncomingPacketChannel) ?usize {
         std.debug.assert(cids.len <= 64);
         table.mutex.lockUncancelable(io);

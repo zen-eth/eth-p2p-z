@@ -31,11 +31,9 @@ pub const FromSockaddrError = error{AddressInvalid};
 
 /// Decode a POSIX `sockaddr_storage` into a `std.Io.net.IpAddress`.
 ///
-/// The pointer must reference at least the bytes corresponding to the discriminated
-/// `family` value. Callers holding a layout-compatible storage from another binding
-/// (for example `quiche.struct_sockaddr_storage`) should `@ptrCast` first so the
-/// alignment requirement is encoded in the type system rather than relying on
-/// `@alignCast` here.
+/// Pointer must reference at least the bytes for the discriminated `family`. Callers
+/// holding a layout-compatible storage from another binding should `@ptrCast` first,
+/// so the alignment requirement lives in the type system rather than an `@alignCast`.
 pub fn fromSockaddrStorage(storage: *const std.posix.sockaddr.storage) FromSockaddrError!std.Io.net.IpAddress {
     return switch (storage.family) {
         std.posix.AF.INET => blk: {

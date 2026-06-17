@@ -1,12 +1,7 @@
 //! `Record`: per-stream state held by the connection actor in its streams
-//! table. Owns no thread-shared resources — every field here is touched
-//! only from the actor fiber.
-//!
-//! Holds a ref to the heap-allocated `SharedState` (the handle holds the
-//! other ref). The actor owns the pending-send scratch buffer used to
-//! batch outbound bytes into quiche, and tracks bookkeeping flags
-//! (fin_sent, peer credit reservation, outbound-ready dedup, deferred
-//! close-write reply).
+//! table. Every field is touched only from the actor fiber — no
+//! thread-shared resources. Holds one ref to the heap-allocated
+//! `SharedState` (the handle holds the other).
 
 const std = @import("std");
 const conn_commands = @import("../connection/commands.zig");

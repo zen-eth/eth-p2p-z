@@ -13,9 +13,8 @@ pub const secp_context = @import("secp_context.zig");
 pub const ref_count = @import("ref_count");
 pub const RefCount = ref_count.RefCount;
 pub const swarm = @import("switch.zig");
-// gossipsub lives on the root import path (NOT routed through protocols.zig):
-// it imports switch.zig, which imports protocols.zig, so exporting it through
-// the protocols chain would risk an import cycle.
+// Rooted here, not under protocols.zig: it imports switch.zig -> protocols.zig,
+// so routing it back through that chain would risk an import cycle.
 pub const gossipsub = @import("protocols/pubsub/gossipsub.zig");
 
 pub const Connection = quic.Connection;
@@ -34,18 +33,15 @@ pub const PeerId = @import("peer_id").PeerId;
 
 pub const PubSubMessage = protobuf.rpc.Message;
 
-/// cgroup-CFS-quota-aware logical CPU count:
-/// `min(cgroup quota, affinity)`, walking the full cgroup ancestor chain. Use
-/// instead of `std.Thread.getCpuCount` when sizing a thread/executor pool. Needs
-/// an `io` (it reads `/proc/self/{cgroup,mountinfo}` + the cgroup tree).
+/// cgroup-CFS-quota-aware logical CPU count `min(cgroup quota, affinity)`: use
+/// instead of `std.Thread.getCpuCount` for sizing a thread/executor pool, since
+/// that is blind to the cgroup quota. Needs `io` (reads `/proc/self/*` + cgroup tree).
 pub const getNumCpus = @import("cpu_count.zig").getNumCpus;
 
-/// Convenience over `getNumCpus` for sizing the zio executor pool BEFORE the real
-/// runtime exists: spins a throwaway bootstrap io for the `/proc` reads, logs the
-/// affinity-vs-effective decision so containerized deployments surface any
-/// oversubscription, and falls back to the affinity count on any detection error.
-/// `std.Thread.getCpuCount` (sched_getaffinity) is blind to the cgroup CPU quota,
-/// so on `--cpus`/k8s-`limits.cpu` it over-reports and oversubscribes executors.
+/// `getNumCpus` for sizing the zio executor pool BEFORE the real runtime exists:
+/// spins a throwaway bootstrap io for the `/proc` reads, falling back to affinity
+/// on any detection error. Logs the decision so containers surface oversubscription
+/// (on `--cpus`/k8s `limits.cpu`, affinity over-reports and oversubscribes).
 pub fn effectiveCpuCount(gpa: std.mem.Allocator) usize {
     const affinity = std.Thread.getCpuCount() catch 1;
     var bootstrap = std.Io.Threaded.init(gpa, .{});

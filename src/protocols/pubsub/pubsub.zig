@@ -10,26 +10,22 @@ pub const protocol_id = "/meshsub/1.1.0";
 pub const protocol_id_v1_0 = "/meshsub/1.0.0";
 pub const protocol_id_v1_2 = "/meshsub/1.2.0";
 
-/// The /meshsub protocol versions this node speaks, in descending preference
-/// order. The dialer proposes these to a peer (best first) and uses whichever
-/// the peer accepts; the listener registers its inbound service for all of them.
-/// 1.2.0 adds IDONTWANT, 1.1.0 adds the gossip/scoring control messages, 1.0.0
-/// is the original floodsub-style mesh — all are wire-compatible up to the
-/// control messages each version introduces.
+/// The /meshsub versions this node speaks, in descending preference order: the
+/// dialer takes the first a peer accepts. 1.2.0 adds IDONTWANT, 1.1.0 adds the
+/// gossip/scoring control messages, 1.0.0 is the original floodsub-style mesh.
 pub const supported_protocols = [_][]const u8{ protocol_id_v1_2, protocol_id, protocol_id_v1_0 };
 
-/// The gossipsub protocol version in effect for one peer. Tracked per peer so
-/// version-gated features (e.g. IDONTWANT, which needs 1.2) only fire toward
-/// peers that negotiated a high enough version. `v1_1` is the baseline default
-/// for a peer whose version is not yet known.
+/// The gossipsub version in effect for one peer, gating version-specific
+/// features (e.g. IDONTWANT needs 1.2). `v1_1` is the baseline default until a
+/// peer's version is known.
 pub const Version = enum {
     v1_0,
     v1_1,
     v1_2,
 
     /// Map a negotiated /meshsub protocol id to its Version. An unrecognised id
-    /// (should not happen — we only ever negotiate from `supported_protocols`)
-    /// falls back to the 1.1 baseline.
+    /// (unreachable — we only negotiate from `supported_protocols`) falls back
+    /// to the 1.1 baseline.
     pub fn fromProtocolId(id: []const u8) Version {
         if (std.mem.eql(u8, id, protocol_id_v1_2)) return .v1_2;
         if (std.mem.eql(u8, id, protocol_id)) return .v1_1;
@@ -131,10 +127,9 @@ pub fn readRpc(allocator: std.mem.Allocator, io: std.Io, stream: *Stream) ReadRp
 
 pub const ReadRpcBufferedError = error{ EndOfStream, ReadFailed, VarintTooLong, MessageTooLarge } || gremlin.Error;
 
-/// Like `readRpc` but over a persistent buffered `std.Io.Reader`: one stream
-/// read per buffer refill instead of one mutex-guarded `readAll` per varint
-/// byte. Over-read bytes stay buffered for the next frame, so the reader must
-/// outlive the stream (one per inbound handler).
+/// Like `readRpc` but over a persistent buffered `std.Io.Reader`. Over-read
+/// bytes stay buffered for the next frame, so the reader must outlive the stream
+/// (one per inbound handler).
 pub fn readRpcBuffered(allocator: std.mem.Allocator, r: *std.Io.Reader) ReadRpcBufferedError!OwnedRpc {
     const len = try readUvarintBuffered(r);
     if (len > max_rpc_message_len) return error.MessageTooLarge;

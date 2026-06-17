@@ -27,19 +27,15 @@ pub const CongestionControl = enum {
     }
 };
 
-/// QUIC transport-parameter and quiche-config knobs that are visible to the
-/// peer (idle timeout, flow control, congestion control, etc.), kept separate
-/// from the local-only actor/endpoint settings: things the peer negotiates
-/// against us, vs. things only our own IO loop sees.
+/// QUIC transport-parameter and quiche-config knobs visible to the peer (idle
+/// timeout, flow control, congestion control, etc.), kept separate from the
+/// local-only actor/endpoint settings the peer never negotiates against.
 pub const TransportOptions = struct {
     max_idle_timeout_ms: u64 = 30_000,
-    /// Keep-alive period in ms. After this long with no outbound packet, the actor
-    /// sends an ack-eliciting PING (`quiche_conn_send_ack_eliciting`) which resets
-    /// BOTH peers' idle timers, so an otherwise-idle connection survives
-    /// `max_idle_timeout_ms` (e.g. a gossipsub subscriber waiting between bursts,
-    /// which would otherwise silently lose every connection). Mirrors
-    /// go-libp2p/quic-go's KeepAlivePeriod (≈ idle/2). Must be
-    /// `< max_idle_timeout_ms`; 0 disables keep-alive.
+    /// After this long with no outbound packet, the actor sends an ack-eliciting
+    /// PING (`quiche_conn_send_ack_eliciting`) resetting BOTH idle timers, so an
+    /// idle connection survives `max_idle_timeout_ms`. Must be
+    /// `< max_idle_timeout_ms`; 0 disables.
     keep_alive_period_ms: u64 = 15_000,
     initial_max_data: u64 = 1024 * 1024,
     initial_max_stream_data_bidi_local: u64 = 256 * 1024,
@@ -57,15 +53,13 @@ pub const TransportOptions = struct {
     /// address on quiche path migration.
     disable_active_migration: bool = true,
     enable_pacing: bool = true,
-    /// RFC 9000 §8.1: the server MUST NOT send more than `factor *` bytes
-    /// before validating the client's address. Quiche defaults to 3 already;
-    /// surface it here so operators can tighten or relax for tunnels.
+    /// RFC 9000 §8.1: the server MUST NOT send more than `factor *` bytes before
+    /// validating the client's address. Surfaced so operators can tune for tunnels.
     max_amplification_factor: u64 = 3,
     /// Maximum delay before sending an ACK frame, in milliseconds. Lower
     /// values reduce loss-recovery latency at the cost of more ACK traffic.
     max_ack_delay_ms: u64 = 25,
-    /// Congestion control algorithm. tokio-quiche defaults to BBR2; we use
-    /// CUBIC because libp2p sees a wider range of network conditions and
+    /// CUBIC (not BBR2): libp2p sees a wide range of network conditions and
     /// CUBIC is friendlier to non-BBR peers.
     congestion_control: CongestionControl = .cubic,
     /// HyStart++ (RFC 9406) — exits slow-start earlier on RTT growth.
@@ -83,12 +77,12 @@ pub const TransportOptions = struct {
     /// disables the cap (quiche pacer chooses based on cwnd/RTT).
     max_pacing_rate_bps: u64 = 0,
     /// When true, retired DCIDs are not reused for outgoing path probes,
-    /// which forces fresh CIDs after migration. Default matches quiche.
+    /// forcing fresh CIDs after migration.
     disable_dcid_reuse: bool = false,
     /// Delegate certificate-chain verification to quiche/BoringSSL. libp2p
     /// peer identity verification still runs after the TLS handshake.
     verify_peer: bool = false,
-    /// Send QUIC GREASE values. Matches tokio-quiche/quiche default behavior.
+    /// Send QUIC GREASE values.
     grease: bool = true,
     /// Enable TLS key logging for local diagnostics.
     log_keys: bool = false,
@@ -97,23 +91,20 @@ pub const TransportOptions = struct {
     enable_early_data: bool = false,
     /// ACK delay exponent transport parameter. RFC 9000 default is 3.
     ack_delay_exponent: u64 = 3,
-    /// Optional stateless reset token. Server-only in effect: quiche reads it
-    /// from the config only for `is_server` connections, so on our dual-role
-    /// endpoint's shared config it applies to accepted connections and is
-    /// ignored for outbound dials.
+    /// Server-only: quiche reads it only for `is_server` connections, so on our
+    /// dual-role endpoint's shared config it applies to accepted connections and
+    /// is ignored for outbound dials.
     stateless_reset_token: ?[16]u8 = null,
-    /// Quiche CUBIC idle restart behavior toggle exposed for parity.
+    /// Toggle quiche's CUBIC idle-restart behavior.
     enable_cubic_idle_restart_fix: bool = false,
 };
 
-/// Per-connection actor tuning: inbound packet routing buffers, outbound
-/// batching, per-stream queues, and datagram pools. These never reach the
-/// wire — they only shape how our own actor handles packets it has already
-/// received or queued for send.
+/// Per-connection actor tuning (never reaches the wire): inbound routing
+/// buffers, outbound batching, per-stream queues, datagram pools.
 ///
-/// The queue-length knobs here ARE the cross-fiber backpressure budget — the
-/// bounded credit between producer and consumer fibers. They are validated
-/// non-zero and must stay >= 1 — a model-critical cross-fiber invariant.
+/// The queue-length knobs ARE the cross-fiber backpressure budget — bounded
+/// credit between producer and consumer fibers — so they must stay >= 1 (a
+/// model-critical invariant, validated below).
 pub const ActorOptions = struct {
     /// Maximum queued inbound UDP payload bytes per connection. Packet metadata
     /// and preallocated queue slots are bounded separately by queue length.
@@ -123,11 +114,9 @@ pub const ActorOptions = struct {
     control_queue_len: usize = 256,
     stream_inbound_queue_bytes: usize = 48 * 1024,
     /// Per-stream outbound cross-fiber buffer (writer fiber -> connection actor).
-    /// `quantum` is the credit-grant chunk per drain; `queue` is the total the
-    /// writer may get ahead. Sized so a large `writeAll` isn't chopped into many
-    /// cross-fiber handoffs. Keep `quantum` ~= one UDP-GSO super-packet (64KB)
-    /// and `queue` a small multiple; do NOT exceed the per-stream QUIC send window
-    /// (`initial_max_stream_data_bidi_*` = 256KB) — buffering past it is wasted.
+    /// `quantum` = credit chunk per drain (~one 64KB UDP-GSO super-packet); `queue`
+    /// = total the writer may get ahead. Do NOT exceed the per-stream QUIC send
+    /// window (`initial_max_stream_data_bidi_*`) — buffering past it is wasted.
     /// Memory cost is `queue_bytes` x concurrent outbound streams.
     stream_outbound_queue_bytes: usize = 128 * 1024,
     stream_inbound_quantum_bytes: usize = 32 * 1024,
@@ -135,10 +124,9 @@ pub const ActorOptions = struct {
     stream_accept_queue_len: usize = 64,
     recv_datagram_slots: usize = 48,
     send_datagram_queue_len: usize = 48,
-    /// Capacity of the per-connection MPSC queue that handles use to signal
-    /// "this stream has new outbound bytes" to the actor. Sized to cover the
-    /// expected concurrent-stream count; on overflow the actor falls back to
-    /// a full stream scan, which is correct but slower. Must be ≥ 1.
+    /// MPSC queue signaling "this stream has new outbound bytes" to the actor.
+    /// On overflow the actor falls back to a full stream scan (correct but
+    /// slower). Must be >= 1.
     outbound_pending_queue_len: usize = 256,
 };
 
@@ -146,28 +134,23 @@ pub const ActorOptions = struct {
 /// per-connection handshake deadline.
 pub const EndpointOptions = struct {
     connection_accept_queue_len: usize = 64,
-    /// Receive-slab pool for the endpoint's recv fiber: received datagrams
-    /// become zero-copy views into pooled buffers instead of per-packet heap
-    /// copies (a GRO super-datagram splits into sibling views of one slab).
-    /// `recv_slab_slots` bounds how many slabs may be pinned at once by
-    /// in-flight packets; an exhausted pool degrades to the heap-copy path.
-    /// 0 disables the pool entirely.
+    /// Receive-slab pool: datagrams become zero-copy views into pooled buffers
+    /// (a GRO super-datagram splits into sibling views of one slab). Bounds how
+    /// many slabs may be pinned at once; exhaustion degrades to the heap-copy
+    /// path. 0 disables the pool.
     recv_slab_slots: usize = 64,
-    /// Bytes per slab; must hold at least one maximum UDP datagram (65_535).
-    /// The default IS one maximum datagram — a per-packet buffer pool, the
-    /// finest pinning granularity (a slab frees as soon as its one packet is
-    /// consumed). Larger values turn each slab into a multi-datagram bump
-    /// arena: fewer pool round-trips, but the slab stays pinned until its
-    /// LAST view releases, so a single slow connection can hold whole slabs
-    /// hostage. Adopt larger sizes with measurements in hand.
+    /// Bytes per slab; must hold one maximum UDP datagram (65_535). The default
+    /// IS one datagram — finest pinning granularity (frees once its one packet
+    /// is consumed). Larger values amortize pool round-trips but pin the slab
+    /// until its LAST view releases, so one slow connection can hold slabs
+    /// hostage; raise only with measurements in hand.
     recv_slab_slot_bytes: usize = 65_535,
     handshake_timeout_ns: u64 = default_handshake_timeout_ns,
     enable_udp_gro: bool = true,
-    /// Send-path UDP GSO (Linux >= 4.18, probed at bind): equal-sized packets
-    /// to one peer go out as one sendmsg with a UDP_SEGMENT cmsg. Falls back to
-    /// per-packet sends where unsupported (macOS, old kernels, Shadow) or on the
-    /// first live GSO failure — some drivers pass the probe but fail real
-    /// segmented sends.
+    /// Send-path UDP GSO (Linux >= 4.18, probed at bind): equal-sized packets to
+    /// one peer go out as one sendmsg with a UDP_SEGMENT cmsg. Falls back to
+    /// per-packet sends where unsupported or on the first live GSO failure (some
+    /// drivers pass the probe but fail real segmented sends).
     enable_udp_gso: bool = true,
     /// Opt-in because packet-info rewrites quiche's local path address on
     /// wildcard sockets; transparent-proxy users can enable it together with
@@ -178,21 +161,14 @@ pub const EndpointOptions = struct {
     enable_orig_dst: bool = false,
     enable_rx_timestamps: bool = true,
     socket_mark: ?u32 = null,
-    /// Restrict the UDP socket to the basic `sendmsg`/`recvmsg` syscalls with no
-    /// ancillary control data — for running under the Shadow network simulator,
-    /// which supports neither `recvmmsg`/`sendmmsg`, UDP GSO/GRO (`UDP_SEGMENT`),
-    /// `IP_PKTINFO`/`IPV6_RECVPKTINFO`, `IP_RECVORIGDSTADDR`, ECN/`IP_RECVTOS`,
-    /// nor per-packet timestamp cmsgs. When set, the socket is configured exactly
-    /// like macOS already runs (no cmsg sockopts at all) and the receive loop uses
-    /// a plain `recvmsg` with no control buffer. This forces all the GRO/pktinfo/
-    /// timestamp toggles above to be treated as off regardless of their value.
-    ///
-    /// Low-risk: macOS already sets none of these sockopts and QUIC interop passes
-    /// there, so this only makes the Linux socket behave the way macOS always has.
-    /// A shadow-compatible node loses the per-packet local-destination address
-    /// (`IP_PKTINFO`); it relies on the socket's bound address for the local side,
-    /// which is correct for a single-homed bind (the Shadow/interop node binds to a
-    /// specific address).
+    /// Restrict the socket to plain `sendmsg`/`recvmsg` with no ancillary control
+    /// data — for the Shadow simulator, which supports none of `recvmmsg`/`sendmmsg`,
+    /// UDP GSO/GRO, `IP_PKTINFO`/`IPV6_RECVPKTINFO`, `IP_RECVORIGDSTADDR`,
+    /// ECN/`IP_RECVTOS`, or timestamp cmsgs. Forces all GRO/pktinfo/timestamp
+    /// toggles above off regardless of their value; this is exactly how macOS
+    /// already runs (and interops), so it's low-risk. Loses the per-packet local
+    /// destination (`IP_PKTINFO`), relying on the bound address instead — correct
+    /// for a single-homed bind.
     shadow_compatible: bool = false,
 };
 

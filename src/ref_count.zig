@@ -1,37 +1,23 @@
-//! A small, generic, atomically reference-counted box: shared ownership of one
-//! heap value, no weak references and no cycle handling.
-//!
-//! `RefCount(T)` heap-allocates a wrapper holding a `T` and an atomic counter.
-//! `init` mints it with one reference; each holder `retain`s to add a reference
-//! and `release`s to drop one. The wrapper (and its `T`) is freed exactly once,
-//! on the 1→0 transition. The counter is atomic so the box can be shared across
-//! fibers/threads; for the ordering rationale see `AtomicRc` and the per-method
-//! docs.
-//!
-//! The inner `T.deinit` (if present) is dispatched at comptime: a `deinit` that
-//! takes an allocator is called as `value.deinit(allocator)`, one that takes only
-//! self as `value.deinit()`, and a `T` with no `deinit` skips the call entirely.
+//! Generic atomically reference-counted box: shared ownership of one heap value,
+//! no weak refs, no cycle handling. The atomic counter lets the box be shared
+//! across fibers/threads; the wrapper (and its `T`) is freed exactly once, on the
+//! 1→0 transition. Ordering rationale lives in `AtomicRc` and the per-method docs.
 
 const std = @import("std");
 
-/// Intrusive atomic refcount: embed as a field of an owning struct; the owner
-/// calls `retain`/`release` and performs its own at-zero cleanup + free. The
-/// counter mechanics live here so every owner shares one audited implementation;
-/// the struct layout, allocation, pointer types, and call sites stay the owner's.
+/// Intrusive atomic refcount: embed as a field of an owning struct that calls
+/// `retain`/`release` and does its own at-zero cleanup + free. Count starts at 1;
+/// `release*` returns `true` exactly once, on the 1→0 transition.
 ///
 /// Two ordering flavors — pick ONE per owner and use it consistently:
 ///
-///   * `retain` / `release` — the lighter pattern: `.monotonic` bump, `.release`
-///     decrement + acquire fence on the 1→0 transition.
+///   * `retain` / `release` — lighter: `.monotonic` bump, `.release` decrement +
+///     acquire fence on the 1→0 transition.
 ///
-///   * `retainChecked` / `releaseChecked` — both directions use `.acq_rel` and
-///     assert the prior count was positive, catching a retain-after-free or an
-///     over-release in debug builds on UAF-sensitive primitives. `.acq_rel` is
-///     strictly stronger than the lighter pattern, so the at-zero reader still
-///     observes every prior holder's writes.
-///
-/// Either way the count starts at 1 and `release*` returns `true` exactly once,
-/// on the 1→0 transition — the caller's signal to run cleanup and free.
+///   * `retainChecked` / `releaseChecked` — `.acq_rel` both directions, asserting
+///     the prior count was positive to catch retain-after-free / over-release in
+///     debug builds. Strictly stronger, so the at-zero reader still observes every
+///     prior holder's writes.
 pub const AtomicRc = struct {
     n: std.atomic.Value(usize) = .init(1),
 
@@ -41,17 +27,17 @@ pub const AtomicRc = struct {
         return .{ .n = .init(initial) };
     }
 
-    /// Add one holder (lighter pattern). Unordered: a new holder becomes
-    /// reachable to other threads only through a synchronizing edge that carries
-    /// the happens-before, so the bump needs no ordering.
+    /// Add one holder (lighter pattern). Unordered: a new holder becomes reachable
+    /// to other threads only through a synchronizing edge that already carries the
+    /// happens-before, so the bump needs no ordering.
     pub fn retain(self: *AtomicRc) void {
         _ = self.n.fetchAdd(1, .monotonic);
     }
 
     /// Give up one holder (lighter pattern). Returns `true` iff this was the LAST
-    /// reference; the caller must then run its cleanup + free. The decrement is
-    /// `.release` and the freeing thread issues an `.acquire` fence on the 1→0
-    /// transition, establishing happens-before with every prior holder's writes.
+    /// reference, the caller's signal to run cleanup + free. The `.release`
+    /// decrement plus `.acquire` fence on the 1→0 transition establishes
+    /// happens-before with every prior holder's writes before reclamation.
     pub fn release(self: *AtomicRc) bool {
         if (self.n.fetchSub(1, .release) != 1) return false;
         _ = self.n.load(.acquire); // acquire fence on the 1→0 transition
@@ -65,10 +51,9 @@ pub const AtomicRc = struct {
         std.debug.assert(previous > 0);
     }
 
-    /// Give up one holder (QUIC lifecycle pattern): `.acq_rel`, asserting the
-    /// prior count was positive to catch an over-release in debug builds.
-    /// Returns `true` iff this was the LAST reference; the caller then runs its
-    /// own cleanup + free.
+    /// Give up one holder (QUIC lifecycle pattern): `.acq_rel`, asserting the prior
+    /// count was positive to catch an over-release in debug builds. Returns `true`
+    /// iff this was the LAST reference; the caller then runs cleanup + free.
     pub fn releaseChecked(self: *AtomicRc) bool {
         const previous = self.n.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
@@ -104,19 +89,18 @@ pub fn RefCount(comptime T: type) type {
             return self;
         }
 
-        /// Add one holder's reference and return `self` for convenient chaining.
-        /// Cheap and unordered: a freshly retained box only becomes reachable to
-        /// other threads through a synchronizing edge that carries the
-        /// happens-before, so the bump itself needs no ordering.
+        /// Add one holder's reference; returns `self` for chaining. Unordered: a
+        /// freshly retained box becomes reachable to other threads only through a
+        /// synchronizing edge that already carries the happens-before.
         pub fn retain(self: *Self) *Self {
             _ = self.refs.fetchAdd(1, .monotonic);
             return self;
         }
 
-        /// Give up one holder's reference. On the 1→0 transition this deinits the
-        /// inner value and frees the wrapper. The decrement is `.release` and the
-        /// freeing thread issues an `.acquire` fence first, establishing
-        /// happens-before with every prior holder's writes before reclamation.
+        /// Give up one holder's reference. On the 1→0 transition, deinits the inner
+        /// value and frees the wrapper. The `.release` decrement plus `.acquire`
+        /// fence establishes happens-before with every prior holder's writes before
+        /// reclamation.
         pub fn release(self: *Self) void {
             if (self.refs.fetchSub(1, .release) != 1) return;
             _ = self.refs.load(.acquire);

@@ -17,22 +17,19 @@ pub const Options = struct {
     listen_addrs: []const []const u8 = &.{},
     observed_addr: ?[]const u8 = null,
     protocols: []const []const u8 = &.{},
-    /// The marshaled signed Envelope advertising our own PeerRecord (libp2p
-    /// identify field 8, `signedPeerRecord`). When set, peers can verify and
-    /// certify our addresses (and forward us in peer-exchange). Built by
-    /// `IdentifyHandler` from a host key; null leaves the field off the wire.
+    /// Marshaled signed Envelope advertising our PeerRecord (libp2p identify field
+    /// 8, `signedPeerRecord`): lets peers verify+certify our addresses and forward
+    /// us in peer-exchange. null leaves the field off the wire.
     signed_peer_record: ?[]const u8 = null,
 };
 
 pub const IdentifyHandler = struct {
     allocator: std.mem.Allocator,
     options: Options = .{},
-    /// Our sealed peer record, owned and freed on `deinit` when present. Built
-    /// once at construction from the host key (the listen addrs are fixed in
-    /// `options`), then served verbatim on every inbound identify — the record
-    /// is immutable, so one shared handler can answer concurrent streams without
-    /// synchronisation. Mirrors `options.signed_peer_record` (a borrowed view of
-    /// these bytes).
+    /// Sealed peer record, owned and freed on `deinit`. Sealed once at
+    /// construction and immutable thereafter, so one shared handler answers
+    /// concurrent streams without synchronisation. `options.signed_peer_record`
+    /// borrows a view of these bytes.
     owned_record: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) IdentifyHandler {
@@ -45,13 +42,12 @@ pub const IdentifyHandler = struct {
 
     /// Like `initWithOptions`, but also seals a PeerRecord with `host_key` and
     /// advertises it as the identify `signedPeerRecord` (libp2p field 8). The
-    /// record names `host_key`'s peer-id, `seq` (a monotonic version: larger means
-    /// newer), and `options.listen_addrs` as its addresses — the SAME listen addrs
-    /// the plain identify sends, so the record stays consistent with the
-    /// `listenAddrs` field. Each addr is encoded to BINARY multiaddr form (matching
-    /// go-libp2p / rust-libp2p so they parse our addresses). The returned handler
-    /// owns the sealed bytes (freed by `deinit`); a seal failure is propagated
-    /// rather than silently dropping the record.
+    /// record names `host_key`'s peer-id, `seq` (monotonic version; larger is
+    /// newer), and `options.listen_addrs` — the SAME addrs the plain identify
+    /// sends, kept consistent with the `listenAddrs` field. Addrs go on the wire
+    /// as BINARY multiaddrs (the libp2p form go-libp2p/rust-libp2p parse). The
+    /// handler owns the sealed bytes; a seal failure propagates rather than
+    /// silently dropping the record.
     pub fn initWithSignedRecord(
         allocator: std.mem.Allocator,
         options: Options,
@@ -60,9 +56,7 @@ pub const IdentifyHandler = struct {
     ) !IdentifyHandler {
         const peer_id = try host_key.peerId(allocator);
 
-        // The PeerRecord carries BINARY multiaddrs (the libp2p wire form). Encode
-        // each string listen addr to bytes, seal, then free the temporaries — the
-        // sealed envelope owns its own copy.
+        // Free the encoded temporaries after sealing — the envelope copies them.
         const bin_addrs = try encodeListenAddrs(allocator, options.listen_addrs);
         defer freeAddrList(allocator, bin_addrs);
 
@@ -102,7 +96,7 @@ pub const OwnedIdentify = struct {
 };
 
 pub fn writeIdentify(allocator: std.mem.Allocator, io: std.Io, stream: *Stream, options: Options) !void {
-    // `listenAddrs` go on the wire as BINARY multiaddrs (so go/rust parse them).
+    // `listenAddrs` go on the wire as BINARY multiaddrs.
     const bin_addrs = try encodeListenAddrs(allocator, options.listen_addrs);
     defer freeAddrList(allocator, bin_addrs);
     const listen_addrs = try nullableSliceList(allocator, bin_addrs);
@@ -142,21 +136,17 @@ pub fn readIdentify(allocator: std.mem.Allocator, io: std.Io, stream: *Stream) !
     };
 }
 
-/// Verify the `signedPeerRecord` (libp2p identify field 8) inside a received
-/// identify and return the validated record for `expected_peer`. Three checks,
-/// mirroring go-libp2p `consumeSignedPeerRecord`: the envelope's signature must
-/// verify against its embedded public key, that key must hash to the record's
-/// peer-id (the key↔peer-id binding, enforced inside `consumeEnvelope`), AND the
-/// record's peer-id must equal the peer we completed the connection with — so a
-/// peer cannot advertise another node's record. Returns null when no record is
-/// present; returns an error when a record is present but invalid or names the
-/// wrong peer.
+/// Verify the `signedPeerRecord` (libp2p identify field 8) and return the
+/// validated record for `expected_peer`. Mirrors go-libp2p `consumeSignedPeerRecord`:
+/// (a) envelope signature verifies against its embedded key, (b) that key hashes
+/// to the record's peer-id (enforced in `consumeEnvelope`), (c) that peer-id equals
+/// the connection peer, so a peer cannot advertise another node's record. null when
+/// no record; error when a record is present but invalid or names the wrong peer.
 ///
-/// The returned `ConsumedRecord` owns its address slices and backing buffer
-/// (free with `deinit`). To populate the gossipsub certified-record store the
-/// caller hands the ORIGINAL envelope bytes (`reader.getSignedPeerRecord()`,
-/// which `putRecord` re-verifies and stores verbatim) to the binding; this helper
-/// proves they verify and bind to the expected peer first.
+/// The returned `ConsumedRecord` owns its address slices and backing buffer (free
+/// with `deinit`). It proves the record verifies and binds; to store it the caller
+/// hands the ORIGINAL envelope bytes (`reader.getSignedPeerRecord()`) to `putRecord`,
+/// which re-verifies and stores them verbatim.
 pub fn consumeSignedPeerRecord(
     allocator: std.mem.Allocator,
     reader: *const identify_pb.IdentifyReader,
@@ -173,11 +163,9 @@ pub fn consumeSignedPeerRecord(
     return consumed;
 }
 
-/// Encode each string-form listen multiaddr into its BINARY multiaddr bytes (the
-/// libp2p wire form). Returns a freshly allocated list of owned byte slices (free
-/// with `freeAddrList`). An addr that fails to encode (an unsupported protocol)
-/// propagates the error rather than being silently dropped, so a misconfigured
-/// listen addr surfaces instead of going on the wire malformed.
+/// Encode each string-form listen multiaddr to its BINARY multiaddr bytes.
+/// Returns an owned list of owned slices (free with `freeAddrList`). A failed
+/// encode (unsupported protocol) propagates rather than going on the wire malformed.
 fn encodeListenAddrs(allocator: std.mem.Allocator, addrs: []const []const u8) ![][]u8 {
     const out = try allocator.alloc([]u8, addrs.len);
     var filled: usize = 0;
