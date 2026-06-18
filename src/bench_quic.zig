@@ -253,6 +253,115 @@ fn runScenario(
     client_conn.close(io, 0, "bench done") catch {};
 }
 
+/// BENCH_HANDSHAKE=<iters>: handshake-LATENCY probe (zio#494). Times `dial`
+/// (the full TLS+QUIC handshake) over loopback, `iters` times, and reports the
+/// average. This is the latency-bound request/response phase where the io_uring
+/// backend over-sleeps (~4x epoll); bulk goodput — the scenarios above — is
+/// unaffected. Run on both backends: `zig build bench-quic -Dzio-backend=epoll`
+/// vs `-Dzio-backend=io_uring`.
+fn runHandshakeLatency(allocator: std.mem.Allocator, io: std.Io, iters: usize) !void {
+    var fixture = try TwoEndpoints.init(allocator, io, .{}, .{});
+    defer fixture.deinit();
+    const server_addr = try fixture.bindServerLoopback();
+    _ = try fixture.bindClientLoopback();
+
+    const server_conns = try allocator.alloc(?*support.Connection, iters);
+    defer allocator.free(server_conns);
+    @memset(server_conns, null);
+    var multi = MultiAccept{ .endpoint = fixture.server, .conns = server_conns };
+    var accept_future = try std.Io.concurrent(io, MultiAccept.run, .{&multi});
+
+    const client_conns = try allocator.alloc(?*support.Connection, iters);
+    defer allocator.free(client_conns);
+    @memset(client_conns, null);
+
+    var total_ns: u64 = 0;
+    var max_ns: u64 = 0;
+    var i: usize = 0;
+    while (i < iters) : (i += 1) {
+        const t0 = io_time.monotonicNs(io);
+        const conn = fixture.client.dial(server_addr, .{
+            .timeout = support.receiveTimeout(support.default_handshake_timeout_ns),
+        }) catch |err| {
+            accept_future.cancel(io);
+            accept_future.await(io);
+            return err;
+        };
+        const t1 = io_time.monotonicNs(io);
+        client_conns[i] = conn;
+        const dt: u64 = @intCast(t1 - t0);
+        total_ns += dt;
+        if (dt > max_ns) max_ns = dt;
+    }
+    accept_future.await(io);
+    if (multi.err) |err| return err;
+
+    const avg_ms = @as(f64, @floatFromInt(total_ns / iters)) / 1e6;
+    const max_ms = @as(f64, @floatFromInt(max_ns)) / 1e6;
+    std.debug.print("handshake latency: backend={s}  iters={d}  avg={d:.3} ms  max={d:.3} ms\n", .{ @tagName(zio.ev.backend), iters, avg_ms, max_ms });
+
+    for (client_conns) |maybe| if (maybe) |c| {
+        c.close(io, 0, "done") catch {};
+        c.deinit();
+    };
+    for (server_conns) |maybe| if (maybe) |c| c.deinit();
+}
+
+const hs_port: u16 = 39494;
+
+/// BENCH_HS_LISTEN=1: TWO-PROCESS repro, listener half. Own zio runtime; binds a
+/// fixed loopback port and accepts handshakes forever (conns kept alive; process
+/// exit frees). Pair with a separate BENCH_HS_DIAL process: two INDEPENDENT
+/// runtimes is what exposes the zio#494 4x — the dialer's loop genuinely idles
+/// between round-trips, so the io_uring over-sleep is not masked by the
+/// shared-runtime activity that a single-process bench has.
+fn runHandshakeListener(allocator: std.mem.Allocator, io: std.Io) !void {
+    var fixture = try TwoEndpoints.init(allocator, io, .{}, .{});
+    defer fixture.deinit();
+    _ = try fixture.server.bind(.{ .ip4 = .loopback(hs_port) });
+    std.debug.print("hs-listener: backend={s}  bound 127.0.0.1:{d}\n", .{ @tagName(zio.ev.backend), hs_port });
+    while (true) {
+        _ = fixture.server.accept() catch break;
+    }
+}
+
+/// BENCH_HS_DIAL=<iters>: TWO-PROCESS repro, dialer half. Own zio runtime; dials
+/// the listener's fixed port `iters` times, timing each full handshake. Each conn
+/// is closed before the next dial and the runtime idles `gap_ms` (BENCH_HS_GAP_MS,
+/// default 100) in between, so EVERY handshake is COLD — a latency-bound dial on
+/// an otherwise-idle loop. That is the zio#494 trigger: back-to-back dials keep
+/// the loop warm with incidental wakeups and hide the over-sleep (see the bulk
+/// scenarios — io_uring is fine there).
+fn runHandshakeDialer(allocator: std.mem.Allocator, io: std.Io, iters: usize, gap_ms: u64) !void {
+    var fixture = try TwoEndpoints.init(allocator, io, .{}, .{});
+    defer fixture.deinit();
+    _ = try fixture.client.bind(.{ .ip4 = .loopback(0) });
+    const server_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(hs_port) };
+
+    var total_ns: u64 = 0;
+    var max_ns: u64 = 0;
+    var i: usize = 0;
+    while (i < iters) : (i += 1) {
+        if (gap_ms > 0) io_time.ms(gap_ms).sleep(io) catch {}; // idle -> next dial is cold
+        const t0 = io_time.monotonicNs(io);
+        const conn = fixture.client.dial(server_addr, .{
+            .timeout = support.receiveTimeout(support.default_handshake_timeout_ns),
+        }) catch |err| {
+            std.debug.print("hs-dialer: dial {d} failed: {}\n", .{ i, err });
+            return err;
+        };
+        const t1 = io_time.monotonicNs(io);
+        const dt: u64 = @intCast(t1 - t0);
+        total_ns += dt;
+        if (dt > max_ns) max_ns = dt;
+        conn.close(io, 0, "done") catch {};
+        conn.deinit(); // drop it so the loop goes quiet again before the next dial
+    }
+    const avg_ms = @as(f64, @floatFromInt(total_ns / iters)) / 1e6;
+    const max_ms = @as(f64, @floatFromInt(max_ns)) / 1e6;
+    std.debug.print("hs-dialer: backend={s}  iters={d}  gap_ms={d}  avg={d:.3} ms  max={d:.3} ms\n", .{ @tagName(zio.ev.backend), iters, gap_ms, avg_ms, max_ms });
+}
+
 /// Investigation harness (BENCH_POISON=1): reproduce the churn-degraded mode
 /// (footprint first), then run bulk and dump the FULL endpoint-stats delta of
 /// both endpoints — attributing exactly which counter moves in degraded runs.
@@ -376,6 +485,21 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.c.getenv("BENCH_BULK_ONLY") != null) {
         try runScenario(allocator, io, "bulk 64KiB chunks", 32 * 1024 * 1024, bulk_chunk);
+        return;
+    }
+    if (std.c.getenv("BENCH_HANDSHAKE")) |v| {
+        const iters = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+        try runHandshakeLatency(allocator, io, if (iters >= 1) iters else 100);
+        return;
+    }
+    if (std.c.getenv("BENCH_HS_LISTEN") != null) {
+        try runHandshakeListener(allocator, io);
+        return;
+    }
+    if (std.c.getenv("BENCH_HS_DIAL")) |v| {
+        const iters = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+        const gap_ms = if (std.c.getenv("BENCH_HS_GAP_MS")) |g| (std.fmt.parseInt(u64, std.mem.span(g), 10) catch 100) else 100;
+        try runHandshakeDialer(allocator, io, if (iters >= 1) iters else 50, gap_ms);
         return;
     }
     try runScenario(allocator, io, "bulk 64KiB chunks", bulk_total, bulk_chunk);
