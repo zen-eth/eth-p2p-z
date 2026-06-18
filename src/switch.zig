@@ -67,6 +67,11 @@ pub const Switch = struct {
     /// way that could block or deadlock.
     pub const PeerEventCallback = struct {
         ctx: *anyopaque,
+        /// Inbound dispatch is owned by the Switch (auto_inbound_dispatch /
+        /// startInboundDispatcher); this callback must NOT start or drive inbound
+        /// dispatch itself. It fires before the Switch posts its auto-start, so a
+        /// callback that started dispatch would just be the no-op'd loser of the
+        /// race with the owning dispatcher.
         on_connected: *const fn (ctx: *anyopaque, peer: PeerId, conn: *SwitchConnection, remote_addr: std.Io.net.IpAddress) void,
         /// Fired once per CONNECTION unregister, not per peer: two connections to
         /// one peer (simultaneous dial) each fire. `conn` identifies WHICH
@@ -117,7 +122,7 @@ pub const Switch = struct {
         ConnectionClosed,
         SelectedProtocolMismatch,
     } || quic.Connection.OpenStreamError || protocols.multistream.Error || std.Io.ConcurrentError;
-    pub const StartInboundDispatchError = error{ ConnectionClosed, AlreadyDispatching } || std.Io.Cancelable || std.Io.ConcurrentError;
+    pub const StartInboundDispatchError = error{ConnectionClosed} || std.Io.Cancelable || std.Io.ConcurrentError;
     pub const CloseError = error{ConnectionClosed} || quic.Connection.CloseError;
 
     pub const ListenError = error{AddressInvalid} || quic.QuicEndpoint.ListenError;
@@ -398,6 +403,9 @@ pub const Switch = struct {
         // Only a genuinely-registered connection reaches here: the append above
         // is the last fallible step, so there is no error path between
         // registration and firing.
+        //
+        // Fires BEFORE the auto-start dispatch below, so the observer learns the
+        // peer connected before any inbound handler runs.
         if (sw.peer_event_callback) |cb| {
             cb.on_connected(cb.ctx, managed.peerId(), managed, managed.remoteAddress());
         }
@@ -993,6 +1001,15 @@ fn actorMain(actor: *SwitchConnectionActor) std.Io.Cancelable!void {
                 ) catch |err| cmd.reply.complete(actor.io, err);
             },
             .dispatch_inbound_stream => |cmd| {
+                // The continuous dispatcher already owns this connection's accept
+                // queue, so a manual single-shot dispatch is satisfied-by-the-running
+                // dispatcher: a second consumer would race it for one stream and one
+                // would starve. Report success and skip (mirrors the idempotent-no-op
+                // at startInboundDispatch).
+                if (actor.dispatcher_running) {
+                    cmd.reply.complete(actor.io, {});
+                    continue;
+                }
                 actor.dispatchInboundStream(cmd.opts) catch |err| {
                     cmd.reply.complete(actor.io, err);
                     if (err == error.Canceled) return error.Canceled;
@@ -1648,6 +1665,94 @@ test "openProtocolStreamMulti negotiates the best protocol the peer supports" {
     client_conn_live = false;
     server_conn.deinit();
     server_conn_live = false;
+}
+
+test "manual dispatchInboundStream is a no-op when the continuous dispatcher already owns inbound" {
+    // With auto_inbound_dispatch at its default (TRUE), accept() auto-starts the
+    // continuous dispatcher, which then OWNS the connection's accept queue. A manual
+    // dispatchInboundStream on the same connection must NOT spin up a second consumer
+    // (the two would race for one stream and one would starve); it must report
+    // success via the no-op path. The continuous dispatcher must still service the
+    // peer's stream — proving no second consumer stole it.
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server_key = try identity.KeyPair.generate(.ED25519);
+    defer server_key.deinit();
+    var client_key = try identity.KeyPair.generate(.ED25519);
+    defer client_key.deinit();
+
+    const server_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &server_key, .{});
+    defer server_endpoint.deinit();
+    const client_endpoint = try quic.QuicEndpoint.initWithIdentity(allocator, io, &client_key, .{});
+    defer client_endpoint.deinit();
+
+    const server = try Switch.init(allocator, io, server_endpoint);
+    defer server.deinit();
+    const client = try Switch.init(allocator, io, client_endpoint);
+    defer client.deinit();
+    // Leave server.auto_inbound_dispatch at its default TRUE: accept() auto-starts
+    // the continuous dispatcher that owns inbound here.
+
+    // Echo one byte and record that the auto-dispatcher's handler ran.
+    const EchoHandler = struct {
+        queue: *std.Io.Queue(u8),
+        fn run(self: *@This(), handler_io: std.Io, stream: *quic.Stream) anyerror!void {
+            var buf: [1]u8 = undefined;
+            try stream.readAll(handler_io, &buf, .{});
+            try stream.writeAll(handler_io, &buf, .{});
+            try self.queue.putOne(handler_io, buf[0]);
+        }
+    };
+    var queue_buffer: [1]u8 = undefined;
+    var queue = std.Io.Queue(u8).init(&queue_buffer);
+    var handler = EchoHandler{ .queue = &queue };
+    try server.addProtocolService(
+        "/test/noop/1.0.0",
+        protocols.streamHandlerService(EchoHandler, EchoHandler.run, &handler),
+    );
+
+    var listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer listen_addr.deinit(allocator);
+    try server.listen(listen_addr);
+    var client_listen_addr = try Multiaddr.fromString(allocator, "/ip4/127.0.0.1/udp/0/quic-v1");
+    defer client_listen_addr.deinit(allocator);
+    try client.listen(client_listen_addr);
+
+    var addrs = try server.listenMultiaddrs(allocator);
+    defer {
+        for (addrs.items) |addr| allocator.free(addr);
+        addrs.deinit(allocator);
+    }
+    var dial_addr = try Multiaddr.fromString(allocator, addrs.items[0]);
+    defer dial_addr.deinit(allocator);
+
+    const client_conn = try client.dial(dial_addr, .{});
+    defer client_conn.deinit();
+    // accept() runs auto-start: the continuous dispatcher now owns server inbound.
+    const server_conn = try server.accept();
+    defer server_conn.deinit();
+
+    // The no-op path returns immediately (it never calls acceptStream), so a short
+    // timeout still proves "success, not error": a real second consumer would block
+    // here until the timeout. Assert void, not an error.
+    try server_conn.dispatchInboundStream(.{
+        .accept_timeout = .{ .duration = .{ .raw = .fromNanoseconds(100 * std.time.ns_per_ms), .clock = .awake } },
+    });
+
+    // The continuous auto-dispatcher still services the client's stream: it echoes
+    // the byte and records that its handler ran — so no second consumer stole it.
+    const stream = try client_conn.openProtocolStream("/test/noop/1.0.0", .{});
+    defer stream.deinit();
+    defer closeStreamForCleanup(io, stream);
+    var out = [_]u8{0x7E};
+    try stream.writeAll(io, &out, .{});
+    var in: [1]u8 = undefined;
+    try stream.readAll(io, &in, .{});
+    try std.testing.expectEqual(@as(u8, 0x7E), in[0]);
+    try std.testing.expectEqual(@as(u8, 0x7E), try queue.getOne(io));
 }
 
 test "a stalled outbound negotiation does not block the connection's command lane" {
