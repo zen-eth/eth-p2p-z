@@ -1568,6 +1568,12 @@ test "openProtocolStreamMulti negotiates the best protocol the peer supports" {
     defer server.deinit();
     const client = try Switch.init(allocator, io, client_endpoint);
     defer client.deinit();
+    // This test drives inbound dispatch MANUALLY (its own dispatch thread), so it
+    // opts out of auto inbound-dispatch — otherwise the auto continuous dispatcher
+    // races the manual single-stream accept on the same connection and one of them
+    // starves on a second stream that never arrives (a timeout-bounded flake).
+    server.auto_inbound_dispatch = false;
+    client.auto_inbound_dispatch = false;
 
     // Server registers middle + low but NOT high. The client proposes
     // [high, middle, low]; the responder rejects "high" and accepts "middle" (the
