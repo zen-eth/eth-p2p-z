@@ -30,8 +30,8 @@
             .hash = "secp256k1-0.0.3-vtxi56DlAACjVafQhd5hn8ClU4o2GdG6X4zUP75NsNCc",
         },
         .quiche_zig = .{
-            .url = "git+https://github.com/chainsafe/quiche-zig#2e0b489b3c9900f658ca97b766b802003525cdb0",
-            .hash = "quiche-0.1.0-rnTCo4cQAACPgyY1ZYEYw7Yw0JNl2jGqlVLz6pOmA06t",
+            .url = "git+https://github.com/GrapeBaBa/quiche-zig#fb1fef3a8cba68327014b8fecf324bd9b7e97cb2",
+            .hash = "quiche-0.1.0-rnTCo5IdAACTLOhOYW-uvl6zoeN0YvNDZS0l1TZaWBC5",
         },
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio#ad85c354d06fc6f7904ce9bbe3dff9498595ea25",

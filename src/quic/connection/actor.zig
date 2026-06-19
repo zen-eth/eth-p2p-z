@@ -1370,14 +1370,12 @@ pub const ConnectionActor = struct {
 
     fn drainRetiredSourceCids(self: *ConnectionActor) usize {
         const conn = self.conn orelse return 0;
-        // Drain quiche's retired-SCID queue WITHOUT reading the out-pointer:
-        // `quiche_conn_retired_scid_next` has the same use-after-free as the
-        // connection-id iterator (ConnectionId dropped before the call returns).
-        // The retired cid lingers in our registry/route table until teardown:
-        // dead weight, not a hazard — quiche drops stray packets for it.
-        var cid_ptr: [*c]const u8 = null;
-        var cid_len: usize = 0;
-        while (quiche.quiche_conn_retired_scid_next(conn, &cid_ptr, &cid_len)) {}
+        // Drain quiche's retired-SCID queue: the iterator pops every retired CID
+        // into its own storage, so creating then freeing it clears the queue. We
+        // don't read the CIDs — they linger in our registry/route table until
+        // teardown: dead weight, not a hazard (quiche drops stray packets for it).
+        const iter = quiche.quiche_conn_retired_scid_iter(conn) orelse return 0;
+        quiche.quiche_connection_id_iter_free(iter);
         return 0;
     }
 
