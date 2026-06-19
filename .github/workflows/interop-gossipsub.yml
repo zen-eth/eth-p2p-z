@@ -1,0 +1,106 @@
+name: Gossipsub interop
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: 0.16.0
+
+# The gossipsub interop scenarios launch real OS processes over loopback QUIC
+# (no Docker/Redis/external harness), so they run on a single ubuntu-latest host
+# and exit non-zero on failure. The scripts build with GOPROXY=off / cargo
+# --offline, so we seed the module/crate caches online first.
+jobs:
+  gossipsub-interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache Zig
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: ~/zig
+          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          wget https://ziglang.org/download/${{ env.ZIG_VERSION }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}.tar.xz
+          tar -xf zig-x86_64-linux-${{ env.ZIG_VERSION }}.tar.xz
+          mv zig-x86_64-linux-${{ env.ZIG_VERSION }} ~/zig
+
+      - name: Add Zig to PATH
+        run: echo "${HOME}/zig" >> $GITHUB_PATH
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            zig-cache
+            ~/.cache/zig
+          key: ${{ runner.os }}-zig-build-${{ hashFiles('**/*.zig') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-build-
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: interop/gossipsub/go-peer/go.sum
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust (cargo + rust-peer target)
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            interop/gossipsub/rust-peer/target
+          key: ${{ runner.os }}-gspeer-rust-${{ hashFiles('interop/gossipsub/rust-peer/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-gspeer-rust-
+
+      # The build scripts run go/cargo offline; populate the caches online first.
+      - name: Seed go-peer modules
+        run: cd interop/gossipsub/go-peer && go mod download
+
+      - name: Seed rust-peer crates
+        run: cd interop/gossipsub/rust-peer && cargo fetch
+
+      - name: zig <-> zig (smoke)
+        run: bash interop/gossipsub/run-zig-zig.sh
+
+      - name: zig <-> go
+        run: bash interop/gossipsub/run-zig-go.sh
+
+      - name: zig <-> rust
+        run: bash interop/gossipsub/run-zig-rust.sh
+
+      - name: cross-impl peer-exchange (go <-> zig)
+        run: bash interop/gossipsub/run-px-crossimpl.sh
+
+      - name: mixed-impl mesh
+        run: bash interop/gossipsub/run-mixed-mesh.sh
+
+      - name: anonymous mixed mesh
+        run: bash interop/gossipsub/run-anonymous-mixed.sh
+
+      - name: version fallback (meshsub 1.1 <-> 1.2)
+        run: bash interop/gossipsub/run-version-fallback.sh
+
+      - name: large-mesh gossip
+        run: bash interop/gossipsub/run-gossip-large.sh
+
+      - name: churn
+        run: bash interop/gossipsub/run-churn.sh
